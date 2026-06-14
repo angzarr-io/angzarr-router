@@ -1,0 +1,17 @@
+[package]
+name = "angzarr-router-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "C-ABI surface over angzarr-router — no semantics in this layer"
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+angzarr-router = { path = "../router" }
+prost = { workspace = true }
+prost-types = { workspace = true }
+
+[build-dependencies]
+prost-build = { workspace = true }

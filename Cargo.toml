@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/router", "crates/router-ffi"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+
+[workspace.dependencies]
+prost = "0.13"
+prost-types = "0.13"
+prost-build = "0.13"

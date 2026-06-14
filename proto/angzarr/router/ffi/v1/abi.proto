@@ -1,0 +1,49 @@
+syntax = "proto3";
+package angzarr.router.ffi.v1;
+
+// Auxiliary payloads crossing the C ABI. These are internal to the FFI
+// boundary and versioned with the ABI (angzarr_abi_version) — they are
+// NOT wire protocol and never leave the process.
+//
+// Errors cross the boundary as google.rpc.Status bytes carrying a
+// google.rpc.ErrorInfo detail (reason = SCREAMING_SNAKE code, domain
+// "angzarr.io", metadata = extras) — the exact shape gRPC serializes on
+// the wire; no invented error proto.
+
+// One (fully-qualified type name → host callback) table row.
+message CallbackEntry {
+  string fq_type = 1;
+  uint64 callback_id = 2;
+}
+
+// Rejection rows carry ORDERED callback lists: multiple compensators for
+// one rejected command all run, in registration order.
+message RejectionEntry {
+  string fq_command_type = 1; // FULLY-QUALIFIED; short names never match
+  repeated uint64 callback_ids = 2;
+}
+
+// Registration payload for one aggregate component: the dispatch tables
+// the binding's registration API (and later, generated wiring) assembles.
+message AggregateDescriptor {
+  string name = 1;
+  string domain = 2;
+  repeated CallbackEntry commands = 3;
+  repeated CallbackEntry appliers = 4;
+  repeated RejectionEntry rejections = 5;
+  // Snapshot loader callback; absent when the aggregate takes no snapshots.
+  optional uint64 snapshot_callback_id = 6;
+}
+
+// aux payload for command-handler callbacks.
+message CommandContextAux {
+  uint32 next_sequence = 1;
+  bool had_prior_events = 2;
+}
+
+// aux payload for rejection (compensation) callbacks.
+message RejectionAux {
+  bytes notification = 1; // serialized angzarr Notification
+  bytes rejection = 2;    // serialized angzarr RejectionNotification
+  CommandContextAux cctx = 3;
+}

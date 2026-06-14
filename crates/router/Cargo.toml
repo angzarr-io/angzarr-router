@@ -1,0 +1,13 @@
+[package]
+name = "angzarr-router"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The shared angzarr client router: dispatch/rebuild semantics, implemented once"
+
+[dependencies]
+prost = { workspace = true }
+prost-types = { workspace = true }
+
+[build-dependencies]
+prost-build = { workspace = true }

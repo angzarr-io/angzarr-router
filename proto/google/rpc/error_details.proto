@@ -1,0 +1,16 @@
+// Vendored from googleapis (Apache-2.0): the ErrorInfo detail message,
+// field-for-field. The cross-language SCREAMING_SNAKE code travels as
+// ErrorInfo.reason (domain "angzarr.io", metadata = extras map).
+syntax = "proto3";
+package google.rpc;
+
+option go_package = "google.golang.org/genproto/googleapis/rpc/errdetails;errdetails";
+option java_multiple_files = true;
+option java_outer_classname = "ErrorDetailsProto";
+option java_package = "com.google.rpc";
+
+message ErrorInfo {
+  string reason = 1;
+  string domain = 2;
+  map<string, string> metadata = 3;
+}
