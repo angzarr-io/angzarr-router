@@ -1,2 +1,8 @@
 /target
 mutants.out*
+
+# devcontainer cargo registry cache (bind-mounted)
+/.devcontainer/cargo-cache/
+
+# container-overlay cargo home (host-delegation runs)
+/.cargo-container/

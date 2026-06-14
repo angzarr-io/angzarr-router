@@ -83,7 +83,7 @@ pub unsafe extern "C" fn angzarr_router_free(r: *mut c_void) {
 }
 
 /// Registers one aggregate component from a serialized
-/// `angzarr.router.ffi.v1.AggregateDescriptor` and the host's callback
+/// `io.angzarr.router.ffi.v1.AggregateDescriptor` and the host's callback
 /// gateway. Returns 0 on success, a negated gRPC code on failure.
 ///
 /// # Safety

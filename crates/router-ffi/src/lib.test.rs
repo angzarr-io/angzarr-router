@@ -15,7 +15,7 @@ use angzarr_router::pb;
 
 use super::*;
 use crate::abi::{STATUS_OK, STATUS_OK_EMPTY};
-use crate::proto::angzarr::router::ffi::v1 as abi_pb;
+use crate::proto::io::angzarr::router::ffi::v1 as abi_pb;
 use crate::proto::google::rpc as rpc_pb;
 
 // --- the host's business messages (what generated protobuf classes would be)

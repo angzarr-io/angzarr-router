@@ -1,0 +1,43 @@
+# angzarr-router — container-side recipes.
+#
+# Mounted over `justfile` inside the container (and used directly inside a
+# devcontainer). Holds the real toolchain invocations; the host `justfile`
+# delegates here via the container-overlay pattern (same as angzarr core).
+set shell := ["bash", "-c"]
+
+TOP := `git rev-parse --show-toplevel`
+
+default:
+    @just --list
+
+# Build the workspace
+build:
+    cargo build --manifest-path {{TOP}}/Cargo.toml --workspace
+
+# Run the unit test bank
+test:
+    cargo test --manifest-path {{TOP}}/Cargo.toml --workspace
+
+# Mutation-test the core modules (gate: kill >= 0.95 on rebuild/aggregate).
+# cargo-mutants copies the source tree, so the proto root must be an absolute
+# path that survives the copy — ANGZARR_PROJECT_PROTO points build.rs at the
+# real submodule checkout.
+mutation-test:
+    cd {{TOP}} && ANGZARR_PROJECT_PROTO=${ANGZARR_PROJECT_PROTO:-{{TOP}}/angzarr-project/proto} cargo mutants -f crates/router/src/rebuild.rs -f crates/router/src/aggregate.rs -f crates/router/src/error.rs -f crates/router/src/lib.rs --timeout 120
+
+# Format
+fmt:
+    cargo fmt --manifest-path {{TOP}}/Cargo.toml --all
+
+# Lint (clippy, warnings are errors)
+lint:
+    cargo clippy --manifest-path {{TOP}}/Cargo.toml --workspace --all-targets -- -D warnings
+
+# Lint the router's own protos (io.angzarr.router.ffi.v1) with buf — the
+# pinned plugins come from this image.
+buf-lint:
+    cd {{TOP}}/proto && buf lint
+
+# Check proto formatting (no rewrite; fails on drift).
+buf-format:
+    cd {{TOP}}/proto && buf format --diff --exit-code

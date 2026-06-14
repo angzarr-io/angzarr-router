@@ -1,5 +1,5 @@
 syntax = "proto3";
-package angzarr.router.ffi.v1;
+package io.angzarr.router.ffi.v1;
 
 // Auxiliary payloads crossing the C ABI. These are internal to the FFI
 // boundary and versioned with the ABI (angzarr_abi_version) — they are

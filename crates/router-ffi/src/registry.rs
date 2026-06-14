@@ -13,7 +13,7 @@ use angzarr_router::rebuild::Rebuilder;
 use angzarr_router::{pb, NOTIFICATION_TYPE_URL};
 
 use crate::abi::{consume_out, status_to_coded, AngzarrBuf, AngzarrCb, STATUS_OK, STATUS_OK_EMPTY};
-use crate::proto::angzarr::router::ffi::v1 as abi_pb;
+use crate::proto::io::angzarr::router::ffi::v1 as abi_pb;
 
 thread_local! {
     /// The host's per-dispatch session pointer. Set for the duration of

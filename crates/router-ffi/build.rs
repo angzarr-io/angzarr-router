@@ -7,7 +7,7 @@ fn main() {
     prost_build::Config::new()
         .compile_protos(
             &[
-                repo_proto.join("angzarr/router/ffi/v1/abi.proto"),
+                repo_proto.join("io/angzarr/router/ffi/v1/abi.proto"),
                 repo_proto.join("google/rpc/status.proto"),
                 repo_proto.join("google/rpc/error_details.proto"),
             ],
