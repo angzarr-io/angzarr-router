@@ -123,7 +123,10 @@ angzarr-router/
 │   │   └── test/counter/counter.proto  # the same fixture as an
 │   │                          # (io.angzarr.v1.component) declaration —
 │   │                          # codegen input for unit 6
-│   └── cases/*.txtpb          # request → expected outcome, textproto
+│   ├── features/*.feature     # behavior in English narrative; true data
+│   │                          # in Scenario-Outline Examples (run by every lang)
+│   └── fixtures/*.txtpb       # orthogonal envelope skeletons only — no
+│                              # test-meaningful values; step defs inject those
 └── justfile                   # build / test / conformance / fmt
 ```
 
@@ -207,7 +210,7 @@ The crate ships a **Rust-side ABI consumer test**: a test module that
 drives the extern "C" surface through raw pointers exactly as a
 foreign binding would — the ABI is proven before any binding exists.
 
-### 2.4 The conformance fixture and cases (review unit 3)
+### 2.4 The conformance fixture, behavior suite, and native harness (review unit 3)
 
 One fixture component, specified twice from one definition: `FIXTURE.md`
 prose for reviewers, and `conformance/proto/test/counter/counter.proto`
@@ -226,18 +229,59 @@ language:
 > - handler records the observed `CommandContext` (exercises
 >   historical-state evidence)
 
-Cases are language-neutral `.txtpb` files: a `ContextualCommand`
-request plus the expected outcome (response book shape — page count,
-sequences, ext — or the expected `ErrorInfo` reason). The case list
-covers: empty history; prior events fold; snapshot + covered boundary
-(sequence == snapshot.sequence skipped, +1 applied); gap page;
-corrupt payload; unknown command before rebuild; each envelope guard;
-fill-only ext; sequence continuation; rejection fan-out order;
-undeclared rejection → empty response; n == 0 rejection code;
+**Behavior is described in Gherkin, in English narrative** — the
+single cross-language contract. Cucumber is the spec because its value
+is the readable behavior story; so the scenarios carry the **true test
+data** (the salient values: amounts, expected counts, rejection codes)
+in step text and `Scenario Outline` Examples tables, and read
+top-to-bottom as behavior that survives any implementation change.
+
+```gherkin
+Scenario Outline: increasing a counter records that many events
+  Given a new counter
+  When the operator increases the counter by <amount>
+  Then <amount> increases are recorded, continuing the sequence
+  Examples: | amount | 1 | 2 | 5 |
+
+Scenario: increasing by zero is rejected, nothing is recorded
+  Given a new counter
+  When the operator increases the counter by 0
+  Then the command is rejected as VALUE_NOT_POSITIVE
+  And no events are recorded
+```
+
+The `.txtpb` fixtures carry **only the orthogonal envelope** — the
+structural boilerplate every case shares and the test is *not* about
+(`ContextualCommand` → `CommandBook` → `cover{domain}` → page → `Any`
+wrapping). They are value-free skeletons; the test-meaningful field is
+omitted and supplied by the scenario:
+
+```textproto
+# fixtures/increase_envelope.txtpb — orthogonal scaffold only; no test data.
+command {
+  cover { domain: "counter" }
+  pages { command { [type.googleapis.com/test.counter.IncreaseBy] {} } }
+}
+```
+
+**Step definitions** (per language: cucumber-rs here, godog/behave in
+the bindings) are the only per-language code: parse the skeleton, **set
+the scenario's data by field** (structured — never string-templating
+the textproto), dispatch, and assert the outcome. They are generic
+across scenarios.
+
+Behavior the suite covers: empty history; prior events fold; snapshot +
+covered boundary (sequence == snapshot.sequence skipped, +1 applied);
+gap page; corrupt payload; unknown command before rebuild; each
+envelope guard; fill-only ext; sequence continuation; rejection fan-out
+order; undeclared rejection → empty response; n == 0 rejection code;
 FailHard → `UNHANDLED_HANDLER_ERROR`.
 
-Every implementation — the Rust core natively, then each binding —
-runs the same case files. One source of truth for "correct."
+Unit 3 ships the suite + fixtures + the **cucumber-rs harness driving
+the Rust core natively** (gate: features green against the core). Every
+later subject — each binding, and the generated clients — supplies only
+its step-definition layer and runs the *same* features and fixtures.
+One source of truth for "correct," authored in English.
 
 ---
 
@@ -251,8 +295,8 @@ client-go/
 └── ffirouter/
     ├── ffirouter.go        # cgo: load/link, registration API, dispatch
     ├── trampoline.go       # //export gateway: one C-visible fn → Go registry by callback_id
+    ├── steps_test.go       # godog step defs: parse skeleton, set scenario data, dispatch, assert
     ├── fixture_test.go     # CounterAggregate in Go
-    ├── conformance_test.go # runs ../angzarr-router conformance cases
     └── differential_test.go
 ```
 
@@ -260,13 +304,18 @@ client-go/
   (`ANGZARR_ROUTER_LIB` env, sibling-checkout default — the
   `validate-client` pattern). Build-tagged (`//go:build ffirouter`) so
   `go test ./...` stays pure-Go until the artifact story lands.
+- **Runs the same `.feature` files + `.txtpb` fixtures** from
+  `../angzarr-router/conformance` via a **godog** step harness — the Go
+  step defs are the only new conformance code; the behavior spec is
+  shared, unchanged.
 - The registration API is shaped like the engine's
   (`OnCommand(fq, thunk)`) — deliberately, since `angzarr codegen go`
   emits against it in unit 6 with minimal emitter changes. The
-  hand-written fixture glue in this unit is the draft of that emitter
-  output and is replaced by it.
+  hand-written fixture glue here is **transitional**: its only jobs are
+  to de-risk the ABI before the generator exists and to serve as the
+  differential oracle. Unit 6 deletes it.
 - **`differential_test.go` is the review centerpiece**: every
-  conformance case (and a property-style sweep of generated books)
+  conformance scenario (and a property-style sweep of generated books)
   runs through BOTH the existing Go engine and the Rust core via FFI,
   asserting identical responses and identical error codes. The Go
   engine — mutation-hardened — is the oracle; any divergence is a
@@ -282,7 +331,7 @@ client-python/
     ├── _abi.py             # cffi (ABI mode, dlopen): decls, callbacks, GIL notes
     └── tests:
         ├── test_fixture.py       # CounterAggregate in Python
-        └── test_conformance.py   # same case files
+        └── steps.py              # behave/pytest-bdd step defs over the same .feature + .txtpb
 ```
 
 - **cffi ABI mode** for the bootstrap: pure-Python consumption of the
@@ -292,6 +341,10 @@ client-python/
   acquisition from router threads. A later graduation to PyO3 is an
   optimization decision, not an architecture change, because the C ABI
   must remain for the future bindings regardless.
+- Runs the **same `.feature` files + `.txtpb` fixtures** via a
+  **behave** (or pytest-bdd) step harness — only the Python step defs
+  are new; the behavior spec is shared. The GIL-threaded dispatch
+  requirement is met by exercising concurrent dispatches in a scenario.
 - Decorators and the existing router package are untouched; this is
   additive.
 
@@ -322,14 +375,19 @@ In [angzarr-cli](https://github.com/angzarr-io/angzarr-cli):
   (`go tool angzarr-cli codegen <lang>`). The conformance fixture's
   `counter.proto` is the test input.
 
-The gate closes the loop in both repos: regenerate the fixture wiring
-from `conformance/proto/`, delete the hand-written glue from units 4–5,
-and re-run conformance and the differential suite through the
-**generated** wiring with identical results. Any awkwardness the
-emitter hits (callback-id assignment, aux unmarshaling, registration
-ordering) is an ABI/API finding surfaced **before** the freeze — the
-emitter is the third consumer of the registration API after the two
-hand-written bindings, and the one all future users go through.
+**Testing the generated client is the whole point of this unit** — the
+generated code is what users ship, so it is a first-class conformance
+subject, not the hand-written glue. The gate closes the loop in both
+repos: regenerate the fixture wiring from `conformance/proto/`, delete
+the transitional hand-written glue from units 4–5, and re-run **the same
+`.feature` suite + `.txtpb` fixtures** (and the differential suite)
+through the **generated** wiring with identical results. So the final
+matrix is `cucumber × {Rust core, Go generated, Python generated}`, all
+green on one English behavior spec. Any awkwardness the emitter hits
+(callback-id assignment, aux unmarshaling, registration ordering) is an
+ABI/API finding surfaced **before** the freeze — the emitter is the
+third consumer of the registration API after the two hand-written
+bindings, and the one all future users go through.
 
 ---
 
@@ -339,10 +397,10 @@ hand-written bindings, and the one all future users go through.
 |---|---|---|---|
 | 1 | Core crate slice + transliterated test bank | angzarr-router | ✅ **done** — tests green; `cargo-mutants` 51/51 viable caught (≥ 0.95) |
 | 2 | FFI crate + Rust-side ABI consumer test | angzarr-router | ✅ **done** — ABI test green; panic/ownership rules each pinned |
-| 3 | Fixture spec + conformance cases | angzarr-router | ▶ **next** — cases pass against the core natively |
-| 4 | Go binding + **differential suite** | client-go | conformance green; differential: zero divergence from the Go engine |
-| 5 | Python binding | client-python | conformance green; GIL-threaded dispatch exercised (concurrent dispatches in test) |
-| 6 | Codegen emitters target the bindings | angzarr-cli (+ both client repos) | wiring regenerated from `conformance/proto/`; hand-written glue deleted; conformance + differential identical through generated wiring |
+| 3 | Fixture + Gherkin behavior suite + cucumber-rs harness | angzarr-router | ▶ **next** — `.feature` suite green against the core natively |
+| 4 | Go binding + godog harness + **differential suite** | client-go | same features green via godog; differential: zero divergence from the Go engine |
+| 5 | Python binding + behave harness | client-python | same features green via behave; GIL-threaded dispatch exercised (concurrent dispatches) |
+| 6 | Codegen emitters → **test the generated clients** | angzarr-cli (+ both client repos) | wiring regenerated from `conformance/proto/`; hand-written glue deleted; same features + differential green through **generated** wiring |
 
 Each unit is one reviewable change. After unit 6: **ABI freeze review**
 — the explicit decision point the decision record requires before R1
