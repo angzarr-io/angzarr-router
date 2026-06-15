@@ -42,7 +42,13 @@ impl Drop for HostCtxGuard {
 
 /// Invokes the host callback with the current dispatch's session pointer.
 /// Returns the status and any host-filled output (ownership taken).
-fn invoke(cb: AngzarrCb, id: u64, type_url: &str, payload: &[u8], aux: &[u8]) -> (i32, Option<Vec<u8>>) {
+fn invoke(
+    cb: AngzarrCb,
+    id: u64,
+    type_url: &str,
+    payload: &[u8],
+    aux: &[u8],
+) -> (i32, Option<Vec<u8>>) {
     let mut out = AngzarrBuf {
         data: std::ptr::null_mut(),
         len: 0,
@@ -82,7 +88,11 @@ impl FfiRouter {
 
     /// Parses an AggregateDescriptor and populates the core tables with
     /// callback-marshaling thunks.
-    pub fn register_aggregate(&mut self, descriptor: &[u8], cb: AngzarrCb) -> Result<(), CodedError> {
+    pub fn register_aggregate(
+        &mut self,
+        descriptor: &[u8],
+        cb: AngzarrCb,
+    ) -> Result<(), CodedError> {
         let desc = abi_pb::AggregateDescriptor::decode(descriptor).map_err(|_| {
             CodedError::invalid_argument(
                 codes::ANY_DECODE_FAILED,
@@ -112,7 +122,8 @@ impl FfiRouter {
             });
         }
 
-        let mut dispatch = AggregateDispatch::new(desc.name.clone(), desc.domain.clone(), rebuilder);
+        let mut dispatch =
+            AggregateDispatch::new(desc.name.clone(), desc.domain.clone(), rebuilder);
 
         for command in &desc.commands {
             let id = command.callback_id;

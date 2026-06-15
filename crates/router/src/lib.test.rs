@@ -11,7 +11,10 @@ fn type_name_from_url_strips_prefix() {
         type_name_from_url("type.googleapis.com/examples.CardsDealt"),
         "examples.CardsDealt"
     );
-    assert_eq!(type_name_from_url("examples.CardsDealt"), "examples.CardsDealt");
+    assert_eq!(
+        type_name_from_url("examples.CardsDealt"),
+        "examples.CardsDealt"
+    );
 }
 
 #[test]
@@ -96,10 +99,9 @@ fn well_formed_rejection_key_extracts_both_parts() {
     let event = page_event(&page).expect("event");
     use prost::Message;
     let notification = pb::Notification::decode(event.value.as_slice()).expect("notification");
-    let rejection = pb::RejectionNotification::decode(
-        notification.payload.expect("payload").value.as_slice(),
-    )
-    .expect("rejection");
+    let rejection =
+        pb::RejectionNotification::decode(notification.payload.expect("payload").value.as_slice())
+            .expect("rejection");
     assert_eq!(
         extract_rejection_key(&rejection),
         ("inventory".to_string(), "examples.ReserveStock".to_string())

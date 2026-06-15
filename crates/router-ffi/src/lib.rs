@@ -162,9 +162,7 @@ fn invalid_pointer(what: &str) -> CodedError {
 
 /// A panic anywhere inside an entry point becomes a coded
 /// UNHANDLED_HANDLER_ERROR — never an unwind across the boundary.
-fn flatten_panic<T>(
-    result: std::thread::Result<Result<T, CodedError>>,
-) -> Result<T, CodedError> {
+fn flatten_panic<T>(result: std::thread::Result<Result<T, CodedError>>) -> Result<T, CodedError> {
     match result {
         Ok(inner) => inner,
         // &*panic: pass the payload itself, not the Box (which is also Any).

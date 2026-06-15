@@ -33,7 +33,10 @@ fn absent_book_normalizes_to_fresh_state() {
     let r = fresh_rebuilder();
     let (state, info) = r.rebuild(None).expect("rebuild(None)");
     assert!(state.applied.is_empty(), "state must be fresh");
-    assert!(!info.had_prior_events, "had_prior_events for an absent book");
+    assert!(
+        !info.had_prior_events,
+        "had_prior_events for an absent book"
+    );
 }
 
 #[test]
@@ -68,7 +71,10 @@ fn unknown_event_type_skipped() {
         info.had_prior_events,
         "had_prior_events must reflect page presence, not applier hits"
     );
-    assert_eq!(info.applied_count, 1, "applied_count counts applier hits only");
+    assert_eq!(
+        info.applied_count, 1,
+        "applied_count counts applier hits only"
+    );
 }
 
 #[test]
@@ -171,10 +177,7 @@ fn snapshot_only_is_prior_history() {
         ..Default::default()
     };
     let (_, info) = r.rebuild(Some(&book)).expect("rebuild");
-    assert!(
-        info.had_prior_events,
-        "a snapshot alone is prior history"
-    );
+    assert!(info.had_prior_events, "a snapshot alone is prior history");
 }
 
 #[test]

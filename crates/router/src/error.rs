@@ -122,7 +122,12 @@ impl CodedError {
 
     /// An unclassified error that escaped a business handler (INTERNAL).
     pub fn unhandled(message: &str) -> Self {
-        Self::coded(codes::UNHANDLED_HANDLER_ERROR, message, [], GrpcCode::Internal)
+        Self::coded(
+            codes::UNHANDLED_HANDLER_ERROR,
+            message,
+            [],
+            GrpcCode::Internal,
+        )
     }
 
     /// Business rejection: retry after refetching state.

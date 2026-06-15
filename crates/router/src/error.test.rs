@@ -21,7 +21,8 @@ fn persisted_corrupt_is_data_loss() {
 
 #[test]
 fn no_handler_registered_is_unimplemented() {
-    let err = CodedError::invalid_argument(codes::NO_HANDLER_REGISTERED, messages::UNKNOWN_COMMAND, []);
+    let err =
+        CodedError::invalid_argument(codes::NO_HANDLER_REGISTERED, messages::UNKNOWN_COMMAND, []);
     assert_eq!(
         err.grpc,
         GrpcCode::Unimplemented,
@@ -60,7 +61,11 @@ fn coded_handler_error_passes_through_unchanged() {
 
 #[test]
 fn rejections_keep_their_grpc_code() {
-    let err = CodedError::rejection_precondition_failed("VALUE_NOT_POSITIVE", "value must be positive", []);
+    let err = CodedError::rejection_precondition_failed(
+        "VALUE_NOT_POSITIVE",
+        "value must be positive",
+        [],
+    );
     assert_eq!(err.grpc, GrpcCode::FailedPrecondition);
     assert_eq!(err.code, "VALUE_NOT_POSITIVE");
 

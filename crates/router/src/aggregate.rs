@@ -135,7 +135,10 @@ impl<S> AggregateDispatch<S> {
     /// command), thunk with rebuilt state and CommandContext, fill-only
     /// stamping on the emitted book. A Notification command page routes to
     /// the FQ-keyed compensation path instead.
-    pub fn dispatch(&self, req: &pb::ContextualCommand) -> Result<pb::BusinessResponse, CodedError> {
+    pub fn dispatch(
+        &self,
+        req: &pb::ContextualCommand,
+    ) -> Result<pb::BusinessResponse, CodedError> {
         let Some(command_book) = req.command.as_ref() else {
             return Err(CodedError::invalid_argument(
                 codes::MISSING_COMMAND_BOOK,
@@ -239,8 +242,7 @@ impl<S> AggregateDispatch<S> {
             had_prior_events: info.had_prior_events,
         };
         if let [thunk] = thunks.as_slice() {
-            return thunk(&notification, &rejection, &mut state, cctx)
-                .map_err(map_handler_error);
+            return thunk(&notification, &rejection, &mut state, cctx).map_err(map_handler_error);
         }
         // Fan-out: run every compensator in registration order, merging
         // their compensation events into one response.

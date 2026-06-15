@@ -104,7 +104,9 @@ impl<S> Rebuilder<S> {
             if covered_through > 0 && crate::page_sequence(page) <= covered_through {
                 continue;
             }
-            let Some(thunk) = self.appliers.get(crate::type_name_from_url(&event.type_url))
+            let Some(thunk) = self
+                .appliers
+                .get(crate::type_name_from_url(&event.type_url))
             else {
                 continue;
             };

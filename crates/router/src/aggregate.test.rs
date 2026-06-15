@@ -16,7 +16,10 @@ use crate::{page_event, TYPE_URL_PREFIX};
 
 const FQ_RESERVE: &str = "io.angzarr.examples.v1.ReserveStock";
 
-fn test_agg_dispatch() -> (AggregateDispatch<TestState>, Arc<Mutex<Vec<CommandContext>>>) {
+fn test_agg_dispatch() -> (
+    AggregateDispatch<TestState>,
+    Arc<Mutex<Vec<CommandContext>>>,
+) {
     let contexts = Arc::new(Mutex::new(Vec::new()));
     let seen = contexts.clone();
     let d = AggregateDispatch::new("agg-test", "order", cover_applier(fresh_rebuilder()))
@@ -155,10 +158,10 @@ fn name_and_domain_are_exact() {
 
 #[test]
 fn command_types_exact() {
-    let d = AggregateDispatch::new("agg", "orders", fresh_rebuilder()).on_command(
-        "test.CreateOrder",
-        |_, _: &mut TestState, _| Ok(Some(pb::EventBook::default())),
-    );
+    let d = AggregateDispatch::new("agg", "orders", fresh_rebuilder())
+        .on_command("test.CreateOrder", |_, _: &mut TestState, _| {
+            Ok(Some(pb::EventBook::default()))
+        });
     assert_eq!(d.command_types(), vec!["test.CreateOrder".to_string()]);
 }
 
@@ -269,7 +272,10 @@ fn rejection_receives_command_context() {
     };
     d.dispatch(&cmd).expect("dispatch");
     let cctx = *saw.lock().unwrap();
-    assert_eq!(cctx.next_sequence, 7, "compensation stamping needs next_sequence");
+    assert_eq!(
+        cctx.next_sequence, 7,
+        "compensation stamping needs next_sequence"
+    );
     assert!(cctx.had_prior_events, "had_prior_events with prior history");
 }
 
@@ -285,7 +291,10 @@ fn undeclared_rejection_delegates_to_framework() {
             "io.angzarr.examples.v1.SomethingElse",
         )))
         .expect("undeclared rejection must not error (framework default)");
-    assert!(resp.result.is_none(), "undeclared rejection yields an empty response");
+    assert!(
+        resp.result.is_none(),
+        "undeclared rejection yields an empty response"
+    );
 }
 
 #[test]
@@ -370,7 +379,11 @@ fn stamps_ext_and_sequences_fill_only() {
         .expect("dispatch");
     let events = events_of(&resp).expect("events");
     assert_eq!(
-        events.cover.as_ref().and_then(|c| c.ext.as_ref()).map(|e| e.type_url.as_str()),
+        events
+            .cover
+            .as_ref()
+            .and_then(|c| c.ext.as_ref())
+            .map(|e| e.type_url.as_str()),
         Some(parent.type_url.as_str()),
         "command cover.ext not stamped onto emitted book"
     );
@@ -394,7 +407,9 @@ fn stamps_ext_and_sequences_fill_only() {
     );
 
     // No ext on the command → emitted cover.ext stays unset.
-    let resp = d.dispatch(&cmd_with("test.Create", None, 0)).expect("dispatch");
+    let resp = d
+        .dispatch(&cmd_with("test.Create", None, 0))
+        .expect("dispatch");
     let events = events_of(&resp).expect("events");
     assert!(
         events.cover.as_ref().and_then(|c| c.ext.as_ref()).is_none(),

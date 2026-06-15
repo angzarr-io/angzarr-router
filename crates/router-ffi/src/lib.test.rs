@@ -15,8 +15,8 @@ use angzarr_router::pb;
 
 use super::*;
 use crate::abi::{STATUS_OK, STATUS_OK_EMPTY};
-use crate::proto::io::angzarr::router::ffi::v1 as abi_pb;
 use crate::proto::google::rpc as rpc_pb;
+use crate::proto::io::angzarr::router::ffi::v1 as abi_pb;
 
 // --- the host's business messages (what generated protobuf classes would be)
 
@@ -154,7 +154,8 @@ unsafe extern "C" fn host_cb(
         CB_INCREASE_BY => {
             let cctx = abi_pb::CommandContextAux::decode(aux).expect("cctx aux");
             with_session(key, |s| {
-                s.observed_cctx.push((cctx.next_sequence, cctx.had_prior_events))
+                s.observed_cctx
+                    .push((cctx.next_sequence, cctx.had_prior_events))
             });
             let cmd = IncreaseBy::decode(payload).expect("IncreaseBy");
             if cmd.n == 0 {
@@ -175,8 +176,11 @@ unsafe extern "C" fn host_cb(
             pb::Notification::decode(raux.notification.as_slice()).expect("notification");
             pb::RejectionNotification::decode(raux.rejection.as_slice()).expect("rejection");
             with_session(key, |s| {
-                s.markers
-                    .push(if callback_id == CB_COMP_A { "comp-a" } else { "comp-b" })
+                s.markers.push(if callback_id == CB_COMP_A {
+                    "comp-a"
+                } else {
+                    "comp-b"
+                })
             });
             let resp = pb::BusinessResponse {
                 result: Some(pb::business_response::Result::Events(pb::EventBook {
@@ -343,11 +347,19 @@ fn empty_history_command_emits_stamped_events() {
         panic!("expected events result");
     };
     assert_eq!(book.pages.len(), 2);
-    let seqs: Vec<u32> = book.pages.iter().map(angzarr_router::page_sequence).collect();
+    let seqs: Vec<u32> = book
+        .pages
+        .iter()
+        .map(angzarr_router::page_sequence)
+        .collect();
     assert_eq!(seqs, vec![0, 1], "fill-only stamping from next_sequence 0");
 
     let s = session_snapshot(session);
-    assert_eq!(s.observed_cctx, vec![(0, false)], "fresh aggregate evidence");
+    assert_eq!(
+        s.observed_cctx,
+        vec![(0, false)],
+        "fresh aggregate evidence"
+    );
     assert_eq!(s.counter, 0, "no history — appliers must not run");
 }
 
@@ -366,14 +378,21 @@ fn prior_events_fold_through_host_appliers() {
     assert_eq!(ret, 0);
     let s = session_snapshot(session);
     assert_eq!(s.counter, 2, "both history pages folded host-side");
-    assert_eq!(s.observed_cctx, vec![(2, true)], "historical-state evidence");
+    assert_eq!(
+        s.observed_cctx,
+        vec![(2, true)],
+        "historical-state evidence"
+    );
 
     let resp = decode_response(&bytes);
     let Some(pb::business_response::Result::Events(book)) = resp.result else {
         panic!("expected events result");
     };
     assert_eq!(
-        book.pages.iter().map(angzarr_router::page_sequence).collect::<Vec<_>>(),
+        book.pages
+            .iter()
+            .map(angzarr_router::page_sequence)
+            .collect::<Vec<_>>(),
         vec![2],
         "emitted sequence continues prior history"
     );
@@ -440,10 +459,7 @@ fn rejection_crosses_as_status_with_error_info() {
 #[test]
 fn plain_handler_failure_is_internal() {
     let router = Router::with_counter();
-    let (ret, _) = router.dispatch(
-        next_session(),
-        &command_req(FQ_FAIL_HARD, Vec::new(), None),
-    );
+    let (ret, _) = router.dispatch(next_session(), &command_req(FQ_FAIL_HARD, Vec::new(), None));
     assert_eq!(ret, -13, "unclassified host failure surfaces as INTERNAL");
 }
 
@@ -505,8 +521,7 @@ fn notification_command(fq_command: &str) -> Any {
     };
     let notification = pb::Notification {
         payload: Some(Any {
-            type_url: "type.googleapis.com/io.angzarr.v1.RejectionNotification"
-                .to_string(),
+            type_url: "type.googleapis.com/io.angzarr.v1.RejectionNotification".to_string(),
             value: rejection.encode_to_vec(),
         }),
         ..Default::default()
