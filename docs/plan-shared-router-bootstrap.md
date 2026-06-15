@@ -21,6 +21,25 @@ only after this slice's review freezes the ABI.
 
 ---
 
+## Status (angzarr-router)
+
+- **Unit 1 — core crate**: ✅ done. `Rebuilder` + `AggregateDispatch`,
+  transliterated test bank green (40 tests), `cargo-mutants` 51/51
+  viable caught (≥0.95 gate met).
+- **Unit 2 — FFI crate**: ✅ done. Full C-ABI + `catch_unwind` guards +
+  the Rust-side ABI consumer test (21 tests).
+- **Unit 3 — conformance fixture + cases**: ▶ next, not started.
+- Units 4–6 (client-go / client-python / angzarr-cli): later repos,
+  after the ABI-freeze review that follows unit 3.
+
+Framework protos are consumed under the **io.angzarr** packages
+(`io.angzarr.v1`); the router's own ABI protos are
+`io.angzarr.router.ffi.v1`. angzarr-produced type URLs use the bare
+canonical form (`/io.angzarr.v1.X`); notification/2PC recognition matches
+the full FQN regardless of resolver prefix.
+
+---
+
 ## 1. The slice: aggregate dispatch, complete; nothing else
 
 One component kind, all of its semantics, no serving layer:
@@ -36,8 +55,8 @@ One component kind, all of its semantics, no serving layer:
   (`NO_HANDLER_REGISTERED` for an unknown command, never a rebuild
   error); `CommandContext{next_sequence, had_prior_events}`;
   fill-only ext propagation and consecutive sequence stamping on
-  emitted books; rejection routing — notification detection by exact
-  type URL, FQ-keyed lookup, ordered multi-compensator fan-out with
+  emitted books; rejection routing — notification detection by full
+  FQN (prefix-agnostic), FQ-keyed lookup, ordered multi-compensator fan-out with
   merged responses, `DelegateToFramework` (empty response) for
   undeclared rejections.
 - The error model: coded errors crossing the FFI as
@@ -97,12 +116,12 @@ angzarr-router/
 │           ├── registry.rs    # component descriptors → core tables
 │           └── lib.rs         # extern "C" surface + panic guards
 ├── proto/
-│   └── angzarr/router/ffi/v1/abi.proto   # aux payloads (below)
+│   └── io/angzarr/router/ffi/v1/abi.proto   # aux payloads (below)
 ├── conformance/
 │   ├── FIXTURE.md             # the fixture component, specified in prose
 │   ├── proto/
 │   │   └── test/counter/counter.proto  # the same fixture as an
-│   │                          # (angzarr.v1.component) declaration —
+│   │                          # (io.angzarr.v1.component) declaration —
 │   │                          # codegen input for unit 6
 │   └── cases/*.txtpb          # request → expected outcome, textproto
 └── justfile                   # build / test / conformance / fmt
@@ -136,7 +155,7 @@ one with the same triage discipline.
 
 ### 2.2 ABI aux protos
 
-Defined in this repo under package `angzarr.router.ffi.v1`, versioned
+Defined in this repo under package `io.angzarr.router.ffi.v1`, versioned
 with the ABI (they are internal to the boundary, not wire protocol):
 
 ```proto
@@ -192,7 +211,7 @@ foreign binding would — the ABI is proven before any binding exists.
 
 One fixture component, specified twice from one definition: `FIXTURE.md`
 prose for reviewers, and `conformance/proto/test/counter/counter.proto`
-as a real `(angzarr.v1.component)` service declaration — the codegen
+as a real `(io.angzarr.v1.component)` service declaration — the codegen
 input for unit 6. The business methods are implemented in ~40 lines per
 language:
 
@@ -318,9 +337,9 @@ hand-written bindings, and the one all future users go through.
 
 | # | Unit | Repo | Gate |
 |---|---|---|---|
-| 1 | Core crate slice + transliterated test bank | angzarr-router | tests green; `cargo-mutants` kill ≥ 0.95 on `rebuild.rs`/`aggregate.rs` |
-| 2 | FFI crate + Rust-side ABI consumer test | angzarr-router | ABI test green; panic/ownership rules each pinned by a test |
-| 3 | Fixture spec + conformance cases | angzarr-router | cases pass against the core natively |
+| 1 | Core crate slice + transliterated test bank | angzarr-router | ✅ **done** — tests green; `cargo-mutants` 51/51 viable caught (≥ 0.95) |
+| 2 | FFI crate + Rust-side ABI consumer test | angzarr-router | ✅ **done** — ABI test green; panic/ownership rules each pinned |
+| 3 | Fixture spec + conformance cases | angzarr-router | ▶ **next** — cases pass against the core natively |
 | 4 | Go binding + **differential suite** | client-go | conformance green; differential: zero divergence from the Go engine |
 | 5 | Python binding | client-python | conformance green; GIL-threaded dispatch exercised (concurrent dispatches in test) |
 | 6 | Codegen emitters target the bindings | angzarr-cli (+ both client repos) | wiring regenerated from `conformance/proto/`; hand-written glue deleted; conformance + differential identical through generated wiring |
