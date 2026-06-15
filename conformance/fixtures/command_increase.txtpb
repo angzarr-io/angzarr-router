@@ -1,0 +1,10 @@
+# Orthogonal envelope for an IncreaseBy command. The salient field `n` is
+# omitted on purpose — the step definition sets it from the scenario.
+command {
+  cover { domain: "counter" }
+  pages {
+    command {
+      [type.googleapis.com/test.counter.IncreaseBy] {}
+    }
+  }
+}

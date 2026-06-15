@@ -1,0 +1,210 @@
+//! Conformance harness support: the generated fixture types, a descriptor
+//! pool for parsing `.txtpb` fixtures, the CounterAggregate built on the
+//! router core, and the "parse a skeleton, set the scenario's data" helpers
+//! the step definitions call. The cucumber step defs live in
+//! `tests/cucumber.rs`.
+
+use std::sync::OnceLock;
+
+use angzarr_router::aggregate::AggregateDispatch;
+use angzarr_router::error::{CodedError, HandlerError};
+use angzarr_router::rebuild::Rebuilder;
+use prost::Message;
+use prost_reflect::{DescriptorPool, DynamicMessage};
+
+/// Generated `test.counter` fixture messages (Increased, IncreaseBy, …).
+pub mod counter {
+    include!(concat!(env!("OUT_DIR"), "/test.counter.rs"));
+}
+
+/// Re-export the router's framework types under `pb`.
+pub use angzarr_router::pb;
+pub use counter::CounterState;
+
+const FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/conformance_fds.bin"));
+
+// The orthogonal envelope skeletons — structural scaffold only; the
+// test-meaningful field is omitted and supplied by the step definitions.
+const SKEL_INCREASE: &str = include_str!("../../../conformance/fixtures/command_increase.txtpb");
+const SKEL_FAILHARD: &str = include_str!("../../../conformance/fixtures/command_failhard.txtpb");
+const SKEL_UNHANDLED: &str = include_str!("../../../conformance/fixtures/command_unhandled.txtpb");
+const SKEL_INCREASED_EVENT: &str =
+    include_str!("../../../conformance/fixtures/event_increased.txtpb");
+
+const CONTEXTUAL_COMMAND: &str = "io.angzarr.v1.ContextualCommand";
+const EVENT_PAGE: &str = "io.angzarr.v1.EventPage";
+
+/// The descriptor pool over the fixture + framework protos — resolves both
+/// `io.angzarr.v1.*` envelopes and `test.counter.*` payloads, so Any-expanded
+/// textproto fixtures decode.
+pub fn pool() -> &'static DescriptorPool {
+    static POOL: OnceLock<DescriptorPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("conformance descriptor set must decode")
+    })
+}
+
+/// Parse a `.txtpb` fixture (textproto, Any-expansion allowed) into a typed
+/// prost message. `full_name` is the fixture's root message type.
+pub fn parse_txtpb<M>(full_name: &str, text: &str) -> M
+where
+    M: prost::Message + Default,
+{
+    let descriptor = pool()
+        .get_message_by_name(full_name)
+        .unwrap_or_else(|| panic!("{full_name} not in conformance pool"));
+    let dynamic = DynamicMessage::parse_text_format(descriptor, text)
+        .unwrap_or_else(|e| panic!("parse {full_name} txtpb: {e}"));
+    dynamic
+        .transcode_to::<M>()
+        .unwrap_or_else(|e| panic!("transcode {full_name}: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// The fixture: CounterAggregate on the router core (see FIXTURE.md).
+// ---------------------------------------------------------------------------
+
+/// Build the CounterAggregate dispatch table (appliers, handlers, ordered
+/// rejection compensators).
+pub fn counter_aggregate() -> AggregateDispatch<CounterState> {
+    let rebuilder = Rebuilder::new(CounterState::default).apply(
+        "test.counter.Increased",
+        |state: &mut CounterState, _event| {
+            state.count += 1;
+            Ok(())
+        },
+    );
+
+    AggregateDispatch::new("counter-aggregate", "counter", rebuilder)
+        // n > 0 emits n Increased; n == 0 rejects VALUE_NOT_POSITIVE.
+        .on_command("test.counter.IncreaseBy", |any, _state, _ctx| {
+            let cmd = counter::IncreaseBy::decode(any.value.as_slice())
+                .map_err(|e| HandlerError::Other(format!("decode IncreaseBy: {e}")))?;
+            if cmd.n == 0 {
+                return Err(HandlerError::Coded(CodedError::rejection_invalid_argument(
+                    "VALUE_NOT_POSITIVE",
+                    "increase amount must be positive",
+                    [],
+                )));
+            }
+            let pages = (0..cmd.n)
+                .map(|_| pb::EventPage {
+                    payload: Some(pb::event_page::Payload::Event(increased_any())),
+                    ..Default::default()
+                })
+                .collect();
+            Ok(Some(pb::EventBook {
+                pages,
+                ..Default::default()
+            }))
+        })
+        // Unclassified failure → UNHANDLED_HANDLER_ERROR.
+        .on_command("test.counter.FailHard", |_any, _state, _ctx| {
+            Err(HandlerError::Other("hard failure".to_string()))
+        })
+        // Two compensators for the same rejected command → ordered fan-out.
+        .on_rejected("test.counter.Reserve", |_n, _r, _s, _c| {
+            Ok(marker_response("reserve-compensation-first"))
+        })
+        .on_rejected("test.counter.Reserve", |_n, _r, _s, _c| {
+            Ok(marker_response("reserve-compensation-second"))
+        })
+}
+
+fn increased_any() -> prost_types::Any {
+    prost_types::Any {
+        type_url: angzarr_router::type_url("test.counter.Increased"),
+        value: counter::Increased {}.encode_to_vec(),
+    }
+}
+
+/// A single-page response carrying one Increased marker (used by the
+/// fan-out compensators; `_label` documents which compensator emitted it).
+fn marker_response(_label: &str) -> pb::BusinessResponse {
+    pb::BusinessResponse {
+        result: Some(pb::business_response::Result::Events(pb::EventBook {
+            pages: vec![pb::EventPage {
+                payload: Some(pb::event_page::Payload::Event(increased_any())),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Skeleton → command helpers: parse the orthogonal envelope, then SET the
+// scenario's data by field (never string-templating the textproto).
+// ---------------------------------------------------------------------------
+
+/// An IncreaseBy command with the scenario's `n` set on the inner message.
+pub fn increase_command(n: u32) -> pb::ContextualCommand {
+    let mut cc: pb::ContextualCommand = parse_txtpb(CONTEXTUAL_COMMAND, SKEL_INCREASE);
+    let any = inner_command_any(&mut cc);
+    let mut inner =
+        counter::IncreaseBy::decode(any.value.as_slice()).expect("decode IncreaseBy skeleton");
+    inner.n = n;
+    any.value = inner.encode_to_vec();
+    cc
+}
+
+/// The FailHard command (no scenario data).
+pub fn failhard_command() -> pb::ContextualCommand {
+    parse_txtpb(CONTEXTUAL_COMMAND, SKEL_FAILHARD)
+}
+
+/// A command whose type has no registered handler (drives NO_HANDLER_REGISTERED).
+pub fn unhandled_command() -> pb::ContextualCommand {
+    parse_txtpb(CONTEXTUAL_COMMAND, SKEL_UNHANDLED)
+}
+
+/// Prior history of `n` confirmed increases: the Increased skeleton replayed
+/// at consecutive sequences, with `next_sequence` continuing past them.
+pub fn prior_history(n: u32) -> Option<pb::EventBook> {
+    if n == 0 {
+        return None;
+    }
+    let page: pb::EventPage = parse_txtpb(EVENT_PAGE, SKEL_INCREASED_EVENT);
+    let pages = (0..n)
+        .map(|seq| {
+            let mut p = page.clone();
+            p.header = Some(pb::PageHeader {
+                sync_mode: None,
+                sequence_type: Some(pb::page_header::SequenceType::Sequence(seq)),
+            });
+            p
+        })
+        .collect();
+    Some(pb::EventBook {
+        pages,
+        next_sequence: n,
+        ..Default::default()
+    })
+}
+
+fn inner_command_any(cc: &mut pb::ContextualCommand) -> &mut prost_types::Any {
+    let book = cc.command.as_mut().expect("command book");
+    match book.pages[0].payload.as_mut().expect("command payload") {
+        pb::command_page::Payload::Command(any) => any,
+        pb::command_page::Payload::External(_) => {
+            panic!("conformance fixtures carry inline commands, not offloaded payloads")
+        }
+    }
+}
+
+#[cfg(test)]
+mod smoke {
+    use super::*;
+
+    /// The whole pipeline works: compile counter.proto, extern the framework
+    /// types to the router crate, build the pool, and parse an Any-expanded
+    /// envelope skeleton into the router's own ContextualCommand.
+    #[test]
+    fn parses_increase_envelope_skeleton() {
+        let cc: pb::ContextualCommand = parse_txtpb(CONTEXTUAL_COMMAND, SKEL_INCREASE);
+        let book = cc.command.expect("command book");
+        assert_eq!(book.cover.as_ref().expect("cover").domain, "counter");
+        let any = angzarr_router::command_payload(&book.pages[0]).expect("command any");
+        assert!(any.type_url.ends_with("test.counter.IncreaseBy"));
+    }
+}

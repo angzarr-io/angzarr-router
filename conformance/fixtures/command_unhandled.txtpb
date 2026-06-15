@@ -1,0 +1,10 @@
+# A command with no registered handler (Reserve is a rejection key only,
+# never an on_command) — drives NO_HANDLER_REGISTERED before rebuild.
+command {
+  cover { domain: "counter" }
+  pages {
+    command {
+      [type.googleapis.com/test.counter.Reserve] {}
+    }
+  }
+}

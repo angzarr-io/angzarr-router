@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package test.counter;
+
+import "io/angzarr/v1/options.proto";
+import "io/angzarr/v1/types.proto";
+import "io/angzarr/v1/command_handler.proto";
+
+// Conformance fixture: the smallest aggregate that exercises every
+// load-bearing dispatch mechanism (per-page appliers, a handler with
+// framework context in and a book out, host state that never crosses,
+// ordered rejection fan-out, the coded-error path).
+//
+// Declared as an (io.angzarr.v1.component) so this file is ALSO the
+// codegen input for unit 6: the generated client must pass the same
+// behavior suite as the hand-written harness.
+
+// --- event ---
+message Increased {}
+
+// --- commands ---
+message IncreaseBy {
+  uint32 n = 1;
+}
+message FailHard {}
+message Reserve {}
+
+// --- state ---
+message CounterState {
+  uint32 count = 1;
+}
+
+// CounterAggregate (domain "counter", state = CounterState.count).
+service CounterAggregate {
+  option (io.angzarr.v1.component) = {
+    kind: COMPONENT_KIND_AGGREGATE
+    input_domain: "counter"
+    state: "test.counter.CounterState"
+  };
+
+  // n > 0 → emits n Increased events; n == 0 → rejection VALUE_NOT_POSITIVE.
+  rpc HandleIncreaseBy(IncreaseBy) returns (io.angzarr.v1.EventBook);
+  // Returns a plain (unclassified) error → UNHANDLED_HANDLER_ERROR.
+  rpc HandleFailHard(FailHard) returns (io.angzarr.v1.EventBook);
+
+  // Applier: each Increased folds into state (count += 1).
+  rpc ApplyIncreased(Increased) returns (CounterState) {
+    option (io.angzarr.v1.applies) = true;
+  }
+
+  // Two compensators for the SAME rejected command → ordered fan-out:
+  // both run, in declaration order, and their events merge.
+  rpc OnReserveRejectedFirst(io.angzarr.v1.RejectionNotification)
+      returns (io.angzarr.v1.BusinessResponse) {
+    option (io.angzarr.v1.rejected) = { command: "test.counter.Reserve" };
+  }
+  rpc OnReserveRejectedSecond(io.angzarr.v1.RejectionNotification)
+      returns (io.angzarr.v1.BusinessResponse) {
+    option (io.angzarr.v1.rejected) = { command: "test.counter.Reserve" };
+  }
+}

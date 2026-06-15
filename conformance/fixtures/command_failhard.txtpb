@@ -1,0 +1,9 @@
+# Orthogonal envelope for the FailHard command (no fields).
+command {
+  cover { domain: "counter" }
+  pages {
+    command {
+      [type.googleapis.com/test.counter.FailHard] {}
+    }
+  }
+}
