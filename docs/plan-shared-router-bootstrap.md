@@ -28,9 +28,18 @@ only after this slice's review freezes the ABI.
   viable caught (≥0.95 gate met).
 - **Unit 2 — FFI crate**: ✅ done. Full C-ABI + `catch_unwind` guards +
   the Rust-side ABI consumer test (21 tests).
-- **Unit 3 — conformance fixture + cases**: ▶ next, not started.
+- **Unit 3 — conformance suite + cucumber-rs harness**: ◐ in progress.
+  Harness built and green end-to-end — cucumber-rs drives the core
+  natively, parsing the `.txtpb` envelope skeletons and setting each
+  scenario's data by field (7 scenarios / 22 steps). Covered: empty-history
+  increase, prior fold + sequence continuation, `n==0` → VALUE_NOT_POSITIVE,
+  FailHard → UNHANDLED_HANDLER_ERROR, unknown → NO_HANDLER_REGISTERED.
+  Remaining behaviors: rejection fan-out order, undeclared rejection,
+  snapshot + covered boundary, corrupt payload (PERSISTED_EVENT_CORRUPT),
+  envelope guards (MISSING_COMMAND_BOOK/PAGE/PAYLOAD), fill-only ext,
+  `had_prior_events` evidence.
 - Units 4–6 (client-go / client-python / angzarr-cli): later repos,
-  after the ABI-freeze review that follows unit 3.
+  after unit 3 completes and the ABI-freeze review.
 
 Framework protos are consumed under the **io.angzarr** packages
 (`io.angzarr.v1`); the router's own ABI protos are
@@ -397,7 +406,7 @@ bindings, and the one all future users go through.
 |---|---|---|---|
 | 1 | Core crate slice + transliterated test bank | angzarr-router | ✅ **done** — tests green; `cargo-mutants` 51/51 viable caught (≥ 0.95) |
 | 2 | FFI crate + Rust-side ABI consumer test | angzarr-router | ✅ **done** — ABI test green; panic/ownership rules each pinned |
-| 3 | Fixture + Gherkin behavior suite + cucumber-rs harness | angzarr-router | ▶ **next** — `.feature` suite green against the core natively |
+| 3 | Fixture + Gherkin behavior suite + cucumber-rs harness | angzarr-router | ◐ **in progress** — harness green, core behaviors pass (7 scenarios/22 steps); remaining: fan-out, undeclared rejection, snapshot/boundary, corrupt payload, envelope guards, fill-only ext, `had_prior_events` |
 | 4 | Go binding + godog harness + **differential suite** | client-go | same features green via godog; differential: zero divergence from the Go engine |
 | 5 | Python binding + behave harness | client-python | same features green via behave; GIL-threaded dispatch exercised (concurrent dispatches) |
 | 6 | Codegen emitters → **test the generated clients** | angzarr-cli (+ both client repos) | wiring regenerated from `conformance/proto/`; hand-written glue deleted; same features + differential green through **generated** wiring |
