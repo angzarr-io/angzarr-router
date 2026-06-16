@@ -68,3 +68,18 @@ Feature: Counter aggregate dispatch
     Given a new counter
     When an unregistered command is rejected
     Then no compensation is recorded
+
+  Scenario: a fresh counter supplies no prior-history evidence to the handler
+    Given a new counter
+    When the operator increases the counter by 1
+    Then the handler saw no prior history, at next sequence 0
+
+  Scenario: prior events are reported to the handler as historical evidence
+    Given a counter that has already recorded 2 increases
+    When the operator increases the counter by 1
+    Then the handler saw prior history, at next sequence 2
+
+  Scenario: a snapshot seeds state and its covered page is not refolded
+    Given a counter restored from a snapshot of 10 with one newer event
+    When the operator increases the counter by 1
+    Then the handler saw a counter of 11, at next sequence 12

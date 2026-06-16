@@ -16,12 +16,23 @@ struct CounterWorld {
     prior: Option<pb::EventBook>,
     /// Outcome of the dispatched command.
     result: Option<Result<pb::BusinessResponse, CodedError>>,
+    /// Historical-state evidence the handler recorded during dispatch.
+    observed: conf::ObservedSink,
 }
 
 impl CounterWorld {
     fn dispatch(&mut self, mut cc: pb::ContextualCommand) {
         cc.events = self.prior.clone();
-        self.result = Some(conf::counter_aggregate().dispatch(&cc));
+        self.result = Some(conf::counter_aggregate(self.observed.clone()).dispatch(&cc));
+    }
+
+    fn last_observed(&self) -> conf::Observed {
+        *self
+            .observed
+            .lock()
+            .unwrap()
+            .last()
+            .expect("the handler recorded an observation")
     }
 }
 
@@ -30,7 +41,7 @@ async fn new_counter(w: &mut CounterWorld) {
     w.prior = None;
 }
 
-#[given(regex = r"^a counter that has already recorded (\d+) increase$")]
+#[given(regex = r"^a counter that has already recorded (\d+) increases?$")]
 async fn prior_increases(w: &mut CounterWorld, n: u32) {
     w.prior = conf::prior_history(n);
 }
@@ -38,6 +49,11 @@ async fn prior_increases(w: &mut CounterWorld, n: u32) {
 #[given("a counter whose history holds a corrupt event")]
 async fn corrupt_history(w: &mut CounterWorld) {
     w.prior = conf::corrupt_prior_history();
+}
+
+#[given("a counter restored from a snapshot of 10 with one newer event")]
+async fn snapshot_history(w: &mut CounterWorld) {
+    w.prior = conf::snapshot_history();
 }
 
 #[when(regex = r"^the operator increases the counter by (\d+)$")]
@@ -147,6 +163,21 @@ async fn compensations_in_order(w: &mut CounterWorld) {
         vec!["test.counter.CompensatedFirst", "test.counter.CompensatedSecond"],
         "compensators must merge in registration order"
     );
+}
+
+#[then(regex = r"^the handler saw (no )?prior history, at next sequence (\d+)$")]
+async fn observed_history(w: &mut CounterWorld, no: String, next_sequence: u32) {
+    let obs = w.last_observed();
+    assert_eq!(obs.had_prior_events, no.is_empty(), "had_prior_events evidence");
+    assert_eq!(obs.next_sequence, next_sequence, "next_sequence evidence");
+}
+
+#[then(regex = r"^the handler saw a counter of (\d+), at next sequence (\d+)$")]
+async fn observed_count(w: &mut CounterWorld, count: u32, next_sequence: u32) {
+    let obs = w.last_observed();
+    assert_eq!(obs.count, count, "rebuilt count (snapshot + uncovered pages only)");
+    assert_eq!(obs.next_sequence, next_sequence, "next_sequence evidence");
+    assert!(obs.had_prior_events, "a snapshot implies had_prior_events");
 }
 
 #[then("no compensation is recorded")]

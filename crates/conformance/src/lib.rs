@@ -4,7 +4,7 @@
 //! the step definitions call. The cucumber step defs live in
 //! `tests/cucumber.rs`.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use angzarr_router::aggregate::AggregateDispatch;
 use angzarr_router::error::{CodedError, HandlerError};
@@ -33,6 +33,20 @@ const SKEL_INCREASED_EVENT: &str =
 
 const CONTEXTUAL_COMMAND: &str = "io.angzarr.v1.ContextualCommand";
 const EVENT_PAGE: &str = "io.angzarr.v1.EventPage";
+
+/// What the IncreaseBy handler observed at dispatch time: the historical-state
+/// evidence the framework supplies (`next_sequence`, `had_prior_events`) and
+/// the rebuilt `count`. Recorded into a harness-owned sink, since host state
+/// never crosses the boundary — this is how scenarios assert that evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Observed {
+    pub next_sequence: u32,
+    pub had_prior_events: bool,
+    pub count: u32,
+}
+
+/// Sink the harness passes into the fixture to capture each [`Observed`].
+pub type ObservedSink = Arc<Mutex<Vec<Observed>>>;
 
 /// The descriptor pool over the fixture + framework protos — resolves both
 /// `io.angzarr.v1.*` envelopes and `test.counter.*` payloads, so Any-expanded
@@ -66,22 +80,32 @@ where
 
 /// Build the CounterAggregate dispatch table (appliers, handlers, ordered
 /// rejection compensators).
-pub fn counter_aggregate() -> AggregateDispatch<CounterState> {
-    let rebuilder = Rebuilder::new(CounterState::default).apply(
-        "test.counter.Increased",
-        |state: &mut CounterState, event| {
+pub fn counter_aggregate(observed: ObservedSink) -> AggregateDispatch<CounterState> {
+    let rebuilder = Rebuilder::new(CounterState::default)
+        .apply("test.counter.Increased", |state: &mut CounterState, event| {
             // Decode the payload so a corrupt persisted event fails the fold
             // (PERSISTED_EVENT_CORRUPT). Increased is empty, so every
             // well-formed event decodes and simply increments.
             counter::Increased::decode(event.value.as_slice())?;
             state.count += 1;
             Ok(())
-        },
-    );
+        })
+        .with_snapshot(|state: &mut CounterState, snapshot| {
+            // Seed state from the snapshot; pages at or below its sequence are
+            // already folded in and must not re-apply (covered-page boundary).
+            state.count = counter::CounterState::decode(snapshot.value.as_slice())?.count;
+            Ok(())
+        });
 
     AggregateDispatch::new("counter-aggregate", "counter", rebuilder)
         // n > 0 emits n Increased; n == 0 rejects VALUE_NOT_POSITIVE.
-        .on_command("test.counter.IncreaseBy", |any, _state, _ctx| {
+        .on_command("test.counter.IncreaseBy", move |any, state, ctx| {
+            // Record the historical-state evidence (host state never crosses).
+            observed.lock().unwrap().push(Observed {
+                next_sequence: ctx.next_sequence,
+                had_prior_events: ctx.had_prior_events,
+                count: state.count,
+            });
             let cmd = counter::IncreaseBy::decode(any.value.as_slice())
                 .map_err(|e| HandlerError::Other(format!("decode IncreaseBy: {e}")))?;
             if cmd.n == 0 {
@@ -296,6 +320,34 @@ pub fn corrupt_prior_history() -> Option<pb::EventBook> {
     Some(pb::EventBook {
         pages: vec![page],
         next_sequence: 1,
+        ..Default::default()
+    })
+}
+
+/// Prior history seeded by a snapshot of `count == 10` at sequence 10, plus a
+/// covered page (sequence 10, already in the snapshot → skipped) and one
+/// uncovered page (sequence 11 → applied). A rebuild therefore observes
+/// `count == 11`: snapshot loaded, covered page not refolded, newer page applied.
+pub fn snapshot_history() -> Option<pb::EventBook> {
+    let increased_at = |seq: u32| {
+        let mut p: pb::EventPage = parse_txtpb(EVENT_PAGE, SKEL_INCREASED_EVENT);
+        p.header = Some(pb::PageHeader {
+            sync_mode: None,
+            sequence_type: Some(pb::page_header::SequenceType::Sequence(seq)),
+        });
+        p
+    };
+    Some(pb::EventBook {
+        snapshot: Some(pb::Snapshot {
+            state: Some(prost_types::Any {
+                type_url: angzarr_router::type_url("test.counter.CounterState"),
+                value: CounterState { count: 10 }.encode_to_vec(),
+            }),
+            sequence: 10,
+            ..Default::default()
+        }),
+        pages: vec![increased_at(10), increased_at(11)],
+        next_sequence: 12,
         ..Default::default()
     })
 }
