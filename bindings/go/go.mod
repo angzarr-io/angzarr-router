@@ -1,9 +1,11 @@
 module github.com/angzarr-io/angzarr-router/bindings/go
 
-go 1.24
+go 1.25.0
 
 require (
 	github.com/cucumber/godog v0.15.1
+	google.golang.org/genproto/googleapis/api v0.0.0-20260615183401-62b3387ff324
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260615183401-62b3387ff324
 	google.golang.org/protobuf v1.36.11
 )
 

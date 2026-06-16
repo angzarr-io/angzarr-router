@@ -3,10 +3,11 @@ package ffirouter
 import (
 	"errors"
 
+	errdetails "google.golang.org/genproto/googleapis/rpc/errdetails"
+	rpcstatus "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 
-	rpcpb "github.com/angzarr-io/angzarr-router/bindings/go/gen/google/rpc"
 	pb "github.com/angzarr-io/angzarr-router/bindings/go/gen/io/angzarr/v1"
 )
 
@@ -149,12 +150,12 @@ func (d *AggregateDispatch[S]) OnRejected(fqCommand string, thunk RejectionThunk
 // carrying a google.rpc.ErrorInfo detail — the exact shape the core
 // decodes (and that gRPC puts on the wire).
 func buildStatus(grpc GrpcCode, message, code string, extras map[string]string) []byte {
-	info := &rpcpb.ErrorInfo{Reason: code, Domain: errorInfoDomain, Metadata: extras}
+	info := &errdetails.ErrorInfo{Reason: code, Domain: errorInfoDomain, Metadata: extras}
 	anyInfo, err := anypb.New(info)
 	if err != nil {
 		return nil
 	}
-	st := &rpcpb.Status{
+	st := &rpcstatus.Status{
 		Code:    int32(grpc),
 		Message: message,
 		Details: []*anypb.Any{anyInfo},
@@ -186,14 +187,14 @@ func errorStatus(err error) ([]byte, int32) {
 // the gRPC fallback when the bytes are absent or undecodable.
 func decodeStatus(b []byte, ret int32) error {
 	ce := &CodedError{Grpc: GrpcCode(-ret)}
-	var st rpcpb.Status
+	var st rpcstatus.Status
 	if len(b) > 0 && proto.Unmarshal(b, &st) == nil {
 		ce.Message = st.Message
 		if st.Code != 0 {
 			ce.Grpc = GrpcCode(st.Code)
 		}
 		for _, d := range st.Details {
-			info := &rpcpb.ErrorInfo{}
+			info := &errdetails.ErrorInfo{}
 			if d.UnmarshalTo(info) == nil {
 				ce.Code = info.Reason
 				ce.Extras = info.Metadata

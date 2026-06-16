@@ -1,12 +1,21 @@
-# Go codegen for the binding. Managed mode re-homes every generated
-# package under this module's gen/ tree — the framework protos carry a
-# go_package pointing at client-go's module, which is wrong for the
-# router-owned binding (§8). google/protobuf WKTs are runtime-provided and
-# never generated; google/rpc/* are generated here so the binding has no
-# genproto dependency (it only decodes bytes the core produced).
+# Go codegen for the binding's OWN protos (io.angzarr.v1,
+# io.angzarr.router.ffi.v1, test.counter). Managed mode re-homes them under
+# this module's gen/ tree — the framework protos carry a go_package
+# pointing at client-go's module, wrong for the router-owned binding (§8).
+#
+# google.* are the exception — third-party standards consumed from their
+# published genproto modules (kept go_package, excluded via --exclude-path),
+# not re-homed. sererr is ours, so it is generated and re-homed like the
+# rest. The differential build (which also links the client-go oracle, a
+# pre-rename copy of our framework) sets GOLANG_PROTOBUF_REGISTRATION_CONFLICT
+# to tolerate the two-version overlap that cannot be avoided anyway (the
+# options.proto extension numbers are identical across the rename).
 version: v2
 managed:
   enabled: true
+  disable:
+    - file_option: go_package
+      path: google
   override:
     - file_option: go_package_prefix
       value: github.com/angzarr-io/angzarr-router/bindings/go/gen
