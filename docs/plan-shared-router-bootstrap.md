@@ -423,13 +423,25 @@ same C ABI (§8):
 
 ```
 angzarr-router/bindings/python/
+├── pyproject.toml         # deps (cffi, protobuf pinned, googleapis-common-protos); dev (pytest, pytest-bdd)
+├── buf.gen.yaml           # protocolbuffers/python; google excluded; sererr generated
 └── angzarr_router_ffi/
-    ├── __init__.py         # public registration + dispatch API
-    ├── _abi.py             # cffi (ABI mode, dlopen): decls, callbacks, GIL notes
+    ├── __init__.py         # public registration + dispatch API + coded-error model
+    ├── _abi.py             # cffi (ABI mode, dlopen): cdef the C ABI, locate the cdylib
+    ├── _dispatch.py        # Router, registration, dispatch marshaling, ffi.callback trampoline
+    ├── gen/…               # generated _pb2 (io.angzarr.v1, ffi abi, test.counter, sererr)
     └── tests:
-        ├── test_fixture.py       # CounterAggregate in Python
-        └── steps.py              # behave/pytest-bdd step defs over the same .feature + .txtpb
+        ├── fixture.py            # CounterAggregate in Python
+        ├── test_property.py      # binding-only (prior, amount) sweep
+        ├── test_concurrency.py   # GIL-threaded concurrent dispatch
+        └── steps/                # pytest-bdd step defs over the same .feature + .txtpb
 ```
+
+Planned in TDD sub-units **P1–P6** (mirroring unit 4's S1–S5): cffi load
+smoke test; binding core (registration API + `ffi.callback` trampoline +
+dispatch marshaling + coded-error model); CounterAggregate fixture;
+pytest-bdd conformance harness; property sweep + concurrency; just recipes.
+Detailed working plan: this session's `unit5-python-binding.plan.md`.
 
 - **cffi ABI mode** for the bootstrap: pure-Python consumption of the
   same C ABI Go uses — no Rust toolchain required to consume it, and the
@@ -438,9 +450,12 @@ angzarr-router/bindings/python/
   acquisition from router threads. A later graduation to PyO3 is an
   optimization decision, not an architecture change, because the C ABI
   must remain for the future bindings regardless.
-- Runs the **same conformance `.feature` files + `.txtpb` fixtures**
-  in-repo via a **behave** (or pytest-bdd) step harness — only the Python
-  step defs are new; the behavior spec is shared. The GIL-threaded
+- **pytest-bdd** (matching client-python) consumes the **same conformance
+  `.feature` files + `.txtpb` fixtures** in-repo — only the Python step
+  defs are new; the behavior spec is shared. google.rpc comes from
+  **googleapis-common-protos** (the genproto analog), sererr is generated
+  (ours); Python protobuf via buf's `protocolbuffers/python` plugin pinned
+  for runtime compatibility. The GIL-threaded
   dispatch requirement is met by exercising concurrent dispatches in a
   scenario.
 - **client-python is untouched and not linked**, mirroring §3's
@@ -449,6 +464,33 @@ angzarr-router/bindings/python/
   same two-version registry collision applies). The shared feature suite
   plus a binding-only property sweep is the validation. This is additive
   and lands in router.
+
+### 4.1 Toolchain & images (findings)
+
+The build images and the per-binding dependency split, recorded as findings
+so they don't get rediscovered each binding:
+
+- **Per-language images, per-project deps.** The org publishes one
+  toolchain image per language (`angzarr-rust`, `angzarr-go`,
+  `angzarr-python`, …) from the `angzarr-project` submodule
+  (`build/images/**`, write-protected). Each image carries the base
+  toolchain; each binding declares its *runtime* deps in-tree — go.mod for
+  Go, `pyproject.toml`/`uv.lock` for Python. So **unit 5 needs no
+  angzarr-python image change**: the image has python+uv+buf+gcc, and
+  cffi/pytest-bdd/protobuf/googleapis-common-protos are uv deps.
+- **No unified image; carry the cdylib forward.** The router-ffi cdylib is
+  built once in `angzarr-rust` and carried forward to each language image
+  via the shared `target/` mount (the cdylib is the ABI boundary). Proven
+  for Go (`just go-binding-test`); same for Python (`angzarr-python`).
+- **go standardized at 1.25.** The genproto the Go binding pulls requires
+  go 1.25, so the `angzarr-go` image was bumped 1.24.4 → 1.25.5 (with
+  per-language complexity tooling) in `angzarr-project` `341a0db`; the
+  router's submodule pointer is bumped to match. The image `:latest`
+  republishes only on push to main, so until `feat/deferred-provenance`
+  merges, `go 1.25` arrives via go's toolchain auto-download.
+- **Image changes are submodule writes.** Anything under
+  `build/images/**` lives in `angzarr-project` — get explicit permission
+  before editing it.
 
 ---
 
