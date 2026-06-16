@@ -52,12 +52,17 @@ only after this slice's review freezes the ABI.
   `.feature` + `.txtpb` suite via godog (17 scenarios / 49 steps green)
   plus a 169-case binding-only property sweep. Go protobuf types generated
   with buf (managed-mode re-homed under the binding's module); google.* via
-  genproto. **No old client linked** — see §3 no-old-client-linking
-  decision; the shared conformance suite is the cross-language contract.
-- Units 4–6 (`bindings/go` + `bindings/python` in this repo; angzarr-cli
-  emitters): later, after unit 3 completes. The bindings live **in this
-  repo** from the start — the home decision (§8), not a later migration;
-  no old client library is linked (§3 no-old-client-linking decision). The
+  genproto, sererr generated (ours). **No old client linked** — see §3
+  no-old-client-linking decision; the shared conformance suite is the
+  cross-language contract. **Build wiring** (§6): the binding runs in the
+  `angzarr-go` image (like client-go) with the router-ffi cdylib built in
+  `angzarr-rust` and **carried forward** via the shared `target/` mount —
+  the cdylib is the ABI boundary, so no unified all-languages image is
+  needed. `just go-binding-test` is green end to end. Ecosystem
+  standardizes on **go 1.25** (genproto requires it).
+- Units 5–6 (`bindings/python` in this repo; angzarr-cli emitters): next.
+  The bindings live **in this repo** from the start — the home decision
+  (§8), not a later migration; no old client library is linked (§3). The
   **ABI-freeze review comes after unit 6**, not before the bindings — the
   whole point of doing two FFI languages in the bootstrap is that units
   4–6 exercise the ABI and surface findings while it is still cheap to
@@ -551,7 +556,12 @@ settled when unit 2 lands; it settles at the post-unit-6 review.
 - Emitter rows for saga/PM/projector/upcaster components; unit 6
   covers the aggregate emitters only, and the others repeat its
   pattern once their dispatch exists in the core.
-- No packaging/CI artifact pipelines; sibling-checkout builds only.
+- No packaging pipelines (distributable wheels / vendored static libs) yet.
+  The dev/CI build is established: per-language toolchain images with the
+  router-ffi cdylib built in `angzarr-rust` and **carried forward** to each
+  language's image (the cdylib is the ABI boundary; no unified image). The
+  org images live in the `angzarr-project` submodule; go is standardized at
+  1.25.
 - Java/Kotlin (one JVM binding), TypeScript (Node N-API), C#, and C++
   (direct C-ABI consumer, the thinnest binding) follow the frozen ABI.
 
