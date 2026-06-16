@@ -83,13 +83,10 @@ type observation struct {
 	count uint32
 }
 
-// increasedAny is a single Increased event payload, Any-wrapped.
+// increasedAny is a single Increased event payload, Any-wrapped with the
+// framework's bare-"/" type URL (not the type.googleapis.com Any default).
 func increasedAny() *anypb.Any {
-	a, err := anypb.New(&counter.Increased{})
-	if err != nil {
-		panic(err)
-	}
-	return a
+	return &anypb.Any{TypeUrl: typeURL(fqIncreased), Value: mustMarshal(&counter.Increased{})}
 }
 
 // markerResponse is a compensation response carrying one marker event whose
@@ -99,49 +96,11 @@ func markerResponse(name string) *pb.BusinessResponse {
 	return &pb.BusinessResponse{
 		Result: &pb.BusinessResponse_Events{Events: &pb.EventBook{
 			Pages: []*pb.EventPage{{Payload: &pb.EventPage_Event{
-				Event: &anypb.Any{TypeUrl: "type.googleapis.com/test.counter." + name},
+				Event: &anypb.Any{TypeUrl: typeURL("test.counter." + name)},
 			}}},
 		}},
 	}
 }
 
-// increaseCommand builds a ContextualCommand carrying IncreaseBy{n}.
-func increaseCommand(n uint32) *pb.ContextualCommand {
-	cmd, err := anypb.New(&counter.IncreaseBy{N: n})
-	if err != nil {
-		panic(err)
-	}
-	return &pb.ContextualCommand{
-		Command: &pb.CommandBook{
-			Cover: &pb.Cover{Domain: "counter"},
-			Pages: []*pb.CommandPage{{Payload: &pb.CommandPage_Command{Command: cmd}}},
-		},
-	}
-}
-
-// failHardCommand builds a ContextualCommand carrying FailHard.
-func failHardCommand() *pb.ContextualCommand {
-	cmd, err := anypb.New(&counter.FailHard{})
-	if err != nil {
-		panic(err)
-	}
-	return &pb.ContextualCommand{
-		Command: &pb.CommandBook{
-			Cover: &pb.Cover{Domain: "counter"},
-			Pages: []*pb.CommandPage{{Payload: &pb.CommandPage_Command{Command: cmd}}},
-		},
-	}
-}
-
-// priorIncreases builds a prior-events book of n Increased pages at
-// consecutive sequences 0..n-1, with the next sequence the core derives.
-func priorIncreases(n uint32) *pb.EventBook {
-	pages := make([]*pb.EventPage, n)
-	for i := range pages {
-		pages[i] = &pb.EventPage{
-			Header:  &pb.PageHeader{SequenceType: &pb.PageHeader_Sequence{Sequence: uint32(i)}},
-			Payload: &pb.EventPage_Event{Event: increasedAny()},
-		}
-	}
-	return &pb.EventBook{Pages: pages, NextSequence: n}
-}
+// Command and prior-history builders live in builders_test.go (skeleton
+// parsing, shared with the godog harness).
