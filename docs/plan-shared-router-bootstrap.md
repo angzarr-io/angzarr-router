@@ -454,8 +454,11 @@ Detailed working plan: this session's `unit5-python-binding.plan.md`.
   `.feature` files + `.txtpb` fixtures** in-repo — only the Python step
   defs are new; the behavior spec is shared. google.rpc comes from
   **googleapis-common-protos** (the genproto analog), sererr is generated
-  (ours); Python protobuf via buf's `protocolbuffers/python` plugin pinned
-  for runtime compatibility. The GIL-threaded
+  (ours); Python protobuf via the **current `protocolbuffers/python`**
+  plugin with **stock `protobuf` (7.x, pip default)** — verified: the latest
+  plugin's gencode imports cleanly under stock 7.x and `text_format`
+  Any-expansion round-trips, so no version pinning gymnastics are needed
+  (uv.lock fixes the exact set). The GIL-threaded
   dispatch requirement is met by exercising concurrent dispatches in a
   scenario.
 - **client-python is untouched and not linked**, mirroring §3's
