@@ -4,6 +4,7 @@ sessions:
   - witty-bony-bath
   - solid-tight-perch
   - lined-weird-race
+  - gray-white-snuff
 ---
 
 # Bootstrap plan: minimal Rust core + Go and Python bindings
@@ -14,8 +15,10 @@ This plan defines the smallest set of code that proves the shared-router
 design end to end in three languages, sliced into review-sized units.
 Its purpose is **careful review**: every deliverable is sized to be read
 line by line, the ABI is exercised by two real bindings before it
-freezes, and nothing existing is destabilized — the Go engine keeps
-running client-go throughout and doubles as a differential oracle.
+freezes, and nothing existing is destabilized — client-go keeps running
+unchanged throughout. The shared conformance feature suite is the
+cross-language behavior contract; no old client library is linked as a
+differential oracle (§3).
 
 Initial languages: **Rust (core), Go, Python**. Future bindings
 (Java/Kotlin via one JVM binding, TypeScript via Node N-API, C#) start
@@ -42,10 +45,19 @@ only after this slice's review freezes the ABI.
   covered boundary, and `had_prior_events`/next_sequence evidence (the
   handler records the observed CommandContext + rebuilt count into a
   harness-owned sink, since host state never crosses).
+- **Unit 4 — Go binding (`bindings/go`)**: ✅ done. cgo over `router-ffi`
+  (cross-platform dynamic+rpath link), engine-shaped registration API +
+  `//export` trampoline routing callbacks by id, host state never crosses
+  (parked in a `cgo.Handle` session). Runs the **same** conformance
+  `.feature` + `.txtpb` suite via godog (17 scenarios / 49 steps green)
+  plus a 169-case binding-only property sweep. Go protobuf types generated
+  with buf (managed-mode re-homed under the binding's module); google.* via
+  genproto. **No old client linked** — see §3 no-old-client-linking
+  decision; the shared conformance suite is the cross-language contract.
 - Units 4–6 (`bindings/go` + `bindings/python` in this repo; angzarr-cli
   emitters): later, after unit 3 completes. The bindings live **in this
   repo** from the start — the home decision (§8), not a later migration;
-  client-go enters only as the differential oracle dependency (§3). The
+  no old client library is linked (§3 no-old-client-linking decision). The
   **ABI-freeze review comes after unit 6**, not before the bindings — the
   whole point of doing two FFI languages in the bootstrap is that units
   4–6 exercise the ABI and surface findings while it is still cheap to
@@ -341,53 +353,63 @@ One source of truth for "correct," authored in English.
 
 A new directory **in this repo** — `bindings/go/` — built against the
 core and FFI crates in the same workspace (the home decision, §8).
-**client-go is untouched**: it enters only as a test-only module
-dependency that supplies the differential oracle (the dependency points
-router → client-go, never the reverse).
+**client-go is untouched and not linked.** The bindings reference the
+shared conformance features (which originate from the old engine's
+behavior) but do not import any old client library as a live or golden
+differential oracle — see "No old-client linking" below.
 
 ```
 angzarr-router/bindings/go/
 ├── ffirouter.go        # cgo: load/link, registration API, dispatch
 ├── trampoline.go       # //export gateway: one C-visible fn → Go registry by callback_id
+├── api.go              # pure-Go registration surface + coded-error model
 ├── steps_test.go       # godog step defs: parse skeleton, set scenario data, dispatch, assert
+├── builders_test.go    # skeleton-parsing command/event builders (shared)
 ├── fixture_test.go     # CounterAggregate in Go
-└── differential_test.go
+└── property_test.go    # broad (prior, amount) sweep vs the reference model
 ```
 
-- cgo links the locally built `angzarr-router-ffi` static/dynamic lib
+- cgo links the locally built `angzarr-router-ffi` cdylib
   (`ANGZARR_ROUTER_LIB` env, sibling-checkout default — the
   `validate-client` pattern). Build-tagged (`//go:build ffirouter`) so a
-  plain build stays pure-Go until the artifact story lands.
+  plain build stays pure-Go until the artifact story lands. Dynamic +
+  rpath keeps the link flags uniform across Linux/macOS/Windows.
 - **Runs the conformance `.feature` files + `.txtpb` fixtures in-repo**
   (`../../conformance`) via a **godog** step harness — the Go step defs
   are the only new conformance code; the behavior spec is shared,
-  unchanged. No cross-repo fixture reference.
+  unchanged. No cross-repo fixture reference. This shared feature suite
+  is the cross-language behavior contract.
 - The registration API is shaped like the engine's
   (`OnCommand(fq, thunk)`) — deliberately, since `angzarr codegen go`
   emits against it in unit 6 with minimal emitter changes. The
-  hand-written fixture glue here is **transitional**: its only jobs are
-  to de-risk the ABI before the generator exists and to feed the
-  differential oracle. Unit 6 deletes it.
-- **`differential_test.go` is the review centerpiece**: every
-  conformance scenario (and a property-style sweep of generated books)
-  runs through BOTH the client-go engine (imported as a test-only module
-  dependency) and the Rust core via FFI, asserting identical responses
-  and identical error codes. The client-go engine — mutation-hardened —
-  is the oracle; any divergence is a core bug found before review ends.
-  This bank is also the parity evidence R3 needs to **replace** the
-  engine (§8).
-  - One caveat the suite must be designed around: the core's unit-1
-    test bank is a *transliteration* of the Go engine's, so a
-    differential replay of those same scenarios catches divergence but
-    not a misconception both inherited from one shared mental model
-    (e.g. covered-page inclusivity read the same wrong way in both).
-    The independent signal therefore lives in the two parts that were
-    **not** copied from the oracle: the property-style sweep of
-    randomly generated books (inputs neither author hand-picked) and
-    the freshly-authored English Gherkin spec. Weight the sweep
-    accordingly — make it broad, not a token pass — because the
-    per-scenario replays mostly re-confirm the shared model rather than
-    test it.
+  hand-written fixture glue here is **transitional**: its only job is to
+  de-risk the ABI before the generator exists. Unit 6 deletes it.
+- **The property sweep is the breadth signal.** Because the core's unit-1
+  test bank is a *transliteration* of the Go engine's, the per-scenario
+  conformance replays mostly re-confirm a shared mental model. The
+  independent signal lives in the freshly-authored English Gherkin spec
+  and a **broad** property-style sweep of generated books (inputs neither
+  author hand-picked) — `property_test.go` runs every (prior history,
+  increase amount) pair across a grid and checks the core's sequence
+  stamping and rejection threshold against the obvious reference model.
+  Make it broad, not a token pass.
+
+**No old-client linking (decision).** An earlier draft made
+`differential_test.go` the centerpiece: replay every case through BOTH the
+client-go engine and the Rust core in one test binary. That requires
+linking two versions of the framework's generated code (ours,
+`io.angzarr.v1`, and client-go's pre-rename `angzarr_client.proto.angzarr.v1`)
+into one process. Their `options.proto` extension numbers (50100…) are
+identical across the rename, so the protobuf global registry collides
+irreducibly — extensions key on `(ServiceOptions, number)`, not file path,
+so unlike messages they cannot be deduplicated. The only ways through are a
+registration-conflict override or an out-of-process oracle, both friction
+for marginal signal. **Resolution:** drop the live/golden oracle in every
+language. The shared conformance feature suite is the cross-language
+contract (the old engine's behavior is what authored it); each binding
+proves itself by passing that suite plus a binding-only property sweep. No
+binding imports an old client library. This is the parity basis R3 uses to
+**replace** each engine (§8): old and new both pass the one shared suite.
 
 ## 4. The Python binding (review unit 5, ~300–500 lines)
 
@@ -416,7 +438,12 @@ angzarr-router/bindings/python/
   step defs are new; the behavior spec is shared. The GIL-threaded
   dispatch requirement is met by exercising concurrent dispatches in a
   scenario.
-- client-python is untouched; this is additive and lands in router.
+- **client-python is untouched and not linked**, mirroring §3's
+  no-old-client-linking decision: Python references the shared conformance
+  features but does not import the old client as a differential oracle (the
+  same two-version registry collision applies). The shared feature suite
+  plus a binding-only property sweep is the validation. This is additive
+  and lands in router.
 
 ---
 
@@ -459,7 +486,7 @@ subject, not the hand-written glue. The gate closes the loop across the
 two repos (angzarr-cli + angzarr-router): regenerate the `bindings/go`
 and `bindings/python` fixture wiring from `conformance/proto/`, delete
 the transitional hand-written glue from units 4–5, and re-run **the same
-`.feature` suite + `.txtpb` fixtures** (and the differential suite)
+`.feature` suite + `.txtpb` fixtures** (and the property sweep)
 through the **generated** wiring with identical results. So the final
 matrix is `cucumber × {Rust core, Go generated, Python generated}`, all
 green on one English behavior spec. Any awkwardness the emitter hits
@@ -477,9 +504,9 @@ bindings, and the one all future users go through.
 | 1 | Core crate slice + transliterated test bank | angzarr-router | ✅ **done** — tests green; `cargo-mutants` 51/51 viable caught (≥ 0.95) |
 | 2 | FFI crate + Rust-side ABI consumer test | angzarr-router | ✅ **done** — ABI test green; panic/ownership rules each pinned |
 | 3 | Fixture + Gherkin behavior suite + cucumber-rs harness | angzarr-router | ✅ **done** — 17 scenarios/49 steps green against the core; every slice behavior covered (guards, corrupt payload, fill-only ext, fan-out, undeclared rejection, snapshot/boundary, `had_prior_events`) |
-| 4 | Go binding + godog harness + **differential suite** | angzarr-router (`bindings/go`) | same features green via godog; differential: zero divergence from the client-go engine (imported as oracle) |
-| 5 | Python binding + behave harness | angzarr-router (`bindings/python`) | same features green via behave; GIL-threaded dispatch exercised (concurrent dispatches) |
-| 6 | Codegen emitters → **test the generated clients** | angzarr-cli + angzarr-router | wiring regenerated from `conformance/proto/` into `bindings/*`; hand-written glue deleted; same features + differential green through **generated** wiring |
+| 4 | Go binding + godog harness + **property sweep** | angzarr-router (`bindings/go`) | ✅ **done** — 17 scenarios/49 steps green via godog against the FFI core; 169-case property sweep green; cross-platform cgo link; no old client linked |
+| 5 | Python binding + behave harness | angzarr-router (`bindings/python`) | same features green via behave; binding-only property sweep; GIL-threaded dispatch exercised (concurrent dispatches); no old client linked |
+| 6 | Codegen emitters → **test the generated clients** | angzarr-cli + angzarr-router | wiring regenerated from `conformance/proto/` into `bindings/*`; hand-written glue deleted; same feature suite green through **generated** wiring |
 
 Each unit is one reviewable change — **except unit 6, which spans two
 repos and cannot merge atomically.** angzarr-cli (the emitter change)
@@ -489,7 +516,7 @@ generated wiring") presupposes that release. Its intra-unit sequence:
 (a) angzarr-cli lands the new emitter output mode — additive, the
 units 4–5 hand-written glue still present and green; (b) angzarr-router
 regenerates its `bindings/go` and `bindings/python` fixture wiring,
-deletes the transitional glue, re-runs the feature + differential suites
+deletes the transitional glue, re-runs the feature suite + property sweep
 — one PR per binding. Each step has a green state to review against;
 "unit 6" is the gate across the two repos, not a single diff. (Collapsing
 units 4–6 into router + angzarr-cli, rather than spreading them over four
@@ -519,8 +546,8 @@ settled when unit 2 lands; it settles at the post-unit-6 review.
 ## 7. What this defers, explicitly
 
 - No change to what client-go ships today — its engine keeps running
-  (and serves as the differential oracle, §3) until R3 **replaces** it
-  outright (§8); it is not modified by the bootstrap at all.
+  until R3 **replaces** it outright (§8); it is not modified by, nor
+  linked into, the bootstrap at all (§3 no-old-client-linking decision).
 - Emitter rows for saga/PM/projector/upcaster components; unit 6
   covers the aggregate emitters only, and the others repeat its
   pattern once their dispatch exists in the core.
@@ -573,7 +600,7 @@ angzarr-router/
 
 Co-location directly dissolves the cross-repo coordination §6 calls out:
 ABI and bindings move in lockstep, one CI runs every binding's
-conformance + differential suite against the core, the unit-6 cross-repo
+conformance suite + property sweep against the core, the unit-6 cross-repo
 merge shrinks from four repos to two, and packaging the native lib (the
 wheel-with-vendored-staticlib story §2 defers) is owned by one pipeline.
 
@@ -596,18 +623,18 @@ go through `router-ffi`. Its generated wiring depends on `bindings/rust/`
 exactly as Go's depends on `bindings/go/` (§2).
 
 **Sequencing and replacement.** The bindings are built in router from
-unit 4 onward (§3–§5); client-go is never modified, entering only as the
-test-only oracle dependency whose mutation-hardened engine must run live
-during the differential suite. The bootstrap proves *aggregate* dispatch
-only — client-go today is far more (all component kinds, upcaster,
-cloudevents, identity, destinations, serving, retry), so its full surface
-migrates into `bindings/go` across the R1→R3 semantics port, and only
-then is the repo replaceable. At R3, **replace** each language's engine
-outright — do not keep a parallel copy running behind an indefinite
-parity gate. The engine is deleted, not deprecated in place; its history
-lives in git if it is ever needed. This sharpens R3 from "parity gate,
-then eventual retirement" to "replace once the differential suite is
-green."
+unit 4 onward (§3–§5); client-go is never modified and never linked into
+the bootstrap. The bootstrap proves *aggregate* dispatch only — client-go
+today is far more (all component kinds, upcaster, cloudevents, identity,
+destinations, serving, retry), so its full surface migrates into
+`bindings/go` across the R1→R3 semantics port, and only then is the repo
+replaceable. At R3, **replace** each language's engine outright — do not
+keep a parallel copy running behind an indefinite parity gate. The engine
+is deleted, not deprecated in place; its history lives in git if it is
+ever needed. The parity basis is the shared conformance feature suite: the
+old engine and the new binding both pass the one suite (it is the old
+engine's behavior that authored it), so R3 is "replace once the binding is
+green on the shared suite," not a bespoke live differential.
 
 **Rust is not a bootstrap unit.** The bootstrap exists to stress the
 *FFI ABI* with two genuinely different binding mechanisms (cgo vs cffi);
