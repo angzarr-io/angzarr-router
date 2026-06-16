@@ -41,3 +41,25 @@ buf-lint:
 # Check proto formatting (no rewrite; fails on drift).
 buf-format:
     cd {{TOP}}/proto && buf format --diff --exit-code
+
+# --- Go binding (bindings/go) -------------------------------------------
+# go + cgo over the router-ffi cdylib. The cdylib is built here by cargo
+# (target/debug); the cgo link + rpath resolve it from the same tree.
+
+# Regenerate the Go binding's protobuf types. google.* come from genproto
+# and are excluded; sererr is ours and re-homed under the binding's module.
+go-binding-gen:
+    cd {{TOP}} && buf generate --template bindings/go/buf.gen.yaml \
+        --exclude-path angzarr-project/proto/google --exclude-path proto/google
+
+# Build the Go binding (after building the cdylib it links).
+go-binding-build: build
+    cd {{TOP}}/bindings/go && go build -tags ffirouter ./...
+
+# Run the Go binding's conformance suite (godog) + property sweep.
+go-binding-test: build
+    cd {{TOP}}/bindings/go && go test -tags ffirouter ./...
+
+# Format check + vet the Go binding.
+go-binding-lint:
+    cd {{TOP}}/bindings/go && test -z "$(gofmt -l .)" && go vet -tags ffirouter ./...

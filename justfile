@@ -16,8 +16,13 @@ set shell := ["bash", "-c"]
 import? 'angzarr-project/submodule.just'
 
 TOP := `git rev-parse --show-toplevel`
-# Pinned org toolchain image (rust + buf + protoc + prost/tonic plugins).
-# Override with ANGZARR_ROUTER_IMAGE to pin a specific git-SHA tag.
+# Pinned org toolchain image. The Rust recipes need cargo + buf + protoc +
+# prost/tonic plugins; the Go binding recipes additionally need go + cgo
+# (gcc) + protoc-gen-go in the SAME image, since the binding links the
+# cargo-built cdylib. That calls for a single all-languages image — the
+# current `angzarr-rust` has the Rust side but no go, so `just go-binding-*`
+# needs ANGZARR_ROUTER_IMAGE pointed at a combined image (rust + go, later
+# python/jvm/…). Override with ANGZARR_ROUTER_IMAGE to pin a git-SHA tag.
 ROUTER_IMAGE := env_var_or_default("ANGZARR_ROUTER_IMAGE", "ghcr.io/angzarr-io/angzarr-rust:latest")
 # Container runtime: docker (rootless or rootful). Empty inside a container.
 CONTAINER_CMD := `command -v docker 2>/dev/null || echo ""`
@@ -66,3 +71,21 @@ buf-lint: (_container "buf-lint")
 
 # Check proto formatting
 buf-format: (_container "buf-format")
+
+# --- Go binding (bindings/go) -------------------------------------------
+# go + cgo over the cargo-built router-ffi cdylib; delegated into the same
+# toolchain image as every other recipe, so the cdylib and the binding that
+# links it build in one environment. Requires ROUTER_IMAGE to carry go +
+# cgo + protoc-gen-go alongside cargo (the all-languages image above).
+
+# Regenerate the Go binding's protobuf types (buf + protoc-gen-go)
+go-binding-gen: (_container "go-binding-gen")
+
+# Build the Go binding against the locally built cdylib
+go-binding-build: (_container "go-binding-build")
+
+# Run the Go binding's conformance suite (godog) + property sweep
+go-binding-test: (_container "go-binding-test")
+
+# Format check + vet the Go binding
+go-binding-lint: (_container "go-binding-lint")
