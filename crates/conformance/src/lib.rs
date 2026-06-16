@@ -69,7 +69,11 @@ where
 pub fn counter_aggregate() -> AggregateDispatch<CounterState> {
     let rebuilder = Rebuilder::new(CounterState::default).apply(
         "test.counter.Increased",
-        |state: &mut CounterState, _event| {
+        |state: &mut CounterState, event| {
+            // Decode the payload so a corrupt persisted event fails the fold
+            // (PERSISTED_EVENT_CORRUPT). Increased is empty, so every
+            // well-formed event decodes and simply increments.
+            counter::Increased::decode(event.value.as_slice())?;
             state.count += 1;
             Ok(())
         },
@@ -148,6 +152,28 @@ pub fn increase_command(n: u32) -> pb::ContextualCommand {
     cc
 }
 
+/// A well-known opaque linkage stamped on a command's cover, used to prove
+/// fill-only ext propagation onto emitted events.
+pub fn parent_linkage() -> prost_types::Any {
+    prost_types::Any {
+        type_url: angzarr_router::type_url("test.counter.Parent"),
+        value: vec![1, 2, 3],
+    }
+}
+
+/// An IncreaseBy command carrying parent linkage on its cover.
+pub fn increase_command_with_linkage(n: u32) -> pb::ContextualCommand {
+    let mut cc = increase_command(n);
+    cc.command
+        .as_mut()
+        .expect("command book")
+        .cover
+        .as_mut()
+        .expect("cover")
+        .ext = Some(parent_linkage());
+    cc
+}
+
 /// The FailHard command (no scenario data).
 pub fn failhard_command() -> pb::ContextualCommand {
     parse_txtpb(CONTEXTUAL_COMMAND, SKEL_FAILHARD)
@@ -202,6 +228,25 @@ pub fn prior_history(n: u32) -> Option<pb::EventBook> {
     Some(pb::EventBook {
         pages,
         next_sequence: n,
+        ..Default::default()
+    })
+}
+
+/// Prior history whose single Increased event carries undecodable payload
+/// bytes (a truncated varint) → the applier fails the fold, surfacing
+/// PERSISTED_EVENT_CORRUPT when a known command rebuilds over it.
+pub fn corrupt_prior_history() -> Option<pb::EventBook> {
+    let mut page: pb::EventPage = parse_txtpb(EVENT_PAGE, SKEL_INCREASED_EVENT);
+    if let Some(pb::event_page::Payload::Event(any)) = page.payload.as_mut() {
+        any.value = vec![0xff, 0xff, 0xff];
+    }
+    page.header = Some(pb::PageHeader {
+        sync_mode: None,
+        sequence_type: Some(pb::page_header::SequenceType::Sequence(0)),
+    });
+    Some(pb::EventBook {
+        pages: vec![page],
+        next_sequence: 1,
         ..Default::default()
     })
 }

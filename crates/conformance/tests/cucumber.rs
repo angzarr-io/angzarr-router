@@ -35,9 +35,19 @@ async fn prior_increases(w: &mut CounterWorld, n: u32) {
     w.prior = conf::prior_history(n);
 }
 
+#[given("a counter whose history holds a corrupt event")]
+async fn corrupt_history(w: &mut CounterWorld) {
+    w.prior = conf::corrupt_prior_history();
+}
+
 #[when(regex = r"^the operator increases the counter by (\d+)$")]
 async fn increase_by(w: &mut CounterWorld, n: u32) {
     w.dispatch(conf::increase_command(n));
+}
+
+#[when(regex = r"^the operator increases the counter by (\d+) on behalf of a parent$")]
+async fn increase_on_behalf(w: &mut CounterWorld, n: u32) {
+    w.dispatch(conf::increase_command_with_linkage(n));
 }
 
 #[when("the operator triggers a hard failure")]
@@ -83,6 +93,25 @@ async fn rejected_as(w: &mut CounterWorld, code: String) {
 #[then(regex = r"^the command fails with ([A-Z_]+)$")]
 async fn fails_with(w: &mut CounterWorld, code: String) {
     assert_failed_with(w, &code);
+}
+
+#[then("the recorded events carry the parent linkage")]
+async fn carry_linkage(w: &mut CounterWorld) {
+    let resp = w
+        .result
+        .as_ref()
+        .expect("a command was dispatched")
+        .as_ref()
+        .expect("expected a successful response");
+    let book = match &resp.result {
+        Some(pb::business_response::Result::Events(book)) => book,
+        other => panic!("expected an events response, got {other:?}"),
+    };
+    assert_eq!(
+        book.cover.as_ref().and_then(|c| c.ext.as_ref()),
+        Some(&conf::parent_linkage()),
+        "emitted events must inherit the command's parent linkage (fill-only ext)"
+    );
 }
 
 #[then("no events are recorded")]

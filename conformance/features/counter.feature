@@ -48,3 +48,13 @@ Feature: Counter aggregate dispatch
   Scenario: a command page with no payload is refused
     When a command whose page carries no payload is dispatched
     Then the command fails with MISSING_COMMAND_PAYLOAD
+
+  Scenario: a corrupt persisted event fails the command on rebuild
+    Given a counter whose history holds a corrupt event
+    When the operator increases the counter by 1
+    Then the command fails with PERSISTED_EVENT_CORRUPT
+
+  Scenario: emitted events inherit the command's parent linkage
+    Given a new counter
+    When the operator increases the counter by 1 on behalf of a parent
+    Then the recorded events carry the parent linkage
