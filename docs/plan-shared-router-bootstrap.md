@@ -2,6 +2,7 @@
 sessions:
   - slim-pricy-power
   - witty-bony-bath
+  - solid-tight-perch
 ---
 
 # Bootstrap plan: minimal Rust core + Go and Python bindings
@@ -27,7 +28,7 @@ only after this slice's review freezes the ABI.
   transliterated test bank green (40 tests), `cargo-mutants` 51/51
   viable caught (≥0.95 gate met).
 - **Unit 2 — FFI crate**: ✅ done. Full C-ABI + `catch_unwind` guards +
-  the Rust-side ABI consumer test (21 tests).
+  the Rust-side ABI consumer test (22 tests).
 - **Unit 3 — conformance suite + cucumber-rs harness**: ◐ in progress.
   Harness built and green end-to-end — cucumber-rs drives the core
   natively, parsing the `.txtpb` envelope skeletons and setting each
@@ -39,7 +40,10 @@ only after this slice's review freezes the ABI.
   envelope guards (MISSING_COMMAND_BOOK/PAGE/PAYLOAD), fill-only ext,
   `had_prior_events` evidence.
 - Units 4–6 (client-go / client-python / angzarr-cli): later repos,
-  after unit 3 completes and the ABI-freeze review.
+  after unit 3 completes. The **ABI-freeze review comes after unit 6**,
+  not before the bindings — the whole point of doing three languages in
+  the bootstrap is that units 4–6 exercise the ABI and surface findings
+  while it is still cheap to change (§6).
 
 Framework protos are consumed under the **io.angzarr** packages
 (`io.angzarr.v1`); the router's own ABI protos are
@@ -70,7 +74,9 @@ One component kind, all of its semantics, no serving layer:
   undeclared rejections.
 - The error model: coded errors crossing the FFI as
   `google.rpc.ErrorInfo` (reason = SCREAMING_SNAKE code, domain
-  `angzarr.io`, metadata extras); unclassified handler failures →
+  `angzarr.io` — the reverse-DNS error domain, distinct from the
+  `io.angzarr` proto package; this follows the ErrorInfo convention,
+  not a typo — metadata extras); unclassified handler failures →
   `UNHANDLED_HANDLER_ERROR`; Rust panics caught at every FFI entry and
   surfaced as coded failures.
 
@@ -197,7 +203,8 @@ void* angzarr_router_new(void);
 int32_t angzarr_router_register_aggregate(void* r,
     const uint8_t* descriptor, size_t descriptor_len,   // serialized descriptor proto:
     angzarr_cb cb);                                     // name, domain, command/applier/
-                                                        // rejection tables with callback ids
+                                                        // rejection tables with callback ids,
+                                                        // + optional snapshot-loader callback id
 int32_t angzarr_router_dispatch(void* r, void* host_ctx,
     const uint8_t* contextual_command, size_t len,      // ContextualCommand bytes
     angzarr_buf* out);                                  // BusinessResponse bytes | ErrorInfo bytes
@@ -209,8 +216,16 @@ Rules under review (each carries a test):
   `UNHANDLED_HANDLER_ERROR` with the panic message in metadata
 - router-owned buffers valid only during the callback; host fills
   `out` only via `angzarr_buf_alloc`
+- `out` ownership is unconditional: a buffer the host allocates via
+  `angzarr_buf_alloc` is router-freed whether the callback returns ok
+  or a coded error — the error/partial-fill path leaks nothing
 - one synchronous callback at a time per dispatch; dispatches on
-  different host_ctx values may run concurrently
+  different host_ctx values may run concurrently. This is not deferred
+  to a binding: the unit-2 consumer test pins it natively
+  (`concurrent_dispatches_isolate_sessions` drives parallel dispatches
+  across distinct sessions through the C surface and asserts per-session
+  isolation), so a Send/Sync or reentrancy defect surfaces here, in
+  Rust — not first through Python's GIL in unit 5
 - `host_ctx` is opaque to Rust — it is where the binding parks the
   per-dispatch state object (the state-never-crosses principle made
   concrete)
@@ -218,6 +233,20 @@ Rules under review (each carries a test):
 The crate ships a **Rust-side ABI consumer test**: a test module that
 drives the extern "C" surface through raw pointers exactly as a
 foreign binding would — the ABI is proven before any binding exists.
+It exercises the **full marshaling surface**, not just the happy
+command path: snapshot-loader callback + covered-page skip, ordered
+rejection fan-out with `RejectionAux` decode, `CommandContextAux`
+(including `had_prior_events`), the `ErrorInfo` error model, the
+panic / null-pointer / garbage-bytes guards, and concurrent dispatch
+across distinct sessions. The hard part — the aux encode/decode and
+fan-out ordering across the seam — is therefore pinned here, in Rust,
+deterministically, rather than first surfacing through cgo or Python's
+GIL. The marshaling channels needing this scrutiny are exactly the
+boundary-invented aux payloads; the fill-only ext and sequence stamps,
+by contrast, ride **in-band** inside the `ContextualCommand` /
+`BusinessResponse` book bytes that already cross opaquely, so they are
+covered transitively by the byte round-trip (one explicit
+`cover.ext`-survives assertion on a command test closes even that).
 
 ### 2.4 The conformance fixture, behavior suite, and native harness (review unit 3)
 
@@ -277,7 +306,11 @@ command {
 the bindings) are the only per-language code: parse the skeleton, **set
 the scenario's data by field** (structured — never string-templating
 the textproto), dispatch, and assert the outcome. They are generic
-across scenarios.
+across scenarios. One consequence is accepted explicitly: the
+Examples-value → proto-field mapping is reimplemented in each language's
+step layer (cucumber-rs / godog / behave). It is the one duplicated
+piece of knowledge the design keeps per-language — small, mechanical,
+and the price of a shared English spec with no shared step runtime.
 
 Behavior the suite covers: empty history; prior events fold; snapshot +
 covered boundary (sequence == snapshot.sequence skipped, +1 applied);
@@ -330,6 +363,18 @@ client-go/
   engine — mutation-hardened — is the oracle; any divergence is a
   core bug found before review ends. This test bank is also the
   retirement gate evidence for R3 later.
+  - One caveat the suite must be designed around: the core's unit-1
+    test bank is a *transliteration* of the Go engine's, so a
+    differential replay of those same scenarios catches divergence but
+    not a misconception both inherited from one shared mental model
+    (e.g. covered-page inclusivity read the same wrong way in both).
+    The independent signal therefore lives in the two parts that were
+    **not** copied from the oracle: the property-style sweep of
+    randomly generated books (inputs neither author hand-picked) and
+    the freshly-authored English Gherkin spec. Weight the sweep
+    accordingly — make it broad, not a token pass — because the
+    per-scenario replays mostly re-confirm the shared model rather than
+    test it.
 
 ## 4. client-python: the Python binding (review unit 5, ~300–500 lines)
 
@@ -371,14 +416,21 @@ In [angzarr-cli](https://github.com/angzarr-io/angzarr-cli):
 
 - The model layer (descriptor walking, C-0070..77 validations) is
   untouched — it is language- and runtime-neutral by design.
-- The `go` and `python` emitters gain an output mode targeting the
-  binding registration APIs from units 4–5: same strict typed seam
-  (interface / ABC, one typed method per declared rpc, no
-  `Unimplemented` embedding), and a `New<Component>Dispatch`-shaped
+- The emitters target the binding registration APIs from units 4–5:
+  same strict typed seam (interface / ABC, one typed method per declared
+  rpc, no `Unimplemented` embedding), and a `New<Component>Dispatch`-shaped
   constructor that assigns callback ids and registers unmarshal thunks
   with the binding instead of the Go engine's tables. The generation
   rule is unchanged: nothing that needs an `if`; semantics stay in the
-  core.
+  core. **Scope caveat — confirm before unit 6 starts:** this is an
+  *added output mode* only for an emitter that already exists. The Go
+  emitter does; the Python emitter may be **net-new** rather than a mode
+  on an existing one. Check the angzarr-cli emitter registry
+  (`codegen/generate.go`) first — if it registers only the Go emitter,
+  unit 6 must build the Python emitter from scratch (the C-0070..77
+  model layer is reusable, the emitter is not), which is materially
+  larger than "add a mode" and is the gate that closes the whole slice.
+  Size unit 6 against what is actually there, not against this sentence.
 - Input is the standard invocation surface — proto files/dirs or a
   descriptor set, exactly as `buf.gen.yaml` drives it today
   (`go tool angzarr-cli codegen <lang>`). The conformance fixture's
@@ -411,12 +463,38 @@ bindings, and the one all future users go through.
 | 5 | Python binding + behave harness | client-python | same features green via behave; GIL-threaded dispatch exercised (concurrent dispatches) |
 | 6 | Codegen emitters → **test the generated clients** | angzarr-cli (+ both client repos) | wiring regenerated from `conformance/proto/`; hand-written glue deleted; same features + differential green through **generated** wiring |
 
-Each unit is one reviewable change. After unit 6: **ABI freeze review**
-— the explicit decision point the decision record requires before R1
-(full semantics port) and the remaining roadmap proceed. Findings from
-the bindings (awkward signatures, missing aux fields) are cheap to fix
-before the freeze and expensive after; that is the entire reason the
-bootstrap is three languages instead of one.
+Each unit is one reviewable change — **except unit 6, which spans three
+repos and cannot merge atomically.** angzarr-cli (the emitter change)
+must release before either client repo can regenerate against it, and
+the deletion gate ("hand-written glue deleted, same suite green through
+generated wiring") presupposes that release. Its intra-unit sequence:
+(a) angzarr-cli lands the new emitter output mode — additive, the
+units 4–5 hand-written glue still present and green; (b) client-go
+regenerates its fixture wiring, deletes its transitional glue, re-runs
+the feature + differential suites — its own PR; (c) client-python does
+the same — its own PR. Each step has a green state to review against;
+"unit 6" is the gate across the three, not a single diff.
+
+After unit 6: **ABI freeze review** — the explicit decision point the
+decision record requires before R1 (full semantics port) and the
+remaining roadmap proceed. Findings from the bindings (awkward
+signatures, missing aux fields) are cheap to fix before the freeze and
+expensive after; that is the entire reason the bootstrap is three
+languages instead of one. **What freezes is the dispatch-path ABI** the
+slice actually exercises: the callback signature, `angzarr_buf`
+ownership, the descriptor shape (including `snapshot_callback_id`), and
+the `google.rpc.ErrorInfo` error model. The decision record's
+serve/lifecycle surface (`_serve`, `_shutdown(drain_ms)`,
+config/transport resolution) and the non-aggregate component kinds with
+their aux protos are **out of this freeze and remain additive** (per
+decision-record §4.5) — "freeze" here is not a claim over a surface the
+bootstrap never touched.
+
+Findings the bootstrap is expected to surface can reopen earlier units:
+an emitter awkwardness in step (a) is an ABI/API finding that sends the
+descriptor or callback shape back to **unit 2** before the freeze. That
+round-trip is the point of three consumers — the ABI is not de-facto
+settled when unit 2 lands; it settles at the post-unit-6 review.
 
 ## 7. What this defers, explicitly
 
