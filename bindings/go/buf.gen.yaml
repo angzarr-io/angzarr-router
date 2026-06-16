@@ -1,0 +1,16 @@
+# Go codegen for the binding. Managed mode re-homes every generated
+# package under this module's gen/ tree — the framework protos carry a
+# go_package pointing at client-go's module, which is wrong for the
+# router-owned binding (§8). google/protobuf WKTs are runtime-provided and
+# never generated; google/rpc/* are generated here so the binding has no
+# genproto dependency (it only decodes bytes the core produced).
+version: v2
+managed:
+  enabled: true
+  override:
+    - file_option: go_package_prefix
+      value: github.com/angzarr-io/angzarr-router/bindings/go/gen
+plugins:
+  - local: protoc-gen-go
+    out: bindings/go/gen
+    opt: paths=source_relative
