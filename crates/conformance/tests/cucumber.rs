@@ -60,6 +60,16 @@ async fn unhandled_command(w: &mut CounterWorld) {
     w.dispatch(conf::unhandled_command());
 }
 
+#[when("a Reserve command is rejected")]
+async fn reserve_rejected(w: &mut CounterWorld) {
+    w.dispatch(conf::rejection_command("test.counter.Reserve"));
+}
+
+#[when("an unregistered command is rejected")]
+async fn unregistered_rejected(w: &mut CounterWorld) {
+    w.dispatch(conf::rejection_command("test.counter.Undeclared"));
+}
+
 #[when("a command with no command book is dispatched")]
 async fn missing_book(w: &mut CounterWorld) {
     w.dispatch(conf::command_missing_book());
@@ -112,6 +122,47 @@ async fn carry_linkage(w: &mut CounterWorld) {
         Some(&conf::parent_linkage()),
         "emitted events must inherit the command's parent linkage (fill-only ext)"
     );
+}
+
+#[then("the compensations run first then second")]
+async fn compensations_in_order(w: &mut CounterWorld) {
+    let resp = w
+        .result
+        .as_ref()
+        .expect("a command was dispatched")
+        .as_ref()
+        .expect("expected a merged compensation response");
+    let book = match &resp.result {
+        Some(pb::business_response::Result::Events(book)) => book,
+        other => panic!("expected an events response, got {other:?}"),
+    };
+    let types: Vec<&str> = book
+        .pages
+        .iter()
+        .filter_map(angzarr_router::page_event)
+        .map(|any| angzarr_router::type_name_from_url(&any.type_url))
+        .collect();
+    assert_eq!(
+        types,
+        vec!["test.counter.CompensatedFirst", "test.counter.CompensatedSecond"],
+        "compensators must merge in registration order"
+    );
+}
+
+#[then("no compensation is recorded")]
+async fn no_compensation(w: &mut CounterWorld) {
+    let resp = w
+        .result
+        .as_ref()
+        .expect("a command was dispatched")
+        .as_ref()
+        .expect("an undeclared rejection must delegate (empty Ok), not fail");
+    let empty = match &resp.result {
+        None => true,
+        Some(pb::business_response::Result::Events(book)) => book.pages.is_empty(),
+        _ => false,
+    };
+    assert!(empty, "expected no compensation events, got {:?}", resp.result);
 }
 
 #[then("no events are recorded")]

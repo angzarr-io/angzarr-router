@@ -58,3 +58,13 @@ Feature: Counter aggregate dispatch
     Given a new counter
     When the operator increases the counter by 1 on behalf of a parent
     Then the recorded events carry the parent linkage
+
+  Scenario: a rejected command runs its compensators in registration order
+    Given a new counter
+    When a Reserve command is rejected
+    Then the compensations run first then second
+
+  Scenario: a rejection with no registered compensator is left to the framework
+    Given a new counter
+    When an unregistered command is rejected
+    Then no compensation is recorded

@@ -108,10 +108,10 @@ pub fn counter_aggregate() -> AggregateDispatch<CounterState> {
         })
         // Two compensators for the same rejected command → ordered fan-out.
         .on_rejected("test.counter.Reserve", |_n, _r, _s, _c| {
-            Ok(marker_response("reserve-compensation-first"))
+            Ok(marker_response("CompensatedFirst"))
         })
         .on_rejected("test.counter.Reserve", |_n, _r, _s, _c| {
-            Ok(marker_response("reserve-compensation-second"))
+            Ok(marker_response("CompensatedSecond"))
         })
 }
 
@@ -122,13 +122,16 @@ fn increased_any() -> prost_types::Any {
     }
 }
 
-/// A single-page response carrying one Increased marker (used by the
-/// fan-out compensators; `_label` documents which compensator emitted it).
-fn marker_response(_label: &str) -> pb::BusinessResponse {
+/// A single-page compensation response whose event type carries `label`, so
+/// the fan-out order is observable in the merged book.
+fn marker_response(label: &str) -> pb::BusinessResponse {
     pb::BusinessResponse {
         result: Some(pb::business_response::Result::Events(pb::EventBook {
             pages: vec![pb::EventPage {
-                payload: Some(pb::event_page::Payload::Event(increased_any())),
+                payload: Some(pb::event_page::Payload::Event(prost_types::Any {
+                    type_url: angzarr_router::type_url(&format!("test.counter.{label}")),
+                    value: Vec::new(),
+                })),
                 ..Default::default()
             }],
             ..Default::default()
@@ -182,6 +185,52 @@ pub fn failhard_command() -> pb::ContextualCommand {
 /// A command whose type has no registered handler (drives NO_HANDLER_REGISTERED).
 pub fn unhandled_command() -> pb::ContextualCommand {
     parse_txtpb(CONTEXTUAL_COMMAND, SKEL_UNHANDLED)
+}
+
+/// A ContextualCommand carrying a rejection `Notification` for `fq_command`,
+/// routed through the same dispatch entry as a command (the core detects the
+/// notification type and takes the compensation path). Built by field — the
+/// envelope nests Notification → RejectionNotification → the rejected book.
+pub fn rejection_command(fq_command: &str) -> pb::ContextualCommand {
+    let counter_cover = || {
+        Some(pb::Cover {
+            domain: "counter".to_string(),
+            ..Default::default()
+        })
+    };
+    let rejection = pb::RejectionNotification {
+        rejected_command: Some(pb::CommandBook {
+            cover: counter_cover(),
+            pages: vec![pb::CommandPage {
+                payload: Some(pb::command_page::Payload::Command(prost_types::Any {
+                    type_url: angzarr_router::type_url(fq_command),
+                    value: Vec::new(),
+                })),
+                ..Default::default()
+            }],
+        }),
+        ..Default::default()
+    };
+    let notification = pb::Notification {
+        payload: Some(prost_types::Any {
+            type_url: angzarr_router::type_url("io.angzarr.v1.RejectionNotification"),
+            value: rejection.encode_to_vec(),
+        }),
+        ..Default::default()
+    };
+    pb::ContextualCommand {
+        command: Some(pb::CommandBook {
+            cover: counter_cover(),
+            pages: vec![pb::CommandPage {
+                payload: Some(pb::command_page::Payload::Command(prost_types::Any {
+                    type_url: angzarr_router::NOTIFICATION_TYPE_URL.to_string(),
+                    value: notification.encode_to_vec(),
+                })),
+                ..Default::default()
+            }],
+        }),
+        events: None,
+    }
 }
 
 // Envelope-guard negatives: a well-formed skeleton with exactly one structural
