@@ -364,6 +364,33 @@ fn empty_history_command_emits_stamped_events() {
 }
 
 #[test]
+fn command_cover_ext_survives_the_round_trip() {
+    // Fill-only ext is not an aux channel — it rides in-band inside the
+    // ContextualCommand / BusinessResponse book bytes. This pins that the
+    // stamped cover.ext survives the FFI seam, not just the native path.
+    let router = Router::with_counter();
+    let session = next_session();
+    let ext = Any {
+        type_url: "type.googleapis.com/test.counter.Parent".to_string(),
+        value: vec![1, 2, 3],
+    };
+    let mut req = command_req(FQ_INCREASE_BY, IncreaseBy { n: 1 }.encode_to_vec(), None);
+    req.command.as_mut().unwrap().cover.as_mut().unwrap().ext = Some(ext.clone());
+
+    let (ret, bytes) = router.dispatch(session, &req);
+    assert_eq!(ret, 0);
+    let resp = decode_response(&bytes);
+    let Some(pb::business_response::Result::Events(book)) = resp.result else {
+        panic!("expected events result");
+    };
+    assert_eq!(
+        book.cover.as_ref().and_then(|c| c.ext.as_ref()),
+        Some(&ext),
+        "command cover.ext must survive the FFI round-trip onto the emitted book",
+    );
+}
+
+#[test]
 fn prior_events_fold_through_host_appliers() {
     let router = Router::with_counter();
     let session = next_session();
