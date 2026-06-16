@@ -158,6 +158,30 @@ pub fn unhandled_command() -> pb::ContextualCommand {
     parse_txtpb(CONTEXTUAL_COMMAND, SKEL_UNHANDLED)
 }
 
+// Envelope-guard negatives: a well-formed skeleton with exactly one structural
+// field cleared, so the guard fires regardless of the rest being valid.
+
+/// No command book at all → MISSING_COMMAND_BOOK.
+pub fn command_missing_book() -> pb::ContextualCommand {
+    let mut cc = increase_command(1);
+    cc.command = None;
+    cc
+}
+
+/// A command book with no pages → MISSING_COMMAND_PAGE.
+pub fn command_missing_page() -> pb::ContextualCommand {
+    let mut cc = increase_command(1);
+    cc.command.as_mut().expect("command book").pages.clear();
+    cc
+}
+
+/// A command page carrying no payload → MISSING_COMMAND_PAYLOAD.
+pub fn command_missing_payload() -> pb::ContextualCommand {
+    let mut cc = increase_command(1);
+    cc.command.as_mut().expect("command book").pages[0].payload = None;
+    cc
+}
+
 /// Prior history of `n` confirmed increases: the Increased skeleton replayed
 /// at consecutive sequences, with `next_sequence` continuing past them.
 pub fn prior_history(n: u32) -> Option<pb::EventBook> {

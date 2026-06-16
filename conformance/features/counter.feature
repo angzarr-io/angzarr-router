@@ -36,3 +36,15 @@ Feature: Counter aggregate dispatch
     Given a new counter
     When an unhandled command is dispatched
     Then the command fails with NO_HANDLER_REGISTERED
+
+  Scenario: a command carrying no command book is refused
+    When a command with no command book is dispatched
+    Then the command fails with MISSING_COMMAND_BOOK
+
+  Scenario: a command book with no pages is refused
+    When a command with an empty command book is dispatched
+    Then the command fails with MISSING_COMMAND_PAGE
+
+  Scenario: a command page with no payload is refused
+    When a command whose page carries no payload is dispatched
+    Then the command fails with MISSING_COMMAND_PAYLOAD
