@@ -42,6 +42,12 @@ ffi.cdef(
     int32_t  angzarr_router_dispatch_projector(void* r, void* host_ctx,
                  const uint8_t* request, size_t request_len,
                  angzarr_buf* out);
+    int32_t  angzarr_router_register_saga(void* r,
+                 const uint8_t* descriptor, size_t descriptor_len,
+                 angzarr_cb cb);
+    int32_t  angzarr_router_dispatch_saga(void* r, void* host_ctx,
+                 const uint8_t* request, size_t request_len,
+                 angzarr_buf* out);
     """
 )
 

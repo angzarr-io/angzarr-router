@@ -22,7 +22,7 @@ from google.rpc import error_details_pb2, status_pb2
 
 from ._abi import ffi, lib
 from .gen.io.angzarr.router.ffi.v1 import abi_pb2
-from .gen.io.angzarr.v1 import command_handler_pb2, types_pb2
+from .gen.io.angzarr.v1 import command_handler_pb2, saga_pb2, types_pb2
 
 # --- ABI status codes (mirror crates/router-ffi/src/abi.rs) ---
 _STATUS_OK = 0  # success with a payload in `out`
@@ -185,6 +185,76 @@ class ProjectorDispatch:
         return self
 
 
+class Destinations:
+    """Coordinator-supplied next-sequences for command stamping. Sagas and
+    process managers are translators — they stamp emitted commands, they do
+    not rebuild destination state to make decisions."""
+
+    __slots__ = ("_sequences",)
+
+    def __init__(self, sequences: Optional[dict[str, int]] = None):
+        self._sequences = dict(sequences) if sequences else {}
+
+    def sequence_for(self, domain: str) -> Optional[int]:
+        """The next sequence for a domain, or None when none was supplied."""
+        return self._sequences.get(domain)
+
+    def has(self, domain: str) -> bool:
+        """Whether a sequence exists for the domain."""
+        return domain in self._sequences
+
+    def domains(self) -> list[str]:
+        """Every domain carrying a sequence (unordered)."""
+        return list(self._sequences.keys())
+
+    def stamp_command(self, command_book, domain: str) -> None:
+        """Stamp every page of ``command_book`` with the next sequence for
+        ``domain``. A domain with no supplied sequence raises the coded
+        MISSING_DESTINATION_SEQUENCE (check output_domains config)."""
+        seq = self._sequences.get(domain)
+        if seq is None:
+            raise CodedError(
+                code="MISSING_DESTINATION_SEQUENCE",
+                message="no sequence for destination domain",
+                grpc=GrpcCode.INVALID_ARGUMENT,
+                extras={"domain": domain},
+            )
+        for page in command_book.pages:
+            page.header.sequence = seq
+
+
+# Saga thunk shapes (a saga is stateless — no state argument):
+#   event:     (event: Any, dests: Destinations) -> (commands, events)
+#   rejection: (notification, rejection) -> events
+SagaEventThunk = Callable[[any_pb2.Any, Destinations], tuple[list, list]]
+SagaRejectionThunk = Callable[[object, object], list]
+
+
+@dataclass
+class SagaDispatch:
+    """One saga component's registration: name, the input domain it consumes,
+    the domains it issues commands to, event handlers, and ordered rejection
+    compensators. A saga is stateless — no rebuilder, no state. Shaped like the
+    core/Go API so the unit-6 emitter targets it with minimal changes."""
+
+    name: str
+    input_domain: str
+    targets: list[str] = field(default_factory=list)
+    events: dict[str, SagaEventThunk] = field(default_factory=dict)
+    rejections: dict[str, list[SagaRejectionThunk]] = field(default_factory=dict)
+
+    def on_event(self, full_name: str, thunk: SagaEventThunk) -> "SagaDispatch":
+        """Register the translation thunk for a fully-qualified event type."""
+        self.events[full_name] = thunk
+        return self
+
+    def on_rejected(self, fq_command: str, thunk: SagaRejectionThunk) -> "SagaDispatch":
+        """Append a compensator for one fully-qualified command type; repeated
+        calls register an ordered fan-out (C-0042)."""
+        self.rejections.setdefault(fq_command, []).append(thunk)
+        return self
+
+
 # --- error model: CodedError <-> google.rpc.Status bytes ---
 
 
@@ -342,6 +412,35 @@ def _projector_unknown_invoker(thunk: ProjectorUnknownThunk) -> Invoker:
     def inv(_session, type_url, _payload, _aux):
         thunk(type_url)
         return None, _STATUS_OK
+
+    return inv
+
+
+def _saga_event_invoker(thunk: SagaEventThunk) -> Invoker:
+    # Saga is stateless — the session's host state is untouched. The event
+    # thunk rebuilds Destinations from the aux and returns a SagaResponse.
+    def inv(_session, type_url, payload, aux):
+        sax = abi_pb2.SagaEventAux()
+        sax.ParseFromString(aux)
+        dests = Destinations(dict(sax.destination_sequences))
+        commands, events = thunk(any_pb2.Any(type_url=type_url, value=payload), dests)
+        resp = saga_pb2.SagaResponse(commands=commands, events=events)
+        return resp.SerializeToString(), _STATUS_OK
+
+    return inv
+
+
+def _saga_rejection_invoker(thunk: SagaRejectionThunk) -> Invoker:
+    def inv(_session, _type_url, _payload, aux):
+        rax = abi_pb2.RejectionAux()
+        rax.ParseFromString(aux)
+        notification = types_pb2.Notification()
+        notification.ParseFromString(rax.notification)
+        rejection = types_pb2.RejectionNotification()
+        rejection.ParseFromString(rax.rejection)
+        events = thunk(notification, rejection)
+        resp = saga_pb2.SagaResponse(events=events)
+        return resp.SerializeToString(), _STATUS_OK
 
     return inv
 
@@ -543,15 +642,52 @@ class Router:
         session = _Session(self)
         handle = ffi.new_handle(session)
         out = ffi.new("angzarr_buf*")
-        ret = lib.angzarr_router_dispatch_projector(
-            self._ptr, handle, _as_u8(req), len(req), out
-        )
+        ret = lib.angzarr_router_dispatch_projector(self._ptr, handle, _as_u8(req), len(req), out)
         resp_bytes = _consume_out(out)
         if ret == 0:
             proj = types_pb2.Projection()
             if resp_bytes:
                 proj.ParseFromString(resp_bytes)
             return proj
+        raise _decode_status(resp_bytes, ret)
+
+    def register_saga(self, dispatch: SagaDispatch) -> None:
+        """Register one saga component: assign callback ids to every
+        event/rejection thunk, serialize the SagaDescriptor, and hand it to the
+        core with the shared trampoline."""
+        with self._lock:
+            desc = abi_pb2.SagaDescriptor(name=dispatch.name, input_domain=dispatch.input_domain)
+            desc.target_domains.extend(dispatch.targets)
+            for fq, thunk in dispatch.events.items():
+                cid = self._assign(_saga_event_invoker(thunk))
+                desc.events.append(abi_pb2.CallbackEntry(fq_type=fq, callback_id=cid))
+            for fq, thunks in dispatch.rejections.items():
+                entry = abi_pb2.RejectionEntry(fq_command_type=fq)
+                for thunk in thunks:
+                    entry.callback_ids.append(self._assign(_saga_rejection_invoker(thunk)))
+                desc.rejections.append(entry)
+
+            desc_bytes = desc.SerializeToString()
+            ret = lib.angzarr_router_register_saga(
+                self._ptr, _as_u8(desc_bytes), len(desc_bytes), _trampoline
+            )
+            if ret != 0:
+                raise _decode_status(None, ret)
+
+    def dispatch_saga(self, saga_request) -> object:
+        """Run one SagaHandleRequest through the registered saga and return the
+        SagaResponse, or raise a CodedError decoded from the core's failure."""
+        req = saga_request.SerializeToString()
+        session = _Session(self)
+        handle = ffi.new_handle(session)
+        out = ffi.new("angzarr_buf*")
+        ret = lib.angzarr_router_dispatch_saga(self._ptr, handle, _as_u8(req), len(req), out)
+        resp_bytes = _consume_out(out)
+        if ret == 0:
+            resp = saga_pb2.SagaResponse()
+            if resp_bytes:
+                resp.ParseFromString(resp_bytes)
+            return resp
         raise _decode_status(resp_bytes, ret)
 
 

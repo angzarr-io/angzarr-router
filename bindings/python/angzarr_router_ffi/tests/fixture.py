@@ -10,7 +10,15 @@ from dataclasses import dataclass
 
 from google.protobuf import any_pb2
 
-from .. import AggregateDispatch, CommandContext, ProjectorDispatch, Rebuilder, reject
+from .. import (
+    AggregateDispatch,
+    CommandContext,
+    Destinations,
+    ProjectorDispatch,
+    Rebuilder,
+    SagaDispatch,
+    reject,
+)
 from ..gen.io.angzarr.v1 import command_handler_pb2, types_pb2
 from ..gen.test.counter import counter_pb2
 from .builders import (
@@ -133,4 +141,30 @@ def counter_projector() -> ProjectorDispatch:
         .for_domains("counter")
         .on_event(FQ_INCREASED, fold_increased)
         .finish(finish)
+    )
+
+
+def order_saga() -> SagaDispatch:
+    """The OrderSaga conformance fixture (saga.feature) in Python: it
+    translates each Increased source event into one Reserve command for
+    "inventory" (stamped from the destination sequence when present), and
+    compensates a rejected Reserve by injecting one fact event."""
+
+    def on_increased(_event: any_pb2.Any, dests: Destinations):
+        cmd = types_pb2.CommandBook()
+        cmd.cover.domain = "inventory"
+        cmd.pages.add().command.type_url = type_url(FQ_RESERVE)
+        if dests.has("inventory"):
+            dests.stamp_command(cmd, "inventory")
+        return [cmd], []
+
+    def on_reserve_rejected(_notification, _rejection):
+        event = types_pb2.EventBook()
+        event.pages.add()
+        return [event]
+
+    return (
+        SagaDispatch("order-saga", "order", ["inventory"])
+        .on_event(FQ_INCREASED, on_increased)
+        .on_rejected(FQ_RESERVE, on_reserve_rejected)
     )
