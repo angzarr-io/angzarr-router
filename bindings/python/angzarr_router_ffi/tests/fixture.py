@@ -14,12 +14,13 @@ from .. import (
     AggregateDispatch,
     CommandContext,
     Destinations,
+    ProcessManagerDispatch,
     ProjectorDispatch,
     Rebuilder,
     SagaDispatch,
     reject,
 )
-from ..gen.io.angzarr.v1 import command_handler_pb2, types_pb2
+from ..gen.io.angzarr.v1 import command_handler_pb2, process_manager_pb2, types_pb2
 from ..gen.test.counter import counter_pb2
 from .builders import (
     FQ_FAIL_HARD,
@@ -166,5 +167,51 @@ def order_saga() -> SagaDispatch:
     return (
         SagaDispatch("order-saga", "order", ["inventory"])
         .on_event(FQ_INCREASED, on_increased)
+        .on_rejected(FQ_RESERVE, on_reserve_rejected)
+    )
+
+
+class _ProcessManagerState:
+    """The PM's own event-sourced state — never crosses the FFI."""
+
+    __slots__ = ("count",)
+
+    def __init__(self):
+        self.count = 0
+
+
+def order_pm() -> ProcessManagerDispatch:
+    """The OrderProcessManager conformance fixture (process_manager.feature) in
+    Python: over the "counter" domain it reacts to the newest Increased trigger
+    by emitting one Reserve command for "inventory" (stamped from the
+    destination sequence when present) plus one fact per prior state event, and
+    compensates a rejected Reserve with a process event and an escalation."""
+
+    def apply_increased(state: _ProcessManagerState, _event: any_pb2.Any) -> None:
+        state.count += 1
+
+    def on_increased(_event, state: _ProcessManagerState, dests: Destinations):
+        cmd = types_pb2.CommandBook()
+        cmd.cover.domain = "inventory"
+        cmd.pages.add().command.type_url = type_url(FQ_RESERVE)
+        if dests.has("inventory"):
+            dests.stamp_command(cmd, "inventory")
+        resp = process_manager_pb2.ProcessManagerHandleResponse()
+        resp.commands.append(cmd)
+        for _ in range(state.count):
+            resp.facts.add().pages.add()
+        return resp
+
+    def on_reserve_rejected(_notification, _rejection, _state):
+        event = types_pb2.EventBook()
+        event.pages.add()
+        escalation = types_pb2.Notification()
+        escalation.cover.domain = "escalated"
+        return [event], escalation
+
+    rebuilder = Rebuilder(_ProcessManagerState).apply("test.counter.Increased", apply_increased)
+    return (
+        ProcessManagerDispatch("order-pm", "order-pm", rebuilder)
+        .on_event("counter", FQ_INCREASED, on_increased)
         .on_rejected(FQ_RESERVE, on_reserve_rejected)
     )

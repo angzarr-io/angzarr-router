@@ -22,7 +22,12 @@ from google.rpc import error_details_pb2, status_pb2
 
 from ._abi import ffi, lib
 from .gen.io.angzarr.router.ffi.v1 import abi_pb2
-from .gen.io.angzarr.v1 import command_handler_pb2, saga_pb2, types_pb2
+from .gen.io.angzarr.v1 import (
+    command_handler_pb2,
+    process_manager_pb2,
+    saga_pb2,
+    types_pb2,
+)
 
 # --- ABI status codes (mirror crates/router-ffi/src/abi.rs) ---
 _STATUS_OK = 0  # success with a payload in `out`
@@ -255,6 +260,40 @@ class SagaDispatch:
         return self
 
 
+# Process-manager thunk shapes (a PM is stateful — it sees rebuilt state):
+#   event:     (event: Any, state, dests) -> ProcessManagerHandleResponse
+#   rejection: (notification, rejection, state) -> (process_events, escalation|None)
+PMEventThunk = Callable[[any_pb2.Any, object, "Destinations"], object]
+PMRejectionThunk = Callable[[object, object, object], tuple[list, Optional[object]]]
+
+
+@dataclass
+class ProcessManagerDispatch:
+    """One process-manager component's registration: name, its own domain, the
+    rebuilder for its event-sourced state, event handlers keyed by (input
+    domain, FQ event type), and ordered rejection compensators. Shaped like the
+    core/Go API so the unit-6 emitter targets it with minimal changes."""
+
+    name: str
+    pm_domain: str
+    rebuilder: Rebuilder
+    handlers: dict[str, dict[str, PMEventThunk]] = field(default_factory=dict)
+    rejections: dict[str, list[PMRejectionThunk]] = field(default_factory=dict)
+
+    def on_event(
+        self, input_domain: str, full_name: str, thunk: PMEventThunk
+    ) -> "ProcessManagerDispatch":
+        """Register the thunk for (input domain, fully-qualified event type)."""
+        self.handlers.setdefault(input_domain, {})[full_name] = thunk
+        return self
+
+    def on_rejected(self, fq_command: str, thunk: PMRejectionThunk) -> "ProcessManagerDispatch":
+        """Append a compensator for one fully-qualified command type; repeated
+        calls register an ordered fan-out (C-0042)."""
+        self.rejections.setdefault(fq_command, []).append(thunk)
+        return self
+
+
 # --- error model: CodedError <-> google.rpc.Status bytes ---
 
 
@@ -440,6 +479,39 @@ def _saga_rejection_invoker(thunk: SagaRejectionThunk) -> Invoker:
         rejection.ParseFromString(rax.rejection)
         events = thunk(notification, rejection)
         resp = saga_pb2.SagaResponse(events=events)
+        return resp.SerializeToString(), _STATUS_OK
+
+    return inv
+
+
+def _pm_event_invoker(factory, thunk: PMEventThunk) -> Invoker:
+    # The PM is stateful: the appliers fold process_state into the session's
+    # state first, then this handler reads it. The host returns a full
+    # ProcessManagerHandleResponse.
+    def inv(session, type_url, payload, aux):
+        pax = abi_pb2.PmEventAux()
+        pax.ParseFromString(aux)
+        dests = Destinations(dict(pax.destination_sequences))
+        state = session.ensure_state(factory)
+        resp = thunk(any_pb2.Any(type_url=type_url, value=payload), state, dests)
+        return resp.SerializeToString(), _STATUS_OK
+
+    return inv
+
+
+def _pm_rejection_invoker(factory, thunk: PMRejectionThunk) -> Invoker:
+    def inv(session, _type_url, _payload, aux):
+        rax = abi_pb2.RejectionAux()
+        rax.ParseFromString(aux)
+        notification = types_pb2.Notification()
+        notification.ParseFromString(rax.notification)
+        rejection = types_pb2.RejectionNotification()
+        rejection.ParseFromString(rax.rejection)
+        state = session.ensure_state(factory)
+        process_events, escalation = thunk(notification, rejection, state)
+        resp = process_manager_pb2.ProcessManagerHandleResponse(process_events=process_events)
+        if escalation is not None:
+            resp.notification.CopyFrom(escalation)
         return resp.SerializeToString(), _STATUS_OK
 
     return inv
@@ -685,6 +757,61 @@ class Router:
         resp_bytes = _consume_out(out)
         if ret == 0:
             resp = saga_pb2.SagaResponse()
+            if resp_bytes:
+                resp.ParseFromString(resp_bytes)
+            return resp
+        raise _decode_status(resp_bytes, ret)
+
+    def register_process_manager(self, dispatch: ProcessManagerDispatch) -> None:
+        """Register one process-manager component: assign callback ids to every
+        applier/snapshot/event/rejection thunk, serialize the
+        ProcessManagerDescriptor, and hand it to the core with the shared
+        trampoline."""
+        with self._lock:
+            factory = dispatch.rebuilder.factory
+            desc = abi_pb2.ProcessManagerDescriptor(
+                name=dispatch.name, pm_domain=dispatch.pm_domain
+            )
+            for fq, thunk in dispatch.rebuilder.appliers.items():
+                cid = self._assign(_applier_invoker(factory, thunk))
+                desc.appliers.append(abi_pb2.CallbackEntry(fq_type=fq, callback_id=cid))
+            if dispatch.rebuilder.snapshot is not None:
+                desc.snapshot_callback_id = self._assign(
+                    _applier_invoker(factory, dispatch.rebuilder.snapshot)
+                )
+            for input_domain, by_type in dispatch.handlers.items():
+                for fq, thunk in by_type.items():
+                    cid = self._assign(_pm_event_invoker(factory, thunk))
+                    desc.events.append(
+                        abi_pb2.PmEventEntry(input_domain=input_domain, fq_type=fq, callback_id=cid)
+                    )
+            for fq, thunks in dispatch.rejections.items():
+                entry = abi_pb2.RejectionEntry(fq_command_type=fq)
+                for thunk in thunks:
+                    entry.callback_ids.append(self._assign(_pm_rejection_invoker(factory, thunk)))
+                desc.rejections.append(entry)
+
+            desc_bytes = desc.SerializeToString()
+            ret = lib.angzarr_router_register_process_manager(
+                self._ptr, _as_u8(desc_bytes), len(desc_bytes), _trampoline
+            )
+            if ret != 0:
+                raise _decode_status(None, ret)
+
+    def dispatch_process_manager(self, pm_request) -> object:
+        """Run one ProcessManagerHandleRequest through the registered PM and
+        return the ProcessManagerHandleResponse, or raise a CodedError decoded
+        from the core's failure."""
+        req = pm_request.SerializeToString()
+        session = _Session(self)
+        handle = ffi.new_handle(session)
+        out = ffi.new("angzarr_buf*")
+        ret = lib.angzarr_router_dispatch_process_manager(
+            self._ptr, handle, _as_u8(req), len(req), out
+        )
+        resp_bytes = _consume_out(out)
+        if ret == 0:
+            resp = process_manager_pb2.ProcessManagerHandleResponse()
             if resp_bytes:
                 resp.ParseFromString(resp_bytes)
             return resp
