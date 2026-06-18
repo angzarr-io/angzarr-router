@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use angzarr_router::aggregate::AggregateDispatch;
 use angzarr_router::error::{CodedError, HandlerError};
+use angzarr_router::process_manager::ProcessManagerDispatch;
 use angzarr_router::projector::ProjectorDispatch;
 use angzarr_router::rebuild::Rebuilder;
 use angzarr_router::saga::SagaDispatch;
@@ -84,14 +85,17 @@ where
 /// rejection compensators).
 pub fn counter_aggregate(observed: ObservedSink) -> AggregateDispatch<CounterState> {
     let rebuilder = Rebuilder::new(CounterState::default)
-        .apply("test.counter.Increased", |state: &mut CounterState, event| {
-            // Decode the payload so a corrupt persisted event fails the fold
-            // (PERSISTED_EVENT_CORRUPT). Increased is empty, so every
-            // well-formed event decodes and simply increments.
-            counter::Increased::decode(event.value.as_slice())?;
-            state.count += 1;
-            Ok(())
-        })
+        .apply(
+            "test.counter.Increased",
+            |state: &mut CounterState, event| {
+                // Decode the payload so a corrupt persisted event fails the fold
+                // (PERSISTED_EVENT_CORRUPT). Increased is empty, so every
+                // well-formed event decodes and simply increments.
+                counter::Increased::decode(event.value.as_slice())?;
+                state.count += 1;
+                Ok(())
+            },
+        )
         .with_snapshot(|state: &mut CounterState, snapshot| {
             // Seed state from the snapshot; pages at or below its sequence are
             // already folded in and must not re-apply (covered-page boundary).
@@ -353,6 +357,173 @@ pub fn saga_empty_source() -> pb::SagaHandleRequest {
 pub fn saga_missing_source() -> pb::SagaHandleRequest {
     pb::SagaHandleRequest {
         source: None,
+        ..Default::default()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The fixture: OrderProcessManager on the router core (stateful dispatch).
+// ---------------------------------------------------------------------------
+
+/// The PM's own event-sourced state. Host state — it never crosses the
+/// boundary; the harness reads reactions out of the response.
+#[derive(Default)]
+pub struct ProcessManagerState {
+    pub count: u32,
+}
+
+/// Build the OrderProcessManager dispatch table: over the "counter" domain it
+/// reacts to the NEWEST Increased trigger by emitting one Reserve command for
+/// "inventory" (stamped from the destination sequence when present) plus a
+/// process event; a rejected Reserve compensates with a process event and an
+/// escalation. Its own state counts prior Increased process events, so a
+/// rebuild is observable.
+pub fn order_pm() -> ProcessManagerDispatch<ProcessManagerState> {
+    let rebuilder = Rebuilder::new(ProcessManagerState::default).apply(
+        "test.counter.Increased",
+        |state: &mut ProcessManagerState, event| {
+            counter::Increased::decode(event.value.as_slice())?;
+            state.count += 1;
+            Ok(())
+        },
+    );
+
+    ProcessManagerDispatch::new("order-pm", "order-pm", rebuilder)
+        .on_event(
+            "counter",
+            "test.counter.Increased",
+            |_event, state: &mut ProcessManagerState, dests| {
+                let mut cmd = reserve_command_to("inventory");
+                if dests.has("inventory") {
+                    dests.stamp_command(&mut cmd, "inventory")?;
+                }
+                // Emit one fact per prior state event so the rebuild is
+                // observable in the response.
+                let facts = (0..state.count).map(|_| pm_process_event()).collect();
+                Ok(pb::ProcessManagerHandleResponse {
+                    commands: vec![cmd],
+                    facts,
+                    ..Default::default()
+                })
+            },
+        )
+        .on_rejected("test.counter.Reserve", |_n, _r, _state| {
+            Ok((vec![pm_process_event()], Some(pm_escalation())))
+        })
+}
+
+fn pm_process_event() -> pb::EventBook {
+    pb::EventBook {
+        pages: vec![pb::EventPage::default()],
+        ..Default::default()
+    }
+}
+
+fn pm_escalation() -> pb::Notification {
+    pb::Notification {
+        cover: Some(pb::Cover {
+            domain: "escalated".to_string(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// A PM request whose trigger carries the given event pages in `domain`, plus
+/// the destination-sequence map. `process_state` is the PM's prior state book.
+pub fn pm_trigger_request(
+    domain: &str,
+    event_fqs: &[&str],
+    process_state: Option<pb::EventBook>,
+    dest: &[(&str, u32)],
+) -> pb::ProcessManagerHandleRequest {
+    let pages = event_fqs
+        .iter()
+        .map(|fq| pb::EventPage {
+            payload: Some(pb::event_page::Payload::Event(prost_types::Any {
+                type_url: angzarr_router::type_url(fq),
+                value: Vec::new(),
+            })),
+            ..Default::default()
+        })
+        .collect();
+    pb::ProcessManagerHandleRequest {
+        trigger: Some(pb::EventBook {
+            cover: Some(pb::Cover {
+                domain: domain.to_string(),
+                ..Default::default()
+            }),
+            pages,
+            ..Default::default()
+        }),
+        process_state,
+        destination_sequences: dest.iter().map(|(d, s)| (d.to_string(), *s)).collect(),
+    }
+}
+
+/// A PM request whose trigger's newest page is a rejection Notification for
+/// `fq_command`.
+pub fn pm_rejection_request(fq_command: &str) -> pb::ProcessManagerHandleRequest {
+    let mut rejected = reserve_command_to("inventory");
+    if let Some(pb::command_page::Payload::Command(any)) = rejected.pages[0].payload.as_mut() {
+        any.type_url = angzarr_router::type_url(fq_command);
+    }
+    let rejection = pb::RejectionNotification {
+        rejected_command: Some(rejected),
+        ..Default::default()
+    };
+    let notification = pb::Notification {
+        payload: Some(prost_types::Any {
+            type_url: angzarr_router::type_url("io.angzarr.v1.RejectionNotification"),
+            value: rejection.encode_to_vec(),
+        }),
+        ..Default::default()
+    };
+    pb::ProcessManagerHandleRequest {
+        trigger: Some(pb::EventBook {
+            cover: Some(pb::Cover {
+                domain: "counter".to_string(),
+                ..Default::default()
+            }),
+            pages: vec![pb::EventPage {
+                payload: Some(pb::event_page::Payload::Event(prost_types::Any {
+                    type_url: angzarr_router::NOTIFICATION_TYPE_URL.to_string(),
+                    value: notification.encode_to_vec(),
+                })),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        process_state: None,
+        destination_sequences: Default::default(),
+    }
+}
+
+/// A PM request with an empty trigger book → EMPTY_PM_TRIGGER.
+pub fn pm_empty_trigger() -> pb::ProcessManagerHandleRequest {
+    pb::ProcessManagerHandleRequest {
+        trigger: Some(pb::EventBook::default()),
+        ..Default::default()
+    }
+}
+
+/// A PM request with no trigger at all → MISSING_PM_TRIGGER.
+pub fn pm_missing_trigger() -> pb::ProcessManagerHandleRequest {
+    pb::ProcessManagerHandleRequest {
+        trigger: None,
+        ..Default::default()
+    }
+}
+
+/// A PM process-state book of `n` Increased events (drives the rebuild).
+pub fn pm_state_of(n: u32) -> pb::EventBook {
+    pb::EventBook {
+        pages: (0..n)
+            .map(|_| pb::EventPage {
+                payload: Some(pb::event_page::Payload::Event(increased_any())),
+                ..Default::default()
+            })
+            .collect(),
         ..Default::default()
     }
 }

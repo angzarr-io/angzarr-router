@@ -9,6 +9,7 @@ use prost::Message;
 
 use angzarr_router::aggregate::AggregateDispatch;
 use angzarr_router::error::{codes, CodedError, HandlerError};
+use angzarr_router::process_manager::ProcessManagerDispatch;
 use angzarr_router::projector::ProjectorDispatch;
 use angzarr_router::rebuild::Rebuilder;
 use angzarr_router::saga::SagaDispatch;
@@ -81,6 +82,7 @@ pub struct FfiRouter {
     aggregates: Vec<(String, AggregateDispatch<()>)>,
     projectors: Vec<(String, ProjectorDispatch<()>)>,
     sagas: Vec<(String, SagaDispatch)>,
+    process_managers: Vec<(String, ProcessManagerDispatch<()>)>,
 }
 
 impl FfiRouter {
@@ -89,6 +91,7 @@ impl FfiRouter {
             aggregates: Vec::new(),
             projectors: Vec::new(),
             sagas: Vec::new(),
+            process_managers: Vec::new(),
         }
     }
 
@@ -354,11 +357,11 @@ impl FfiRouter {
                     STATUS_OK => {
                         let resp = pb::SagaResponse::decode(bytes.unwrap_or_default().as_slice())
                             .map_err(|_| {
-                                HandlerError::Other(
-                                    "host saga handler returned undecodable SagaResponse bytes"
-                                        .to_string(),
-                                )
-                            })?;
+                            HandlerError::Other(
+                                "host saga handler returned undecodable SagaResponse bytes"
+                                    .to_string(),
+                            )
+                        })?;
                         Ok((resp.commands, resp.events))
                     }
                     STATUS_OK_EMPTY => Ok((Vec::new(), Vec::new())),
@@ -369,8 +372,9 @@ impl FfiRouter {
 
         for rejection in &desc.rejections {
             for &id in &rejection.callback_ids {
-                dispatch =
-                    dispatch.on_rejected(&rejection.fq_command_type, move |notification, rejection| {
+                dispatch = dispatch.on_rejected(
+                    &rejection.fq_command_type,
+                    move |notification, rejection| {
                         let aux = abi_pb::RejectionAux {
                             notification: notification.encode_to_vec(),
                             rejection: rejection.encode_to_vec(),
@@ -394,7 +398,8 @@ impl FfiRouter {
                             STATUS_OK_EMPTY => Ok(Vec::new()),
                             _ => Err(host_error(ret, bytes)),
                         }
-                    });
+                    },
+                );
             }
         }
 
@@ -424,6 +429,148 @@ impl FfiRouter {
                 return Err(CodedError::invalid_argument(
                     codes::NO_HANDLER_REGISTERED,
                     "no single saga registered to claim the source",
+                    [],
+                ));
+            }
+        };
+
+        let _guard = HostCtxGuard::set(host_ctx);
+        let resp = dispatch.dispatch(&req)?;
+        Ok(resp.encode_to_vec())
+    }
+
+    /// Parses a ProcessManagerDescriptor and populates a core PM table.
+    /// Stateful: appliers/snapshot rebuild the PM's own state across the
+    /// callback (host owns the instance); event thunks pass destination
+    /// sequences to the host and return a ProcessManagerHandleResponse;
+    /// compensators run in registration order (C-0042).
+    pub fn register_process_manager(
+        &mut self,
+        descriptor: &[u8],
+        cb: AngzarrCb,
+    ) -> Result<(), CodedError> {
+        let desc = abi_pb::ProcessManagerDescriptor::decode(descriptor).map_err(|_| {
+            CodedError::invalid_argument(
+                codes::ANY_DECODE_FAILED,
+                "failed to decode ProcessManagerDescriptor",
+                [],
+            )
+        })?;
+
+        let mut rebuilder: Rebuilder<()> = Rebuilder::new(|| ());
+        for applier in &desc.appliers {
+            let id = applier.callback_id;
+            rebuilder = rebuilder.apply(&applier.fq_type, move |_, any| {
+                let (ret, _) = invoke(cb, id, &any.type_url, &any.value, &[]);
+                if ret < 0 {
+                    return Err("host applier failed".into());
+                }
+                Ok(())
+            });
+        }
+        if let Some(id) = desc.snapshot_callback_id {
+            rebuilder = rebuilder.with_snapshot(move |_, any| {
+                let (ret, _) = invoke(cb, id, &any.type_url, &any.value, &[]);
+                if ret < 0 {
+                    return Err("host snapshot loader failed".into());
+                }
+                Ok(())
+            });
+        }
+
+        let mut dispatch =
+            ProcessManagerDispatch::new(desc.name.clone(), desc.pm_domain.clone(), rebuilder);
+
+        for event in &desc.events {
+            let id = event.callback_id;
+            dispatch = dispatch.on_event(&event.input_domain, &event.fq_type, move |any, _state, dests| {
+                let destination_sequences = dests
+                    .domains()
+                    .into_iter()
+                    .filter_map(|d| dests.sequence_for(&d).map(|s| (d, s)))
+                    .collect();
+                let aux = abi_pb::PmEventAux {
+                    destination_sequences,
+                }
+                .encode_to_vec();
+                let (ret, bytes) = invoke(cb, id, &any.type_url, &any.value, &aux);
+                match ret {
+                    STATUS_OK => pb::ProcessManagerHandleResponse::decode(
+                        bytes.unwrap_or_default().as_slice(),
+                    )
+                    .map_err(|_| {
+                        HandlerError::Other(
+                            "host PM handler returned undecodable \
+                             ProcessManagerHandleResponse bytes"
+                                .to_string(),
+                        )
+                    }),
+                    STATUS_OK_EMPTY => Ok(pb::ProcessManagerHandleResponse::default()),
+                    _ => Err(host_error(ret, bytes)),
+                }
+            });
+        }
+
+        for rejection in &desc.rejections {
+            for &id in &rejection.callback_ids {
+                dispatch = dispatch.on_rejected(
+                    &rejection.fq_command_type,
+                    move |notification, rejection, _state| {
+                        let aux = abi_pb::RejectionAux {
+                            notification: notification.encode_to_vec(),
+                            rejection: rejection.encode_to_vec(),
+                            cctx: None, // PM compensators read rebuilt state, not CommandContext
+                        }
+                        .encode_to_vec();
+                        let (ret, bytes) = invoke(cb, id, NOTIFICATION_TYPE_URL, &[], &aux);
+                        match ret {
+                            STATUS_OK => {
+                                let resp = pb::ProcessManagerHandleResponse::decode(
+                                    bytes.unwrap_or_default().as_slice(),
+                                )
+                                .map_err(|_| {
+                                    HandlerError::Other(
+                                        "host PM compensator returned undecodable \
+                                         ProcessManagerHandleResponse bytes"
+                                            .to_string(),
+                                    )
+                                })?;
+                                Ok((resp.process_events, resp.notification))
+                            }
+                            STATUS_OK_EMPTY => Ok((Vec::new(), None)),
+                            _ => Err(host_error(ret, bytes)),
+                        }
+                    },
+                );
+            }
+        }
+
+        self.process_managers.push((desc.name, dispatch));
+        Ok(())
+    }
+
+    /// Decodes ProcessManagerHandleRequest bytes, routes to the registered PM
+    /// (sole PM claims the trigger), and runs the core dispatch with the host
+    /// session installed.
+    pub fn dispatch_process_manager(
+        &self,
+        host_ctx: *mut c_void,
+        request: &[u8],
+    ) -> Result<Vec<u8>, CodedError> {
+        let req = pb::ProcessManagerHandleRequest::decode(request).map_err(|_| {
+            CodedError::invalid_argument(
+                codes::ANY_DECODE_FAILED,
+                "failed to decode ProcessManagerHandleRequest",
+                [],
+            )
+        })?;
+
+        let dispatch = match self.process_managers.as_slice() {
+            [(_, only)] => only,
+            _ => {
+                return Err(CodedError::invalid_argument(
+                    codes::NO_HANDLER_REGISTERED,
+                    "no single process manager registered to claim the trigger",
                     [],
                 ));
             }

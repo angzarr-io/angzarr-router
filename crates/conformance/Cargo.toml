@@ -30,3 +30,7 @@ harness = false
 [[test]]
 name = "saga"
 harness = false
+
+[[test]]
+name = "process_manager"
+harness = false

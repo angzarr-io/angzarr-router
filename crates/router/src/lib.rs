@@ -9,6 +9,7 @@
 pub mod aggregate;
 pub mod destinations;
 pub mod error;
+pub mod process_manager;
 pub mod projector;
 pub mod proto;
 pub mod rebuild;

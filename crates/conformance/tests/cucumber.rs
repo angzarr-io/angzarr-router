@@ -160,7 +160,10 @@ async fn compensations_in_order(w: &mut CounterWorld) {
         .collect();
     assert_eq!(
         types,
-        vec!["test.counter.CompensatedFirst", "test.counter.CompensatedSecond"],
+        vec![
+            "test.counter.CompensatedFirst",
+            "test.counter.CompensatedSecond"
+        ],
         "compensators must merge in registration order"
     );
 }
@@ -168,14 +171,21 @@ async fn compensations_in_order(w: &mut CounterWorld) {
 #[then(regex = r"^the handler saw (no )?prior history, at next sequence (\d+)$")]
 async fn observed_history(w: &mut CounterWorld, no: String, next_sequence: u32) {
     let obs = w.last_observed();
-    assert_eq!(obs.had_prior_events, no.is_empty(), "had_prior_events evidence");
+    assert_eq!(
+        obs.had_prior_events,
+        no.is_empty(),
+        "had_prior_events evidence"
+    );
     assert_eq!(obs.next_sequence, next_sequence, "next_sequence evidence");
 }
 
 #[then(regex = r"^the handler saw a counter of (\d+), at next sequence (\d+)$")]
 async fn observed_count(w: &mut CounterWorld, count: u32, next_sequence: u32) {
     let obs = w.last_observed();
-    assert_eq!(obs.count, count, "rebuilt count (snapshot + uncovered pages only)");
+    assert_eq!(
+        obs.count, count,
+        "rebuilt count (snapshot + uncovered pages only)"
+    );
     assert_eq!(obs.next_sequence, next_sequence, "next_sequence evidence");
     assert!(obs.had_prior_events, "a snapshot implies had_prior_events");
 }
@@ -193,7 +203,11 @@ async fn no_compensation(w: &mut CounterWorld) {
         Some(pb::business_response::Result::Events(book)) => book.pages.is_empty(),
         _ => false,
     };
-    assert!(empty, "expected no compensation events, got {:?}", resp.result);
+    assert!(
+        empty,
+        "expected no compensation events, got {:?}",
+        resp.result
+    );
 }
 
 #[then("no events are recorded")]

@@ -58,7 +58,10 @@ fn domains_lists_every_supplied_domain() {
     let d = Destinations::new(seqs(&[("inventory", 7), ("fulfillment", 3)]));
     let mut got = d.domains();
     got.sort();
-    assert_eq!(got, vec!["fulfillment".to_string(), "inventory".to_string()]);
+    assert_eq!(
+        got,
+        vec!["fulfillment".to_string(), "inventory".to_string()]
+    );
 }
 
 #[test]
@@ -75,7 +78,11 @@ fn stamp_command_sets_sequence_on_every_page() {
     let mut cmd = command_book("inventory", 3);
     d.stamp_command(&mut cmd, "inventory").expect("stamp");
     for page in &cmd.pages {
-        assert_eq!(page_sequence(page), Some(42), "every page carries the sequence");
+        assert_eq!(
+            page_sequence(page),
+            Some(42),
+            "every page carries the sequence"
+        );
     }
 }
 
@@ -87,7 +94,10 @@ fn stamp_command_missing_domain_is_coded() {
         .stamp_command(&mut cmd, "shipping")
         .expect_err("missing destination sequence must fail");
     assert_eq!(err.code, codes::MISSING_DESTINATION_SEQUENCE);
-    assert_eq!(err.extras.get(extras::DOMAIN), Some(&"shipping".to_string()));
+    assert_eq!(
+        err.extras.get(extras::DOMAIN),
+        Some(&"shipping".to_string())
+    );
 }
 
 #[test]

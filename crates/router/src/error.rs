@@ -36,6 +36,9 @@ pub mod codes {
     pub const MISSING_SAGA_SOURCE: &str = "MISSING_SAGA_SOURCE";
     pub const EMPTY_SAGA_SOURCE: &str = "EMPTY_SAGA_SOURCE";
     pub const MISSING_DESTINATION_SEQUENCE: &str = "MISSING_DESTINATION_SEQUENCE";
+    pub const MISSING_PM_TRIGGER: &str = "MISSING_PM_TRIGGER";
+    pub const EMPTY_PM_TRIGGER: &str = "EMPTY_PM_TRIGGER";
+    pub const MISSING_PM_EVENT_PAYLOAD: &str = "MISSING_PM_EVENT_PAYLOAD";
 }
 
 /// Canonical static message text (byte-equal across languages).
@@ -50,6 +53,9 @@ pub mod messages {
     pub const MISSING_SAGA_SOURCE: &str = "missing saga source";
     pub const EMPTY_SAGA_SOURCE: &str = "empty saga source";
     pub const MISSING_DESTINATION_SEQUENCE: &str = "no sequence for destination domain";
+    pub const MISSING_PM_TRIGGER: &str = "missing PM trigger";
+    pub const EMPTY_PM_TRIGGER: &str = "empty PM trigger";
+    pub const MISSING_PM_EVENT_PAYLOAD: &str = "missing event payload on PM trigger";
 }
 
 /// Cross-language detail-key constants.

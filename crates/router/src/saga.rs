@@ -31,7 +31,10 @@ pub type EventFn = Box<
 /// by fully-qualified command type; multiple thunks for one command run in
 /// registration order (C-0042).
 pub type RejectionFn = Box<
-    dyn Fn(&pb::Notification, &pb::RejectionNotification) -> Result<Vec<pb::EventBook>, HandlerError>
+    dyn Fn(
+            &pb::Notification,
+            &pb::RejectionNotification,
+        ) -> Result<Vec<pb::EventBook>, HandlerError>
         + Send
         + Sync,
 >;
@@ -66,7 +69,10 @@ impl SagaDispatch {
     pub fn on_event(
         mut self,
         full_name: &str,
-        thunk: impl Fn(&Any, &Destinations) -> Result<(Vec<pb::CommandBook>, Vec<pb::EventBook>), HandlerError>
+        thunk: impl Fn(
+                &Any,
+                &Destinations,
+            ) -> Result<(Vec<pb::CommandBook>, Vec<pb::EventBook>), HandlerError>
             + Send
             + Sync
             + 'static,
@@ -81,7 +87,10 @@ impl SagaDispatch {
     pub fn on_rejected(
         mut self,
         fq_command: &str,
-        thunk: impl Fn(&pb::Notification, &pb::RejectionNotification) -> Result<Vec<pb::EventBook>, HandlerError>
+        thunk: impl Fn(
+                &pb::Notification,
+                &pb::RejectionNotification,
+            ) -> Result<Vec<pb::EventBook>, HandlerError>
             + Send
             + Sync
             + 'static,

@@ -240,6 +240,72 @@ pub unsafe extern "C" fn angzarr_router_dispatch_saga(
     }
 }
 
+/// Registers one process-manager component from a serialized
+/// `io.angzarr.router.ffi.v1.ProcessManagerDescriptor` and the host's
+/// callback gateway. Returns 0 on success, a negated gRPC code on failure.
+///
+/// # Safety
+/// `r` must be a live router; `descriptor` must point to `descriptor_len`
+/// readable bytes; `cb` must remain valid for the router's lifetime.
+#[no_mangle]
+pub unsafe extern "C" fn angzarr_router_register_process_manager(
+    r: *mut c_void,
+    descriptor: *const u8,
+    descriptor_len: usize,
+    cb: AngzarrCb,
+) -> i32 {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if r.is_null() {
+            return Err(invalid_pointer("router"));
+        }
+        let router = &mut *(r as *mut FfiRouter);
+        let bytes = slice_from(descriptor, descriptor_len);
+        router.register_process_manager(bytes, cb)
+    }));
+    match flatten_panic(result) {
+        Ok(()) => 0,
+        Err(err) => -(err.grpc as i32),
+    }
+}
+
+/// Dispatches `ProcessManagerHandleRequest` bytes through the registered
+/// process manager. On success returns 0 and fills `out` with
+/// `ProcessManagerHandleResponse` bytes; on failure returns the negated gRPC
+/// code and fills `out` with `google.rpc.Status` bytes. Either way the host
+/// releases `out` with `angzarr_buf_release`.
+///
+/// # Safety
+/// `r` must be a live router; `request` must point to `request_len` readable
+/// bytes; `out` must point to a writable `AngzarrBuf`.
+#[no_mangle]
+pub unsafe extern "C" fn angzarr_router_dispatch_process_manager(
+    r: *mut c_void,
+    host_ctx: *mut c_void,
+    request: *const u8,
+    request_len: usize,
+    out: *mut AngzarrBuf,
+) -> i32 {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if r.is_null() {
+            return Err(invalid_pointer("router"));
+        }
+        let router = &*(r as *const FfiRouter);
+        let bytes = slice_from(request, request_len);
+        router.dispatch_process_manager(host_ctx, bytes)
+    }));
+    match flatten_panic(result) {
+        Ok(response) => {
+            fill_out(out, &response);
+            0
+        }
+        Err(err) => {
+            let code = err.grpc as i32;
+            fill_out(out, &coded_to_status_bytes(err));
+            -code
+        }
+    }
+}
+
 /// Dispatches `ContextualCommand` bytes through the registered tables.
 /// On success returns 0 and fills `out` with `BusinessResponse` bytes; on
 /// failure returns the negated gRPC code and fills `out` with

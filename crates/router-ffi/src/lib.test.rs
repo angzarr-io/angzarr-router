@@ -52,9 +52,12 @@ const CB_PROJ_FOLD: u64 = 8;
 const CB_PROJ_FINISH: u64 = 9;
 const CB_SAGA_EVENT: u64 = 10;
 const CB_SAGA_COMP: u64 = 11;
+const CB_PM_EVENT: u64 = 12;
+const CB_PM_COMP: u64 = 13;
 
 const FQ_ORDER_CREATED: &str = "test.order.OrderCreated";
 const FQ_RESERVE_STOCK: &str = "test.order.ReserveStock";
+const FQ_ORDER_SHIPPED: &str = "test.order.OrderShipped";
 
 // --- host-side session registry (state never crosses the boundary)
 
@@ -238,6 +241,59 @@ unsafe extern "C" fn host_cb(
                     pages: vec![pb::EventPage::default()],
                     ..Default::default()
                 }],
+            };
+            host_fill(out, &resp.encode_to_vec());
+            STATUS_OK
+        }
+        CB_PM_EVENT => {
+            // Stateful PM: the host reacts to the newest trigger event and
+            // emits one stamped command, returning the full PM response.
+            let paux = abi_pb::PmEventAux::decode(aux).expect("pm event aux");
+            let mut cmd = pb::CommandBook {
+                cover: Some(pb::Cover {
+                    domain: "inventory".to_string(),
+                    ..Default::default()
+                }),
+                pages: vec![pb::CommandPage {
+                    payload: Some(pb::command_page::Payload::Command(Any {
+                        type_url: format!("type.googleapis.com/{FQ_RESERVE_STOCK}"),
+                        value: Vec::new(),
+                    })),
+                    ..Default::default()
+                }],
+            };
+            if let Some(&seq) = paux.destination_sequences.get("inventory") {
+                for page in &mut cmd.pages {
+                    page.header = Some(pb::PageHeader {
+                        sequence_type: Some(pb::page_header::SequenceType::Sequence(seq)),
+                        ..Default::default()
+                    });
+                }
+            }
+            let resp = pb::ProcessManagerHandleResponse {
+                commands: vec![cmd],
+                ..Default::default()
+            };
+            host_fill(out, &resp.encode_to_vec());
+            STATUS_OK
+        }
+        CB_PM_COMP => {
+            let raux = abi_pb::RejectionAux::decode(aux).expect("rejection aux");
+            pb::Notification::decode(raux.notification.as_slice()).expect("notification");
+            pb::RejectionNotification::decode(raux.rejection.as_slice()).expect("rejection");
+            let resp = pb::ProcessManagerHandleResponse {
+                process_events: vec![pb::EventBook {
+                    pages: vec![pb::EventPage::default()],
+                    ..Default::default()
+                }],
+                notification: Some(pb::Notification {
+                    cover: Some(pb::Cover {
+                        domain: "escalated".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
             };
             host_fill(out, &resp.encode_to_vec());
             STATUS_OK
@@ -936,7 +992,11 @@ impl Router {
 
 /// A SagaHandleRequest over a source book in `domain` carrying the given
 /// event pages, plus a destination-sequence map.
-fn saga_request(domain: &str, pages: Vec<pb::EventPage>, dest: &[(&str, u32)]) -> pb::SagaHandleRequest {
+fn saga_request(
+    domain: &str,
+    pages: Vec<pb::EventPage>,
+    dest: &[(&str, u32)],
+) -> pb::SagaHandleRequest {
     pb::SagaHandleRequest {
         source: Some(pb::EventBook {
             cover: Some(pb::Cover {
@@ -968,14 +1028,22 @@ fn saga_emits_stamped_command_through_the_abi() {
     // coordinator-supplied destination sequence.
     let router = Router::with_saga();
     let session = next_session();
-    let req = saga_request("order", vec![event_page_of(FQ_ORDER_CREATED)], &[("inventory", 7)]);
+    let req = saga_request(
+        "order",
+        vec![event_page_of(FQ_ORDER_CREATED)],
+        &[("inventory", 7)],
+    );
     let (ret, bytes) = router.dispatch_saga(session, &req);
     assert_eq!(ret, 0);
     let resp = pb::SagaResponse::decode(bytes.as_slice()).expect("SagaResponse");
     assert_eq!(resp.commands.len(), 1, "one command emitted");
     let cmd = &resp.commands[0];
     assert_eq!(cmd.cover.as_ref().unwrap().domain, "inventory");
-    let seq = match cmd.pages[0].header.as_ref().and_then(|h| h.sequence_type.as_ref()) {
+    let seq = match cmd.pages[0]
+        .header
+        .as_ref()
+        .and_then(|h| h.sequence_type.as_ref())
+    {
         Some(pb::page_header::SequenceType::Sequence(s)) => *s,
         _ => panic!("command page not stamped"),
     };
@@ -989,7 +1057,9 @@ fn saga_compensator_runs_through_the_abi() {
     let router = Router::with_saga();
     let session = next_session();
     let notification_page = pb::EventPage {
-        payload: Some(pb::event_page::Payload::Event(notification_command(FQ_RESERVE_STOCK))),
+        payload: Some(pb::event_page::Payload::Event(notification_command(
+            FQ_RESERVE_STOCK,
+        ))),
         ..Default::default()
     };
     let req = saga_request("order", vec![notification_page], &[]);
@@ -998,4 +1068,121 @@ fn saga_compensator_runs_through_the_abi() {
     let resp = pb::SagaResponse::decode(bytes.as_slice()).expect("SagaResponse");
     assert!(resp.commands.is_empty());
     assert_eq!(resp.events.len(), 1, "compensator injected one fact event");
+}
+
+// --- process-manager ABI surface (per-kind entry points)
+
+fn pm_descriptor_bytes() -> Vec<u8> {
+    abi_pb::ProcessManagerDescriptor {
+        name: "OrderPM".to_string(),
+        pm_domain: "order-pm".to_string(),
+        appliers: Vec::new(),
+        snapshot_callback_id: None,
+        events: vec![abi_pb::PmEventEntry {
+            input_domain: "orders".to_string(),
+            fq_type: FQ_ORDER_SHIPPED.to_string(),
+            callback_id: CB_PM_EVENT,
+        }],
+        rejections: vec![abi_pb::RejectionEntry {
+            fq_command_type: FQ_RESERVE_STOCK.to_string(),
+            callback_ids: vec![CB_PM_COMP],
+        }],
+    }
+    .encode_to_vec()
+}
+
+impl Router {
+    fn with_process_manager() -> Self {
+        let r = angzarr_router_new();
+        let desc = pm_descriptor_bytes();
+        let ret =
+            unsafe { angzarr_router_register_process_manager(r, desc.as_ptr(), desc.len(), host_cb) };
+        assert_eq!(ret, 0, "process-manager registration failed");
+        Router(r)
+    }
+
+    fn dispatch_process_manager(
+        &self,
+        session: usize,
+        req: &pb::ProcessManagerHandleRequest,
+    ) -> (i32, Vec<u8>) {
+        let bytes = req.encode_to_vec();
+        let mut out = AngzarrBuf {
+            data: std::ptr::null_mut(),
+            len: 0,
+        };
+        let ret = unsafe {
+            angzarr_router_dispatch_process_manager(
+                self.0,
+                session as *mut c_void,
+                bytes.as_ptr(),
+                bytes.len(),
+                &mut out,
+            )
+        };
+        let response = if out.data.is_null() {
+            Vec::new()
+        } else {
+            let copied = unsafe { std::slice::from_raw_parts(out.data, out.len) }.to_vec();
+            unsafe { angzarr_buf_release(out.data, out.len) };
+            copied
+        };
+        (ret, response)
+    }
+}
+
+/// A PM request over a trigger book in `domain` carrying the given pages.
+fn pm_request(domain: &str, pages: Vec<pb::EventPage>, dest: &[(&str, u32)]) -> pb::ProcessManagerHandleRequest {
+    pb::ProcessManagerHandleRequest {
+        trigger: Some(pb::EventBook {
+            cover: Some(pb::Cover {
+                domain: domain.to_string(),
+                ..Default::default()
+            }),
+            pages,
+            ..Default::default()
+        }),
+        process_state: None,
+        destination_sequences: dest.iter().map(|(d, s)| (d.to_string(), *s)).collect(),
+    }
+}
+
+#[test]
+fn pm_emits_stamped_command_through_the_abi() {
+    // The whole PM path across raw pointers: register a PM, dispatch a trigger
+    // whose newest page is the declared event, and confirm the host emitted
+    // one command stamped with the destination sequence.
+    let router = Router::with_process_manager();
+    let session = next_session();
+    let req = pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)], &[("inventory", 4)]);
+    let (ret, bytes) = router.dispatch_process_manager(session, &req);
+    assert_eq!(ret, 0);
+    let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
+    assert_eq!(resp.commands.len(), 1);
+    let seq = match resp.commands[0].pages[0].header.as_ref().and_then(|h| h.sequence_type.as_ref()) {
+        Some(pb::page_header::SequenceType::Sequence(s)) => *s,
+        _ => panic!("command not stamped"),
+    };
+    assert_eq!(seq, 4, "host stamped the destination sequence over the ABI");
+}
+
+#[test]
+fn pm_compensator_runs_through_the_abi() {
+    // A Notification trigger routes to the compensator, whose process event +
+    // escalation cross back as a ProcessManagerHandleResponse.
+    let router = Router::with_process_manager();
+    let session = next_session();
+    let notification_page = pb::EventPage {
+        payload: Some(pb::event_page::Payload::Event(notification_command(FQ_RESERVE_STOCK))),
+        ..Default::default()
+    };
+    let req = pm_request("orders", vec![notification_page], &[]);
+    let (ret, bytes) = router.dispatch_process_manager(session, &req);
+    assert_eq!(ret, 0);
+    let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
+    assert_eq!(resp.process_events.len(), 1, "compensator emitted one process event");
+    assert_eq!(
+        resp.notification.expect("escalation").cover.unwrap().domain,
+        "escalated"
+    );
 }

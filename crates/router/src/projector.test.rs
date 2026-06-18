@@ -24,7 +24,8 @@ struct Folded {
 
 /// Folds a Cover event into the write log by domain.
 fn fold_cover(p: &mut Folded, any: &Any) -> Result<(), HandlerError> {
-    let c = pb::Cover::decode(any.value.as_slice()).map_err(|e| HandlerError::Other(e.to_string()))?;
+    let c =
+        pb::Cover::decode(any.value.as_slice()).map_err(|e| HandlerError::Other(e.to_string()))?;
     p.entries.push(c.domain);
     Ok(())
 }
@@ -45,7 +46,8 @@ fn book(domain: &str, pages: Vec<pb::EventPage>) -> pb::EventBook {
 /// sequence — so the public dispatch result observes how many folds ran.
 /// `domains == None` consumes every domain.
 fn counting_projector(domains: Option<&[&str]>) -> ProjectorDispatch<Folded> {
-    let mut d = ProjectorDispatch::new("write-model", Folded::default).on_event(&cover_full_name(), fold_cover);
+    let mut d = ProjectorDispatch::new("write-model", Folded::default)
+        .on_event(&cover_full_name(), fold_cover);
     if let Some(ds) = domains {
         d = d.for_domains(ds.iter().copied());
     }
@@ -66,7 +68,9 @@ fn cover_pages(domain: &str, n: usize) -> Vec<pb::EventPage> {
 #[test]
 fn every_page_folds_into_one_projection() {
     let d = counting_projector(None);
-    let proj = d.dispatch(&book("order", cover_pages("order", 3))).expect("dispatch");
+    let proj = d
+        .dispatch(&book("order", cover_pages("order", 3)))
+        .expect("dispatch");
     assert_eq!(proj.sequence, 3, "all three pages fold into one projection");
 }
 
@@ -75,7 +79,9 @@ fn single_instance_reused_across_delivery() {
     // A fresh instance per page would leave the fold count at most 1; five
     // folds into one sequence pins C-0086 (one instance per delivery).
     let d = counting_projector(None);
-    let proj = d.dispatch(&book("order", cover_pages("order", 5))).expect("dispatch");
+    let proj = d
+        .dispatch(&book("order", cover_pages("order", 5)))
+        .expect("dispatch");
     assert_eq!(proj.sequence, 5);
 }
 
@@ -93,7 +99,10 @@ fn unhandled_event_type_is_skipped() {
     );
     let d = counting_projector(None);
     let proj = d.dispatch(&book("order", pages)).expect("dispatch");
-    assert_eq!(proj.sequence, 2, "unknown type skipped, declared pair folds");
+    assert_eq!(
+        proj.sequence, 2,
+        "unknown type skipped, declared pair folds"
+    );
 }
 
 #[test]
@@ -110,7 +119,9 @@ fn undeclared_domain_folds_nothing_but_finishes() {
 #[test]
 fn declared_domain_folds() {
     let d = counting_projector(Some(&["order"]));
-    let proj = d.dispatch(&book("order", cover_pages("order", 2))).expect("dispatch");
+    let proj = d
+        .dispatch(&book("order", cover_pages("order", 2)))
+        .expect("dispatch");
     assert_eq!(proj.sequence, 2);
 }
 
@@ -136,8 +147,11 @@ fn missing_cover_is_coded_error() {
 fn no_finish_returns_default_projection() {
     // Without a finisher, dispatch returns a default Projection carrying the
     // cover and projector name (sequence 0, no payload).
-    let d = ProjectorDispatch::new("write-model", Folded::default).on_event(&cover_full_name(), fold_cover);
-    let proj = d.dispatch(&book("order", cover_pages("order", 3))).expect("dispatch");
+    let d = ProjectorDispatch::new("write-model", Folded::default)
+        .on_event(&cover_full_name(), fold_cover);
+    let proj = d
+        .dispatch(&book("order", cover_pages("order", 3)))
+        .expect("dispatch");
     assert_eq!(proj.projector, "write-model");
     assert_eq!(proj.cover.expect("cover").domain, "order");
     assert_eq!(proj.sequence, 0);
@@ -156,7 +170,9 @@ fn finish_customizes_projection() {
                 projection: Some(cover_any(&p.entries.join(","))),
             })
         });
-    let proj = d.dispatch(&book("order", cover_pages("order", 2))).expect("dispatch");
+    let proj = d
+        .dispatch(&book("order", cover_pages("order", 2)))
+        .expect("dispatch");
     assert_eq!(proj.sequence, 99);
     assert!(proj.projection.is_some(), "finish sets a custom payload");
 }
@@ -173,7 +189,10 @@ fn on_unknown_observes_unhandled_type_url() {
         value: Vec::new(),
     })];
     d.dispatch(&book("order", pages)).expect("dispatch");
-    assert_eq!(seen.lock().unwrap().as_slice(), &[type_url("test.Unregistered")]);
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        &[type_url("test.Unregistered")]
+    );
 }
 
 #[test]
@@ -186,7 +205,9 @@ fn accessors_report_name_and_registered_types() {
 #[test]
 fn handler_error_propagates_as_unhandled() {
     let d = ProjectorDispatch::new("write-model", Folded::default)
-        .on_event(&cover_full_name(), |_p, _any| Err(HandlerError::Other("boom".to_string())));
+        .on_event(&cover_full_name(), |_p, _any| {
+            Err(HandlerError::Other("boom".to_string()))
+        });
     let err = d
         .dispatch(&book("order", cover_pages("order", 1)))
         .expect_err("handler error must fail dispatch");

@@ -79,7 +79,11 @@ async fn emits_one_command(w: &mut SagaWorld, target: String) {
 #[then(regex = r"^the command carries destination sequence (\d+)$")]
 async fn command_carries_sequence(w: &mut SagaWorld, seq: u32) {
     let cmd = &w.response().commands[0];
-    let got = match cmd.pages[0].header.as_ref().and_then(|h| h.sequence_type.as_ref()) {
+    let got = match cmd.pages[0]
+        .header
+        .as_ref()
+        .and_then(|h| h.sequence_type.as_ref())
+    {
         Some(pb::page_header::SequenceType::Sequence(s)) => *s,
         _ => panic!("command page carries no explicit sequence"),
     };

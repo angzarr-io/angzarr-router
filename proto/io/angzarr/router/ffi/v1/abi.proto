@@ -75,6 +75,35 @@ message SagaEventAux {
   map<string, uint32> destination_sequences = 1;
 }
 
+// Registration payload for one process-manager component. STATEFUL: the PM
+// rebuilds its own event-sourced state (the appliers/snapshot) before each
+// handler. Event handlers are keyed by (input domain, fully-qualified event
+// type) — a 2-level table; rejection rows carry ORDERED compensators
+// (C-0042), the first escalation winning.
+message ProcessManagerDescriptor {
+  string name = 1;
+  string pm_domain = 2;
+  repeated CallbackEntry appliers = 3; // rebuild the PM's own state
+  optional uint64 snapshot_callback_id = 4;
+  repeated PmEventEntry events = 5;
+  repeated RejectionEntry rejections = 6;
+}
+
+// One ((input domain, fully-qualified event type) → host callback) row for a
+// process manager's 2-level handler table.
+message PmEventEntry {
+  string input_domain = 1;
+  string fq_type = 2;
+  uint64 callback_id = 3;
+}
+
+// aux payload for process-manager event callbacks: the coordinator-supplied
+// destination next-sequences the host stamps emitted commands from. The host
+// returns a ProcessManagerHandleResponse.
+message PmEventAux {
+  map<string, uint32> destination_sequences = 1;
+}
+
 // aux payload for rejection (compensation) callbacks.
 message RejectionAux {
   bytes notification = 1; // serialized angzarr Notification
