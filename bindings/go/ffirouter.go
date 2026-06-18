@@ -31,6 +31,8 @@ void*    angzarr_router_new(void);
 void     angzarr_router_free(void*);
 int32_t  angzarr_router_register_aggregate(void*, const uint8_t*, size_t, angzarr_cb);
 int32_t  angzarr_router_dispatch(void*, void*, const uint8_t*, size_t, angzarr_buf*);
+int32_t  angzarr_router_register_projector(void*, const uint8_t*, size_t, angzarr_cb);
+int32_t  angzarr_router_dispatch_projector(void*, void*, const uint8_t*, size_t, angzarr_buf*);
 
 // The Go //export trampoline (defined in trampoline.go). Declared with
 // non-const pointers because cgo //export cannot express const.
@@ -50,12 +52,21 @@ static int32_t angzarr_register(void* r, const uint8_t* d, size_t n) {
     return angzarr_router_register_aggregate(r, d, n, angzarr_go_cb);
 }
 
+static int32_t angzarr_register_projector(void* r, const uint8_t* d, size_t n) {
+    return angzarr_router_register_projector(r, d, n, angzarr_go_cb);
+}
+
 // host_ctx is a runtime/cgo.Handle (an integer) reinterpreted as void*; the
 // router treats it as opaque and hands it back to the trampoline. Casting
 // through C keeps the Go side free of uintptr<->unsafe.Pointer churn.
 static int32_t angzarr_dispatch_h(void* r, uintptr_t ctx,
         const uint8_t* req, size_t n, angzarr_buf* out) {
     return angzarr_router_dispatch(r, (void*)ctx, req, n, out);
+}
+
+static int32_t angzarr_dispatch_projector_h(void* r, uintptr_t ctx,
+        const uint8_t* req, size_t n, angzarr_buf* out) {
+    return angzarr_router_dispatch_projector(r, (void*)ctx, req, n, out);
 }
 */
 import "C"
@@ -183,6 +194,77 @@ func RegisterAggregate[S any](r *Router, d *AggregateDispatch[S]) error {
 	return nil
 }
 
+// RegisterProjector registers one projector component: it assigns callback
+// ids to every fold/finish/unknown thunk, serializes the ProjectorDescriptor,
+// and hands it to the core with the shared callback gateway. A free function
+// (not a method) because Go methods cannot introduce the projection type
+// parameter.
+func RegisterProjector[P any](r *Router, d *ProjectorDispatch[P]) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	factory := d.factory
+	desc := &abipb.ProjectorDescriptor{Name: d.name, Domains: d.domains}
+
+	for fq, thunk := range d.events {
+		id := r.assign(projectorEventInvoker(factory, thunk))
+		desc.Events = append(desc.Events, &abipb.CallbackEntry{FqType: fq, CallbackId: id})
+	}
+	if d.unknown != nil {
+		id := r.assign(projectorUnknownInvoker(d.unknown))
+		desc.UnknownCallbackId = &id
+	}
+	if d.finish != nil {
+		id := r.assign(projectorFinishInvoker(factory, d.finish))
+		desc.FinishCallbackId = &id
+	}
+
+	descBytes, err := proto.Marshal(desc)
+	if err != nil {
+		return fmt.Errorf("marshal ProjectorDescriptor: %w", err)
+	}
+	var dptr *C.uint8_t
+	if len(descBytes) > 0 {
+		dptr = (*C.uint8_t)(unsafe.Pointer(&descBytes[0]))
+	}
+	ret := C.angzarr_register_projector(r.ptr, dptr, C.size_t(len(descBytes)))
+	runtime.KeepAlive(descBytes)
+	if ret != 0 {
+		return decodeStatus(nil, int32(ret))
+	}
+	return nil
+}
+
+// DispatchProjector folds one EventBook through the registered projector and
+// returns the Projection, or a *CodedError decoded from the core's failure.
+func (r *Router) DispatchProjector(book *pb.EventBook) (*pb.Projection, error) {
+	reqBytes, err := proto.Marshal(book)
+	if err != nil {
+		return nil, fmt.Errorf("marshal EventBook: %w", err)
+	}
+
+	h := cgo.NewHandle(&session{router: r})
+	defer h.Delete()
+
+	var reqPtr *C.uint8_t
+	if len(reqBytes) > 0 {
+		reqPtr = (*C.uint8_t)(unsafe.Pointer(&reqBytes[0]))
+	}
+	var out C.angzarr_buf
+	ret := C.angzarr_dispatch_projector_h(r.ptr, C.uintptr_t(h), reqPtr, C.size_t(len(reqBytes)), &out)
+	runtime.KeepAlive(reqBytes)
+	respBytes := consumeBuf(&out)
+
+	if ret == 0 {
+		var proj pb.Projection
+		if err := proto.Unmarshal(respBytes, &proj); err != nil {
+			return nil, fmt.Errorf("unmarshal Projection: %w", err)
+		}
+		return &proj, nil
+	}
+	return nil, decodeStatus(respBytes, int32(ret))
+}
+
 // Dispatch runs one ContextualCommand through the core and returns the
 // BusinessResponse, or a *CodedError decoded from the core's failure.
 func (r *Router) Dispatch(cc *pb.ContextualCommand) (*pb.BusinessResponse, error) {
@@ -295,6 +377,47 @@ func rejectionInvoker[S any](factory func() S, thunk RejectionThunk[S]) invoker 
 			return errorStatus(fmt.Errorf("marshal BusinessResponse: %w", err))
 		}
 		return b, 0
+	}
+}
+
+// projectorEventInvoker / projectorFinishInvoker / projectorUnknownInvoker
+// build the type-erased bridge for the projector thunks.
+
+func projectorEventInvoker[P any](factory func() P, thunk ProjectorEventThunk[P]) invoker {
+	return func(s *session, typeURL string, payload, _ []byte) ([]byte, int32) {
+		st := ensureState(s, factory)
+		if err := thunk(st, &anypb.Any{TypeUrl: typeURL, Value: payload}); err != nil {
+			return errorStatus(err)
+		}
+		return nil, 0
+	}
+}
+
+func projectorFinishInvoker[P any](factory func() P, thunk ProjectorFinishThunk[P]) invoker {
+	return func(s *session, _ string, payload, _ []byte) ([]byte, int32) {
+		// The core hands the EventBook over as the callback payload so the
+		// finisher can carry its cover onto the Projection.
+		var book pb.EventBook
+		if err := proto.Unmarshal(payload, &book); err != nil {
+			return errorStatus(fmt.Errorf("unmarshal EventBook: %w", err))
+		}
+		st := ensureState(s, factory)
+		proj, err := thunk(st, &book)
+		if err != nil {
+			return errorStatus(err)
+		}
+		b, err := proto.Marshal(proj)
+		if err != nil {
+			return errorStatus(fmt.Errorf("marshal Projection: %w", err))
+		}
+		return b, 0
+	}
+}
+
+func projectorUnknownInvoker(thunk ProjectorUnknownThunk) invoker {
+	return func(_ *session, typeURL string, _, _ []byte) ([]byte, int32) {
+		thunk(typeURL)
+		return nil, 0
 	}
 }
 
