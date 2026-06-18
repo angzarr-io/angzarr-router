@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use angzarr_router::aggregate::AggregateDispatch;
 use angzarr_router::error::{CodedError, HandlerError};
+use angzarr_router::projector::ProjectorDispatch;
 use angzarr_router::rebuild::Rebuilder;
 use prost::Message;
 use prost_reflect::{DescriptorPool, DynamicMessage};
@@ -161,6 +162,75 @@ fn marker_response(label: &str) -> pb::BusinessResponse {
             ..Default::default()
         })),
     }
+}
+
+// ---------------------------------------------------------------------------
+// The fixture: CounterProjector on the router core (read-side dispatch).
+// ---------------------------------------------------------------------------
+
+/// The projection the CounterProjector folds events into. Host state — it
+/// never crosses the boundary; the harness reads the fold count back out of
+/// the finished Projection.
+#[derive(Default)]
+pub struct ProjectorState {
+    pub count: u32,
+}
+
+/// Build the CounterProjector dispatch table: over the "counter" domain it
+/// folds each Increased event into a running count, then finishes into a
+/// Projection whose sequence carries that count and whose payload is the
+/// CounterState. A book from any other domain folds nothing (C-0032).
+pub fn counter_projector() -> ProjectorDispatch<ProjectorState> {
+    ProjectorDispatch::new("counter-projector", ProjectorState::default)
+        .for_domains(["counter"])
+        .on_event(
+            "test.counter.Increased",
+            |state: &mut ProjectorState, event| {
+                // Decode so a corrupt event fails the fold, exactly as the
+                // aggregate applier does. Increased is empty — every
+                // well-formed event decodes and increments.
+                counter::Increased::decode(event.value.as_slice())
+                    .map_err(|e| HandlerError::Other(format!("decode Increased: {e}")))?;
+                state.count += 1;
+                Ok(())
+            },
+        )
+        .finish(|state: &mut ProjectorState, events| {
+            Ok(pb::Projection {
+                cover: events.cover.clone(),
+                projector: "counter-projector".to_string(),
+                sequence: state.count,
+                projection: Some(prost_types::Any {
+                    type_url: angzarr_router::type_url("test.counter.CounterState"),
+                    value: CounterState { count: state.count }.encode_to_vec(),
+                }),
+            })
+        })
+}
+
+/// An EventBook of `n` Increased events whose cover carries `domain` — the
+/// projector's delivery.
+pub fn delivery(domain: &str, n: u32) -> pb::EventBook {
+    pb::EventBook {
+        cover: Some(pb::Cover {
+            domain: domain.to_string(),
+            ..Default::default()
+        }),
+        pages: (0..n)
+            .map(|_| pb::EventPage {
+                payload: Some(pb::event_page::Payload::Event(increased_any())),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+/// A delivery with no cover → drives MISSING_EVENT_BOOK_COVER.
+pub fn delivery_without_cover(n: u32) -> pb::EventBook {
+    let mut book = delivery("counter", n);
+    book.cover = None;
+    book
 }
 
 // ---------------------------------------------------------------------------

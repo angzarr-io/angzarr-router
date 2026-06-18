@@ -48,6 +48,8 @@ const CB_COMP_A: u64 = 4;
 const CB_COMP_B: u64 = 5;
 const CB_RETURN_NOTHING: u64 = 6;
 const CB_SNAPSHOT: u64 = 7;
+const CB_PROJ_FOLD: u64 = 8;
+const CB_PROJ_FINISH: u64 = 9;
 
 // --- host-side session registry (state never crosses the boundary)
 
@@ -166,6 +168,27 @@ unsafe extern "C" fn host_cb(
                 return -9;
             }
             host_fill(out, &increased_book(cmd.n).encode_to_vec());
+            STATUS_OK
+        }
+        CB_PROJ_FOLD => {
+            // Host folds one Increased event into its projection instance.
+            if Increased::decode(payload).is_err() {
+                return -3;
+            }
+            with_session(key, |s| s.counter += 1);
+            STATUS_OK_EMPTY
+        }
+        CB_PROJ_FINISH => {
+            // Pack the folded count into the wire Projection. The core hands
+            // the EventBook over as the payload so the host can carry cover.
+            let book = pb::EventBook::decode(payload).expect("finish EventBook");
+            let proj = pb::Projection {
+                cover: book.cover,
+                projector: "CounterProjector".to_string(),
+                sequence: with_session(key, |s| s.counter),
+                ..Default::default()
+            };
+            host_fill(out, &proj.encode_to_vec());
             STATUS_OK
         }
         CB_FAIL_HARD => -13, // plain failure, no status payload
@@ -715,4 +738,93 @@ fn garbage_request_bytes_are_coded_not_fatal() {
     unsafe { angzarr_buf_release(out.data, out.len) };
     let (_, reason) = decode_status(&copied);
     assert_eq!(reason, "ANY_DECODE_FAILED");
+}
+
+// --- projector ABI surface (per-kind entry points)
+
+fn projector_descriptor_bytes() -> Vec<u8> {
+    abi_pb::ProjectorDescriptor {
+        name: "CounterProjector".to_string(),
+        domains: vec!["counter".to_string()],
+        events: vec![abi_pb::CallbackEntry {
+            fq_type: FQ_INCREASED.to_string(),
+            callback_id: CB_PROJ_FOLD,
+        }],
+        finish_callback_id: Some(CB_PROJ_FINISH),
+        unknown_callback_id: None,
+    }
+    .encode_to_vec()
+}
+
+impl Router {
+    fn with_projector() -> Self {
+        let r = angzarr_router_new();
+        let desc = projector_descriptor_bytes();
+        let ret =
+            unsafe { angzarr_router_register_projector(r, desc.as_ptr(), desc.len(), host_cb) };
+        assert_eq!(ret, 0, "projector registration failed");
+        Router(r)
+    }
+
+    fn dispatch_projector(&self, session: usize, book: &pb::EventBook) -> (i32, Vec<u8>) {
+        let bytes = book.encode_to_vec();
+        let mut out = AngzarrBuf {
+            data: std::ptr::null_mut(),
+            len: 0,
+        };
+        let ret = unsafe {
+            angzarr_router_dispatch_projector(
+                self.0,
+                session as *mut c_void,
+                bytes.as_ptr(),
+                bytes.len(),
+                &mut out,
+            )
+        };
+        let response = if out.data.is_null() {
+            Vec::new()
+        } else {
+            let copied = unsafe { std::slice::from_raw_parts(out.data, out.len) }.to_vec();
+            unsafe { angzarr_buf_release(out.data, out.len) };
+            copied
+        };
+        (ret, response)
+    }
+}
+
+fn book_in_domain(domain: &str, n: u32) -> pb::EventBook {
+    let mut book = increased_book(n);
+    book.cover = Some(pb::Cover {
+        domain: domain.to_string(),
+        ..Default::default()
+    });
+    book
+}
+
+#[test]
+fn projector_folds_every_page_through_the_abi() {
+    // The whole projector path across raw pointers: register a projector,
+    // dispatch an EventBook, and confirm the host folded every page into one
+    // projection whose finisher reports the count.
+    let router = Router::with_projector();
+    let session = next_session();
+    let (ret, bytes) = router.dispatch_projector(session, &book_in_domain("counter", 3));
+    assert_eq!(ret, 0);
+    let proj = pb::Projection::decode(bytes.as_slice()).expect("Projection");
+    assert_eq!(proj.projector, "CounterProjector");
+    assert_eq!(proj.sequence, 3, "all three pages folded into one instance");
+    assert_eq!(session_snapshot(session).counter, 3);
+}
+
+#[test]
+fn projector_undeclared_domain_folds_nothing_through_the_abi() {
+    // ForDomains("counter") with a book in another domain: no fold callback
+    // fires, but finish still runs and reports zero.
+    let router = Router::with_projector();
+    let session = next_session();
+    let (ret, bytes) = router.dispatch_projector(session, &book_in_domain("inventory", 3));
+    assert_eq!(ret, 0);
+    let proj = pb::Projection::decode(bytes.as_slice()).expect("Projection");
+    assert_eq!(proj.sequence, 0, "undeclared domain folds nothing");
+    assert_eq!(session_snapshot(session).counter, 0);
 }

@@ -8,6 +8,7 @@
 
 pub mod aggregate;
 pub mod error;
+pub mod projector;
 pub mod proto;
 pub mod rebuild;
 

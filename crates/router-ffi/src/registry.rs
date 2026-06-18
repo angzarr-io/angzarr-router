@@ -9,6 +9,7 @@ use prost::Message;
 
 use angzarr_router::aggregate::AggregateDispatch;
 use angzarr_router::error::{codes, CodedError, HandlerError};
+use angzarr_router::projector::ProjectorDispatch;
 use angzarr_router::rebuild::Rebuilder;
 use angzarr_router::{pb, NOTIFICATION_TYPE_URL};
 
@@ -77,12 +78,14 @@ fn host_error(ret: i32, bytes: Option<Vec<u8>>) -> HandlerError {
 /// The registered tables behind an opaque router handle.
 pub struct FfiRouter {
     aggregates: Vec<(String, AggregateDispatch<()>)>,
+    projectors: Vec<(String, ProjectorDispatch<()>)>,
 }
 
 impl FfiRouter {
     pub fn new() -> Self {
         FfiRouter {
             aggregates: Vec::new(),
+            projectors: Vec::new(),
         }
     }
 
@@ -190,6 +193,62 @@ impl FfiRouter {
         Ok(())
     }
 
+    /// Parses a ProjectorDescriptor and populates a core projector table
+    /// with callback-marshaling thunks. The host owns the projection
+    /// instance (parked in host_ctx); folds and finish cross the callback.
+    pub fn register_projector(
+        &mut self,
+        descriptor: &[u8],
+        cb: AngzarrCb,
+    ) -> Result<(), CodedError> {
+        let desc = abi_pb::ProjectorDescriptor::decode(descriptor).map_err(|_| {
+            CodedError::invalid_argument(
+                codes::ANY_DECODE_FAILED,
+                "failed to decode ProjectorDescriptor",
+                [],
+            )
+        })?;
+
+        let mut dispatch = ProjectorDispatch::new(desc.name.clone(), || ());
+        if !desc.domains.is_empty() {
+            dispatch = dispatch.for_domains(desc.domains.clone());
+        }
+        for event in &desc.events {
+            let id = event.callback_id;
+            dispatch = dispatch.on_event(&event.fq_type, move |_, any| {
+                let (ret, _) = invoke(cb, id, &any.type_url, &any.value, &[]);
+                if ret < 0 {
+                    return Err(HandlerError::Other("host fold failed".to_string()));
+                }
+                Ok(())
+            });
+        }
+        if let Some(id) = desc.unknown_callback_id {
+            dispatch = dispatch.on_unknown(move |type_url| {
+                invoke(cb, id, type_url, &[], &[]);
+            });
+        }
+        if let Some(id) = desc.finish_callback_id {
+            dispatch = dispatch.finish(move |_, events| {
+                let book = events.encode_to_vec();
+                let (ret, bytes) = invoke(cb, id, "", &book, &[]);
+                match ret {
+                    STATUS_OK | STATUS_OK_EMPTY => {
+                        pb::Projection::decode(bytes.unwrap_or_default().as_slice()).map_err(|_| {
+                            HandlerError::Other(
+                                "host finisher returned undecodable Projection bytes".to_string(),
+                            )
+                        })
+                    }
+                    _ => Err(host_error(ret, bytes)),
+                }
+            });
+        }
+
+        self.projectors.push((desc.name, dispatch));
+        Ok(())
+    }
+
     /// Decodes ContextualCommand bytes, routes to the claiming aggregate
     /// (by cover domain; a sole registered aggregate claims everything),
     /// and runs the core dispatch with the host session installed.
@@ -225,6 +284,34 @@ impl FfiRouter {
 
         let _guard = HostCtxGuard::set(host_ctx);
         let resp = dispatch.dispatch(&req)?;
+        Ok(resp.encode_to_vec())
+    }
+
+    /// Decodes EventBook bytes, routes to the registered projector (sole
+    /// projector claims everything; the core applies its own domain filter),
+    /// and runs the core dispatch with the host session installed.
+    pub fn dispatch_projector(
+        &self,
+        host_ctx: *mut c_void,
+        request: &[u8],
+    ) -> Result<Vec<u8>, CodedError> {
+        let book = pb::EventBook::decode(request).map_err(|_| {
+            CodedError::invalid_argument(codes::ANY_DECODE_FAILED, "failed to decode EventBook", [])
+        })?;
+
+        let dispatch = match self.projectors.as_slice() {
+            [(_, only)] => only,
+            _ => {
+                return Err(CodedError::invalid_argument(
+                    codes::NO_HANDLER_REGISTERED,
+                    "no single projector registered to claim the EventBook",
+                    [],
+                ));
+            }
+        };
+
+        let _guard = HostCtxGuard::set(host_ctx);
+        let resp = dispatch.dispatch(&book)?;
         Ok(resp.encode_to_vec())
     }
 }

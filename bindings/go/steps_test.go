@@ -22,8 +22,10 @@ func TestConformance(t *testing.T) {
 	suite := godog.TestSuite{
 		ScenarioInitializer: initializeScenario,
 		Options: &godog.Options{
-			Format:   "pretty",
-			Paths:    []string{"../../conformance/features"},
+			Format: "pretty",
+			// counter.feature only for now; projector.feature lands here when
+			// the Go ProjectorDispatch binding + its steps are wired (S1).
+			Paths:    []string{"../../conformance/features/counter.feature"},
 			TestingT: t,
 			Strict:   true,
 		},

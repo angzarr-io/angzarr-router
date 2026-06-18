@@ -35,6 +35,21 @@ message AggregateDescriptor {
   optional uint64 snapshot_callback_id = 6;
 }
 
+// Registration payload for one projector component. Folds cross the
+// callback (the host owns the projection instance); finish packs it into
+// the wire Projection. Empty `domains` consumes every domain.
+message ProjectorDescriptor {
+  string name = 1;
+  repeated string domains = 2;
+  repeated CallbackEntry events = 3;
+  // Packs the folded projection into the wire Projection; absent → the core
+  // returns a default Projection (cover + name only).
+  optional uint64 finish_callback_id = 4;
+  // Observes events with no fold thunk; absent → such events are skipped
+  // (the core logs a warn).
+  optional uint64 unknown_callback_id = 5;
+}
+
 // aux payload for command-handler callbacks.
 message CommandContextAux {
   uint32 next_sequence = 1;

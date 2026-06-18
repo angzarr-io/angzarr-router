@@ -22,3 +22,7 @@ futures = "0.3"
 [[test]]
 name = "cucumber"
 harness = false
+
+[[test]]
+name = "projector"
+harness = false

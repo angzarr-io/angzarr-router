@@ -245,6 +245,9 @@ fn assert_failed_with(w: &CounterWorld, code: &str) {
 
 #[tokio::main]
 async fn main() {
-    let features = concat!(env!("CARGO_MANIFEST_DIR"), "/../../conformance/features");
-    CounterWorld::cucumber().run_and_exit(features).await;
+    let feature = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../conformance/features/counter.feature"
+    );
+    CounterWorld::cucumber().run_and_exit(feature).await;
 }

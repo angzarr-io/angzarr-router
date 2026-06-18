@@ -32,6 +32,7 @@ pub mod codes {
     pub const REJECTION_NOTIFICATION_DECODE_FAILED: &str = "REJECTION_NOTIFICATION_DECODE_FAILED";
     pub const PERSISTED_EVENT_CORRUPT: &str = "PERSISTED_EVENT_CORRUPT";
     pub const UNHANDLED_HANDLER_ERROR: &str = "UNHANDLED_HANDLER_ERROR";
+    pub const MISSING_EVENT_BOOK_COVER: &str = "MISSING_EVENT_BOOK_COVER";
 }
 
 /// Canonical static message text (byte-equal across languages).
@@ -42,6 +43,7 @@ pub mod messages {
     pub const REJECTION_NOTIFICATION_DECODE_FAILED: &str =
         "failed to decode RejectionNotification payload";
     pub const PERSISTED_EVENT_CORRUPT: &str = "persisted event payload corrupt";
+    pub const MISSING_EVENT_BOOK_COVER: &str = "missing event book cover";
 }
 
 /// Cross-language detail-key constants.
