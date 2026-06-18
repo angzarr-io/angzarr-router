@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 from google.protobuf import any_pb2
 
-from .. import AggregateDispatch, CommandContext, Rebuilder, reject
+from .. import AggregateDispatch, CommandContext, ProjectorDispatch, Rebuilder, reject
 from ..gen.io.angzarr.v1 import command_handler_pb2, types_pb2
 from ..gen.test.counter import counter_pb2
 from .builders import (
@@ -99,4 +99,38 @@ def counter_aggregate(observed: list[Observation] | None = None) -> AggregateDis
         .on_command(FQ_FAIL_HARD, on_fail_hard)
         .on_rejected(FQ_RESERVE, on_reserve_first)
         .on_rejected(FQ_RESERVE, on_reserve_second)
+    )
+
+
+class _Projection:
+    """The host projection state — it never crosses the FFI; the harness reads
+    the fold count back off the finished Projection."""
+
+    __slots__ = ("count",)
+
+    def __init__(self):
+        self.count = 0
+
+
+def counter_projector() -> ProjectorDispatch:
+    """The CounterProjector conformance fixture (projector.feature) in Python:
+    over the "counter" domain it folds each Increased into a count, then
+    finishes into a Projection carrying that count as its sequence."""
+
+    def fold_increased(state: _Projection, _event: any_pb2.Any) -> None:
+        state.count += 1
+
+    def finish(state: _Projection, events) -> object:
+        proj = types_pb2.Projection()
+        if events.HasField("cover"):
+            proj.cover.CopyFrom(events.cover)
+        proj.projector = "counter-projector"
+        proj.sequence = state.count
+        return proj
+
+    return (
+        ProjectorDispatch("counter-projector", _Projection)
+        .for_domains("counter")
+        .on_event(FQ_INCREASED, fold_increased)
+        .finish(finish)
     )

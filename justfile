@@ -29,10 +29,13 @@ ROUTER_PYTHON_IMAGE := env_var_or_default("ANGZARR_ROUTER_PYTHON_IMAGE", "ghcr.i
 # Container runtime: docker (rootless or rootful). Empty inside a container.
 CONTAINER_CMD := `command -v docker 2>/dev/null || echo ""`
 # `-u $(id -u):$(id -g)` is right for ROOTFUL docker (bind-mount files get the
-# host UID). With ROOTLESS docker it is WRONG: the userns already maps
-# container-root → host UID, so -u remaps onto an unowned subuid and breaks
-# bind-mount writes. Detect rootless via the daemon and skip -u.
-CONTAINER_USER_ARG := if `docker info 2>/dev/null | grep -q rootless && echo yes || echo no` == "yes" { "" } else { "-u $(id -u):$(id -g)" }
+# host UID). With ROOTLESS docker that is WRONG: the userns maps
+# container-root → host UID, so -u $(id -u) remaps onto an unowned subuid and
+# breaks bind-mount writes. Force -u 0:0 instead of relying on the image's
+# default user — images that set a non-root USER (the python image runs as
+# `angzarr`) otherwise land on a subuid that cannot write the mount (and trips
+# git's dubious-ownership guard). Running as container-root maps to the host UID.
+CONTAINER_USER_ARG := if `docker info 2>/dev/null | grep -q rootless && echo yes || echo no` == "yes" { "-u 0:0" } else { "-u $(id -u):$(id -g)" }
 CONTAINER_RUN := CONTAINER_CMD + " run --rm " + CONTAINER_USER_ARG
 
 # Delegate a container-side recipe: run directly inside a devcontainer,

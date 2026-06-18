@@ -139,6 +139,52 @@ class AggregateDispatch:
         return self
 
 
+# Projector thunk shapes:
+#   event:   (state, event: Any) -> None             (folds; raises on corrupt)
+#   finish:  (state, events: EventBook) -> Projection (packs the folded state)
+#   unknown: (type_url: str) -> None                  (observes an unhandled type)
+ProjectorEventThunk = Callable[[object, any_pb2.Any], None]
+ProjectorFinishThunk = Callable[[object, object], object]
+ProjectorUnknownThunk = Callable[[str], None]
+
+
+@dataclass
+class ProjectorDispatch:
+    """One projector component's registration: name, the domains it consumes
+    (empty = all), fold handlers, an optional catch-all for unhandled types,
+    and an optional finisher. Shaped like the core/Go API so the unit-6
+    emitter targets it with minimal changes."""
+
+    name: str
+    factory: Callable[[], object]
+    domains: list[str] = field(default_factory=list)
+    events: dict[str, ProjectorEventThunk] = field(default_factory=dict)
+    unknown: Optional[ProjectorUnknownThunk] = None
+    finisher: Optional[ProjectorFinishThunk] = None
+
+    def for_domains(self, *domains: str) -> "ProjectorDispatch":
+        """Restrict folding to books whose cover carries one of these domains.
+        Unset (the default) consumes every domain."""
+        self.domains = list(domains)
+        return self
+
+    def on_event(self, full_name: str, thunk: ProjectorEventThunk) -> "ProjectorDispatch":
+        """Register the fold thunk for a fully-qualified event type name."""
+        self.events[full_name] = thunk
+        return self
+
+    def on_unknown(self, thunk: ProjectorUnknownThunk) -> "ProjectorDispatch":
+        """Register a catch-all for events with no fold thunk."""
+        self.unknown = thunk
+        return self
+
+    def finish(self, thunk: ProjectorFinishThunk) -> "ProjectorDispatch":
+        """Register the finisher that packs the folded instance into the wire
+        Projection."""
+        self.finisher = thunk
+        return self
+
+
 # --- error model: CodedError <-> google.rpc.Status bytes ---
 
 
@@ -263,6 +309,39 @@ def _rejection_invoker(factory, thunk: RejectionThunk) -> Invoker:
         if resp is None:
             return None, _STATUS_OK_EMPTY
         return resp.SerializeToString(), _STATUS_OK
+
+    return inv
+
+
+def _projector_event_invoker(factory, thunk: ProjectorEventThunk) -> Invoker:
+    def inv(session, type_url, payload, _aux):
+        state = session.ensure_state(factory)
+        thunk(state, any_pb2.Any(type_url=type_url, value=payload))
+        return None, _STATUS_OK
+
+    return inv
+
+
+def _projector_finish_invoker(factory, thunk: ProjectorFinishThunk) -> Invoker:
+    def inv(session, _type_url, payload, _aux):
+        # The core hands the EventBook over as the callback payload so the
+        # finisher can carry its cover onto the Projection.
+        book = types_pb2.EventBook()
+        if payload:
+            book.ParseFromString(payload)
+        state = session.ensure_state(factory)
+        projection = thunk(state, book)
+        if projection is None:
+            return None, _STATUS_OK_EMPTY
+        return projection.SerializeToString(), _STATUS_OK
+
+    return inv
+
+
+def _projector_unknown_invoker(thunk: ProjectorUnknownThunk) -> Invoker:
+    def inv(_session, type_url, _payload, _aux):
+        thunk(type_url)
+        return None, _STATUS_OK
 
     return inv
 
@@ -428,6 +507,51 @@ class Router:
             if resp_bytes:
                 resp.ParseFromString(resp_bytes)
             return resp
+        raise _decode_status(resp_bytes, ret)
+
+    def register_projector(self, dispatch: ProjectorDispatch) -> None:
+        """Register one projector component: assign callback ids to every
+        fold/finish/unknown thunk, serialize the ProjectorDescriptor, and hand
+        it to the core with the shared trampoline."""
+        with self._lock:
+            factory = dispatch.factory
+            desc = abi_pb2.ProjectorDescriptor(name=dispatch.name)
+            desc.domains.extend(dispatch.domains)
+            for fq, thunk in dispatch.events.items():
+                cid = self._assign(_projector_event_invoker(factory, thunk))
+                desc.events.append(abi_pb2.CallbackEntry(fq_type=fq, callback_id=cid))
+            if dispatch.unknown is not None:
+                desc.unknown_callback_id = self._assign(
+                    _projector_unknown_invoker(dispatch.unknown)
+                )
+            if dispatch.finisher is not None:
+                desc.finish_callback_id = self._assign(
+                    _projector_finish_invoker(factory, dispatch.finisher)
+                )
+
+            desc_bytes = desc.SerializeToString()
+            ret = lib.angzarr_router_register_projector(
+                self._ptr, _as_u8(desc_bytes), len(desc_bytes), _trampoline
+            )
+            if ret != 0:
+                raise _decode_status(None, ret)
+
+    def dispatch_projector(self, event_book) -> object:
+        """Fold one EventBook through the registered projector and return the
+        Projection, or raise a CodedError decoded from the core's failure."""
+        req = event_book.SerializeToString()
+        session = _Session(self)
+        handle = ffi.new_handle(session)
+        out = ffi.new("angzarr_buf*")
+        ret = lib.angzarr_router_dispatch_projector(
+            self._ptr, handle, _as_u8(req), len(req), out
+        )
+        resp_bytes = _consume_out(out)
+        if ret == 0:
+            proj = types_pb2.Projection()
+            if resp_bytes:
+                proj.ParseFromString(resp_bytes)
+            return proj
         raise _decode_status(resp_bytes, ret)
 
 
