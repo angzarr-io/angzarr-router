@@ -35,6 +35,8 @@ int32_t  angzarr_router_register_projector(void*, const uint8_t*, size_t, angzar
 int32_t  angzarr_router_dispatch_projector(void*, void*, const uint8_t*, size_t, angzarr_buf*);
 int32_t  angzarr_router_register_saga(void*, const uint8_t*, size_t, angzarr_cb);
 int32_t  angzarr_router_dispatch_saga(void*, void*, const uint8_t*, size_t, angzarr_buf*);
+int32_t  angzarr_router_register_process_manager(void*, const uint8_t*, size_t, angzarr_cb);
+int32_t  angzarr_router_dispatch_process_manager(void*, void*, const uint8_t*, size_t, angzarr_buf*);
 
 // The Go //export trampoline (defined in trampoline.go). Declared with
 // non-const pointers because cgo //export cannot express const.
@@ -62,6 +64,10 @@ static int32_t angzarr_register_saga(void* r, const uint8_t* d, size_t n) {
     return angzarr_router_register_saga(r, d, n, angzarr_go_cb);
 }
 
+static int32_t angzarr_register_process_manager(void* r, const uint8_t* d, size_t n) {
+    return angzarr_router_register_process_manager(r, d, n, angzarr_go_cb);
+}
+
 // host_ctx is a runtime/cgo.Handle (an integer) reinterpreted as void*; the
 // router treats it as opaque and hands it back to the trampoline. Casting
 // through C keeps the Go side free of uintptr<->unsafe.Pointer churn.
@@ -78,6 +84,11 @@ static int32_t angzarr_dispatch_projector_h(void* r, uintptr_t ctx,
 static int32_t angzarr_dispatch_saga_h(void* r, uintptr_t ctx,
         const uint8_t* req, size_t n, angzarr_buf* out) {
     return angzarr_router_dispatch_saga(r, (void*)ctx, req, n, out);
+}
+
+static int32_t angzarr_dispatch_process_manager_h(void* r, uintptr_t ctx,
+        const uint8_t* req, size_t n, angzarr_buf* out) {
+    return angzarr_router_dispatch_process_manager(r, (void*)ctx, req, n, out);
 }
 */
 import "C"
@@ -318,6 +329,92 @@ func (r *Router) DispatchSaga(req *pb.SagaHandleRequest) (*pb.SagaResponse, erro
 	return nil, decodeStatus(respBytes, int32(ret))
 }
 
+// RegisterProcessManager registers one process-manager component: it assigns
+// callback ids to every applier/snapshot/event/rejection thunk, serializes the
+// ProcessManagerDescriptor, and hands it to the core with the shared callback
+// gateway. A free function (not a method) because Go methods cannot introduce
+// the state type parameter.
+func RegisterProcessManager[S any](r *Router, d *ProcessManagerDispatch[S]) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	factory := d.rebuilder.factory
+	desc := &abipb.ProcessManagerDescriptor{Name: d.name, PmDomain: d.pmDomain}
+
+	for fq, thunk := range d.rebuilder.appliers {
+		id := r.assign(applierInvoker(factory, thunk))
+		desc.Appliers = append(desc.Appliers, &abipb.CallbackEntry{FqType: fq, CallbackId: id})
+	}
+	if d.rebuilder.snapshot != nil {
+		id := r.assign(applierInvoker(factory, d.rebuilder.snapshot))
+		desc.SnapshotCallbackId = &id
+	}
+	for inputDomain, byType := range d.handlers {
+		for fq, thunk := range byType {
+			id := r.assign(pmEventInvoker(factory, thunk))
+			desc.Events = append(desc.Events, &abipb.PmEventEntry{
+				InputDomain: inputDomain,
+				FqType:      fq,
+				CallbackId:  id,
+			})
+		}
+	}
+	for fq, thunks := range d.rejections {
+		entry := &abipb.RejectionEntry{FqCommandType: fq}
+		for _, thunk := range thunks {
+			id := r.assign(pmRejectionInvoker(factory, thunk))
+			entry.CallbackIds = append(entry.CallbackIds, id)
+		}
+		desc.Rejections = append(desc.Rejections, entry)
+	}
+
+	descBytes, err := proto.Marshal(desc)
+	if err != nil {
+		return fmt.Errorf("marshal ProcessManagerDescriptor: %w", err)
+	}
+	var dptr *C.uint8_t
+	if len(descBytes) > 0 {
+		dptr = (*C.uint8_t)(unsafe.Pointer(&descBytes[0]))
+	}
+	ret := C.angzarr_register_process_manager(r.ptr, dptr, C.size_t(len(descBytes)))
+	runtime.KeepAlive(descBytes)
+	if ret != 0 {
+		return decodeStatus(nil, int32(ret))
+	}
+	return nil
+}
+
+// DispatchProcessManager runs one ProcessManagerHandleRequest through the
+// registered PM and returns the ProcessManagerHandleResponse, or a *CodedError
+// decoded from the core's failure.
+func (r *Router) DispatchProcessManager(req *pb.ProcessManagerHandleRequest) (*pb.ProcessManagerHandleResponse, error) {
+	reqBytes, err := proto.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal ProcessManagerHandleRequest: %w", err)
+	}
+
+	h := cgo.NewHandle(&session{router: r})
+	defer h.Delete()
+
+	var reqPtr *C.uint8_t
+	if len(reqBytes) > 0 {
+		reqPtr = (*C.uint8_t)(unsafe.Pointer(&reqBytes[0]))
+	}
+	var out C.angzarr_buf
+	ret := C.angzarr_dispatch_process_manager_h(r.ptr, C.uintptr_t(h), reqPtr, C.size_t(len(reqBytes)), &out)
+	runtime.KeepAlive(reqBytes)
+	respBytes := consumeBuf(&out)
+
+	if ret == 0 {
+		var resp pb.ProcessManagerHandleResponse
+		if err := proto.Unmarshal(respBytes, &resp); err != nil {
+			return nil, fmt.Errorf("unmarshal ProcessManagerHandleResponse: %w", err)
+		}
+		return &resp, nil
+	}
+	return nil, decodeStatus(respBytes, int32(ret))
+}
+
 // DispatchProjector folds one EventBook through the registered projector and
 // returns the Projection, or a *CodedError decoded from the core's failure.
 func (r *Router) DispatchProjector(book *pb.EventBook) (*pb.Projection, error) {
@@ -548,6 +645,62 @@ func sagaRejectionInvoker(thunk SagaRejectionThunk) invoker {
 		b, err := proto.Marshal(&pb.SagaResponse{Events: events})
 		if err != nil {
 			return errorStatus(fmt.Errorf("marshal SagaResponse: %w", err))
+		}
+		return b, 0
+	}
+}
+
+// pmEventInvoker / pmRejectionInvoker bridge the process-manager thunks. The
+// PM is stateful, so both lazily seed the session's state via the rebuilder
+// factory (the appliers fold process_state into it first, exactly as the
+// aggregate does).
+
+func pmEventInvoker[S any](factory func() S, thunk PMEventThunk[S]) invoker {
+	return func(s *session, typeURL string, payload, aux []byte) ([]byte, int32) {
+		var pax abipb.PmEventAux
+		if err := proto.Unmarshal(aux, &pax); err != nil {
+			return errorStatus(fmt.Errorf("unmarshal PmEventAux: %w", err))
+		}
+		dests := NewDestinations(pax.DestinationSequences)
+		st := ensureState(s, factory)
+		resp, err := thunk(&anypb.Any{TypeUrl: typeURL, Value: payload}, st, dests)
+		if err != nil {
+			return errorStatus(err)
+		}
+		b, err := proto.Marshal(resp)
+		if err != nil {
+			return errorStatus(fmt.Errorf("marshal ProcessManagerHandleResponse: %w", err))
+		}
+		return b, 0
+	}
+}
+
+func pmRejectionInvoker[S any](factory func() S, thunk PMRejectionThunk[S]) invoker {
+	return func(s *session, _ string, _, aux []byte) ([]byte, int32) {
+		var rax abipb.RejectionAux
+		if err := proto.Unmarshal(aux, &rax); err != nil {
+			return errorStatus(fmt.Errorf("unmarshal RejectionAux: %w", err))
+		}
+		var n pb.Notification
+		if err := proto.Unmarshal(rax.Notification, &n); err != nil {
+			return errorStatus(fmt.Errorf("unmarshal Notification: %w", err))
+		}
+		var rej pb.RejectionNotification
+		if err := proto.Unmarshal(rax.Rejection, &rej); err != nil {
+			return errorStatus(fmt.Errorf("unmarshal RejectionNotification: %w", err))
+		}
+		st := ensureState(s, factory)
+		processEvents, escalation, err := thunk(&n, &rej, st)
+		if err != nil {
+			return errorStatus(err)
+		}
+		resp := &pb.ProcessManagerHandleResponse{
+			ProcessEvents: processEvents,
+			Notification:  escalation,
+		}
+		b, err := proto.Marshal(resp)
+		if err != nil {
+			return errorStatus(fmt.Errorf("marshal ProcessManagerHandleResponse: %w", err))
 		}
 		return b, 0
 	}
