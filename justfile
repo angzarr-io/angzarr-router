@@ -25,6 +25,7 @@ TOP := `git rev-parse --show-toplevel`
 # Override either with the matching env var to pin a git-SHA tag.
 ROUTER_IMAGE := env_var_or_default("ANGZARR_ROUTER_IMAGE", "ghcr.io/angzarr-io/angzarr-rust:latest")
 ROUTER_GO_IMAGE := env_var_or_default("ANGZARR_ROUTER_GO_IMAGE", "ghcr.io/angzarr-io/angzarr-go:latest")
+ROUTER_PYTHON_IMAGE := env_var_or_default("ANGZARR_ROUTER_PYTHON_IMAGE", "ghcr.io/angzarr-io/angzarr-python:latest")
 # Container runtime: docker (rootless or rootful). Empty inside a container.
 CONTAINER_CMD := `command -v docker 2>/dev/null || echo ""`
 # `-u $(id -u):$(id -g)` is right for ROOTFUL docker (bind-mount files get the
@@ -70,6 +71,24 @@ _go_container +ARGS:
             "{{ROUTER_GO_IMAGE}}" just {{ARGS}}
     fi
 
+# Same delegation, into the Python toolchain image (python + uv + buf +
+# grpcio-tools). The router-ffi cdylib the binding dlopens is built first in
+# the rust image and carried forward via the shared target/ mount.
+[private]
+_py_container +ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "${DEVCONTAINER:-}" = "true" ]; then
+        just --justfile "{{TOP}}/justfile.container" {{ARGS}}
+    else
+        {{CONTAINER_RUN}} --network=host \
+            -v "{{TOP}}:/workspace:Z" \
+            -v "{{TOP}}/justfile.container:/workspace/justfile:ro" \
+            -w /workspace \
+            -e ANGZARR_PROJECT_PROTO=/workspace/angzarr-project/proto \
+            "{{ROUTER_PYTHON_IMAGE}}" just {{ARGS}}
+    fi
+
 # Build the workspace
 build: (_container "build")
 
@@ -108,3 +127,22 @@ go-binding-test: build (_go_container "go-binding-test")
 
 # Format check + vet the Go binding
 go-binding-lint: (_go_container "go-binding-lint")
+
+# --- Python binding (bindings/python) -----------------------------------
+# Runs in the Python image (like client-python); the router-ffi cdylib is
+# built in the rust image (`build`) and carried forward via the shared
+# target/ mount — dlopen'd by cffi. The ABI is exercised a second way (cffi
+# vs cgo) before it freezes (§4). Generated protobuf code is never committed
+# (regenerate on need), so build/test regenerate first.
+
+# Regenerate the Python binding's protobuf types (buf + import fixup)
+py-binding-gen: (_py_container "py-binding-gen")
+
+# Build the Python binding env (cdylib in the rust image, then uv sync)
+py-binding-build: build (_py_container "py-binding-build")
+
+# Run the Python binding's conformance suite (pytest-bdd) + property sweep
+py-binding-test: build (_py_container "py-binding-test")
+
+# Lint + format check the Python binding (ruff)
+py-binding-lint: (_py_container "py-binding-lint")

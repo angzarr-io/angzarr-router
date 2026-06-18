@@ -1,0 +1,25 @@
+# Python codegen for the binding's protos (io.angzarr.v1,
+# io.angzarr.router.ffi.v1, test.counter, sererr). Pinned to the
+# protocolbuffers/python plugin tag whose gencode targets the protobuf 7.x
+# runtime the binding pins (pyproject/uv.lock) — gencode and runtime must
+# agree or protobuf's runtime-version check fails at import.
+#
+# google.* are NOT generated: google.protobuf comes from the protobuf
+# runtime and google.rpc/google.api from googleapis-common-protos (the
+# Python analog of Go's genproto) — the standard-over-rolling-our-own
+# precedent (§3). They are excluded at the `buf generate` invocation
+# (justfile.container py-binding-gen).
+#
+# IMPORT REWRITE (load-bearing). The python plugin emits cross-file imports
+# by proto PATH: `from io.angzarr.v1 import types_pb2`. A top-level `io`
+# package cannot be imported — stdlib `io` is already loaded as a
+# non-package module before any user code runs, so `from io.angzarr...`
+# raises "io is not a package". (client-python never hit this: its package
+# predates the io.angzarr rename.) scripts/fixup_gen_imports.py rewrites
+# those path imports to the `angzarr_router_ffi.gen.` package prefix after
+# generation; that step is part of `py-binding-gen` and the generated tree
+# is committed.
+version: v2
+plugins:
+  - remote: buf.build/protocolbuffers/python:v35.1
+    out: bindings/python/angzarr_router_ffi/gen

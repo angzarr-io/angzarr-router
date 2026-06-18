@@ -1,0 +1,50 @@
+# angzarr-router Python binding: cffi (ABI mode) over the router-ffi C ABI,
+# the same boundary the Go binding links. Pure-Python consumption — no Rust
+# toolchain to consume the cdylib.
+#
+# Not a packaged distribution yet (packaging — wheels with a vendored
+# cdylib — is deferred, §7); uv manages the dev/test venv only, so the
+# project itself is not built or installed (tool.uv.package = false). Tests
+# import the source tree directly via pytest's pythonpath.
+[project]
+name = "angzarr-router-ffi"
+version = "0.0.0"
+description = "Python binding for the angzarr shared router (cffi over the router-ffi C ABI)"
+requires-python = ">=3.10"
+dependencies = [
+    # cffi ABI mode (ffi.dlopen) over the router-ffi cdylib.
+    "cffi>=1.16",
+    # protobuf runtime. Pinned to the 7.x series the protocolbuffers/python
+    # buf plugin (buf.gen.yaml) generates against — gencode embeds a
+    # runtime-version check that fails if the runtime is older.
+    "protobuf>=7.35.1,<8",
+    # google.rpc.Status / ErrorInfo (the error model) + google.api — the
+    # Python analog of Go's genproto. google.* are NOT generated (§3).
+    "googleapis-common-protos>=1.65",
+]
+
+[dependency-groups]
+# Installed by `uv sync` (and `uv run`) for the dev/test loop.
+dev = [
+    "pytest>=8.0",
+    "pytest-bdd>=7.0",
+]
+
+[tool.uv]
+# Virtual project: manage the venv + dependencies, but do not build/install
+# this project (no packaging yet). Tests run against the source tree.
+package = false
+
+[tool.pytest.ini_options]
+# bindings/python is the rootdir; put it on sys.path so `angzarr_router_ffi`
+# (and its generated `gen/` subtree) import without an install step.
+pythonpath = ["."]
+testpaths = ["angzarr_router_ffi/tests"]
+# The shared cross-language behavior suite lives in the repo's conformance/
+# tree, resolved relative to this rootdir.
+bdd_features_base_dir = "../../conformance/features"
+
+[tool.ruff]
+line-length = 100
+# Generated protobuf code is not ours to lint.
+extend-exclude = ["angzarr_router_ffi/gen"]

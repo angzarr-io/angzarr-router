@@ -55,14 +55,49 @@ go-binding-gen:
     cd {{TOP}} && buf generate --template bindings/go/buf.gen.yaml \
         --exclude-path angzarr-project/proto/google --exclude-path proto/google
 
-# Build the Go binding (cdylib already built + carried forward).
-go-binding-build:
+# Build the Go binding (cdylib already built + carried forward). Generated
+# protobuf code is never committed (regenerate on need), so gen runs first.
+go-binding-build: go-binding-gen
     cd {{TOP}}/bindings/go && go build -tags ffirouter ./...
 
 # Run the Go binding's conformance suite (godog) + property sweep.
-go-binding-test:
+go-binding-test: go-binding-gen
     cd {{TOP}}/bindings/go && go test -tags ffirouter ./...
 
-# Format check + vet the Go binding.
-go-binding-lint:
+# Format check + vet the Go binding (regenerate first; gen is not committed).
+go-binding-lint: go-binding-gen
     cd {{TOP}}/bindings/go && test -z "$(gofmt -l .)" && go vet -tags ffirouter ./...
+
+# --- Python binding (bindings/python) -----------------------------------
+# Run in the Python image. cffi dlopens the router-ffi cdylib, which is built
+# in the rust image and carried forward in target/debug (the host `build`
+# step runs first); _abi.py resolves it from the shared tree (or
+# ANGZARR_ROUTER_LIB). These recipes deliberately do NOT depend on `build` —
+# there is no cargo in the Python image.
+
+# Regenerate the Python binding's protobuf types. google.* come from the
+# protobuf runtime + googleapis-common-protos and are excluded; the plugin
+# emits path-based imports (`from io.angzarr.v1 import ...`) which cannot be
+# imported as written (stdlib `io` collision), so fixup_gen_imports.py reroots
+# them under the binding's gen package. Generated code is never committed.
+py-binding-gen:
+    cd {{TOP}} && buf generate --template bindings/python/buf.gen.yaml \
+        --exclude-path angzarr-project/proto/google --exclude-path proto/google \
+        --exclude-path angzarr-project/proto/io/angzarr/examples
+    cd {{TOP}} && python3 bindings/python/scripts/fixup_gen_imports.py \
+        bindings/python/angzarr_router_ffi/gen
+
+# Sync the Python binding's dependency env (cdylib already built + carried
+# forward); regenerate protobuf types first.
+py-binding-build: py-binding-gen
+    cd {{TOP}}/bindings/python && uv sync
+
+# Run the Python binding's conformance suite (pytest-bdd) + property sweep +
+# GIL-threaded concurrency. `uv run` syncs deps as needed.
+py-binding-test: py-binding-gen
+    cd {{TOP}}/bindings/python && uv run pytest -q
+
+# Lint + format check the Python binding (ruff; generated code excluded).
+py-binding-lint:
+    cd {{TOP}}/bindings/python && uv run --with ruff ruff check . && \
+        uv run --with ruff ruff format --check .
