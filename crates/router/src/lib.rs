@@ -7,10 +7,12 @@
 //! duplicate them into generated output, bindings, or component adapters.
 
 pub mod aggregate;
+pub mod destinations;
 pub mod error;
 pub mod projector;
 pub mod proto;
 pub mod rebuild;
+pub mod saga;
 
 pub use proto::io::angzarr::v1 as pb;
 

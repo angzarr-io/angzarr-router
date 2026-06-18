@@ -28,6 +28,7 @@ fn main() {
             &[
                 root.join("io/angzarr/v1/types.proto"),
                 root.join("io/angzarr/v1/command_handler.proto"),
+                root.join("io/angzarr/v1/saga.proto"),
             ],
             &[root],
         )

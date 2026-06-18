@@ -26,3 +26,7 @@ harness = false
 [[test]]
 name = "projector"
 harness = false
+
+[[test]]
+name = "saga"
+harness = false

@@ -11,6 +11,7 @@ use angzarr_router::aggregate::AggregateDispatch;
 use angzarr_router::error::{codes, CodedError, HandlerError};
 use angzarr_router::projector::ProjectorDispatch;
 use angzarr_router::rebuild::Rebuilder;
+use angzarr_router::saga::SagaDispatch;
 use angzarr_router::{pb, NOTIFICATION_TYPE_URL};
 
 use crate::abi::{consume_out, status_to_coded, AngzarrBuf, AngzarrCb, STATUS_OK, STATUS_OK_EMPTY};
@@ -79,6 +80,7 @@ fn host_error(ret: i32, bytes: Option<Vec<u8>>) -> HandlerError {
 pub struct FfiRouter {
     aggregates: Vec<(String, AggregateDispatch<()>)>,
     projectors: Vec<(String, ProjectorDispatch<()>)>,
+    sagas: Vec<(String, SagaDispatch)>,
 }
 
 impl FfiRouter {
@@ -86,6 +88,7 @@ impl FfiRouter {
         FfiRouter {
             aggregates: Vec::new(),
             projectors: Vec::new(),
+            sagas: Vec::new(),
         }
     }
 
@@ -312,6 +315,122 @@ impl FfiRouter {
 
         let _guard = HostCtxGuard::set(host_ctx);
         let resp = dispatch.dispatch(&book)?;
+        Ok(resp.encode_to_vec())
+    }
+
+    /// Parses a SagaDescriptor and populates a core saga table with
+    /// callback-marshaling thunks. Event thunks pass the coordinator-supplied
+    /// destination sequences to the host (which stamps and returns a
+    /// SagaResponse); compensators run in registration order (C-0042).
+    pub fn register_saga(&mut self, descriptor: &[u8], cb: AngzarrCb) -> Result<(), CodedError> {
+        let desc = abi_pb::SagaDescriptor::decode(descriptor).map_err(|_| {
+            CodedError::invalid_argument(
+                codes::ANY_DECODE_FAILED,
+                "failed to decode SagaDescriptor",
+                [],
+            )
+        })?;
+
+        let mut dispatch = SagaDispatch::new(
+            desc.name.clone(),
+            desc.input_domain.clone(),
+            desc.target_domains.clone(),
+        );
+
+        for event in &desc.events {
+            let id = event.callback_id;
+            dispatch = dispatch.on_event(&event.fq_type, move |any, dests| {
+                let destination_sequences = dests
+                    .domains()
+                    .into_iter()
+                    .filter_map(|d| dests.sequence_for(&d).map(|s| (d, s)))
+                    .collect();
+                let aux = abi_pb::SagaEventAux {
+                    destination_sequences,
+                }
+                .encode_to_vec();
+                let (ret, bytes) = invoke(cb, id, &any.type_url, &any.value, &aux);
+                match ret {
+                    STATUS_OK => {
+                        let resp = pb::SagaResponse::decode(bytes.unwrap_or_default().as_slice())
+                            .map_err(|_| {
+                                HandlerError::Other(
+                                    "host saga handler returned undecodable SagaResponse bytes"
+                                        .to_string(),
+                                )
+                            })?;
+                        Ok((resp.commands, resp.events))
+                    }
+                    STATUS_OK_EMPTY => Ok((Vec::new(), Vec::new())),
+                    _ => Err(host_error(ret, bytes)),
+                }
+            });
+        }
+
+        for rejection in &desc.rejections {
+            for &id in &rejection.callback_ids {
+                dispatch =
+                    dispatch.on_rejected(&rejection.fq_command_type, move |notification, rejection| {
+                        let aux = abi_pb::RejectionAux {
+                            notification: notification.encode_to_vec(),
+                            rejection: rejection.encode_to_vec(),
+                            cctx: None, // sagas are stateless — no CommandContext
+                        }
+                        .encode_to_vec();
+                        let (ret, bytes) = invoke(cb, id, NOTIFICATION_TYPE_URL, &[], &aux);
+                        match ret {
+                            STATUS_OK => {
+                                let resp =
+                                    pb::SagaResponse::decode(bytes.unwrap_or_default().as_slice())
+                                        .map_err(|_| {
+                                            HandlerError::Other(
+                                                "host saga compensator returned undecodable \
+                                                 SagaResponse bytes"
+                                                    .to_string(),
+                                            )
+                                        })?;
+                                Ok(resp.events)
+                            }
+                            STATUS_OK_EMPTY => Ok(Vec::new()),
+                            _ => Err(host_error(ret, bytes)),
+                        }
+                    });
+            }
+        }
+
+        self.sagas.push((desc.name, dispatch));
+        Ok(())
+    }
+
+    /// Decodes SagaHandleRequest bytes, routes to the registered saga (sole
+    /// saga claims the source), and runs the core dispatch with the host
+    /// session installed.
+    pub fn dispatch_saga(
+        &self,
+        host_ctx: *mut c_void,
+        request: &[u8],
+    ) -> Result<Vec<u8>, CodedError> {
+        let req = pb::SagaHandleRequest::decode(request).map_err(|_| {
+            CodedError::invalid_argument(
+                codes::ANY_DECODE_FAILED,
+                "failed to decode SagaHandleRequest",
+                [],
+            )
+        })?;
+
+        let dispatch = match self.sagas.as_slice() {
+            [(_, only)] => only,
+            _ => {
+                return Err(CodedError::invalid_argument(
+                    codes::NO_HANDLER_REGISTERED,
+                    "no single saga registered to claim the source",
+                    [],
+                ));
+            }
+        };
+
+        let _guard = HostCtxGuard::set(host_ctx);
+        let resp = dispatch.dispatch(&req)?;
         Ok(resp.encode_to_vec())
     }
 }

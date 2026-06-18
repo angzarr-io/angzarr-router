@@ -23,7 +23,7 @@ test:
 # path that survives the copy — ANGZARR_PROJECT_PROTO points build.rs at the
 # real submodule checkout.
 mutation-test:
-    cd {{TOP}} && ANGZARR_PROJECT_PROTO=${ANGZARR_PROJECT_PROTO:-{{TOP}}/angzarr-project/proto} cargo mutants -f crates/router/src/rebuild.rs -f crates/router/src/aggregate.rs -f crates/router/src/projector.rs -f crates/router/src/error.rs -f crates/router/src/lib.rs --timeout 120
+    cd {{TOP}} && ANGZARR_PROJECT_PROTO=${ANGZARR_PROJECT_PROTO:-{{TOP}}/angzarr-project/proto} cargo mutants -f crates/router/src/rebuild.rs -f crates/router/src/aggregate.rs -f crates/router/src/projector.rs -f crates/router/src/saga.rs -f crates/router/src/destinations.rs -f crates/router/src/error.rs -f crates/router/src/lib.rs --timeout 120
 
 # Format
 fmt:

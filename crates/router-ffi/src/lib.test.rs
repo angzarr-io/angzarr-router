@@ -50,6 +50,11 @@ const CB_RETURN_NOTHING: u64 = 6;
 const CB_SNAPSHOT: u64 = 7;
 const CB_PROJ_FOLD: u64 = 8;
 const CB_PROJ_FINISH: u64 = 9;
+const CB_SAGA_EVENT: u64 = 10;
+const CB_SAGA_COMP: u64 = 11;
+
+const FQ_ORDER_CREATED: &str = "test.order.OrderCreated";
+const FQ_RESERVE_STOCK: &str = "test.order.ReserveStock";
 
 // --- host-side session registry (state never crosses the boundary)
 
@@ -189,6 +194,52 @@ unsafe extern "C" fn host_cb(
                 ..Default::default()
             };
             host_fill(out, &proj.encode_to_vec());
+            STATUS_OK
+        }
+        CB_SAGA_EVENT => {
+            // Host translates the source event into one stamped command,
+            // stamping from the coordinator-supplied destination sequences.
+            let saux = abi_pb::SagaEventAux::decode(aux).expect("saga event aux");
+            let mut cmd = pb::CommandBook {
+                cover: Some(pb::Cover {
+                    domain: "inventory".to_string(),
+                    ..Default::default()
+                }),
+                pages: vec![pb::CommandPage {
+                    payload: Some(pb::command_page::Payload::Command(Any {
+                        type_url: format!("type.googleapis.com/{FQ_RESERVE_STOCK}"),
+                        value: Vec::new(),
+                    })),
+                    ..Default::default()
+                }],
+            };
+            if let Some(&seq) = saux.destination_sequences.get("inventory") {
+                for page in &mut cmd.pages {
+                    page.header = Some(pb::PageHeader {
+                        sequence_type: Some(pb::page_header::SequenceType::Sequence(seq)),
+                        ..Default::default()
+                    });
+                }
+            }
+            let resp = pb::SagaResponse {
+                commands: vec![cmd],
+                events: Vec::new(),
+            };
+            host_fill(out, &resp.encode_to_vec());
+            STATUS_OK
+        }
+        CB_SAGA_COMP => {
+            let raux = abi_pb::RejectionAux::decode(aux).expect("rejection aux");
+            pb::Notification::decode(raux.notification.as_slice()).expect("notification");
+            pb::RejectionNotification::decode(raux.rejection.as_slice()).expect("rejection");
+            let resp = pb::SagaResponse {
+                commands: Vec::new(),
+                events: vec![pb::EventBook {
+                    pages: vec![pb::EventPage::default()],
+                    ..Default::default()
+                }],
+            };
+            host_fill(out, &resp.encode_to_vec());
             STATUS_OK
         }
         CB_FAIL_HARD => -13, // plain failure, no status payload
@@ -827,4 +878,124 @@ fn projector_undeclared_domain_folds_nothing_through_the_abi() {
     let proj = pb::Projection::decode(bytes.as_slice()).expect("Projection");
     assert_eq!(proj.sequence, 0, "undeclared domain folds nothing");
     assert_eq!(session_snapshot(session).counter, 0);
+}
+
+// --- saga ABI surface (per-kind entry points)
+
+fn saga_descriptor_bytes() -> Vec<u8> {
+    abi_pb::SagaDescriptor {
+        name: "OrderFulfillment".to_string(),
+        input_domain: "order".to_string(),
+        target_domains: vec!["inventory".to_string()],
+        events: vec![abi_pb::CallbackEntry {
+            fq_type: FQ_ORDER_CREATED.to_string(),
+            callback_id: CB_SAGA_EVENT,
+        }],
+        rejections: vec![abi_pb::RejectionEntry {
+            fq_command_type: FQ_RESERVE_STOCK.to_string(),
+            callback_ids: vec![CB_SAGA_COMP],
+        }],
+    }
+    .encode_to_vec()
+}
+
+impl Router {
+    fn with_saga() -> Self {
+        let r = angzarr_router_new();
+        let desc = saga_descriptor_bytes();
+        let ret = unsafe { angzarr_router_register_saga(r, desc.as_ptr(), desc.len(), host_cb) };
+        assert_eq!(ret, 0, "saga registration failed");
+        Router(r)
+    }
+
+    fn dispatch_saga(&self, session: usize, req: &pb::SagaHandleRequest) -> (i32, Vec<u8>) {
+        let bytes = req.encode_to_vec();
+        let mut out = AngzarrBuf {
+            data: std::ptr::null_mut(),
+            len: 0,
+        };
+        let ret = unsafe {
+            angzarr_router_dispatch_saga(
+                self.0,
+                session as *mut c_void,
+                bytes.as_ptr(),
+                bytes.len(),
+                &mut out,
+            )
+        };
+        let response = if out.data.is_null() {
+            Vec::new()
+        } else {
+            let copied = unsafe { std::slice::from_raw_parts(out.data, out.len) }.to_vec();
+            unsafe { angzarr_buf_release(out.data, out.len) };
+            copied
+        };
+        (ret, response)
+    }
+}
+
+/// A SagaHandleRequest over a source book in `domain` carrying the given
+/// event pages, plus a destination-sequence map.
+fn saga_request(domain: &str, pages: Vec<pb::EventPage>, dest: &[(&str, u32)]) -> pb::SagaHandleRequest {
+    pb::SagaHandleRequest {
+        source: Some(pb::EventBook {
+            cover: Some(pb::Cover {
+                domain: domain.to_string(),
+                ..Default::default()
+            }),
+            pages,
+            ..Default::default()
+        }),
+        destination_sequences: dest.iter().map(|(d, s)| (d.to_string(), *s)).collect(),
+        ..Default::default()
+    }
+}
+
+fn event_page_of(fq: &str) -> pb::EventPage {
+    pb::EventPage {
+        payload: Some(pb::event_page::Payload::Event(Any {
+            type_url: format!("type.googleapis.com/{fq}"),
+            value: Vec::new(),
+        })),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn saga_emits_stamped_command_through_the_abi() {
+    // The whole saga path across raw pointers: register a saga, dispatch a
+    // source book, and confirm the host emitted one command stamped with the
+    // coordinator-supplied destination sequence.
+    let router = Router::with_saga();
+    let session = next_session();
+    let req = saga_request("order", vec![event_page_of(FQ_ORDER_CREATED)], &[("inventory", 7)]);
+    let (ret, bytes) = router.dispatch_saga(session, &req);
+    assert_eq!(ret, 0);
+    let resp = pb::SagaResponse::decode(bytes.as_slice()).expect("SagaResponse");
+    assert_eq!(resp.commands.len(), 1, "one command emitted");
+    let cmd = &resp.commands[0];
+    assert_eq!(cmd.cover.as_ref().unwrap().domain, "inventory");
+    let seq = match cmd.pages[0].header.as_ref().and_then(|h| h.sequence_type.as_ref()) {
+        Some(pb::page_header::SequenceType::Sequence(s)) => *s,
+        _ => panic!("command page not stamped"),
+    };
+    assert_eq!(seq, 7, "host stamped the destination sequence over the ABI");
+}
+
+#[test]
+fn saga_compensator_runs_through_the_abi() {
+    // A Notification source page routes to the registered compensator, whose
+    // injected fact event crosses back as a SagaResponse.
+    let router = Router::with_saga();
+    let session = next_session();
+    let notification_page = pb::EventPage {
+        payload: Some(pb::event_page::Payload::Event(notification_command(FQ_RESERVE_STOCK))),
+        ..Default::default()
+    };
+    let req = saga_request("order", vec![notification_page], &[]);
+    let (ret, bytes) = router.dispatch_saga(session, &req);
+    assert_eq!(ret, 0);
+    let resp = pb::SagaResponse::decode(bytes.as_slice()).expect("SagaResponse");
+    assert!(resp.commands.is_empty());
+    assert_eq!(resp.events.len(), 1, "compensator injected one fact event");
 }

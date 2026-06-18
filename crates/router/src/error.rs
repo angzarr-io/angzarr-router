@@ -33,6 +33,9 @@ pub mod codes {
     pub const PERSISTED_EVENT_CORRUPT: &str = "PERSISTED_EVENT_CORRUPT";
     pub const UNHANDLED_HANDLER_ERROR: &str = "UNHANDLED_HANDLER_ERROR";
     pub const MISSING_EVENT_BOOK_COVER: &str = "MISSING_EVENT_BOOK_COVER";
+    pub const MISSING_SAGA_SOURCE: &str = "MISSING_SAGA_SOURCE";
+    pub const EMPTY_SAGA_SOURCE: &str = "EMPTY_SAGA_SOURCE";
+    pub const MISSING_DESTINATION_SEQUENCE: &str = "MISSING_DESTINATION_SEQUENCE";
 }
 
 /// Canonical static message text (byte-equal across languages).
@@ -44,6 +47,9 @@ pub mod messages {
         "failed to decode RejectionNotification payload";
     pub const PERSISTED_EVENT_CORRUPT: &str = "persisted event payload corrupt";
     pub const MISSING_EVENT_BOOK_COVER: &str = "missing event book cover";
+    pub const MISSING_SAGA_SOURCE: &str = "missing saga source";
+    pub const EMPTY_SAGA_SOURCE: &str = "empty saga source";
+    pub const MISSING_DESTINATION_SEQUENCE: &str = "no sequence for destination domain";
 }
 
 /// Cross-language detail-key constants.

@@ -50,10 +50,29 @@ message ProjectorDescriptor {
   optional uint64 unknown_callback_id = 5;
 }
 
+// Registration payload for one saga component. A stateless translator:
+// declared events emit commands (the host stamps them from the supplied
+// destination sequences) and/or injected fact events; rejection rows carry
+// ORDERED compensators (C-0042). Empty `target_domains` is allowed.
+message SagaDescriptor {
+  string name = 1;
+  string input_domain = 2;
+  repeated string target_domains = 3;
+  repeated CallbackEntry events = 4;
+  repeated RejectionEntry rejections = 5;
+}
+
 // aux payload for command-handler callbacks.
 message CommandContextAux {
   uint32 next_sequence = 1;
   bool had_prior_events = 2;
+}
+
+// aux payload for saga event callbacks: the coordinator-supplied
+// destination next-sequences the host stamps emitted commands from. The
+// host returns a SagaResponse (commands + injected fact events).
+message SagaEventAux {
+  map<string, uint32> destination_sequences = 1;
 }
 
 // aux payload for rejection (compensation) callbacks.

@@ -10,6 +10,7 @@ use angzarr_router::aggregate::AggregateDispatch;
 use angzarr_router::error::{CodedError, HandlerError};
 use angzarr_router::projector::ProjectorDispatch;
 use angzarr_router::rebuild::Rebuilder;
+use angzarr_router::saga::SagaDispatch;
 use prost::Message;
 use prost_reflect::{DescriptorPool, DynamicMessage};
 
@@ -231,6 +232,129 @@ pub fn delivery_without_cover(n: u32) -> pb::EventBook {
     let mut book = delivery("counter", n);
     book.cover = None;
     book
+}
+
+// ---------------------------------------------------------------------------
+// The fixture: OrderSaga on the router core (translation-side dispatch).
+// ---------------------------------------------------------------------------
+
+/// Build the OrderSaga dispatch table: it translates each Increased source
+/// event into one Reserve command for "inventory" (stamped from the
+/// coordinator-supplied destination sequence when present), and compensates a
+/// rejected Reserve by injecting one fact event. Undeclared events and
+/// undeclared rejections are silently skipped (DelegateToFramework).
+pub fn order_saga() -> SagaDispatch {
+    SagaDispatch::new("order-saga", "order", ["inventory"])
+        .on_event("test.counter.Increased", |_any, dests| {
+            let mut cmd = reserve_command_to("inventory");
+            if dests.has("inventory") {
+                dests.stamp_command(&mut cmd, "inventory")?;
+            }
+            Ok((vec![cmd], Vec::new()))
+        })
+        .on_rejected("test.counter.Reserve", |_n, _r| Ok(vec![saga_fact_event()]))
+}
+
+fn reserve_command_to(domain: &str) -> pb::CommandBook {
+    pb::CommandBook {
+        cover: Some(pb::Cover {
+            domain: domain.to_string(),
+            ..Default::default()
+        }),
+        pages: vec![pb::CommandPage {
+            payload: Some(pb::command_page::Payload::Command(prost_types::Any {
+                type_url: angzarr_router::type_url("test.counter.Reserve"),
+                value: Vec::new(),
+            })),
+            ..Default::default()
+        }],
+    }
+}
+
+/// A single-page fact event the compensator injects — its presence (not its
+/// content) is what the rejection scenarios assert.
+fn saga_fact_event() -> pb::EventBook {
+    pb::EventBook {
+        pages: vec![pb::EventPage::default()],
+        ..Default::default()
+    }
+}
+
+/// A SagaHandleRequest whose source carries one event of `event_fq` in the
+/// "order" domain, plus the coordinator's destination-sequence map.
+pub fn saga_event_source(event_fq: &str, dest: &[(&str, u32)]) -> pb::SagaHandleRequest {
+    pb::SagaHandleRequest {
+        source: Some(pb::EventBook {
+            cover: Some(pb::Cover {
+                domain: "order".to_string(),
+                ..Default::default()
+            }),
+            pages: vec![pb::EventPage {
+                payload: Some(pb::event_page::Payload::Event(prost_types::Any {
+                    type_url: angzarr_router::type_url(event_fq),
+                    value: Vec::new(),
+                })),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        destination_sequences: dest.iter().map(|(d, s)| (d.to_string(), *s)).collect(),
+        ..Default::default()
+    }
+}
+
+/// A SagaHandleRequest whose source is a rejection Notification for
+/// `fq_command` — routes to the compensation path.
+pub fn saga_rejection_source(fq_command: &str) -> pb::SagaHandleRequest {
+    // The rejected command's type is what keys the compensator lookup.
+    let mut rejected = reserve_command_to("inventory");
+    if let Some(pb::command_page::Payload::Command(any)) = rejected.pages[0].payload.as_mut() {
+        any.type_url = angzarr_router::type_url(fq_command);
+    }
+    let rejection = pb::RejectionNotification {
+        rejected_command: Some(rejected),
+        ..Default::default()
+    };
+    let notification = pb::Notification {
+        payload: Some(prost_types::Any {
+            type_url: angzarr_router::type_url("io.angzarr.v1.RejectionNotification"),
+            value: rejection.encode_to_vec(),
+        }),
+        ..Default::default()
+    };
+    pb::SagaHandleRequest {
+        source: Some(pb::EventBook {
+            cover: Some(pb::Cover {
+                domain: "order".to_string(),
+                ..Default::default()
+            }),
+            pages: vec![pb::EventPage {
+                payload: Some(pb::event_page::Payload::Event(prost_types::Any {
+                    type_url: angzarr_router::NOTIFICATION_TYPE_URL.to_string(),
+                    value: notification.encode_to_vec(),
+                })),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// A SagaHandleRequest whose source book carries no pages → EMPTY_SAGA_SOURCE.
+pub fn saga_empty_source() -> pb::SagaHandleRequest {
+    pb::SagaHandleRequest {
+        source: Some(pb::EventBook::default()),
+        ..Default::default()
+    }
+}
+
+/// A SagaHandleRequest with no source at all → MISSING_SAGA_SOURCE.
+pub fn saga_missing_source() -> pb::SagaHandleRequest {
+    pb::SagaHandleRequest {
+        source: None,
+        ..Default::default()
+    }
 }
 
 // ---------------------------------------------------------------------------
