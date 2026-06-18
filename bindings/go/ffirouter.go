@@ -33,6 +33,8 @@ int32_t  angzarr_router_register_aggregate(void*, const uint8_t*, size_t, angzar
 int32_t  angzarr_router_dispatch(void*, void*, const uint8_t*, size_t, angzarr_buf*);
 int32_t  angzarr_router_register_projector(void*, const uint8_t*, size_t, angzarr_cb);
 int32_t  angzarr_router_dispatch_projector(void*, void*, const uint8_t*, size_t, angzarr_buf*);
+int32_t  angzarr_router_register_saga(void*, const uint8_t*, size_t, angzarr_cb);
+int32_t  angzarr_router_dispatch_saga(void*, void*, const uint8_t*, size_t, angzarr_buf*);
 
 // The Go //export trampoline (defined in trampoline.go). Declared with
 // non-const pointers because cgo //export cannot express const.
@@ -56,6 +58,10 @@ static int32_t angzarr_register_projector(void* r, const uint8_t* d, size_t n) {
     return angzarr_router_register_projector(r, d, n, angzarr_go_cb);
 }
 
+static int32_t angzarr_register_saga(void* r, const uint8_t* d, size_t n) {
+    return angzarr_router_register_saga(r, d, n, angzarr_go_cb);
+}
+
 // host_ctx is a runtime/cgo.Handle (an integer) reinterpreted as void*; the
 // router treats it as opaque and hands it back to the trampoline. Casting
 // through C keeps the Go side free of uintptr<->unsafe.Pointer churn.
@@ -67,6 +73,11 @@ static int32_t angzarr_dispatch_h(void* r, uintptr_t ctx,
 static int32_t angzarr_dispatch_projector_h(void* r, uintptr_t ctx,
         const uint8_t* req, size_t n, angzarr_buf* out) {
     return angzarr_router_dispatch_projector(r, (void*)ctx, req, n, out);
+}
+
+static int32_t angzarr_dispatch_saga_h(void* r, uintptr_t ctx,
+        const uint8_t* req, size_t n, angzarr_buf* out) {
+    return angzarr_router_dispatch_saga(r, (void*)ctx, req, n, out);
 }
 */
 import "C"
@@ -233,6 +244,78 @@ func RegisterProjector[P any](r *Router, d *ProjectorDispatch[P]) error {
 		return decodeStatus(nil, int32(ret))
 	}
 	return nil
+}
+
+// RegisterSaga registers one saga component: it assigns callback ids to every
+// event/rejection thunk, serializes the SagaDescriptor, and hands it to the
+// core with the shared callback gateway. A method (not a free function) since
+// a saga is stateless — it introduces no state type parameter.
+func (r *Router) RegisterSaga(d *SagaDispatch) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	desc := &abipb.SagaDescriptor{
+		Name:          d.name,
+		InputDomain:   d.inputDomain,
+		TargetDomains: d.targets,
+	}
+	for fq, thunk := range d.events {
+		id := r.assign(sagaEventInvoker(thunk))
+		desc.Events = append(desc.Events, &abipb.CallbackEntry{FqType: fq, CallbackId: id})
+	}
+	for fq, thunks := range d.rejections {
+		entry := &abipb.RejectionEntry{FqCommandType: fq}
+		for _, thunk := range thunks {
+			id := r.assign(sagaRejectionInvoker(thunk))
+			entry.CallbackIds = append(entry.CallbackIds, id)
+		}
+		desc.Rejections = append(desc.Rejections, entry)
+	}
+
+	descBytes, err := proto.Marshal(desc)
+	if err != nil {
+		return fmt.Errorf("marshal SagaDescriptor: %w", err)
+	}
+	var dptr *C.uint8_t
+	if len(descBytes) > 0 {
+		dptr = (*C.uint8_t)(unsafe.Pointer(&descBytes[0]))
+	}
+	ret := C.angzarr_register_saga(r.ptr, dptr, C.size_t(len(descBytes)))
+	runtime.KeepAlive(descBytes)
+	if ret != 0 {
+		return decodeStatus(nil, int32(ret))
+	}
+	return nil
+}
+
+// DispatchSaga runs one SagaHandleRequest through the registered saga and
+// returns the SagaResponse, or a *CodedError decoded from the core's failure.
+func (r *Router) DispatchSaga(req *pb.SagaHandleRequest) (*pb.SagaResponse, error) {
+	reqBytes, err := proto.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal SagaHandleRequest: %w", err)
+	}
+
+	h := cgo.NewHandle(&session{router: r})
+	defer h.Delete()
+
+	var reqPtr *C.uint8_t
+	if len(reqBytes) > 0 {
+		reqPtr = (*C.uint8_t)(unsafe.Pointer(&reqBytes[0]))
+	}
+	var out C.angzarr_buf
+	ret := C.angzarr_dispatch_saga_h(r.ptr, C.uintptr_t(h), reqPtr, C.size_t(len(reqBytes)), &out)
+	runtime.KeepAlive(reqBytes)
+	respBytes := consumeBuf(&out)
+
+	if ret == 0 {
+		var resp pb.SagaResponse
+		if err := proto.Unmarshal(respBytes, &resp); err != nil {
+			return nil, fmt.Errorf("unmarshal SagaResponse: %w", err)
+		}
+		return &resp, nil
+	}
+	return nil, decodeStatus(respBytes, int32(ret))
 }
 
 // DispatchProjector folds one EventBook through the registered projector and
@@ -418,6 +501,55 @@ func projectorUnknownInvoker(thunk ProjectorUnknownThunk) invoker {
 	return func(_ *session, typeURL string, _, _ []byte) ([]byte, int32) {
 		thunk(typeURL)
 		return nil, 0
+	}
+}
+
+// sagaEventInvoker / sagaRejectionInvoker bridge the saga thunks. A saga is
+// stateless, so neither touches the session's host state — the event thunk
+// rebuilds Destinations from the aux and returns a SagaResponse.
+
+func sagaEventInvoker(thunk SagaEventThunk) invoker {
+	return func(_ *session, typeURL string, payload, aux []byte) ([]byte, int32) {
+		var sax abipb.SagaEventAux
+		if err := proto.Unmarshal(aux, &sax); err != nil {
+			return errorStatus(fmt.Errorf("unmarshal SagaEventAux: %w", err))
+		}
+		dests := NewDestinations(sax.DestinationSequences)
+		commands, events, err := thunk(&anypb.Any{TypeUrl: typeURL, Value: payload}, dests)
+		if err != nil {
+			return errorStatus(err)
+		}
+		b, err := proto.Marshal(&pb.SagaResponse{Commands: commands, Events: events})
+		if err != nil {
+			return errorStatus(fmt.Errorf("marshal SagaResponse: %w", err))
+		}
+		return b, 0
+	}
+}
+
+func sagaRejectionInvoker(thunk SagaRejectionThunk) invoker {
+	return func(_ *session, _ string, _, aux []byte) ([]byte, int32) {
+		var rax abipb.RejectionAux
+		if err := proto.Unmarshal(aux, &rax); err != nil {
+			return errorStatus(fmt.Errorf("unmarshal RejectionAux: %w", err))
+		}
+		var n pb.Notification
+		if err := proto.Unmarshal(rax.Notification, &n); err != nil {
+			return errorStatus(fmt.Errorf("unmarshal Notification: %w", err))
+		}
+		var rej pb.RejectionNotification
+		if err := proto.Unmarshal(rax.Rejection, &rej); err != nil {
+			return errorStatus(fmt.Errorf("unmarshal RejectionNotification: %w", err))
+		}
+		events, err := thunk(&n, &rej)
+		if err != nil {
+			return errorStatus(err)
+		}
+		b, err := proto.Marshal(&pb.SagaResponse{Events: events})
+		if err != nil {
+			return errorStatus(fmt.Errorf("marshal SagaResponse: %w", err))
+		}
+		return b, 0
 	}
 }
 
