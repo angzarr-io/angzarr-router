@@ -24,6 +24,8 @@ from ._dispatch import (
     Router,
     SagaDispatch,
     abi_version,
+    any_decode_error,
+    pack,
     reject,
 )
 
@@ -39,5 +41,7 @@ __all__ = [
     "Router",
     "SagaDispatch",
     "abi_version",
+    "any_decode_error",
+    "pack",
     "reject",
 ]

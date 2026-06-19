@@ -41,6 +41,14 @@ CODE_UNHANDLED_HANDLER_ERROR = "UNHANDLED_HANDLER_ERROR"
 # (distinct from the io.angzarr proto package — see plan §1).
 ERROR_INFO_DOMAIN = "angzarr.io"
 
+# The code AnyDecodeError carries.
+CODE_ANY_DECODE_FAILED = "ANY_DECODE_FAILED"
+
+# The framework's Any type-URL convention: a bare "/" followed by the
+# fully-qualified message name (NOT the type.googleapis.com prefix Any.Pack
+# defaults to). The core keys event/command dispatch on it.
+_FRAMEWORK_ANY_PREFIX = "/"
+
 
 class GrpcCode(enum.IntEnum):
     """The numeric gRPC status codes carried with a coded error. Plain ints
@@ -80,6 +88,29 @@ def reject(code: str, message: str) -> CodedError:
     """Build an invalid-argument business rejection — the common shape a
     command handler raises to reject a command with a coded reason."""
     return CodedError(code=code, message=message, grpc=GrpcCode.INVALID_ARGUMENT)
+
+
+def any_decode_error(type_url: str, cause: BaseException) -> CodedError:
+    """Report that a google.protobuf.Any payload failed to parse to its
+    expected type. Generated dispatch thunks raise it when a command or event
+    Any cannot be decoded — a malformed payload is an invalid argument, not a
+    handler bug."""
+    return CodedError(
+        code=CODE_ANY_DECODE_FAILED,
+        message=f"decode Any {type_url!r}: {cause}",
+        grpc=GrpcCode.INVALID_ARGUMENT,
+        extras={"type_url": type_url},
+    )
+
+
+def pack(msg) -> any_pb2.Any:
+    """Wrap a message in a google.protobuf.Any using the framework's bare-"/"
+    type-URL convention. Generated typed-emit wiring uses it to build an
+    EventBook from the typed events a command handler returns."""
+    return any_pb2.Any(
+        type_url=_FRAMEWORK_ANY_PREFIX + msg.DESCRIPTOR.full_name,
+        value=msg.SerializeToString(),
+    )
 
 
 @dataclass

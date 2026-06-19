@@ -2,6 +2,7 @@ package ffirouter
 
 import (
 	"errors"
+	"fmt"
 
 	errdetails "google.golang.org/genproto/googleapis/rpc/errdetails"
 	rpcstatus "google.golang.org/genproto/googleapis/rpc/status"
@@ -14,6 +15,14 @@ import (
 // codeUnhandledHandlerError is the code an unclassified handler failure
 // surfaces as — the binding's job to classify, mirroring client-go.
 const codeUnhandledHandlerError = "UNHANDLED_HANDLER_ERROR"
+
+// codeAnyDecodeFailed is the code AnyDecodeError carries.
+const codeAnyDecodeFailed = "ANY_DECODE_FAILED"
+
+// frameworkAnyPrefix is the framework's Any type-URL convention: a bare "/"
+// followed by the fully-qualified message name (NOT the type.googleapis.com
+// prefix anypb.New defaults to). The core keys event/command dispatch on it.
+const frameworkAnyPrefix = "/"
 
 // errorInfoDomain is the reverse-DNS error domain on every ErrorInfo the
 // boundary emits (distinct from the io.angzarr proto package).
@@ -56,6 +65,33 @@ func (e *CodedError) Error() string {
 // a command handler returns to reject the command with a coded reason.
 func Reject(code, message string) *CodedError {
 	return &CodedError{Code: code, Message: message, Grpc: GrpcInvalidArgument}
+}
+
+// AnyDecodeError reports that a google.protobuf.Any payload failed to
+// unmarshal to its expected type. Generated dispatch thunks return it when a
+// command or event Any cannot be decoded — a malformed payload is an invalid
+// argument, not a handler bug.
+func AnyDecodeError(typeURL string, cause error) *CodedError {
+	return &CodedError{
+		Code:    codeAnyDecodeFailed,
+		Message: fmt.Sprintf("decode Any %q: %v", typeURL, cause),
+		Grpc:    GrpcInvalidArgument,
+		Extras:  map[string]string{"type_url": typeURL},
+	}
+}
+
+// Pack wraps a message in a google.protobuf.Any using the framework's bare-"/"
+// type-URL convention. Generated typed-emit wiring uses it to build an
+// EventBook from the typed events a command handler returns.
+func Pack(msg proto.Message) (*anypb.Any, error) {
+	value, err := proto.Marshal(msg)
+	if err != nil {
+		return nil, err
+	}
+	return &anypb.Any{
+		TypeUrl: frameworkAnyPrefix + string(msg.ProtoReflect().Descriptor().FullName()),
+		Value:   value,
+	}, nil
 }
 
 // CommandContext is the historical-state evidence a handler sees. Host
