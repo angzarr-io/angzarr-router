@@ -1,6 +1,6 @@
 //go:build ffirouter
 
-package ffirouter
+package conformance
 
 import (
 	"context"
@@ -12,7 +12,9 @@ import (
 	"github.com/cucumber/godog"
 	"google.golang.org/protobuf/proto"
 
+	. "github.com/angzarr-io/angzarr-router/bindings/go"
 	pb "github.com/angzarr-io/angzarr-router/bindings/go/gen/io/angzarr/v1"
+	counter "github.com/angzarr-io/angzarr-router/bindings/go/gen/test/counter"
 )
 
 // TestConformance runs the shared cross-language behavior suite — the same
@@ -25,7 +27,7 @@ func TestConformance(t *testing.T) {
 			Format: "pretty",
 			// counter.feature only for now; projector.feature lands here when
 			// the Go ProjectorDispatch binding + its steps are wired (S1).
-			Paths:    []string{"../../conformance/features/counter.feature"},
+			Paths:    []string{"../../../conformance/features/counter.feature"},
 			TestingT: t,
 			Strict:   true,
 		},
@@ -54,7 +56,7 @@ func (w *counterWorld) reset() {
 	w.prior = nil
 	w.resp = nil
 	w.err = nil
-	if err := RegisterAggregate(w.router, counterAggregate(w.observed)); err != nil {
+	if err := counter.RegisterCounterAggregate(w.router, counterAggregate{w.observed}); err != nil {
 		panic(fmt.Sprintf("register fixture: %v", err))
 	}
 }

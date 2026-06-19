@@ -8,8 +8,9 @@ GIL acquisition."""
 import threading
 
 from .. import Router
+from ..gen.test.counter import counter_angzarr
 from . import builders
-from .fixture import counter_aggregate
+from .fixture import CounterAggregate
 
 _THREADS = 8
 _ITERATIONS = 50
@@ -17,7 +18,7 @@ _ITERATIONS = 50
 
 def test_concurrent_dispatches_isolate_sessions():
     router = Router()
-    router.register_aggregate(counter_aggregate())
+    counter_angzarr.register_counter_aggregate(router, CounterAggregate())
     errors: list[Exception] = []
 
     def worker(prior_n: int) -> None:

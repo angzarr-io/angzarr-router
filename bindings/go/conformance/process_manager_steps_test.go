@@ -1,6 +1,6 @@
 //go:build ffirouter
 
-package ffirouter
+package conformance
 
 import (
 	"context"
@@ -11,7 +11,9 @@ import (
 	"github.com/cucumber/godog"
 	"google.golang.org/protobuf/types/known/anypb"
 
+	. "github.com/angzarr-io/angzarr-router/bindings/go"
 	pb "github.com/angzarr-io/angzarr-router/bindings/go/gen/io/angzarr/v1"
+	counter "github.com/angzarr-io/angzarr-router/bindings/go/gen/test/counter"
 )
 
 // TestProcessManagerConformance runs the shared process_manager.feature
@@ -22,7 +24,7 @@ func TestProcessManagerConformance(t *testing.T) {
 		ScenarioInitializer: initializeProcessManagerScenario,
 		Options: &godog.Options{
 			Format:   "pretty",
-			Paths:    []string{"../../conformance/features/process_manager.feature"},
+			Paths:    []string{"../../../conformance/features/process_manager.feature"},
 			TestingT: t,
 			Strict:   true,
 		},
@@ -30,50 +32,6 @@ func TestProcessManagerConformance(t *testing.T) {
 	if suite.Run() != 0 {
 		t.Fatal("process-manager conformance scenarios failed")
 	}
-}
-
-// pmState is the PM's own event-sourced state — it never crosses the FFI; the
-// harness reads reactions out of the response.
-type pmState struct{ count uint32 }
-
-// orderPM is the OrderProcessManager fixture in Go (the process_manager.feature
-// behavior): over the "counter" domain it reacts to the newest Increased
-// trigger by emitting one Reserve command for "inventory" (stamped from the
-// destination sequence when present) plus one fact per prior state event, and
-// compensates a rejected Reserve with a process event and an escalation.
-func orderPM() *ProcessManagerDispatch[*pmState] {
-	rb := NewRebuilder(func() *pmState { return &pmState{} }).
-		Apply(fqIncreased, func(s *pmState, _ *anypb.Any) error {
-			s.count++
-			return nil
-		})
-	return NewProcessManagerDispatch("order-pm", "order-pm", rb).
-		OnEvent("counter", fqIncreased, func(_ *anypb.Any, s *pmState, dests *Destinations) (*pb.ProcessManagerHandleResponse, error) {
-			cmd := &pb.CommandBook{
-				Cover: &pb.Cover{Domain: "inventory"},
-				Pages: []*pb.CommandPage{{Payload: &pb.CommandPage_Command{
-					Command: &anypb.Any{TypeUrl: typeURL(fqReserve)},
-				}}},
-			}
-			if dests.Has("inventory") {
-				if err := dests.StampCommand(cmd, "inventory"); err != nil {
-					return nil, err
-				}
-			}
-			facts := make([]*pb.EventBook, s.count)
-			for i := range facts {
-				facts[i] = &pb.EventBook{Pages: []*pb.EventPage{{}}}
-			}
-			return &pb.ProcessManagerHandleResponse{
-				Commands: []*pb.CommandBook{cmd},
-				Facts:    facts,
-			}, nil
-		}).
-		OnRejected(fqReserve, func(_ *pb.Notification, _ *pb.RejectionNotification, _ *pmState) ([]*pb.EventBook, *pb.Notification, error) {
-			return []*pb.EventBook{{Pages: []*pb.EventPage{{}}}},
-				&pb.Notification{Cover: &pb.Cover{Domain: "escalated"}},
-				nil
-		})
 }
 
 type pmWorld struct {
@@ -89,7 +47,7 @@ func (w *pmWorld) reset() {
 	w.router = NewRouter()
 	w.resp = nil
 	w.err = nil
-	if err := RegisterProcessManager(w.router, orderPM()); err != nil {
+	if err := counter.RegisterOrderProcessManager(w.router, orderPM{}); err != nil {
 		panic(fmt.Sprintf("register PM fixture: %v", err))
 	}
 }

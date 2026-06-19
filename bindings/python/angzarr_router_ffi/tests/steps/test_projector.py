@@ -10,8 +10,9 @@ from pytest_bdd import given, parsers, scenarios, then, when
 
 from ... import CodedError, Router
 from ...gen.io.angzarr.v1 import types_pb2
+from ...gen.test.counter import counter_angzarr
 from ..builders import FQ_INCREASED, type_url
-from ..fixture import counter_projector
+from ..fixture import CounterProjector
 
 scenarios("projector.feature")
 
@@ -22,7 +23,7 @@ class _World:
 
     def __init__(self):
         self.router = Router()
-        self.router.register_projector(counter_projector())
+        counter_angzarr.register_counter_projector(self.router, CounterProjector())
         self.proj = None
         self.err: CodedError | None = None
 

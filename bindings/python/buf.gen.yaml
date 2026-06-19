@@ -42,3 +42,4 @@ plugins:
   # (`angzarr scaffold python`) is an end-user command, not run here.
   - local: ["angzarr", "codegen", "python"]
     out: bindings/python/angzarr_router_ffi/gen
+    opt: paths=source_relative

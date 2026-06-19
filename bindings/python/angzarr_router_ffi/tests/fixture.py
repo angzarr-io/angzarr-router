@@ -1,34 +1,21 @@
-"""The CounterAggregate conformance fixture (FIXTURE.md) in Python — the same
-behavior the Rust core and Go binding implement. ``observed``, when supplied,
-records the CommandContext and rebuilt count each command handler saw (the
-historical-state evidence the suite asserts, since state never crosses the
-boundary)."""
+"""The conformance fixtures in Python, implementing the angzarr-generated
+Handler protocols (gen/test/counter/counter_angzarr.py). Same behavior the Rust
+core and Go binding implement; the dispatch wiring is now generated, so these
+are the proof the generated Python seam is faithful. Registered via the
+generated register_* helpers in each scenario's world.
+
+``observed``, when supplied, records the CommandContext and rebuilt count each
+command handler saw — the historical-state evidence the suite asserts, since
+state never crosses the boundary."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from google.protobuf import any_pb2
-
-from .. import (
-    AggregateDispatch,
-    CommandContext,
-    Destinations,
-    ProcessManagerDispatch,
-    ProjectorDispatch,
-    Rebuilder,
-    SagaDispatch,
-    reject,
-)
+from .. import CommandContext, reject
 from ..gen.io.angzarr.v1 import command_handler_pb2, process_manager_pb2, types_pb2
 from ..gen.test.counter import counter_pb2
-from .builders import (
-    FQ_FAIL_HARD,
-    FQ_INCREASE_BY,
-    FQ_INCREASED,
-    FQ_RESERVE,
-    type_url,
-)
+from .builders import FQ_RESERVE, type_url
 
 
 @dataclass
@@ -40,160 +27,82 @@ class Observation:
     count: int
 
 
-class _Counter:
-    """The host state — it never crosses the FFI."""
-
-    __slots__ = ("count",)
-
-    def __init__(self):
-        self.count = 0
+# --- CounterAggregate ---
 
 
-def _increased_any() -> any_pb2.Any:
-    """A single Increased event payload, Any-wrapped with the framework's
-    bare-"/" type URL (not the type.googleapis.com Any default)."""
-    return any_pb2.Any(
-        type_url=type_url(FQ_INCREASED), value=counter_pb2.Increased().SerializeToString()
-    )
+class CounterAggregate:
+    """Implements counter_angzarr.CounterAggregateHandler. The rebuilder
+    (generated) folds Increased via apply_increased and seeds snapshots
+    generically; the typed-emit handler returns Increased events the wiring
+    packs into the EventBook."""
 
+    def __init__(self, observed: list[Observation] | None = None):
+        self.observed = observed
 
-def _marker_response(name: str):
-    """A compensation response carrying one marker event whose type name
-    records which compensator ran (the suite asserts on the type URL)."""
-    resp = command_handler_pb2.BusinessResponse()
-    page = resp.events.pages.add()
-    page.event.type_url = type_url("test.counter." + name)
-    return resp
-
-
-def counter_aggregate(observed: list[Observation] | None = None) -> AggregateDispatch:
-    def apply_increased(state: _Counter, payload: any_pb2.Any) -> None:
-        ev = counter_pb2.Increased()
-        ev.ParseFromString(payload.value)
-        state.count += 1
-
-    def load_snapshot(state: _Counter, payload: any_pb2.Any) -> None:
-        snap = counter_pb2.CounterState()
-        snap.ParseFromString(payload.value)
-        state.count = snap.count
-
-    rebuilder = (
-        Rebuilder(_Counter).apply(FQ_INCREASED, apply_increased).with_snapshot(load_snapshot)
-    )
-
-    def on_increase(cmd: any_pb2.Any, state: _Counter, cctx: CommandContext):
-        if observed is not None:
-            observed.append(Observation(cctx=cctx, count=state.count))
-        c = counter_pb2.IncreaseBy()
-        c.ParseFromString(cmd.value)
-        if c.n == 0:
+    def increase_by(self, cmd, state, cctx: CommandContext):
+        if self.observed is not None:
+            self.observed.append(Observation(cctx=cctx, count=state.count))
+        if cmd.n == 0:
             raise reject("VALUE_NOT_POSITIVE", "increase amount must be positive")
-        book = types_pb2.EventBook()
-        for _ in range(c.n):
-            book.pages.add().event.CopyFrom(_increased_any())
-        return book
+        return [counter_pb2.Increased() for _ in range(cmd.n)]
 
-    def on_fail_hard(_cmd, _state, _cctx):
+    def fail_hard(self, cmd, state, cctx: CommandContext):
         raise RuntimeError("hard failure")
 
-    def on_reserve_first(_n, _rej, _state, _cctx):
-        return _marker_response("CompensatedFirst")
-
-    def on_reserve_second(_n, _rej, _state, _cctx):
-        return _marker_response("CompensatedSecond")
-
-    return (
-        AggregateDispatch("counter-aggregate", "counter", rebuilder)
-        .on_command(FQ_INCREASE_BY, on_increase)
-        .on_command(FQ_FAIL_HARD, on_fail_hard)
-        .on_rejected(FQ_RESERVE, on_reserve_first)
-        .on_rejected(FQ_RESERVE, on_reserve_second)
-    )
-
-
-class _Projection:
-    """The host projection state — it never crosses the FFI; the harness reads
-    the fold count back off the finished Projection."""
-
-    __slots__ = ("count",)
-
-    def __init__(self):
-        self.count = 0
-
-
-def counter_projector() -> ProjectorDispatch:
-    """The CounterProjector conformance fixture (projector.feature) in Python:
-    over the "counter" domain it folds each Increased into a count, then
-    finishes into a Projection carrying that count as its sequence."""
-
-    def fold_increased(state: _Projection, _event: any_pb2.Any) -> None:
+    def apply_increased(self, state, event) -> None:
         state.count += 1
 
-    def finish(state: _Projection, events) -> object:
-        proj = types_pb2.Projection()
-        if events.HasField("cover"):
-            proj.cover.CopyFrom(events.cover)
-        proj.projector = "counter-projector"
-        proj.sequence = state.count
-        return proj
-
-    return (
-        ProjectorDispatch("counter-projector", _Projection)
-        .for_domains("counter")
-        .on_event(FQ_INCREASED, fold_increased)
-        .finish(finish)
-    )
+    def on_reserve_rejected(self, notification, rejection, state, cctx: CommandContext):
+        # Within-component fan-out collapses to one compensator (subscriber =
+        # component): append both ordered markers in one response.
+        resp = command_handler_pb2.BusinessResponse()
+        for name in ("CompensatedFirst", "CompensatedSecond"):
+            resp.events.pages.add().event.type_url = type_url("test.counter." + name)
+        return resp
 
 
-def order_saga() -> SagaDispatch:
-    """The OrderSaga conformance fixture (saga.feature) in Python: it
-    translates each Increased source event into one Reserve command for
-    "inventory" (stamped from the destination sequence when present), and
-    compensates a rejected Reserve by injecting one fact event."""
+# --- OrderSaga ---
 
-    def on_increased(_event: any_pb2.Any, dests: Destinations):
-        cmd = types_pb2.CommandBook()
-        cmd.cover.domain = "inventory"
-        cmd.pages.add().command.type_url = type_url(FQ_RESERVE)
+
+class OrderSaga:
+    """Implements counter_angzarr.OrderSagaHandler."""
+
+    def increased(self, event, dests):
+        cmd = _reserve_command()
         if dests.has("inventory"):
             dests.stamp_command(cmd, "inventory")
         return [cmd], []
 
-    def on_reserve_rejected(_notification, _rejection):
-        event = types_pb2.EventBook()
-        event.pages.add()
-        return [event]
-
-    return (
-        SagaDispatch("order-saga", "order", ["inventory"])
-        .on_event(FQ_INCREASED, on_increased)
-        .on_rejected(FQ_RESERVE, on_reserve_rejected)
-    )
+    def on_reserve_rejected(self, notification, rejection):
+        return [_one_fact()]
 
 
-class _ProcessManagerState:
-    """The PM's own event-sourced state — never crosses the FFI."""
-
-    __slots__ = ("count",)
-
-    def __init__(self):
-        self.count = 0
+# --- CounterProjector ---
 
 
-def order_pm() -> ProcessManagerDispatch:
-    """The OrderProcessManager conformance fixture (process_manager.feature) in
-    Python: over the "counter" domain it reacts to the newest Increased trigger
-    by emitting one Reserve command for "inventory" (stamped from the
-    destination sequence when present) plus one fact per prior state event, and
-    compensates a rejected Reserve with a process event and an escalation."""
+class CounterProjector:
+    """Implements counter_angzarr.CounterProjectorHandler."""
 
-    def apply_increased(state: _ProcessManagerState, _event: any_pb2.Any) -> None:
-        state.count += 1
+    def increased(self, projection, event) -> None:
+        projection.count += 1
 
-    def on_increased(_event, state: _ProcessManagerState, dests: Destinations):
-        cmd = types_pb2.CommandBook()
-        cmd.cover.domain = "inventory"
-        cmd.pages.add().command.type_url = type_url(FQ_RESERVE)
+    def finish(self, projection, events):
+        proj = types_pb2.Projection()
+        if events.HasField("cover"):
+            proj.cover.CopyFrom(events.cover)
+        proj.projector = "counter-projector"
+        proj.sequence = projection.count
+        return proj
+
+
+# --- OrderProcessManager ---
+
+
+class OrderProcessManager:
+    """Implements counter_angzarr.OrderProcessManagerHandler."""
+
+    def increased(self, event, state, dests):
+        cmd = _reserve_command()
         if dests.has("inventory"):
             dests.stamp_command(cmd, "inventory")
         resp = process_manager_pb2.ProcessManagerHandleResponse()
@@ -202,16 +111,23 @@ def order_pm() -> ProcessManagerDispatch:
             resp.facts.add().pages.add()
         return resp
 
-    def on_reserve_rejected(_notification, _rejection, _state):
-        event = types_pb2.EventBook()
-        event.pages.add()
+    def apply_increased(self, state, event) -> None:
+        state.count += 1
+
+    def on_reserve_rejected(self, notification, rejection, state):
         escalation = types_pb2.Notification()
         escalation.cover.domain = "escalated"
-        return [event], escalation
+        return [_one_fact()], escalation
 
-    rebuilder = Rebuilder(_ProcessManagerState).apply("test.counter.Increased", apply_increased)
-    return (
-        ProcessManagerDispatch("order-pm", "order-pm", rebuilder)
-        .on_event("counter", FQ_INCREASED, on_increased)
-        .on_rejected(FQ_RESERVE, on_reserve_rejected)
-    )
+
+def _reserve_command():
+    cmd = types_pb2.CommandBook()
+    cmd.cover.domain = "inventory"
+    cmd.pages.add().command.type_url = type_url(FQ_RESERVE)
+    return cmd
+
+
+def _one_fact():
+    event = types_pb2.EventBook()
+    event.pages.add()
+    return event

@@ -11,8 +11,9 @@ from pytest_bdd import given, parsers, scenarios, then, when
 
 from ... import CodedError, Router
 from ...gen.io.angzarr.v1 import process_manager_pb2, types_pb2
+from ...gen.test.counter import counter_angzarr
 from ..builders import FQ_INCREASED, FQ_RESERVE, type_url
-from ..fixture import order_pm
+from ..fixture import OrderProcessManager
 
 scenarios("process_manager.feature")
 
@@ -23,7 +24,7 @@ class _World:
 
     def __init__(self):
         self.router = Router()
-        self.router.register_process_manager(order_pm())
+        counter_angzarr.register_order_process_manager(self.router, OrderProcessManager())
         self.resp = None
         self.err: CodedError | None = None
 

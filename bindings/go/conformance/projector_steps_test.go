@@ -1,6 +1,6 @@
 //go:build ffirouter
 
-package ffirouter
+package conformance
 
 import (
 	"context"
@@ -9,9 +9,10 @@ import (
 	"testing"
 
 	"github.com/cucumber/godog"
-	"google.golang.org/protobuf/types/known/anypb"
 
+	. "github.com/angzarr-io/angzarr-router/bindings/go"
 	pb "github.com/angzarr-io/angzarr-router/bindings/go/gen/io/angzarr/v1"
+	counter "github.com/angzarr-io/angzarr-router/bindings/go/gen/test/counter"
 )
 
 // TestProjectorConformance runs the shared projector.feature behavior suite
@@ -22,7 +23,7 @@ func TestProjectorConformance(t *testing.T) {
 		ScenarioInitializer: initializeProjectorScenario,
 		Options: &godog.Options{
 			Format:   "pretty",
-			Paths:    []string{"../../conformance/features/projector.feature"},
+			Paths:    []string{"../../../conformance/features/projector.feature"},
 			TestingT: t,
 			Strict:   true,
 		},
@@ -30,29 +31,6 @@ func TestProjectorConformance(t *testing.T) {
 	if suite.Run() != 0 {
 		t.Fatal("projector conformance scenarios failed")
 	}
-}
-
-// projectionState is the host state the CounterProjector folds into — it
-// never crosses the FFI; the harness reads the count back off the Projection.
-type projectionState struct{ count uint32 }
-
-// counterProjector is the CounterProjector fixture (the projector.feature
-// behavior) in Go: over the "counter" domain it folds each Increased into a
-// count and finishes into a Projection carrying that count as its sequence.
-func counterProjector() *ProjectorDispatch[*projectionState] {
-	return NewProjectorDispatch("counter-projector", func() *projectionState { return &projectionState{} }).
-		ForDomains("counter").
-		OnEvent(fqIncreased, func(s *projectionState, _ *anypb.Any) error {
-			s.count++
-			return nil
-		}).
-		Finish(func(s *projectionState, events *pb.EventBook) (*pb.Projection, error) {
-			return &pb.Projection{
-				Cover:     events.Cover,
-				Projector: "counter-projector",
-				Sequence:  s.count,
-			}, nil
-		})
 }
 
 // projectorWorld holds one scenario's state: a router with the projector
@@ -70,7 +48,7 @@ func (w *projectorWorld) reset() {
 	w.router = NewRouter()
 	w.proj = nil
 	w.err = nil
-	if err := RegisterProjector(w.router, counterProjector()); err != nil {
+	if err := counter.RegisterCounterProjector(w.router, counterProjector{}); err != nil {
 		panic(fmt.Sprintf("register projector fixture: %v", err))
 	}
 }

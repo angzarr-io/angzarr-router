@@ -1,6 +1,6 @@
 //go:build ffirouter
 
-package ffirouter
+package conformance
 
 import (
 	"context"
@@ -11,7 +11,9 @@ import (
 	"github.com/cucumber/godog"
 	"google.golang.org/protobuf/types/known/anypb"
 
+	. "github.com/angzarr-io/angzarr-router/bindings/go"
 	pb "github.com/angzarr-io/angzarr-router/bindings/go/gen/io/angzarr/v1"
+	counter "github.com/angzarr-io/angzarr-router/bindings/go/gen/test/counter"
 )
 
 // TestSagaConformance runs the shared saga.feature behavior suite against the
@@ -22,7 +24,7 @@ func TestSagaConformance(t *testing.T) {
 		ScenarioInitializer: initializeSagaScenario,
 		Options: &godog.Options{
 			Format:   "pretty",
-			Paths:    []string{"../../conformance/features/saga.feature"},
+			Paths:    []string{"../../../conformance/features/saga.feature"},
 			TestingT: t,
 			Strict:   true,
 		},
@@ -30,31 +32,6 @@ func TestSagaConformance(t *testing.T) {
 	if suite.Run() != 0 {
 		t.Fatal("saga conformance scenarios failed")
 	}
-}
-
-// orderSaga is the OrderSaga fixture in Go (the saga.feature behavior): it
-// translates each Increased source event into one Reserve command for
-// "inventory" (stamped from the destination sequence when present), and
-// compensates a rejected Reserve by injecting one fact event.
-func orderSaga() *SagaDispatch {
-	return NewSagaDispatch("order-saga", "order", "inventory").
-		OnEvent(fqIncreased, func(_ *anypb.Any, dests *Destinations) ([]*pb.CommandBook, []*pb.EventBook, error) {
-			cmd := &pb.CommandBook{
-				Cover: &pb.Cover{Domain: "inventory"},
-				Pages: []*pb.CommandPage{{Payload: &pb.CommandPage_Command{
-					Command: &anypb.Any{TypeUrl: typeURL(fqReserve)},
-				}}},
-			}
-			if dests.Has("inventory") {
-				if err := dests.StampCommand(cmd, "inventory"); err != nil {
-					return nil, nil, err
-				}
-			}
-			return []*pb.CommandBook{cmd}, nil, nil
-		}).
-		OnRejected(fqReserve, func(_ *pb.Notification, _ *pb.RejectionNotification) ([]*pb.EventBook, error) {
-			return []*pb.EventBook{{Pages: []*pb.EventPage{{}}}}, nil
-		})
 }
 
 // sagaWorld holds one scenario's state: a router with the saga fixture
@@ -72,7 +49,7 @@ func (w *sagaWorld) reset() {
 	w.router = NewRouter()
 	w.resp = nil
 	w.err = nil
-	if err := w.router.RegisterSaga(orderSaga()); err != nil {
+	if err := counter.RegisterOrderSaga(w.router, orderSaga{}); err != nil {
 		panic(fmt.Sprintf("register saga fixture: %v", err))
 	}
 }

@@ -1,10 +1,13 @@
 //go:build ffirouter
 
-package ffirouter
+package conformance
 
 import (
 	"errors"
 	"testing"
+
+	. "github.com/angzarr-io/angzarr-router/bindings/go"
+	counter "github.com/angzarr-io/angzarr-router/bindings/go/gen/test/counter"
 )
 
 // TestPropertySweep exercises the core's sequence stamping and rejection
@@ -18,7 +21,7 @@ import (
 func TestPropertySweep(t *testing.T) {
 	r := NewRouter()
 	defer r.Close()
-	if err := RegisterAggregate(r, counterAggregate(nil)); err != nil {
+	if err := counter.RegisterCounterAggregate(r, counterAggregate{nil}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 

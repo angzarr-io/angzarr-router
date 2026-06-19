@@ -1,10 +1,13 @@
 //go:build ffirouter
 
-package ffirouter
+package conformance
 
 import (
 	"errors"
 	"testing"
+
+	. "github.com/angzarr-io/angzarr-router/bindings/go"
+	counter "github.com/angzarr-io/angzarr-router/bindings/go/gen/test/counter"
 )
 
 // newCounterRouter registers the CounterAggregate fixture and returns the
@@ -14,7 +17,7 @@ func newCounterRouter(t *testing.T) (*Router, *[]observation) {
 	r := NewRouter()
 	t.Cleanup(r.Close)
 	observed := &[]observation{}
-	if err := RegisterAggregate(r, counterAggregate(observed)); err != nil {
+	if err := counter.RegisterCounterAggregate(r, counterAggregate{observed}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	return r, observed
@@ -63,7 +66,7 @@ func TestDispatch_FailHardIsUnhandled(t *testing.T) {
 	r, _ := newCounterRouter(t)
 	_, derr := r.Dispatch(failHardCommand())
 	var ce *CodedError
-	if !errors.As(derr, &ce) || ce.Code != codeUnhandledHandlerError {
+	if !errors.As(derr, &ce) || ce.Code != "UNHANDLED_HANDLER_ERROR" {
 		t.Fatalf("err = %v, want UNHANDLED_HANDLER_ERROR", derr)
 	}
 }

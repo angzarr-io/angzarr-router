@@ -1,6 +1,6 @@
 //go:build ffirouter
 
-package ffirouter
+package conformance
 
 import (
 	"fmt"
@@ -18,7 +18,7 @@ import (
 // the Rust harness parses. Every builder PARSES the skeleton first, then
 // sets the scenario's data BY FIELD on the structured message — the
 // textproto is never string-templated or altered before parsing.
-const fixturesDir = "../../conformance/fixtures"
+const fixturesDir = "../../../conformance/fixtures"
 
 // The framework's canonical type-URL prefix is a bare "/" (router
 // TYPE_URL_PREFIX); angzarr-produced URLs take that form, not the

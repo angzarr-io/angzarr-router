@@ -6,7 +6,8 @@ from __future__ import annotations
 import pytest
 
 from .. import Router
-from .fixture import Observation, counter_aggregate
+from ..gen.test.counter import counter_angzarr
+from .fixture import CounterAggregate, Observation
 
 
 @pytest.fixture
@@ -20,6 +21,6 @@ def router(observed: list[Observation]):
     """A router with the CounterAggregate fixture registered. Closed after
     each test."""
     r = Router()
-    r.register_aggregate(counter_aggregate(observed))
+    counter_angzarr.register_counter_aggregate(r, CounterAggregate(observed))
     yield r
     r.close()
