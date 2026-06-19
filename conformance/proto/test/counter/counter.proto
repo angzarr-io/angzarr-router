@@ -3,59 +3,124 @@ syntax = "proto3";
 package test.counter;
 
 import "io/angzarr/v1/options.proto";
-import "io/angzarr/v1/types.proto";
-import "io/angzarr/v1/command_handler.proto";
 
-// Conformance fixture: the smallest aggregate that exercises every
-// load-bearing dispatch mechanism (per-page appliers, a handler with
-// framework context in and a book out, host state that never crosses,
-// ordered rejection fan-out, the coded-error path).
+// Conformance fixtures, declared as message annotations (unit 6 codegen input):
+// the generated clients must pass the SAME behavior suite as the hand-written
+// harness. Four components are declared here over one event so the
+// multi-consumer model is exercised hard — Increased folds into the aggregate,
+// folds the projector, folds the process manager's own state, AND triggers the
+// saga and the process manager.
 //
-// Declared as an (io.angzarr.v1.component) so this file is ALSO the
-// codegen input for unit 6: the generated client must pass the same
-// behavior suite as the hand-written harness.
+// CounterAggregate is the smallest aggregate exercising every load-bearing
+// dispatch mechanism (per-page appliers, a handler with framework context in
+// and a book out, host state that never crosses, the coded-error path,
+// compensation). OrderSaga, CounterProjector, and OrderProcessManager add the
+// remaining three kinds. Behaviour is described once in features/ and run
+// against every implementation.
 
 // --- event ---
-message Increased {}
+
+// Increased folds into the aggregate (count += 1), folds the projector and the
+// process manager's own state, and triggers the saga and the process manager.
+// One (event) entry per consuming component (multiple subscribers are modelled
+// as multiple components).
+message Increased {
+  option (io.angzarr.v1.event) = {component: "test.counter.CounterState"};
+  option (io.angzarr.v1.event) = {
+    component: "test.counter.OrderSaga"
+    domain: "order"
+  };
+  option (io.angzarr.v1.event) = {
+    component: "test.counter.CounterProjectorState"
+    domain: "counter"
+  };
+  option (io.angzarr.v1.event) = {
+    component: "test.counter.OrderProcessManagerState"
+    applies: true
+  };
+  option (io.angzarr.v1.event) = {
+    component: "test.counter.OrderProcessManagerState"
+    domain: "counter"
+  };
+}
 
 // --- commands ---
+
+// IncreaseBy emits n Increased events when n > 0; n == 0 rejects with
+// VALUE_NOT_POSITIVE (the typed-emit path).
 message IncreaseBy {
+  option (io.angzarr.v1.command) = {
+    component: "test.counter.CounterState"
+    emits: "test.counter.Increased"
+  };
   uint32 n = 1;
 }
-message FailHard {}
-message Reserve {}
 
-// --- state ---
-message CounterState {
-  uint32 count = 1;
+// FailHard returns a plain (unclassified) error -> UNHANDLED_HANDLER_ERROR. It
+// declares no emits, so the generated handler returns the raw EventBook escape
+// hatch.
+message FailHard {
+  option (io.angzarr.v1.command) = {component: "test.counter.CounterState"};
 }
 
-// CounterAggregate (domain "counter", state = CounterState.count).
-service CounterAggregate {
+// Reserve is never handled; it exists only as the command whose rejection the
+// components compensate (referenced by ComponentOptions.compensates).
+message Reserve {}
+
+// --- aggregate ---
+
+// CounterAggregate (domain "counter"). Its single compensator for a rejected
+// Reserve appends both markers in one response — within-component fan-out is
+// modelled as one handler, since multiple subscribers are multiple components.
+message CounterState {
   option (io.angzarr.v1.component) = {
     kind: COMPONENT_KIND_AGGREGATE
     input_domain: "counter"
-    state: "test.counter.CounterState"
+    name: "CounterAggregate"
+    compensates: "test.counter.Reserve"
   };
+  uint32 count = 1;
+}
 
-  // n > 0 → emits n Increased events; n == 0 → rejection VALUE_NOT_POSITIVE.
-  rpc HandleIncreaseBy(IncreaseBy) returns (io.angzarr.v1.EventBook);
-  // Returns a plain (unclassified) error → UNHANDLED_HANDLER_ERROR.
-  rpc HandleFailHard(FailHard) returns (io.angzarr.v1.EventBook);
+// --- saga ---
 
-  // Applier: each Increased folds into state (count += 1).
-  rpc ApplyIncreased(Increased) returns (CounterState) {
-    option (io.angzarr.v1.applies) = true;
-  }
+// OrderSaga translates each Increased source event into one Reserve command for
+// "inventory" and compensates a rejected Reserve by injecting one fact event. A
+// stateless saga has no state message, so it is declared on this marker.
+message OrderSaga {
+  option (io.angzarr.v1.component) = {
+    kind: COMPONENT_KIND_SAGA
+    input_domain: "order"
+    output_domain: "inventory"
+    compensates: "test.counter.Reserve"
+  };
+}
 
-  // Two compensators for the SAME rejected command → ordered fan-out:
-  // both run, in declaration order, and their events merge.
-  rpc OnReserveRejectedFirst(io.angzarr.v1.RejectionNotification)
-      returns (io.angzarr.v1.BusinessResponse) {
-    option (io.angzarr.v1.rejected) = { command: "test.counter.Reserve" };
-  }
-  rpc OnReserveRejectedSecond(io.angzarr.v1.RejectionNotification)
-      returns (io.angzarr.v1.BusinessResponse) {
-    option (io.angzarr.v1.rejected) = { command: "test.counter.Reserve" };
-  }
+// --- projector ---
+
+// CounterProjector folds each Increased over the "counter" domain into a count
+// and finishes into a Projection carrying that count.
+message CounterProjectorState {
+  option (io.angzarr.v1.component) = {
+    kind: COMPONENT_KIND_PROJECTOR
+    input_domain: "counter"
+    name: "CounterProjector"
+  };
+  uint32 count = 1;
+}
+
+// --- process manager ---
+
+// OrderProcessManager folds Increased into its own state (applies) AND reacts to
+// the newest Increased trigger from "counter" by emitting a Reserve command for
+// "inventory" plus one fact per prior state event, compensating a rejected
+// Reserve with a process event and an escalation.
+message OrderProcessManagerState {
+  option (io.angzarr.v1.component) = {
+    kind: COMPONENT_KIND_PROCESS_MANAGER
+    output_domain: "order-pm"
+    name: "OrderProcessManager"
+    compensates: "test.counter.Reserve"
+  };
+  uint32 count = 1;
 }

@@ -18,8 +18,27 @@
 # predates the io.angzarr rename.) scripts/fixup_gen_imports.py rewrites
 # those path imports to the `angzarr_router_ffi.gen.` package prefix after
 # generation; that step is part of `py-binding-gen` and the generated tree
-# is committed.
+# is committed. The angzarr wiring (*_angzarr.py) imports message modules the
+# same path way, so fixup_gen_imports.py reroots it too.
+#
+# Managed mode is enabled only to satisfy the angzarr plugin: it speaks the
+# protoc-gen-go-style contract (protogen), which requires a go_package on every
+# request file even when emitting Python. The value is irrelevant to the Python
+# output — the protocolbuffers/python plugin ignores go_package.
 version: v2
+managed:
+  enabled: true
+  disable:
+    - file_option: go_package
+      path: google
+  override:
+    - file_option: go_package_prefix
+      value: github.com/angzarr-io/angzarr-router/bindings/go/gen
 plugins:
   - remote: buf.build/protocolbuffers/python:v35.1
+    out: bindings/python/angzarr_router_ffi/gen
+  # angzarr dispatch wiring for declared components. Baked into the python image
+  # (build/images/python) and invoked as a local plugin. The scaffold
+  # (`angzarr scaffold python`) is an end-user command, not run here.
+  - local: ["angzarr", "codegen", "python"]
     out: bindings/python/angzarr_router_ffi/gen

@@ -23,3 +23,10 @@ plugins:
   - local: protoc-gen-go
     out: bindings/go/gen
     opt: paths=source_relative
+  # angzarr dispatch wiring for declared components (test.counter). Baked into
+  # the go image (build/images/go) and invoked as a local plugin. The scaffold
+  # (`angzarr scaffold go`) is an end-user command, not run here — the
+  # conformance fixtures hand-implement the generated Handler interfaces.
+  - local: ["angzarr", "codegen", "go"]
+    out: bindings/go/gen
+    opt: paths=source_relative

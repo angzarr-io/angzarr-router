@@ -38,7 +38,16 @@ _PATTERN = re.compile(
 
 def fixup(gen_dir: pathlib.Path) -> int:
     rewritten = 0
-    for path in sorted(gen_dir.rglob("*_pb2.py")) + sorted(gen_dir.rglob("*_pb2_grpc.py")):
+    # *_pb2.py / *_pb2_grpc.py: protoc-gen-python's own cross-file imports.
+    # *_angzarr.py: the angzarr codegen wiring, which imports framework types
+    # and message modules by the same proto-path form and so needs the same
+    # reroot (its `import angzarr_router_ffi as _az` is left untouched — it is
+    # not under a GEN_ROOT).
+    globs = ("*_pb2.py", "*_pb2_grpc.py", "*_angzarr.py")
+    paths: list[pathlib.Path] = []
+    for pattern in globs:
+        paths.extend(sorted(gen_dir.rglob(pattern)))
+    for path in paths:
         text = path.read_text()
         new = _PATTERN.sub(rf"\1 {PACKAGE_PREFIX}\2.", text)
         if new != text:
