@@ -162,3 +162,28 @@ csharp-binding-lint:
 # Auto-format the C# binding (csharpier; generated code excluded).
 csharp-binding-format:
     cd {{TOP}}/bindings/csharp && csharpier format .
+
+# --- C++ binding (bindings/cpp) ------------------------------------------
+# Run in the C++ image. The binding links the router-ffi staticlib (built in the
+# rust image, carried forward in target/debug). buf generates google/rpc (C++ has
+# no runtime package as Java/C# do) + the angzarr wiring; cmake builds against the
+# image's libprotobuf + Catch2. The conformance suite reads the shared features
+# from the canonical conformance/features (a compile definition).
+
+cpp-binding-gen:
+    cd {{TOP}} && buf generate --template bindings/cpp/buf.gen.yaml \
+        --exclude-path angzarr-project/proto/io/angzarr/examples
+
+cpp-binding-build: cpp-binding-gen
+    cmake -S {{TOP}}/bindings/cpp -B {{TOP}}/bindings/cpp/build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+    cmake --build {{TOP}}/bindings/cpp/build
+
+cpp-binding-test: cpp-binding-gen
+    cmake -S {{TOP}}/bindings/cpp -B {{TOP}}/bindings/cpp/build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+    cmake --build {{TOP}}/bindings/cpp/build
+    ctest --test-dir {{TOP}}/bindings/cpp/build --output-on-failure
+
+# Format check the C++ binding (clang-format; generated tree excluded).
+cpp-binding-lint:
+    cd {{TOP}}/bindings/cpp && clang-format --dry-run --Werror \
+        include/angzarr/router/*.h src/*.cpp conformance/*.h conformance/*.cpp

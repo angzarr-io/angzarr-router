@@ -1,0 +1,26 @@
+# C++ codegen for the binding's protos. Unlike Java/C# (which get google.rpc from
+# a runtime package), C++ has no such package, so google/rpc/* IS generated here;
+# only the well-known google/protobuf/* types are NOT (libprotobuf provides them,
+# and buf does not generate its built-in WKT imports). Generated tree is never
+# committed (regenerate on need).
+#
+# Managed mode sets a go_package prefix only to satisfy the angzarr plugin, which
+# speaks the protoc-gen-go (protogen) contract and requires a go_package on every
+# request file (test.counter declares none). C++ output is unaffected by it.
+version: v2
+managed:
+  enabled: true
+  override:
+    - file_option: go_package_prefix
+      value: github.com/angzarr-io/angzarr-router/bindings/cpp/gen
+plugins:
+  # Pinned to match the image's libprotobuf-dev (Debian bookworm = 3.21.12);
+  # protobuf C++ generated code is version-locked to the runtime.
+  - remote: buf.build/protocolbuffers/cpp:v21.12
+    out: bindings/cpp/gen
+  # angzarr dispatch wiring for declared components (test.counter). Baked into
+  # the base image and invoked as a local plugin. The conformance fixtures
+  # hand-implement the generated <Component>Handler interfaces.
+  - local: ["angzarr", "codegen", "cpp"]
+    out: bindings/cpp/gen
+    opt: paths=source_relative

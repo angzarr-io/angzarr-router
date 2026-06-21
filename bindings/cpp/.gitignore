@@ -1,0 +1,9 @@
+# Generated protobuf + angzarr wiring (regenerate via `just cpp-binding-gen`).
+gen/
+
+# Shared behavioral features, materialized into the conformance project at gen
+# time from the canonical conformance/features.
+conformance/features/
+
+# CMake build output.
+build/

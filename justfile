@@ -263,3 +263,20 @@ csharp-binding-lint: (_csharp_container "csharp-binding-lint")
 
 # Auto-format the C# binding (csharpier)
 csharp-binding-format: (_csharp_container "csharp-binding-format")
+
+# --- C++ binding (bindings/cpp) ------------------------------------------
+# Runs in the C++ image; the router-ffi STATICLIB is built in the rust image
+# (`build`) and carried forward via the shared target/ mount — linked directly
+# (no runtime .so). Generated protobuf + angzarr wiring is never committed.
+
+# Regenerate the C++ binding's protobuf types + angzarr wiring (buf)
+cpp-binding-gen: (_cpp_container "cpp-binding-gen")
+
+# Build the C++ binding (staticlib in the rust image, then cmake in the cpp image)
+cpp-binding-build: build (_cpp_container "cpp-binding-build")
+
+# Run the C++ binding's conformance suite (Catch2 feature-runner)
+cpp-binding-test: build (_cpp_container "cpp-binding-test")
+
+# Format check the C++ binding (clang-format)
+cpp-binding-lint: (_cpp_container "cpp-binding-lint")
