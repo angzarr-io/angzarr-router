@@ -1,0 +1,13 @@
+# Generated protobuf + angzarr wiring (regenerate via `just csharp-binding-gen`).
+gen/
+
+# Shared behavioral features, materialized into the conformance project at gen
+# time from the canonical conformance/features (Reqnroll generates from them).
+conformance/Features/
+
+# .NET build output.
+bin/
+obj/
+
+# Reqnroll local working state (analytics user id).
+conformance/Reqnroll/

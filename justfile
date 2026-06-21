@@ -26,6 +26,10 @@ TOP := `git rev-parse --show-toplevel`
 ROUTER_IMAGE := env_var_or_default("ANGZARR_ROUTER_IMAGE", "ghcr.io/angzarr-io/angzarr-rust:latest")
 ROUTER_GO_IMAGE := env_var_or_default("ANGZARR_ROUTER_GO_IMAGE", "ghcr.io/angzarr-io/angzarr-go:latest")
 ROUTER_PYTHON_IMAGE := env_var_or_default("ANGZARR_ROUTER_PYTHON_IMAGE", "ghcr.io/angzarr-io/angzarr-python:latest")
+ROUTER_JAVA_IMAGE := env_var_or_default("ANGZARR_ROUTER_JAVA_IMAGE", "ghcr.io/angzarr-io/angzarr-java:latest")
+ROUTER_CSHARP_IMAGE := env_var_or_default("ANGZARR_ROUTER_CSHARP_IMAGE", "ghcr.io/angzarr-io/angzarr-csharp:latest")
+ROUTER_CPP_IMAGE := env_var_or_default("ANGZARR_ROUTER_CPP_IMAGE", "ghcr.io/angzarr-io/angzarr-cpp:latest")
+ROUTER_TYPESCRIPT_IMAGE := env_var_or_default("ANGZARR_ROUTER_TYPESCRIPT_IMAGE", "ghcr.io/angzarr-io/angzarr-typescript:latest")
 # Container runtime: docker (rootless or rootful). Empty inside a container.
 CONTAINER_CMD := `command -v docker 2>/dev/null || echo ""`
 # `-u $(id -u):$(id -g)` is right for ROOTFUL docker (bind-mount files get the
@@ -92,6 +96,78 @@ _py_container +ARGS:
             "{{ROUTER_PYTHON_IMAGE}}" just {{ARGS}}
     fi
 
+# Same delegation, into the Java toolchain image (JDK 25 + Gradle + buf +
+# angzarr). The router-ffi cdylib the binding loads via Panama/FFM is built
+# first in the rust image and carried forward via the shared target/ mount.
+[private]
+_java_container +ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "${DEVCONTAINER:-}" = "true" ]; then
+        just --justfile "{{TOP}}/justfile.container" {{ARGS}}
+    else
+        {{CONTAINER_RUN}} --network=host \
+            -v "{{TOP}}:/workspace:Z" \
+            -v "{{TOP}}/justfile.container:/workspace/justfile:ro" \
+            -w /workspace \
+            -e ANGZARR_PROJECT_PROTO=/workspace/angzarr-project/proto \
+            "{{ROUTER_JAVA_IMAGE}}" just {{ARGS}}
+    fi
+
+# Same delegation, into the C# toolchain image (.NET SDK + buf + angzarr). The
+# router-ffi cdylib the binding loads via P/Invoke is built first in the rust
+# image and carried forward via the shared target/ mount.
+[private]
+_csharp_container +ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "${DEVCONTAINER:-}" = "true" ]; then
+        just --justfile "{{TOP}}/justfile.container" {{ARGS}}
+    else
+        {{CONTAINER_RUN}} --network=host \
+            -v "{{TOP}}:/workspace:Z" \
+            -v "{{TOP}}/justfile.container:/workspace/justfile:ro" \
+            -w /workspace \
+            -e ANGZARR_PROJECT_PROTO=/workspace/angzarr-project/proto \
+            "{{ROUTER_CSHARP_IMAGE}}" just {{ARGS}}
+    fi
+
+# Same delegation, into the C++ toolchain image (clang/cmake + buf + angzarr).
+# The router-ffi STATICLIB the binding links directly is built first in the
+# rust image and carried forward via the shared target/ mount.
+[private]
+_cpp_container +ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "${DEVCONTAINER:-}" = "true" ]; then
+        just --justfile "{{TOP}}/justfile.container" {{ARGS}}
+    else
+        {{CONTAINER_RUN}} --network=host \
+            -v "{{TOP}}:/workspace:Z" \
+            -v "{{TOP}}/justfile.container:/workspace/justfile:ro" \
+            -w /workspace \
+            -e ANGZARR_PROJECT_PROTO=/workspace/angzarr-project/proto \
+            "{{ROUTER_CPP_IMAGE}}" just {{ARGS}}
+    fi
+
+# Same delegation, into the TypeScript toolchain image (Node + buf + angzarr).
+# The router-ffi cdylib the binding loads via koffi is built first in the rust
+# image and carried forward via the shared target/ mount.
+[private]
+_typescript_container +ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "${DEVCONTAINER:-}" = "true" ]; then
+        just --justfile "{{TOP}}/justfile.container" {{ARGS}}
+    else
+        {{CONTAINER_RUN}} --network=host \
+            -v "{{TOP}}:/workspace:Z" \
+            -v "{{TOP}}/justfile.container:/workspace/justfile:ro" \
+            -w /workspace \
+            -e ANGZARR_PROJECT_PROTO=/workspace/angzarr-project/proto \
+            "{{ROUTER_TYPESCRIPT_IMAGE}}" just {{ARGS}}
+    fi
+
 # Build the workspace
 build: (_container "build")
 
@@ -149,3 +225,41 @@ py-binding-test: build (_py_container "py-binding-test")
 
 # Lint + format check the Python binding (ruff)
 py-binding-lint: (_py_container "py-binding-lint")
+
+# --- Java binding (bindings/java) ----------------------------------------
+# Runs in the Java image; the router-ffi cdylib is built in the rust image
+# (`build`) and carried forward via the shared target/ mount — loaded in-process
+# via Panama/FFM (no preview flags on JDK 25). Generated protobuf + angzarr
+# wiring is never committed (regenerate on need), so build/test regenerate first.
+
+# Regenerate the Java binding's protobuf types + angzarr dispatch wiring (buf)
+java-binding-gen: (_java_container "java-binding-gen")
+
+# Build the Java binding (cdylib in the rust image, then gradle in the java image)
+java-binding-build: build (_java_container "java-binding-build")
+
+# Run the Java binding's conformance suite (Cucumber-JVM) + property sweep
+java-binding-test: build (_java_container "java-binding-test")
+
+# Lint + format check the Java binding
+java-binding-lint: (_java_container "java-binding-lint")
+
+# --- C# binding (bindings/csharp) ----------------------------------------
+# Runs in the C# image; the router-ffi cdylib is built in the rust image
+# (`build`) and carried forward via the shared target/ mount — loaded in-process
+# via P/Invoke. Generated protobuf + angzarr wiring is never committed.
+
+# Regenerate the C# binding's protobuf types + angzarr wiring (buf) + features
+csharp-binding-gen: (_csharp_container "csharp-binding-gen")
+
+# Build the C# binding (cdylib in the rust image, then dotnet in the csharp image)
+csharp-binding-build: build (_csharp_container "csharp-binding-build")
+
+# Run the C# binding's conformance suite (Reqnroll/NUnit)
+csharp-binding-test: build (_csharp_container "csharp-binding-test")
+
+# Lint + format check the C# binding (csharpier)
+csharp-binding-lint: (_csharp_container "csharp-binding-lint")
+
+# Auto-format the C# binding (csharpier)
+csharp-binding-format: (_csharp_container "csharp-binding-format")

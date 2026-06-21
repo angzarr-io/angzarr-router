@@ -68,6 +68,17 @@ A 500-event rebuild becomes a 25–75ms tax on every command. The fine-
 grained boundary must be in-process; FFI is the only mechanism that
 shares the implementation *and* keeps the boundary in-process.
 
+This verdict is about the *fine-grained* boundary — the per-event
+applier fold — and does not foreclose a gRPC interconnect where the
+boundary is already coarse (whole-book, one RPC per command) or where a
+future need does not pay the per-event tax: a remote or polyglot
+deployment, a language with no viable in-process FFI, or a hard
+process-isolation requirement. Such an interconnect stays speculative;
+its standing cost is proto ser/deser at the hop, so it earns its place
+only where that cost amortizes over a coarse call. Recorded so the
+option reads as deferred, not rejected — to be revisited if a need
+appears.
+
 ---
 
 ## 2. The decision, itemized

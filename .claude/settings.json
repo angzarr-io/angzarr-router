@@ -30,37 +30,37 @@
             "type": "command"
           },
           {
-            "command": "ctxloom hook inject-context --project '/home/babbitt/workspace/angzarr/angzarr-router/main' --part 1 --of 7 c175025f805280c0",
+            "command": "ctxloom hook inject-context --project '/home/babbitt/workspace/angzarr/angzarr-router/main' --part 1 --of 7 25fa8a9e59cf7866",
             "timeout": 60,
             "type": "command"
           },
           {
-            "command": "ctxloom hook inject-context --project '/home/babbitt/workspace/angzarr/angzarr-router/main' --part 2 --of 7 c175025f805280c0",
+            "command": "ctxloom hook inject-context --project '/home/babbitt/workspace/angzarr/angzarr-router/main' --part 2 --of 7 25fa8a9e59cf7866",
             "timeout": 60,
             "type": "command"
           },
           {
-            "command": "ctxloom hook inject-context --project '/home/babbitt/workspace/angzarr/angzarr-router/main' --part 3 --of 7 c175025f805280c0",
+            "command": "ctxloom hook inject-context --project '/home/babbitt/workspace/angzarr/angzarr-router/main' --part 3 --of 7 25fa8a9e59cf7866",
             "timeout": 60,
             "type": "command"
           },
           {
-            "command": "ctxloom hook inject-context --project '/home/babbitt/workspace/angzarr/angzarr-router/main' --part 4 --of 7 c175025f805280c0",
+            "command": "ctxloom hook inject-context --project '/home/babbitt/workspace/angzarr/angzarr-router/main' --part 4 --of 7 25fa8a9e59cf7866",
             "timeout": 60,
             "type": "command"
           },
           {
-            "command": "ctxloom hook inject-context --project '/home/babbitt/workspace/angzarr/angzarr-router/main' --part 5 --of 7 c175025f805280c0",
+            "command": "ctxloom hook inject-context --project '/home/babbitt/workspace/angzarr/angzarr-router/main' --part 5 --of 7 25fa8a9e59cf7866",
             "timeout": 60,
             "type": "command"
           },
           {
-            "command": "ctxloom hook inject-context --project '/home/babbitt/workspace/angzarr/angzarr-router/main' --part 6 --of 7 c175025f805280c0",
+            "command": "ctxloom hook inject-context --project '/home/babbitt/workspace/angzarr/angzarr-router/main' --part 6 --of 7 25fa8a9e59cf7866",
             "timeout": 60,
             "type": "command"
           },
           {
-            "command": "ctxloom hook inject-context --project '/home/babbitt/workspace/angzarr/angzarr-router/main' --part 7 --of 7 c175025f805280c0",
+            "command": "ctxloom hook inject-context --project '/home/babbitt/workspace/angzarr/angzarr-router/main' --part 7 --of 7 25fa8a9e59cf7866",
             "timeout": 60,
             "type": "command"
           }

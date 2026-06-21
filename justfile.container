@@ -101,3 +101,64 @@ py-binding-test: py-binding-gen
 py-binding-lint:
     cd {{TOP}}/bindings/python && uv run --with ruff ruff check . && \
         uv run --with ruff ruff format --check .
+
+# --- Java binding (bindings/java) ----------------------------------------
+# Run in the Java image. Panama/FFM loads the router-ffi cdylib, built in the
+# rust image and carried forward in target/debug (the host `build` step runs
+# first); the binding resolves it from the shared tree (or ANGZARR_ROUTER_LIB).
+# Gradle runs with --no-daemon (container) against the image's system Gradle.
+
+# Regenerate the Java binding's protobuf types + angzarr dispatch wiring.
+# google.* come from protobuf-java + proto-google-common-protos and are
+# excluded. Generated code is never committed (regenerate on need).
+java-binding-gen:
+    cd {{TOP}} && buf generate --template bindings/java/buf.gen.yaml \
+        --exclude-path angzarr-project/proto/google --exclude-path proto/google \
+        --exclude-path angzarr-project/proto/io/angzarr/examples
+
+# Build the Java binding (cdylib already built + carried forward); regenerate
+# protobuf/wiring first.
+java-binding-build: java-binding-gen
+    cd {{TOP}}/bindings/java && gradle --no-daemon --console=plain assemble
+
+# Run the Java binding's conformance suite (Cucumber-JVM) + property sweep.
+java-binding-test: java-binding-gen
+    cd {{TOP}}/bindings/java && gradle --no-daemon --console=plain test
+
+# Format check the Java binding (spotless; generated code excluded).
+java-binding-lint: java-binding-gen
+    cd {{TOP}}/bindings/java && gradle --no-daemon --console=plain spotlessCheck
+
+# --- C# binding (bindings/csharp) ----------------------------------------
+# Run in the C# image. P/Invoke loads the router-ffi cdylib, built in the rust
+# image and carried forward in target/debug (the host `build` step runs first);
+# the binding resolves it from the shared tree (or ANGZARR_ROUTER_LIB). dotnet
+# runs against the image's .NET SDK.
+
+# Regenerate the C# binding's protobuf types + angzarr dispatch wiring, and
+# materialize the shared behavioral features into the conformance project
+# (Reqnroll generates code-behind from them; canonical source is
+# conformance/features). google.* are excluded. Generated code is never committed.
+csharp-binding-gen:
+    cd {{TOP}} && buf generate --template bindings/csharp/buf.gen.yaml \
+        --exclude-path angzarr-project/proto/google --exclude-path proto/google \
+        --exclude-path angzarr-project/proto/io/angzarr/examples
+    rm -rf {{TOP}}/bindings/csharp/conformance/Features
+    mkdir -p {{TOP}}/bindings/csharp/conformance/Features
+    cp {{TOP}}/conformance/features/*.feature {{TOP}}/bindings/csharp/conformance/Features/
+
+# Build the C# binding (cdylib already built + carried forward); regenerate first.
+csharp-binding-build: csharp-binding-gen
+    cd {{TOP}}/bindings/csharp && dotnet build Angzarr.Router.csproj -c Release --nologo
+
+# Run the C# binding's conformance suite (Reqnroll/NUnit) against the cdylib.
+csharp-binding-test: csharp-binding-gen
+    cd {{TOP}}/bindings/csharp && ANGZARR_ROUTER_LIB={{TOP}}/target/debug/libangzarr_router_ffi.so dotnet test conformance/Conformance.csproj --nologo
+
+# Format check the C# binding (csharpier; generated code excluded via .csharpierignore).
+csharp-binding-lint:
+    cd {{TOP}}/bindings/csharp && csharpier check .
+
+# Auto-format the C# binding (csharpier; generated code excluded).
+csharp-binding-format:
+    cd {{TOP}}/bindings/csharp && csharpier format .

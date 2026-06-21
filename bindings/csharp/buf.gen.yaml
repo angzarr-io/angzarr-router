@@ -1,0 +1,32 @@
+# C# codegen for the binding's protos (io.angzarr.v1, io.angzarr.router.ffi.v1,
+# test.counter, sererr). google.* are NOT generated — the well-known types come
+# from the Google.Protobuf runtime and google.rpc from Google.Api.CommonProtos
+# (the genproto / common-protos analog); excluded at the buf generate
+# invocation. Generated tree is never committed (regenerate on need).
+#
+# Managed mode is enabled ONLY to satisfy the angzarr plugin: it speaks the
+# protoc-gen-go-style contract (protogen), which requires a go_package on every
+# request file (test.counter declares none). csharp_namespace is DISABLED in
+# managed mode so the .proto's own csharp_namespace (io.angzarr.v1 → Angzarr)
+# survives untouched and test.counter falls back to its PascalCase default
+# (Test.Counter) — both the protobuf-csharp plugin and the angzarr csharp emitter
+# must see the same effective C# naming, which is the one the .proto declares.
+version: v2
+managed:
+  enabled: true
+  disable:
+    - file_option: go_package
+      path: google
+    - file_option: csharp_namespace
+  override:
+    - file_option: go_package_prefix
+      value: github.com/angzarr-io/angzarr-router/bindings/csharp/gen
+plugins:
+  - remote: buf.build/protocolbuffers/csharp:v28.3
+    out: bindings/csharp/gen
+  # angzarr dispatch wiring for declared components (test.counter). Baked into
+  # the base image and invoked as a local plugin. The conformance fixtures
+  # hand-implement the generated <Component>Handler interfaces.
+  - local: ["angzarr", "codegen", "csharp"]
+    out: bindings/csharp/gen
+    opt: paths=source_relative

@@ -1,0 +1,33 @@
+# Java codegen for the binding's protos (io.angzarr.v1, io.angzarr.router.ffi.v1,
+# test.counter, sererr). google.* are NOT generated — the well-known types and
+# google.rpc come from the protobuf-java runtime + proto-google-common-protos (the
+# Go-genproto / googleapis-common-protos analog); excluded at the buf generate
+# invocation. Generated tree is never committed (regenerate on need).
+#
+# Managed mode is enabled ONLY to satisfy the angzarr plugin: it speaks the
+# protoc-gen-go-style contract (protogen), which requires a go_package on every
+# request file (test.counter declares none). The java_* options are DISABLED in
+# managed mode so the .proto's own java_package (io.angzarr) / java_multiple_files
+# survive untouched — both the protobuf-java plugin and the angzarr java emitter
+# must see the same effective java naming, which is the one the .proto declares.
+version: v2
+managed:
+  enabled: true
+  disable:
+    - file_option: go_package
+      path: google
+    - file_option: java_package
+    - file_option: java_outer_classname
+    - file_option: java_multiple_files
+  override:
+    - file_option: go_package_prefix
+      value: github.com/angzarr-io/angzarr-router/bindings/java/gen
+plugins:
+  - remote: buf.build/protocolbuffers/java:v28.3
+    out: bindings/java/build/generated/proto/main/java
+  # angzarr dispatch wiring for declared components (test.counter). Baked into
+  # the base image and invoked as a local plugin. The conformance fixtures
+  # hand-implement the generated <Component>Handler interfaces.
+  - local: ["angzarr", "codegen", "java"]
+    out: bindings/java/build/generated/proto/main/java
+    opt: paths=source_relative
