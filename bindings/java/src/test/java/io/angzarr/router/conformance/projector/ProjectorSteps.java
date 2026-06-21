@@ -14,7 +14,7 @@ import io.cucumber.java.Before;
 import io.cucumber.java.en.Given;
 import io.cucumber.java.en.Then;
 import io.cucumber.java.en.When;
-import test.counter.counter_angzarr;
+import test.counter.CounterProjectorAngzarr;
 
 /** Step definitions for projector.feature — the CounterProjector read-side fold. */
 public class ProjectorSteps {
@@ -26,7 +26,7 @@ public class ProjectorSteps {
   @Before
   public void before() {
     router = new Router();
-    counter_angzarr.registerCounterProjector(router, new ProjectorFixture());
+    CounterProjectorAngzarr.registerCounterProjector(router, new ProjectorFixture());
     proj = null;
     err = null;
   }

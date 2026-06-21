@@ -21,7 +21,7 @@ public sealed class PmSteps
     public void Before()
     {
         _router = new Router();
-        TC.counter_angzarr.RegisterOrderProcessManager(_router, new PmFixture());
+        TC.OrderProcessManagerAngzarr.RegisterOrderProcessManager(_router, new PmFixture());
         _resp = null;
         _err = null;
     }

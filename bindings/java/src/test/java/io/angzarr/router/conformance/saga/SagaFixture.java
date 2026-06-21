@@ -9,12 +9,12 @@ import io.angzarr.router.Destinations;
 import io.angzarr.router.Thunks.SagaEmission;
 import java.util.List;
 import test.counter.Counter;
-import test.counter.counter_angzarr;
+import test.counter.OrderSagaAngzarr;
 
 /** The conformance OrderSaga fixture, implementing the generated seam: a
  * declared source event emits a Reserve command stamped with the supplied
  * destination sequence; a rejection injects one fact event. */
-final class SagaFixture implements counter_angzarr.OrderSagaHandler {
+final class SagaFixture implements OrderSagaAngzarr.OrderSagaHandler {
 
   @Override
   public SagaEmission increased(Counter.Increased event, Destinations dests) {

@@ -4,7 +4,7 @@
 
 #include "builders.h"
 #include "gherkin.h"
-#include "test/counter/counter_angzarr.h"
+#include "test/counter/counter_projector_angzarr.h"
 
 namespace {
 using namespace angzarr::conformance;

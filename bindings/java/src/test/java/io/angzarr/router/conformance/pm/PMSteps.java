@@ -17,7 +17,7 @@ import io.cucumber.java.en.Then;
 import io.cucumber.java.en.When;
 import java.util.List;
 import java.util.Map;
-import test.counter.counter_angzarr;
+import test.counter.OrderProcessManagerAngzarr;
 
 /** Step definitions for process_manager.feature — the OrderProcessManager
  * stateful trigger-side dispatch. */
@@ -30,7 +30,7 @@ public class PMSteps {
   @Before
   public void before() {
     router = new Router();
-    counter_angzarr.registerOrderProcessManager(router, new PMFixture());
+    OrderProcessManagerAngzarr.registerOrderProcessManager(router, new PMFixture());
     resp = null;
     err = null;
   }

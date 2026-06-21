@@ -10,7 +10,7 @@ import pytest
 from pytest_bdd import given, parsers, scenarios, then, when
 
 from ... import CodedError, Router
-from ...gen.test.counter import counter_angzarr
+from ...gen.test.counter import counter_aggregate_angzarr
 from .. import builders
 from ..fixture import CounterAggregate, Observation
 
@@ -24,7 +24,7 @@ class _World:
     def __init__(self):
         self.observed: list[Observation] = []
         self.router = Router()
-        counter_angzarr.register_counter_aggregate(self.router, CounterAggregate(self.observed))
+        counter_aggregate_angzarr.register_counter_aggregate(self.router, CounterAggregate(self.observed))
         self.prior = None
         self.resp = None
         self.err: CodedError | None = None

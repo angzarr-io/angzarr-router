@@ -21,7 +21,7 @@ public sealed class SagaSteps
     public void Before()
     {
         _router = new Router();
-        TC.counter_angzarr.RegisterOrderSaga(_router, new SagaFixture());
+        TC.OrderSagaAngzarr.RegisterOrderSaga(_router, new SagaFixture());
         _resp = null;
         _err = null;
     }

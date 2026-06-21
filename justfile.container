@@ -52,6 +52,7 @@ buf-format:
 # Regenerate the Go binding's protobuf types. google.* come from genproto
 # and are excluded; sererr is ours and re-homed under the binding's module.
 go-binding-gen:
+    rm -rf {{TOP}}/bindings/go/gen
     cd {{TOP}} && buf generate --template bindings/go/buf.gen.yaml \
         --exclude-path angzarr-project/proto/google --exclude-path proto/google
 
@@ -81,6 +82,7 @@ go-binding-lint: go-binding-gen
 # imported as written (stdlib `io` collision), so fixup_gen_imports.py reroots
 # them under the binding's gen package. Generated code is never committed.
 py-binding-gen:
+    rm -rf {{TOP}}/bindings/python/angzarr_router_ffi/gen
     cd {{TOP}} && buf generate --template bindings/python/buf.gen.yaml \
         --exclude-path angzarr-project/proto/google --exclude-path proto/google \
         --exclude-path angzarr-project/proto/io/angzarr/examples
@@ -112,6 +114,7 @@ py-binding-lint:
 # google.* come from protobuf-java + proto-google-common-protos and are
 # excluded. Generated code is never committed (regenerate on need).
 java-binding-gen:
+    rm -rf {{TOP}}/bindings/java/build/generated/proto/main/java
     cd {{TOP}} && buf generate --template bindings/java/buf.gen.yaml \
         --exclude-path angzarr-project/proto/google --exclude-path proto/google \
         --exclude-path angzarr-project/proto/io/angzarr/examples
@@ -140,6 +143,7 @@ java-binding-lint: java-binding-gen
 # (Reqnroll generates code-behind from them; canonical source is
 # conformance/features). google.* are excluded. Generated code is never committed.
 csharp-binding-gen:
+    rm -rf {{TOP}}/bindings/csharp/gen
     cd {{TOP}} && buf generate --template bindings/csharp/buf.gen.yaml \
         --exclude-path angzarr-project/proto/google --exclude-path proto/google \
         --exclude-path angzarr-project/proto/io/angzarr/examples
@@ -171,6 +175,7 @@ csharp-binding-format:
 # from the canonical conformance/features (a compile definition).
 
 cpp-binding-gen:
+    rm -rf {{TOP}}/bindings/cpp/gen
     cd {{TOP}} && buf generate --template bindings/cpp/buf.gen.yaml \
         --exclude-path angzarr-project/proto/io/angzarr/examples
 
@@ -196,6 +201,7 @@ cpp-binding-lint:
 # loader. Generated protobuf-es + wiring is never committed (regenerate on need).
 
 ts-binding-gen:
+    rm -rf {{TOP}}/bindings/typescript/gen
     cd {{TOP}} && buf generate --template bindings/typescript/buf.gen.yaml \
         --exclude-path angzarr-project/proto/io/angzarr/examples
 

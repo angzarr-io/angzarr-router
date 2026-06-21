@@ -13,7 +13,7 @@ namespace Angzarr.Router.Conformance.Counter;
 /// wiring is generated, so this fixture is the proof the generated seam is
 /// faithful.
 /// </summary>
-internal sealed class CounterFixture : TC.counter_angzarr.CounterAggregateHandler
+internal sealed class CounterFixture : TC.CounterAggregateAngzarr.CounterAggregateHandler
 {
     /// <summary>The historical-state evidence a command handler saw — what the
     /// suite asserts, since state never crosses the boundary.</summary>

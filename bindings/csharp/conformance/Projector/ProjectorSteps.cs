@@ -20,7 +20,7 @@ public sealed class ProjectorSteps
     public void Before()
     {
         _router = new Router();
-        TC.counter_angzarr.RegisterCounterProjector(_router, new ProjectorFixture());
+        TC.CounterProjectorAngzarr.RegisterCounterProjector(_router, new ProjectorFixture());
         _proj = null;
         _err = null;
     }

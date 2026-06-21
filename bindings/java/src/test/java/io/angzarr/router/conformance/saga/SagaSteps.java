@@ -15,7 +15,7 @@ import io.cucumber.java.en.Given;
 import io.cucumber.java.en.Then;
 import io.cucumber.java.en.When;
 import java.util.Map;
-import test.counter.counter_angzarr;
+import test.counter.OrderSagaAngzarr;
 
 /** Step definitions for saga.feature — the OrderSaga translation-side dispatch. */
 public class SagaSteps {
@@ -27,7 +27,7 @@ public class SagaSteps {
   @Before
   public void before() {
     router = new Router();
-    counter_angzarr.registerOrderSaga(router, new SagaFixture());
+    OrderSagaAngzarr.registerOrderSaga(router, new SagaFixture());
     resp = null;
     err = null;
   }

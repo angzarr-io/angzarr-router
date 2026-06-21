@@ -6,7 +6,7 @@
 #include <iostream>
 #include <vector>
 
-#include "test/counter/counter_angzarr.h"
+#include "test/counter/counter_aggregate_angzarr.h"
 
 namespace {
 

@@ -16,12 +16,10 @@ import type {
   Projection,
   SagaResponse,
 } from "@angzarr/router";
-import {
-  registerCounterAggregate,
-  registerCounterProjector,
-  registerOrderProcessManager,
-  registerOrderSaga,
-} from "../gen/test/counter/counter_angzarr";
+import { registerCounterAggregate } from "../gen/test/counter/counter_aggregate_angzarr";
+import { registerCounterProjector } from "../gen/test/counter/counter_projector_angzarr";
+import { registerOrderProcessManager } from "../gen/test/counter/order_process_manager_angzarr";
+import { registerOrderSaga } from "../gen/test/counter/order_saga_angzarr";
 import * as B from "./builders";
 import {
   CounterFixture,

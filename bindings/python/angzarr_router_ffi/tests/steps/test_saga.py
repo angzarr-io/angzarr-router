@@ -10,7 +10,7 @@ from pytest_bdd import given, parsers, scenarios, then, when
 
 from ... import CodedError, Router
 from ...gen.io.angzarr.v1 import saga_pb2, types_pb2
-from ...gen.test.counter import counter_angzarr
+from ...gen.test.counter import order_saga_angzarr
 from ..builders import FQ_INCREASED, FQ_RESERVE, type_url
 from ..fixture import OrderSaga
 
@@ -23,7 +23,7 @@ class _World:
 
     def __init__(self):
         self.router = Router()
-        counter_angzarr.register_order_saga(self.router, OrderSaga())
+        order_saga_angzarr.register_order_saga(self.router, OrderSaga())
         self.resp = None
         self.err: CodedError | None = None
 

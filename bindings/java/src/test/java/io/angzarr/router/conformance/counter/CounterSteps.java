@@ -18,7 +18,7 @@ import io.cucumber.java.en.Then;
 import io.cucumber.java.en.When;
 import java.util.ArrayList;
 import java.util.List;
-import test.counter.counter_angzarr;
+import test.counter.CounterAggregateAngzarr;
 
 /**
  * Step definitions for counter.feature — the shared cross-language behavior
@@ -37,7 +37,7 @@ public class CounterSteps {
   public void before() {
     observed.clear();
     router = new Router();
-    counter_angzarr.registerCounterAggregate(router, new CounterFixture(observed));
+    CounterAggregateAngzarr.registerCounterAggregate(router, new CounterFixture(observed));
     prior = null;
     resp = null;
     err = null;

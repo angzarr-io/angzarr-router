@@ -3,7 +3,7 @@
 package conformance
 
 // The conformance fixtures, implementing the angzarr-generated Handler
-// interfaces (gen/test/counter/counter_angzarr.pb.go). The behaviour is the
+// interfaces (gen/test/counter/*_angzarr.pb.go). The behaviour is the
 // same the hand-written dispatches encoded; the wiring is now generated, so
 // these are the proof the generated seam is faithful. Registered via the
 // generated Register<Component> helpers in each scenario's world.

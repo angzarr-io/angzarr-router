@@ -1,5 +1,5 @@
 """The conformance fixtures in Python, implementing the angzarr-generated
-Handler protocols (gen/test/counter/counter_angzarr.py). Same behavior the Rust
+Handler protocols (gen/test/counter/*_angzarr.py). Same behavior the Rust
 core and Go binding implement; the dispatch wiring is now generated, so these
 are the proof the generated Python seam is faithful. Registered via the
 generated register_* helpers in each scenario's world.
@@ -31,7 +31,7 @@ class Observation:
 
 
 class CounterAggregate:
-    """Implements counter_angzarr.CounterAggregateHandler. The rebuilder
+    """Implements counter_aggregate_angzarr.CounterAggregateHandler. The rebuilder
     (generated) folds Increased via apply_increased and seeds snapshots
     generically; the typed-emit handler returns Increased events the wiring
     packs into the EventBook."""
@@ -65,7 +65,7 @@ class CounterAggregate:
 
 
 class OrderSaga:
-    """Implements counter_angzarr.OrderSagaHandler."""
+    """Implements order_saga_angzarr.OrderSagaHandler."""
 
     def increased(self, event, dests):
         cmd = _reserve_command()
@@ -81,7 +81,7 @@ class OrderSaga:
 
 
 class CounterProjector:
-    """Implements counter_angzarr.CounterProjectorHandler."""
+    """Implements counter_projector_angzarr.CounterProjectorHandler."""
 
     def increased(self, projection, event) -> None:
         projection.count += 1
@@ -99,7 +99,7 @@ class CounterProjector:
 
 
 class OrderProcessManager:
-    """Implements counter_angzarr.OrderProcessManagerHandler."""
+    """Implements order_process_manager_angzarr.OrderProcessManagerHandler."""
 
     def increased(self, event, state, dests):
         cmd = _reserve_command()

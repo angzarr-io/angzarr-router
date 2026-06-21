@@ -10,7 +10,7 @@ conformance features remain the cross-language behavior contract."""
 import pytest
 
 from .. import CodedError, Router
-from ..gen.test.counter import counter_angzarr
+from ..gen.test.counter import counter_aggregate_angzarr
 from . import builders
 from .fixture import CounterAggregate
 
@@ -20,7 +20,7 @@ _BOUND = 13  # 13 x 13 = 169 (prior, amount) combinations
 @pytest.fixture
 def bare_router():
     r = Router()
-    counter_angzarr.register_counter_aggregate(r, CounterAggregate())
+    counter_aggregate_angzarr.register_counter_aggregate(r, CounterAggregate())
     yield r
     r.close()
 

@@ -12,12 +12,12 @@ import io.angzarr.router.conformance.Builders;
 import java.util.ArrayList;
 import java.util.List;
 import test.counter.Counter;
-import test.counter.counter_angzarr;
+import test.counter.OrderProcessManagerAngzarr;
 
 /** The conformance OrderProcessManager fixture: the newest trigger reacts with a
  * stamped Reserve command plus one fact per rebuilt prior-state event; a
  * rejection injects one process event and escalates. */
-final class PMFixture implements counter_angzarr.OrderProcessManagerHandler {
+final class PMFixture implements OrderProcessManagerAngzarr.OrderProcessManagerHandler {
 
   @Override
   public ProcessManagerHandleResponse increased(

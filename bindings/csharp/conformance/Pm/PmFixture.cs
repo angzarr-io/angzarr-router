@@ -7,7 +7,7 @@ namespace Angzarr.Router.Conformance.Pm;
 /// <summary>The conformance OrderProcessManager fixture: the newest trigger
 /// reacts with a stamped Reserve command plus one fact per rebuilt prior-state
 /// event; a rejection injects one process event and escalates.</summary>
-internal sealed class PmFixture : TC.counter_angzarr.OrderProcessManagerHandler
+internal sealed class PmFixture : TC.OrderProcessManagerAngzarr.OrderProcessManagerHandler
 {
     public ProcessManagerHandleResponse Increased(
         TC.Increased ev,

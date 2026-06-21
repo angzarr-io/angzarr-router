@@ -9,7 +9,7 @@ namespace Angzarr.Router.Conformance.Saga;
 /// <summary>The conformance OrderSaga fixture: a declared source event emits a
 /// Reserve command stamped with the supplied destination sequence; a rejection
 /// injects one fact event.</summary>
-internal sealed class SagaFixture : TC.counter_angzarr.OrderSagaHandler
+internal sealed class SagaFixture : TC.OrderSagaAngzarr.OrderSagaHandler
 {
     public SagaEmission Increased(TC.Increased ev, Destinations dests)
     {

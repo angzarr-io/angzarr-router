@@ -6,7 +6,7 @@ namespace Angzarr.Router.Conformance.Projector;
 /// <summary>The conformance CounterProjector fixture: every delivered event
 /// folds into one projection; the finisher carries the cover and folded
 /// count.</summary>
-internal sealed class ProjectorFixture : TC.counter_angzarr.CounterProjectorHandler
+internal sealed class ProjectorFixture : TC.CounterProjectorAngzarr.CounterProjectorHandler
 {
     public void Increased(TC.CounterProjectorState projection, TC.Increased ev) =>
         projection.Count += 1;

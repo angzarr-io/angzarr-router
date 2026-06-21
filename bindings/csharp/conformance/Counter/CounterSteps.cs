@@ -28,7 +28,7 @@ public sealed class CounterSteps
     {
         _observed.Clear();
         _router = new Router();
-        TC.counter_angzarr.RegisterCounterAggregate(_router, new CounterFixture(_observed));
+        TC.CounterAggregateAngzarr.RegisterCounterAggregate(_router, new CounterFixture(_observed));
         _prior = null;
         _resp = null;
         _err = null;

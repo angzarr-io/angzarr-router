@@ -12,7 +12,7 @@ import io.angzarr.router.CommandContext;
 import java.util.ArrayList;
 import java.util.List;
 import test.counter.Counter;
-import test.counter.counter_angzarr;
+import test.counter.CounterAggregateAngzarr;
 
 /**
  * The conformance CounterAggregate fixture, implementing the angzarr-generated
@@ -20,7 +20,7 @@ import test.counter.counter_angzarr;
  * wiring is generated, so this fixture is the proof the generated seam is
  * faithful.
  */
-final class CounterFixture implements counter_angzarr.CounterAggregateHandler {
+final class CounterFixture implements CounterAggregateAngzarr.CounterAggregateHandler {
 
   /** The historical-state evidence a command handler saw — what the suite
    * asserts, since state never crosses the boundary. */

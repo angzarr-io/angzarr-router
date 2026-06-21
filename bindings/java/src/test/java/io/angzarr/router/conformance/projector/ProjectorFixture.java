@@ -3,11 +3,11 @@ package io.angzarr.router.conformance.projector;
 import io.angzarr.EventBook;
 import io.angzarr.Projection;
 import test.counter.Counter;
-import test.counter.counter_angzarr;
+import test.counter.CounterProjectorAngzarr;
 
 /** The conformance CounterProjector fixture: every delivered event folds into
  * one projection; the finisher carries the cover and the folded count. */
-final class ProjectorFixture implements counter_angzarr.CounterProjectorHandler {
+final class ProjectorFixture implements CounterProjectorAngzarr.CounterProjectorHandler {
 
   @Override
   public void increased(Counter.CounterProjectorState.Builder projection, Counter.Increased event) {

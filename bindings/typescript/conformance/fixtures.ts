@@ -21,12 +21,10 @@ import {
   type SagaEmission,
   reject,
 } from "@angzarr/router";
-import {
-  type CounterAggregateHandler,
-  type CounterProjectorHandler,
-  type OrderProcessManagerHandler,
-  type OrderSagaHandler,
-} from "../gen/test/counter/counter_angzarr";
+import { type CounterAggregateHandler } from "../gen/test/counter/counter_aggregate_angzarr";
+import { type CounterProjectorHandler } from "../gen/test/counter/counter_projector_angzarr";
+import { type OrderProcessManagerHandler } from "../gen/test/counter/order_process_manager_angzarr";
+import { type OrderSagaHandler } from "../gen/test/counter/order_saga_angzarr";
 import {
   type CounterProjectorState,
   type CounterState,
