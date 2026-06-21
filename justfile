@@ -280,3 +280,23 @@ cpp-binding-test: build (_cpp_container "cpp-binding-test")
 
 # Format check the C++ binding (clang-format)
 cpp-binding-lint: (_cpp_container "cpp-binding-lint")
+
+# --- TypeScript binding (bindings/typescript) ----------------------------
+# Runs in the TypeScript image; the router-ffi cdylib is built in the rust image
+# (`build`) and carried forward via the shared target/ mount — loaded in-process
+# via koffi. Generated protobuf-es types + angzarr wiring is never committed.
+
+# Regenerate the TS binding's protobuf-es types + angzarr wiring (buf)
+ts-binding-gen: (_typescript_container "ts-binding-gen")
+
+# Build the TS binding (cdylib in the rust image, then npm ci in the ts image)
+ts-binding-build: build (_typescript_container "ts-binding-build")
+
+# Run the TS binding's conformance suite (cucumber-js)
+ts-binding-test: build (_typescript_container "ts-binding-test")
+
+# Format check the TS binding (prettier)
+ts-binding-lint: (_typescript_container "ts-binding-lint")
+
+# Auto-format the TS binding (prettier)
+ts-binding-format: (_typescript_container "ts-binding-format")

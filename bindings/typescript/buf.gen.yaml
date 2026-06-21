@@ -1,0 +1,32 @@
+# TypeScript codegen for the binding's protos. protobuf-es (protoc-gen-es) emits
+# message classes + schemas for io.angzarr.v1, io.angzarr.router.ffi.v1,
+# test.counter, sererr, google.rpc, and google.api; the well-known types
+# (google.protobuf.*) are NOT generated — they come from the @bufbuild/protobuf
+# runtime (@bufbuild/protobuf/wkt). The generated tree is never committed
+# (regenerate on need).
+#
+# Managed mode is enabled ONLY to satisfy the angzarr plugin: it speaks the
+# protoc-gen-go-style contract (protogen), which requires a go_package on every
+# request file (test.counter declares none). protoc-gen-es ignores go_package,
+# so the override is invisible to the TypeScript output.
+version: v2
+managed:
+  enabled: true
+  disable:
+    - file_option: go_package
+      path: google
+  override:
+    - file_option: go_package_prefix
+      value: github.com/angzarr-io/angzarr-router/bindings/typescript/gen
+plugins:
+  - remote: buf.build/bufbuild/es:v2.2.0
+    out: bindings/typescript/gen
+    opt:
+      - target=ts
+      - import_extension=none
+  # angzarr dispatch wiring for declared components (test.counter). The
+  # conformance fixtures hand-implement the generated <Component>Handler
+  # interfaces.
+  - local: ["angzarr", "codegen", "typescript"]
+    out: bindings/typescript/gen
+    opt: paths=source_relative

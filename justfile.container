@@ -187,3 +187,31 @@ cpp-binding-test: cpp-binding-gen
 cpp-binding-lint:
     cd {{TOP}}/bindings/cpp && clang-format --dry-run --Werror \
         include/angzarr/router/*.h src/*.cpp conformance/*.h conformance/*.cpp
+
+# --- TypeScript binding (bindings/typescript) ----------------------------
+# Run in the TypeScript image. The binding loads the router-ffi cdylib (built in
+# the rust image, carried forward in target/debug) in-process via koffi. buf
+# generates protobuf-es message types + the angzarr wiring; cucumber-js runs the
+# shared conformance features (canonical conformance/features) via the tsx ESM
+# loader. Generated protobuf-es + wiring is never committed (regenerate on need).
+
+ts-binding-gen:
+    cd {{TOP}} && buf generate --template bindings/typescript/buf.gen.yaml \
+        --exclude-path angzarr-project/proto/io/angzarr/examples
+
+ts-binding-build: ts-binding-gen
+    cd {{TOP}}/bindings/typescript && npm ci
+
+ts-binding-test: ts-binding-gen
+    cd {{TOP}}/bindings/typescript && npm ci
+    cd {{TOP}}/bindings/typescript && \
+        ANGZARR_ROUTER_LIB={{TOP}}/target/debug/libangzarr_router_ffi.so \
+        NODE_OPTIONS="--import tsx" npx cucumber-js
+
+# Format check the TS binding (prettier; generated tree + node_modules excluded).
+ts-binding-lint:
+    cd {{TOP}}/bindings/typescript && prettier --check "src/**/*.ts" "conformance/**/*.ts" "*.mjs"
+
+# Auto-format the TS binding (prettier).
+ts-binding-format:
+    cd {{TOP}}/bindings/typescript && prettier --write "src/**/*.ts" "conformance/**/*.ts" "*.mjs"

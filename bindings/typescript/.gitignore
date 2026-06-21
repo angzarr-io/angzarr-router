@@ -1,0 +1,4 @@
+# Generated protobuf-es types + angzarr dispatch wiring (regenerate on need).
+/gen/
+# Node deps + tool caches.
+/node_modules/
