@@ -17,20 +17,36 @@
 # raises "io is not a package". (client-python never hit this: its package
 # predates the io.angzarr rename.) scripts/fixup_gen_imports.py rewrites
 # those path imports to the `angzarr_router_ffi.gen.` package prefix after
-# generation; that step is part of `py-binding-gen` and the generated tree
-# is committed. The angzarr wiring (*_angzarr.py) imports message modules the
-# same path way, so fixup_gen_imports.py reroots it too.
+# generation; that step is part of `py-binding-gen`. The generated tree is
+# gitignored and regenerated on demand. The angzarr wiring (*_angzarr.py)
+# imports message modules the same path way, so fixup_gen_imports.py reroots
+# it too.
 #
 # Managed mode is enabled only to satisfy the angzarr plugin: it speaks the
 # protoc-gen-go-style contract (protogen), which requires a go_package on every
-# request file even when emitting Python. The value is irrelevant to the Python
-# output — the protocolbuffers/python plugin ignores go_package.
+# request file even when emitting Python.
+#
+# BYTE-IDENTITY (load-bearing). go_package is NOT irrelevant to Python output: it
+# is embedded in each pb2's serialized FileDescriptorProto (the AddSerializedFile
+# bytes). A binding-specific override therefore makes the SHARED framework
+# descriptors diverge from any other party that generates the same contract,
+# which collides in the global descriptor_pool.Default() ("duplicate file name").
+# So managed mode must NOT touch go_package on the shared framework files — they
+# carry a native go_package, identical for every generator, which keeps copies
+# byte-identical so upb deduplicates re-registration. The override stays only for
+# binding-owned files with no native go_package (abi, test.counter), which no
+# consumer generates. See framework-proto-collision.design.md.
 version: v2
 managed:
   enabled: true
   disable:
     - file_option: go_package
       path: google
+    # Shared framework contract: keep native go_package (byte-identity).
+    - file_option: go_package
+      path: io/angzarr/v1
+    - file_option: go_package
+      path: sererr
   override:
     - file_option: go_package_prefix
       value: github.com/angzarr-io/angzarr-router/bindings/go/gen
