@@ -24,7 +24,9 @@ class _World:
 
     def __init__(self):
         self.router = Router()
-        order_process_manager_angzarr.register_order_process_manager(self.router, OrderProcessManager())
+        order_process_manager_angzarr.register_order_process_manager(
+            self.router, OrderProcessManager()
+        )
         self.resp = None
         self.err: CodedError | None = None
 

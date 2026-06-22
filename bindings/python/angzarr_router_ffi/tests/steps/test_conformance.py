@@ -24,7 +24,9 @@ class _World:
     def __init__(self):
         self.observed: list[Observation] = []
         self.router = Router()
-        counter_aggregate_angzarr.register_counter_aggregate(self.router, CounterAggregate(self.observed))
+        counter_aggregate_angzarr.register_counter_aggregate(
+            self.router, CounterAggregate(self.observed)
+        )
         self.prior = None
         self.resp = None
         self.err: CodedError | None = None
