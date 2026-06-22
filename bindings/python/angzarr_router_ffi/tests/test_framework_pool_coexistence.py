@@ -23,6 +23,9 @@ the single deterministic generator. See framework-proto-collision.design.md.
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import pytest
 from google.protobuf import descriptor_pb2, descriptor_pool
 
@@ -34,11 +37,26 @@ from ..gen.io.angzarr.v1 import (
 )
 from ..gen.sererr.v1 import sererr_pb2
 
-# The binding-specific go_package the buf.gen.yaml override applies. It MUST NOT
-# reach the shared framework descriptors, or their bytes diverge from a
-# consumer's copy and collide in Default(). (abi, test.counter are binding-only
-# — no consumer generates them — so they keep the override.)
-_BINDING_OVERRIDE_MARKER = "angzarr-router/bindings"
+# The string/bool FileOptions buf managed mode can rewrite. Managed mode injects
+# values derived from the proto package (java_package, csharp_namespace, …) —
+# but the contract DECLARES some of these natively, so "must be empty" is wrong.
+# The correct invariant: the descriptor's file options equal exactly what the
+# .proto source declares. Any extra/changed option is a managed-mode mutation,
+# embedded in serialized_pb, that breaks byte-identity with a consumer not
+# running managed mode.
+_FILE_OPTION_FIELDS = [
+    "go_package",
+    "java_package",
+    "java_outer_classname",
+    "java_multiple_files",
+    "csharp_namespace",
+    "objc_class_prefix",
+    "php_namespace",
+    "php_class_prefix",
+    "php_metadata_namespace",
+    "ruby_package",
+    "swift_prefix",
+]
 
 # Files that make up the shared contract every consumer also generates.
 _SHARED_FRAMEWORK = [
@@ -50,16 +68,56 @@ _SHARED_FRAMEWORK = [
 ]
 
 
+def _proto_root() -> Path:
+    """The angzarr-project proto root, found by walking up from this test."""
+    for ancestor in Path(__file__).resolve().parents:
+        candidate = ancestor / "angzarr-project" / "proto"
+        if candidate.is_dir():
+            return candidate
+    pytest.skip("angzarr-project/proto not available")
+
+
+def _declared_file_options(proto_path: Path) -> dict[str, object]:
+    """Parse the top-level (file-scope) options the .proto source declares."""
+    declared: dict[str, object] = {}
+    depth = 0
+    for line in proto_path.read_text().splitlines():
+        stripped = line.strip()
+        if depth == 0 and stripped.startswith("option "):
+            match = re.match(r"option\s+([\w.]+)\s*=\s*(.+);", stripped)
+            if match and match.group(1) in _FILE_OPTION_FIELDS:
+                raw = match.group(2).strip()
+                if raw.startswith('"') and raw.endswith('"'):
+                    declared[match.group(1)] = raw[1:-1]
+                elif raw in ("true", "false"):
+                    declared[match.group(1)] = raw == "true"
+        depth += stripped.count("{") - stripped.count("}")
+    return declared
+
+
+def _descriptor_file_options(options) -> dict[str, object]:
+    return {f: getattr(options, f) for f in _FILE_OPTION_FIELDS if options.HasField(f)}
+
+
 @pytest.mark.parametrize("module", _SHARED_FRAMEWORK, ids=lambda m: m.DESCRIPTOR.name)
-def test_shared_framework_go_package_is_consumer_neutral(module):
-    """A shared framework descriptor must carry its native go_package, not the
-    binding's override — otherwise its serialized bytes differ from a
-    consumer's identical-contract copy and collide in the global pool."""
-    go_package = module.DESCRIPTOR.GetOptions().go_package
-    assert _BINDING_OVERRIDE_MARKER not in go_package, (
-        f"{module.DESCRIPTOR.name} carries a binding-specific go_package "
-        f"({go_package!r}); buf.gen.yaml must keep go_package native on shared "
-        f"framework paths so independently-generated copies stay byte-identical."
+def test_shared_framework_descriptors_are_native(module):
+    """A shared framework descriptor's file options must equal exactly what its
+    .proto declares — no managed-mode injection. Managed mode rewrites not just
+    go_package but java_package/csharp_namespace/etc.; any divergence from the
+    source means the serialized bytes differ from a consumer that doesn't run
+    managed mode, and the two copies collide in the global pool. buf.gen.yaml
+    must disable ALL managed options on the shared framework paths (a disable
+    entry with only `path:` and no `file_option:`)."""
+    name = module.DESCRIPTOR.name
+    actual = _descriptor_file_options(module.DESCRIPTOR.GetOptions())
+    expected = _declared_file_options(_proto_root() / name)
+
+    assert actual == expected, (
+        f"{name} file options diverge from the .proto source.\n"
+        f"  descriptor: {actual}\n  declared:   {expected}\n"
+        f"Extra/changed options are managed-mode mutations baked into "
+        f"serialized_pb that break byte-identity with a consumer not running "
+        f"managed mode."
     )
 
 

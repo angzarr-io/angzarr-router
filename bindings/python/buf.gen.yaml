@@ -42,11 +42,14 @@ managed:
   disable:
     - file_option: go_package
       path: google
-    # Shared framework contract: keep native go_package (byte-identity).
-    - file_option: go_package
-      path: io/angzarr/v1
-    - file_option: go_package
-      path: sererr
+    # Shared framework contract: disable ALL managed options on these paths so
+    # the descriptors are fully native — managed mode otherwise rewrites
+    # go_package AND java_package/csharp_namespace/etc., all embedded in the
+    # serialized FileDescriptorProto, diverging from a consumer that doesn't run
+    # managed mode (e.g. examples-python). Fully native = byte-identical for
+    # every generator. (A disable with no file_option disables all management.)
+    - path: io/angzarr/v1
+    - path: sererr
   override:
     - file_option: go_package_prefix
       value: github.com/angzarr-io/angzarr-router/bindings/go/gen
