@@ -8,7 +8,7 @@ use std::ffi::c_void;
 use prost::Message;
 
 use angzarr_router::aggregate::AggregateDispatch;
-use angzarr_router::error::{codes, CodedError, HandlerError};
+use angzarr_router::error::{codes, messages, CodedError, HandlerError};
 use angzarr_router::process_manager::ProcessManagerDispatch;
 use angzarr_router::projector::ProjectorDispatch;
 use angzarr_router::rebuild::Rebuilder;
@@ -424,17 +424,32 @@ impl FfiRouter {
             )
         })?;
 
+        // Source-shape validation precedes routing: a nil source is
+        // MISSING_SAGA_SOURCE and a source with no pages is EMPTY_SAGA_SOURCE,
+        // regardless of which (if any) saga consumes its domain. Otherwise an
+        // empty/absent source has no cover domain, matches no saga, and would
+        // mis-report as NO_HANDLER_REGISTERED.
+        let Some(source) = req.source.as_ref() else {
+            return Err(CodedError::invalid_argument(
+                codes::MISSING_SAGA_SOURCE,
+                messages::MISSING_SAGA_SOURCE,
+                [],
+            ));
+        };
+        if source.pages.is_empty() {
+            return Err(CodedError::invalid_argument(
+                codes::EMPTY_SAGA_SOURCE,
+                messages::EMPTY_SAGA_SOURCE,
+                [],
+            ));
+        }
+
         // Route by the source book's domain and merge: every saga consuming
         // that domain runs, each skipping event types it does not declare
         // (spec C-0051). This lets one router host multiple sagas — the
         // in-process coordinator the poker example needs — instead of the
         // single-saga special case.
-        let domain = req
-            .source
-            .as_ref()
-            .and_then(|s| s.cover.as_ref())
-            .map(|c| c.domain.as_str())
-            .unwrap_or("");
+        let domain = source.cover.as_ref().map(|c| c.domain.as_str()).unwrap_or("");
         let _guard = HostCtxGuard::set(host_ctx);
         let mut merged = pb::SagaResponse::default();
         let mut matched = false;

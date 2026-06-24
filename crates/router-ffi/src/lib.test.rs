@@ -1070,6 +1070,35 @@ fn saga_compensator_runs_through_the_abi() {
     assert_eq!(resp.events.len(), 1, "compensator injected one fact event");
 }
 
+#[test]
+fn saga_missing_source_through_the_abi_is_missing_saga_source() {
+    // Source-shape validation must precede domain routing: a request with no
+    // source has no cover domain, matches no saga, and must report
+    // MISSING_SAGA_SOURCE — not the routing layer's NO_HANDLER_REGISTERED.
+    let router = Router::with_saga();
+    let session = next_session();
+    let (ret, bytes) = router.dispatch_saga(session, &pb::SagaHandleRequest::default());
+    assert_eq!(ret, -3, "invalid argument, negated");
+    let (_, reason) = decode_status(&bytes);
+    assert_eq!(reason, angzarr_router::error::codes::MISSING_SAGA_SOURCE);
+}
+
+#[test]
+fn saga_empty_source_through_the_abi_is_empty_saga_source() {
+    // A source book with no pages likewise validates before routing as
+    // EMPTY_SAGA_SOURCE, regardless of which saga (if any) consumes its domain.
+    let router = Router::with_saga();
+    let session = next_session();
+    let req = pb::SagaHandleRequest {
+        source: Some(pb::EventBook::default()),
+        ..Default::default()
+    };
+    let (ret, bytes) = router.dispatch_saga(session, &req);
+    assert_eq!(ret, -3, "invalid argument, negated");
+    let (_, reason) = decode_status(&bytes);
+    assert_eq!(reason, angzarr_router::error::codes::EMPTY_SAGA_SOURCE);
+}
+
 // --- process-manager ABI surface (per-kind entry points)
 
 fn pm_descriptor_bytes() -> Vec<u8> {
