@@ -260,9 +260,11 @@ class Destinations:
 
 
 # Saga thunk shapes (a saga is stateless — no state argument):
-#   event:     (event: Any, dests: Destinations) -> (commands, events)
+#   event:     (event: Any, dests: Destinations, source_cover: Cover) -> (commands, events)
 #   rejection: (notification, rejection) -> events
-SagaEventThunk = Callable[[any_pb2.Any, Destinations], tuple[list, list]]
+# source_cover is the source book's cover passed through whole (Rust owns the
+# deserialization) so the saga can route emitted commands by the trigger's identity.
+SagaEventThunk = Callable[[any_pb2.Any, Destinations, object], tuple[list, list]]
 SagaRejectionThunk = Callable[[object, object], list]
 
 
@@ -493,7 +495,9 @@ def _saga_event_invoker(thunk: SagaEventThunk) -> Invoker:
         sax = abi_pb2.SagaEventAux()
         sax.ParseFromString(aux)
         dests = Destinations(dict(sax.destination_sequences))
-        commands, events = thunk(any_pb2.Any(type_url=type_url, value=payload), dests)
+        commands, events = thunk(
+            any_pb2.Any(type_url=type_url, value=payload), dests, sax.source_cover
+        )
         resp = saga_pb2.SagaResponse(commands=commands, events=events)
         return resp.SerializeToString(), _STATUS_OK
 

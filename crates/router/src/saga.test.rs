@@ -113,7 +113,7 @@ fn event_domains(resp: &pb::SagaResponse) -> Vec<String> {
 #[test]
 fn declared_event_emits_its_command() {
     let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory"])
-        .on_event(FQ_ORDER_CREATED, |_e, _d| {
+        .on_event(FQ_ORDER_CREATED, |_e, _d, _c| {
             Ok((vec![command_to("inventory")], vec![]))
         });
     let resp = saga
@@ -134,7 +134,7 @@ fn undeclared_event_type_is_skipped() {
     // Only OrderCreated is declared; a StockReserved page emits nothing and
     // is not an error (spec C-0051).
     let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory"])
-        .on_event(FQ_ORDER_CREATED, |_e, _d| {
+        .on_event(FQ_ORDER_CREATED, |_e, _d, _c| {
             Ok((vec![command_to("inventory")], vec![]))
         });
     let resp = saga
@@ -154,7 +154,7 @@ fn every_page_is_a_fresh_trigger() {
     // The saga walks EVERY page (source = triggering events, not state):
     // three OrderCreated pages each emit one command → three commands.
     let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory"])
-        .on_event(FQ_ORDER_CREATED, |_e, _d| {
+        .on_event(FQ_ORDER_CREATED, |_e, _d, _c| {
             Ok((vec![command_to("inventory")], vec![]))
         });
     let pages = (0..3).map(|_| event_page_of(FQ_ORDER_CREATED)).collect();
@@ -167,7 +167,7 @@ fn every_page_is_a_fresh_trigger() {
 #[test]
 fn event_thunk_can_inject_fact_events() {
     let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory"])
-        .on_event(FQ_ORDER_CREATED, |_e, _d| {
+        .on_event(FQ_ORDER_CREATED, |_e, _d, _c| {
             Ok((vec![], vec![fact_event("fact")]))
         });
     let resp = saga
@@ -187,7 +187,7 @@ fn two_target_fanout_stamps_destination_sequences() {
     // Handler emits one stamped command per target; the coordinator supplied
     // inventory=7, fulfillment=3 → each command page carries its sequence.
     let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory", "fulfillment"])
-        .on_event(FQ_ORDER_CREATED, |_e, dests| {
+        .on_event(FQ_ORDER_CREATED, |_e, dests, _c| {
             let mut inv = command_to("inventory");
             dests.stamp_command(&mut inv, "inventory")?;
             let mut ful = command_to("fulfillment");
@@ -219,7 +219,7 @@ fn handler_observes_destination_sequences() {
     let cap = observed.clone();
     let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory"]).on_event(
         FQ_ORDER_CREATED,
-        move |_e, dests| {
+        move |_e, dests, _c| {
             for d in dests.domains() {
                 if let Some(s) = dests.sequence_for(&d) {
                     cap.lock().unwrap().insert(d, s);
@@ -285,7 +285,7 @@ fn correlation_fills_only_unset_command_covers() {
     // The source correlation id flows onto emitted commands that did not set
     // their own — a command that stamped its own correlation keeps it.
     let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory", "fulfillment"])
-        .on_event(FQ_ORDER_CREATED, |_e, _d| {
+        .on_event(FQ_ORDER_CREATED, |_e, _d, _c| {
             let inherit = command_to("inventory");
             let mut own = command_to("fulfillment");
             own.cover.as_mut().unwrap().correlation_id = "own".to_string();
@@ -353,7 +353,7 @@ fn corrupt_notification_payload_is_coded() {
 #[test]
 fn handler_error_propagates_as_unhandled() {
     let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory"])
-        .on_event(FQ_ORDER_CREATED, |_e, _d| {
+        .on_event(FQ_ORDER_CREATED, |_e, _d, _c| {
             Err(HandlerError::Other("boom".to_string()))
         });
     let err = saga
@@ -370,7 +370,7 @@ fn handler_error_propagates_as_unhandled() {
 #[test]
 fn accessors_report_name_domains_and_types() {
     let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory", "fulfillment"])
-        .on_event(FQ_ORDER_CREATED, |_e, _d| Ok((vec![], vec![])));
+        .on_event(FQ_ORDER_CREATED, |_e, _d, _c| Ok((vec![], vec![])));
     assert_eq!(saga.name(), "OrderFulfillment");
     assert_eq!(saga.input_domain(), "order");
     assert_eq!(

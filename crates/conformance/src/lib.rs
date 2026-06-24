@@ -249,7 +249,7 @@ pub fn delivery_without_cover(n: u32) -> pb::EventBook {
 /// undeclared rejections are silently skipped (DelegateToFramework).
 pub fn order_saga() -> SagaDispatch {
     SagaDispatch::new("order-saga", "order", ["inventory"])
-        .on_event("test.counter.Increased", |_any, dests| {
+        .on_event("test.counter.Increased", |_any, dests, _c| {
             let mut cmd = reserve_command_to("inventory");
             if dests.has("inventory") {
                 dests.stamp_command(&mut cmd, "inventory")?;

@@ -22,7 +22,11 @@ use crate::pb;
 /// Generated thunks unmarshal to the typed event, call the typed business
 /// method, and stamp emitted commands via the supplied Destinations.
 pub type EventFn = Box<
-    dyn Fn(&Any, &Destinations) -> Result<(Vec<pb::CommandBook>, Vec<pb::EventBook>), HandlerError>
+    dyn Fn(
+            &Any,
+            &Destinations,
+            Option<&pb::Cover>,
+        ) -> Result<(Vec<pb::CommandBook>, Vec<pb::EventBook>), HandlerError>
         + Send
         + Sync,
 >;
@@ -72,6 +76,7 @@ impl SagaDispatch {
         thunk: impl Fn(
                 &Any,
                 &Destinations,
+                Option<&pb::Cover>,
             ) -> Result<(Vec<pb::CommandBook>, Vec<pb::EventBook>), HandlerError>
             + Send
             + Sync
@@ -170,7 +175,8 @@ impl SagaDispatch {
             else {
                 continue; // saga only reacts to declared types (spec C-0051)
             };
-            let (commands, events) = thunk(event_any, &dests).map_err(map_handler_error)?;
+            let (commands, events) =
+                thunk(event_any, &dests, source.cover.as_ref()).map_err(map_handler_error)?;
             resp.commands.extend(commands);
             resp.events.extend(events);
         }

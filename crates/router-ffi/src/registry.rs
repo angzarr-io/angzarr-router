@@ -342,7 +342,7 @@ impl FfiRouter {
 
         for event in &desc.events {
             let id = event.callback_id;
-            dispatch = dispatch.on_event(&event.fq_type, move |any, dests| {
+            dispatch = dispatch.on_event(&event.fq_type, move |any, dests, source_cover| {
                 let destination_sequences = dests
                     .domains()
                     .into_iter()
@@ -350,6 +350,7 @@ impl FfiRouter {
                     .collect();
                 let aux = abi_pb::SagaEventAux {
                     destination_sequences,
+                    source_cover: source_cover.cloned(),
                 }
                 .encode_to_vec();
                 let (ret, bytes) = invoke(cb, id, &any.type_url, &any.value, &aux);
@@ -423,20 +424,36 @@ impl FfiRouter {
             )
         })?;
 
-        let dispatch = match self.sagas.as_slice() {
-            [(_, only)] => only,
-            _ => {
-                return Err(CodedError::invalid_argument(
-                    codes::NO_HANDLER_REGISTERED,
-                    "no single saga registered to claim the source",
-                    [],
-                ));
-            }
-        };
-
+        // Route by the source book's domain and merge: every saga consuming
+        // that domain runs, each skipping event types it does not declare
+        // (spec C-0051). This lets one router host multiple sagas — the
+        // in-process coordinator the poker example needs — instead of the
+        // single-saga special case.
+        let domain = req
+            .source
+            .as_ref()
+            .and_then(|s| s.cover.as_ref())
+            .map(|c| c.domain.as_str())
+            .unwrap_or("");
         let _guard = HostCtxGuard::set(host_ctx);
-        let resp = dispatch.dispatch(&req)?;
-        Ok(resp.encode_to_vec())
+        let mut merged = pb::SagaResponse::default();
+        let mut matched = false;
+        for (_, dispatch) in &self.sagas {
+            if dispatch.input_domain() == domain {
+                matched = true;
+                let resp = dispatch.dispatch(&req)?;
+                merged.commands.extend(resp.commands);
+                merged.events.extend(resp.events);
+            }
+        }
+        if !matched {
+            return Err(CodedError::invalid_argument(
+                codes::NO_HANDLER_REGISTERED,
+                "no saga registered for the source domain",
+                [],
+            ));
+        }
+        Ok(merged.encode_to_vec())
     }
 
     /// Parses a ProcessManagerDescriptor and populates a core PM table.

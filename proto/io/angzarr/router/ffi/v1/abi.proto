@@ -1,6 +1,8 @@
 syntax = "proto3";
 package io.angzarr.router.ffi.v1;
 
+import "io/angzarr/v1/types.proto";
+
 // Auxiliary payloads crossing the C ABI. These are internal to the FFI
 // boundary and versioned with the ABI (angzarr_abi_version) — they are
 // NOT wire protocol and never leave the process.
@@ -69,10 +71,16 @@ message CommandContextAux {
 }
 
 // aux payload for saga event callbacks: the coordinator-supplied
-// destination next-sequences the host stamps emitted commands from. The
+// destination next-sequences the host stamps emitted commands from, plus the
+// source event's cover passed through whole (serialized angzarr Cover) so the
+// saga can route emitted commands by the trigger's identity (root, ext). The
 // host returns a SagaResponse (commands + injected fact events).
 message SagaEventAux {
   map<string, uint32> destination_sequences = 1;
+  // The source book's cover, passed through whole and typed (Rust owns the
+  // deserialization) so the saga can route emitted commands by the trigger's
+  // identity (root, ext).
+  io.angzarr.v1.Cover source_cover = 2;
 }
 
 // Registration payload for one process-manager component. STATEFUL: the PM
