@@ -448,19 +448,22 @@ impl FfiRouter {
         // that domain runs, each skipping event types it does not declare
         // (spec C-0051). This lets one router host multiple sagas — the
         // in-process coordinator the poker example needs — instead of the
-        // single-saga special case.
+        // single-saga special case. The route-and-merge loop is shared with the
+        // PM path (route_and_merge); only the tail differs.
         let domain = source.cover.as_ref().map(|c| c.domain.as_str()).unwrap_or("");
         let _guard = HostCtxGuard::set(host_ctx);
-        let mut merged = pb::SagaResponse::default();
-        let mut matched = false;
-        for (_, dispatch) in &self.sagas {
-            if dispatch.input_domain() == domain {
-                matched = true;
-                let resp = dispatch.dispatch(&req)?;
-                merged.commands.extend(resp.commands);
-                merged.events.extend(resp.events);
-            }
-        }
+        let (merged, matched) = route_and_merge(
+            &self.sagas,
+            domain,
+            |dispatch, dom| dispatch.input_domain() == dom,
+            |dispatch| dispatch.dispatch(&req),
+            |acc: &mut pb::SagaResponse, resp| {
+                acc.commands.extend(resp.commands);
+                acc.events.extend(resp.events);
+            },
+        )?;
+        // Saga tail: a source domain no saga consumes is NO_HANDLER_REGISTERED.
+        // (The PM tail treats an unconsumed domain as a no-op per C-0022.)
         if !matched {
             return Err(CodedError::invalid_argument(
                 codes::NO_HANDLER_REGISTERED,
@@ -597,19 +600,73 @@ impl FfiRouter {
             )
         })?;
 
-        let dispatch = match self.process_managers.as_slice() {
-            [(_, only)] => only,
-            _ => {
-                return Err(CodedError::invalid_argument(
-                    codes::NO_HANDLER_REGISTERED,
-                    "no single process manager registered to claim the trigger",
-                    [],
-                ));
-            }
+        // Trigger-shape validation precedes routing (mirrors dispatch_saga): a
+        // nil trigger is MISSING_PM_TRIGGER and a trigger with no pages is
+        // EMPTY_PM_TRIGGER, regardless of which PM (if any) consumes its domain.
+        let Some(trigger) = req.trigger.as_ref() else {
+            return Err(CodedError::invalid_argument(
+                codes::MISSING_PM_TRIGGER,
+                messages::MISSING_PM_TRIGGER,
+                [],
+            ));
         };
+        if trigger.pages.is_empty() {
+            return Err(CodedError::invalid_argument(
+                codes::EMPTY_PM_TRIGGER,
+                messages::EMPTY_PM_TRIGGER,
+                [],
+            ));
+        }
 
+        // Route by the trigger's domain and merge: every PM subscribed to that
+        // domain runs, each no-opping on event types it does not declare
+        // (C-0022), so one router can host multiple PMs (e.g. hand-flow and
+        // reservation both consume `table`). The route-and-merge loop is shared
+        // with the saga path (route_and_merge).
+        let domain = trigger.cover.as_ref().map(|c| c.domain.as_str()).unwrap_or("");
         let _guard = HostCtxGuard::set(host_ctx);
-        let resp = dispatch.dispatch(&req)?;
-        Ok(resp.encode_to_vec())
+        let (merged, _matched) = route_and_merge(
+            &self.process_managers,
+            domain,
+            |dispatch, dom| dispatch.subscriptions().contains_key(dom),
+            |dispatch| dispatch.dispatch(&req),
+            |acc: &mut pb::ProcessManagerHandleResponse, resp| {
+                acc.process_events.extend(resp.process_events);
+                acc.commands.extend(resp.commands);
+                acc.facts.extend(resp.facts);
+                // First escalation wins (mirrors the compensation merge).
+                if acc.notification.is_none() {
+                    acc.notification = resp.notification;
+                }
+            },
+        )?;
+        // PM tail: an unconsumed trigger domain is a no-op (C-0022), not an error.
+        Ok(merged.encode_to_vec())
     }
+}
+
+/// Routes an incoming book to every registered component subscribed to `domain`,
+/// merging each component's response, and reports whether any component claimed
+/// the domain. Each component's own dispatch no-ops on event types it does not
+/// declare, so merging is safe across co-resident components — multiple sagas, or
+/// several process managers sharing a source domain. Shared by `dispatch_saga`
+/// and `dispatch_process_manager`; the callers differ only in the match
+/// predicate, the per-response merge, and what an unmatched domain means (a saga
+/// reports NO_HANDLER_REGISTERED; a PM treats it as a no-op, C-0022).
+fn route_and_merge<C, R: Default>(
+    components: &[(String, C)],
+    domain: &str,
+    subscribes: impl Fn(&C, &str) -> bool,
+    dispatch_one: impl Fn(&C) -> Result<R, CodedError>,
+    mut merge: impl FnMut(&mut R, R),
+) -> Result<(R, bool), CodedError> {
+    let mut merged = R::default();
+    let mut matched = false;
+    for (_, component) in components {
+        if subscribes(component, domain) {
+            matched = true;
+            merge(&mut merged, dispatch_one(component)?);
+        }
+    }
+    Ok((merged, matched))
 }

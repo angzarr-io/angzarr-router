@@ -1215,3 +1215,72 @@ fn pm_compensator_runs_through_the_abi() {
         "escalated"
     );
 }
+
+#[test]
+fn two_process_managers_share_a_source_domain_route_by_type() {
+    // Two PMs subscribe to the SAME source domain (`orders`) for different event
+    // types. A trigger routes to the PM that declares its type; the other no-ops.
+    // Before multi-PM routing, registering two PMs returned NO_HANDLER_REGISTERED.
+    let r = angzarr_router_new();
+    let pm1 = pm_descriptor_bytes(); // OrderPM: orders/OrderShipped -> CB_PM_EVENT
+    let pm2 = abi_pb::ProcessManagerDescriptor {
+        name: "OtherPM".to_string(),
+        pm_domain: "other-pm".to_string(),
+        appliers: Vec::new(),
+        snapshot_callback_id: None,
+        events: vec![abi_pb::PmEventEntry {
+            input_domain: "orders".to_string(),
+            fq_type: FQ_ORDER_CREATED.to_string(),
+            callback_id: CB_PM_EVENT,
+        }],
+        rejections: Vec::new(),
+    }
+    .encode_to_vec();
+    assert_eq!(
+        unsafe { angzarr_router_register_process_manager(r, pm1.as_ptr(), pm1.len(), host_cb) },
+        0,
+    );
+    assert_eq!(
+        unsafe { angzarr_router_register_process_manager(r, pm2.as_ptr(), pm2.len(), host_cb) },
+        0,
+    );
+    let router = Router(r);
+    let session = next_session();
+    let req = pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)], &[("inventory", 4)]);
+    let (ret, bytes) = router.dispatch_process_manager(session, &req);
+    assert_eq!(ret, 0, "multi-PM routing should not report NO_HANDLER");
+    let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
+    assert_eq!(
+        resp.commands.len(),
+        1,
+        "routed to the PM declaring OrderShipped; the OrderCreated PM no-opped",
+    );
+}
+
+#[test]
+fn pm_missing_trigger_through_the_abi_is_missing_pm_trigger() {
+    // Trigger-shape validation precedes routing (mirrors the saga path): a nil
+    // trigger reports MISSING_PM_TRIGGER, not NO_HANDLER from an empty domain.
+    let router = Router::with_process_manager();
+    let session = next_session();
+    let (ret, bytes) =
+        router.dispatch_process_manager(session, &pb::ProcessManagerHandleRequest::default());
+    assert_eq!(ret, -3, "invalid argument, negated");
+    let (_, reason) = decode_status(&bytes);
+    assert_eq!(reason, angzarr_router::error::codes::MISSING_PM_TRIGGER);
+}
+
+#[test]
+fn pm_empty_trigger_through_the_abi_is_empty_pm_trigger() {
+    // A trigger book with no pages validates before routing as EMPTY_PM_TRIGGER.
+    let router = Router::with_process_manager();
+    let session = next_session();
+    let req = pb::ProcessManagerHandleRequest {
+        trigger: Some(pb::EventBook::default()),
+        ..Default::default()
+    };
+    let (ret, bytes) = router.dispatch_process_manager(session, &req);
+    assert_eq!(ret, -3, "invalid argument, negated");
+    let (_, reason) = decode_status(&bytes);
+    assert_eq!(reason, angzarr_router::error::codes::EMPTY_PM_TRIGGER);
+}
