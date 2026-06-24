@@ -318,7 +318,7 @@ public sealed class Router : IDisposable
         {
             var sax = Abi.SagaEventAux.Parser.ParseFrom(aux);
             var dests = DestinationsOf(sax.DestinationSequences);
-            var emission = thunk(AnyOf(typeUrl, payload), dests);
+            var emission = thunk(AnyOf(typeUrl, payload), dests, sax.SourceCover);
             var resp = new SagaResponse();
             resp.Commands.AddRange(emission.Commands);
             resp.Events.AddRange(emission.Events);

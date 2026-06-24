@@ -40,8 +40,10 @@ public delegate Projection ProjectorFinishThunk<TState>(TState projection, Event
 /// <summary>Observes events outside the declared fold set.</summary>
 public delegate void ProjectorUnknownThunk(string typeUrl);
 
-/// <summary>Translates one source event into a saga emission (stateless).</summary>
-public delegate SagaEmission SagaEventThunk(Any @event, Destinations dests);
+/// <summary>Translates one source event into a saga emission (stateless).
+/// sourceCover is the source book's cover, so the saga can route emitted
+/// commands by the trigger's identity (root, ext).</summary>
+public delegate SagaEmission SagaEventThunk(Any @event, Destinations dests, Cover sourceCover);
 
 /// <summary>Compensates a rejected command from a saga (stateless).</summary>
 public delegate IReadOnlyList<EventBook> SagaRejectionThunk(

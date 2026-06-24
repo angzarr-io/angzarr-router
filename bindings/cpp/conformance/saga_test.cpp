@@ -18,7 +18,8 @@ using angzarr::router::SagaEmission;
 // one fact event.
 class SagaFixture : public tc::OrderSagaHandler {
  public:
-  SagaEmission Increased(const tc::Increased&, const Destinations& dests) override {
+  SagaEmission Increased(const tc::Increased&, const Destinations& dests,
+                         const pb::Cover&) override {
     auto cmd = ReserveCommand();
     if (dests.Has("inventory")) cmd = dests.StampCommand(cmd, "inventory");
     return {{cmd}, {}};

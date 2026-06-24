@@ -4,6 +4,7 @@ import com.google.protobuf.Any;
 import com.google.protobuf.Message;
 import io.angzarr.BusinessResponse;
 import io.angzarr.CommandBook;
+import io.angzarr.Cover;
 import io.angzarr.EventBook;
 import io.angzarr.Notification;
 import io.angzarr.ProcessManagerHandleResponse;
@@ -60,7 +61,9 @@ public final class Thunks {
 
   @FunctionalInterface
   public interface SagaEventThunk {
-    SagaEmission translate(Any event, Destinations dests) throws Exception;
+    /** sourceCover is the source book's cover, so the saga can route emitted
+     * commands by the trigger's identity (root, ext). */
+    SagaEmission translate(Any event, Destinations dests, Cover sourceCover) throws Exception;
   }
 
   @FunctionalInterface

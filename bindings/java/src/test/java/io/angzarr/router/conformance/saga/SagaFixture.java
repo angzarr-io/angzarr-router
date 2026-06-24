@@ -2,6 +2,7 @@ package io.angzarr.router.conformance.saga;
 
 import io.angzarr.router.conformance.Builders;
 import io.angzarr.CommandBook;
+import io.angzarr.Cover;
 import io.angzarr.EventBook;
 import io.angzarr.Notification;
 import io.angzarr.RejectionNotification;
@@ -17,7 +18,7 @@ import test.counter.OrderSagaAngzarr;
 final class SagaFixture implements OrderSagaAngzarr.OrderSagaHandler {
 
   @Override
-  public SagaEmission increased(Counter.Increased event, Destinations dests) {
+  public SagaEmission increased(Counter.Increased event, Destinations dests, Cover sourceCover) {
     CommandBook cmd = Builders.reserveCommand();
     if (dests.has("inventory")) {
       cmd = dests.stampCommand(cmd, "inventory");

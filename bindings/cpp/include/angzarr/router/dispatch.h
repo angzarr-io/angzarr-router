@@ -49,7 +49,10 @@ class AggregateDispatch {
 
 class SagaDispatch {
  public:
-  using EventFn = std::function<SagaEmission(const google::protobuf::Any&, const Destinations&)>;
+  // sourceCover is the source book's cover, so the saga can route emitted
+  // commands by the trigger's identity (root, ext).
+  using EventFn = std::function<SagaEmission(
+      const google::protobuf::Any&, const Destinations&, const io::angzarr::v1::Cover&)>;
   using RejectionFn = std::function<std::vector<io::angzarr::v1::EventBook>(
       const io::angzarr::v1::Notification&, const io::angzarr::v1::RejectionNotification&)>;
 

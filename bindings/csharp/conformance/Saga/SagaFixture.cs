@@ -11,7 +11,7 @@ namespace Angzarr.Router.Conformance.Saga;
 /// injects one fact event.</summary>
 internal sealed class SagaFixture : TC.OrderSagaAngzarr.OrderSagaHandler
 {
-    public SagaEmission Increased(TC.Increased ev, Destinations dests)
+    public SagaEmission Increased(TC.Increased ev, Destinations dests, Cover sourceCover)
     {
         var cmd = Builders.ReserveCommand();
         if (dests.Has("inventory"))

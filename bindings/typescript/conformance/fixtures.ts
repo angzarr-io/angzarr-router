@@ -5,6 +5,7 @@ import {
   type BusinessResponse,
   BusinessResponseSchema,
   type CommandContext,
+  type Cover,
   CoverSchema,
   type Destinations,
   type EventBook,
@@ -109,7 +110,11 @@ function marker(name: string) {
  * command stamped with the supplied destination sequence; a rejection injects
  * one fact event. */
 export class SagaFixture implements OrderSagaHandler {
-  increased(_ev: Increased, dests: Destinations): SagaEmission {
+  increased(
+    _ev: Increased,
+    dests: Destinations,
+    _sourceCover?: Cover,
+  ): SagaEmission {
     let cmd = reserveCommand();
     if (dests.has("inventory")) {
       cmd = dests.stampCommand(cmd, "inventory");

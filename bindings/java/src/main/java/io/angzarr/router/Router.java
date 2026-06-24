@@ -304,7 +304,7 @@ public final class Router implements AutoCloseable {
     return (session, typeUrl, payload, aux) -> {
       Abi.SagaEventAux sax = Abi.SagaEventAux.parseFrom(aux);
       Destinations dests = new Destinations(sax.getDestinationSequencesMap());
-      SagaEmission emission = thunk.translate(anyOf(typeUrl, payload), dests);
+      SagaEmission emission = thunk.translate(anyOf(typeUrl, payload), dests, sax.getSourceCover());
       SagaResponse resp =
           SagaResponse.newBuilder()
               .addAllCommands(emission.commands())

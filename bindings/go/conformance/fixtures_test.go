@@ -84,7 +84,7 @@ func markerPage(name string) *pb.EventPage {
 
 type orderSaga struct{}
 
-func (orderSaga) Increased(_ *counter.Increased, dests *Destinations) ([]*pb.CommandBook, []*pb.EventBook, error) {
+func (orderSaga) Increased(_ *counter.Increased, dests *Destinations, _ *pb.Cover) ([]*pb.CommandBook, []*pb.EventBook, error) {
 	cmd := reserveCommand()
 	if dests.Has("inventory") {
 		if err := dests.StampCommand(cmd, "inventory"); err != nil {

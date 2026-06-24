@@ -3,6 +3,7 @@ import { type Any } from "@bufbuild/protobuf/wkt";
 import { type Destinations } from "./destinations";
 import {
   type CommandBook,
+  type Cover,
   type EventBook,
   type Notification,
   type Projection,
@@ -61,8 +62,14 @@ export type ProjectorFinishThunk<T> = (
 /** Observes events outside the declared fold set. */
 export type ProjectorUnknownThunk = (typeUrl: string) => void;
 
-/** Translates one source event into a saga emission (stateless). */
-export type SagaEventThunk = (event: Any, dests: Destinations) => SagaEmission;
+/** Translates one source event into a saga emission (stateless). sourceCover is
+ * the source book's cover, so the saga can route emitted commands by the
+ * trigger's identity (root, ext). */
+export type SagaEventThunk = (
+  event: Any,
+  dests: Destinations,
+  sourceCover?: Cover,
+) => SagaEmission;
 
 /** Compensates a rejected command from a saga (stateless). */
 export type SagaRejectionThunk = (

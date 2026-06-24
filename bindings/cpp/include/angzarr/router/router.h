@@ -278,7 +278,7 @@ class Router {
           std::map<std::string, uint32_t> seqs;
           for (const auto& kv : sax.destination_sequences()) seqs[kv.first] = kv.second;
           Destinations dests(std::move(seqs));
-          auto emission = fn(AnyOf(tu, payload), dests);
+          auto emission = fn(AnyOf(tu, payload), dests, sax.source_cover());
           pb::SagaResponse resp;
           for (auto& c : emission.commands) *resp.add_commands() = c;
           for (auto& e : emission.events) *resp.add_events() = e;

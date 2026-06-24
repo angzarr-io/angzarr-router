@@ -612,7 +612,7 @@ func sagaEventInvoker(thunk SagaEventThunk) invoker {
 			return errorStatus(fmt.Errorf("unmarshal SagaEventAux: %w", err))
 		}
 		dests := NewDestinations(sax.DestinationSequences)
-		commands, events, err := thunk(&anypb.Any{TypeUrl: typeURL, Value: payload}, dests)
+		commands, events, err := thunk(&anypb.Any{TypeUrl: typeURL, Value: payload}, dests, sax.SourceCover)
 		if err != nil {
 			return errorStatus(err)
 		}

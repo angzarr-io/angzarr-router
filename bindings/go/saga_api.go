@@ -8,9 +8,10 @@ import (
 
 // SagaEventThunk translates one source event into commands and/or injected
 // fact events, stamping emitted commands from the supplied Destinations.
-// Binding/generated thunks unmarshal to the typed event and call the typed
-// business method.
-type SagaEventThunk func(event *anypb.Any, dests *Destinations) (commands []*pb.CommandBook, events []*pb.EventBook, err error)
+// sourceCover is the source book's cover, so the saga can route emitted
+// commands by the trigger's identity (root, ext). Binding/generated thunks
+// unmarshal to the typed event and call the typed business method.
+type SagaEventThunk func(event *anypb.Any, dests *Destinations, sourceCover *pb.Cover) (commands []*pb.CommandBook, events []*pb.EventBook, err error)
 
 // SagaRejectionThunk compensates a rejected command, returning fact events to
 // inject. Multiple thunks for one command run in registration order (C-0042).

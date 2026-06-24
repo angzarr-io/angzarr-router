@@ -467,7 +467,7 @@ function sagaEventInvoker(thunk: SagaEventThunk): Invoker {
   return (_session, typeUrl, payload, aux) => {
     const sax = fromBinary(SagaEventAuxSchema, aux);
     const dests = new Destinations(sax.destinationSequences);
-    const emission = thunk(anyOf(typeUrl, payload), dests);
+    const emission = thunk(anyOf(typeUrl, payload), dests, sax.sourceCover);
     const resp = create(SagaResponseSchema, {
       commands: emission.commands,
       events: emission.events,
