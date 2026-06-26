@@ -219,6 +219,17 @@ class Router {
     return any;
   }
 
+  // ParseOrThrow decodes an ABI aux/payload buffer, coding a malformed buffer
+  // as an error the trampoline firewall converts to a status. protobuf C++
+  // ParseFromString returns false rather than throwing, so the result must be
+  // checked explicitly — mirrors ParseResponse for response decodes.
+  template <class T>
+  static void ParseOrThrow(T& msg, const std::string& bytes, const char* what) {
+    if (!msg.ParseFromString(bytes)) {
+      throw CodedError::Unhandled(std::string("unmarshal ") + what);
+    }
+  }
+
   // --- invoker adapters (the lone TState cast lives in EnsureState) --------
 
   template <class TState>
@@ -234,7 +245,7 @@ class Router {
     return [fn](Session& s, const std::string& tu, const std::string& payload,
                 const std::string& aux) {
       abi::CommandContextAux cax;
-      cax.ParseFromString(aux);
+      ParseOrThrow(cax, aux, "CommandContextAux");
       CommandContext cctx{cax.next_sequence(), cax.had_prior_events()};
       auto book = fn(AnyOf(tu, payload), s.EnsureState<TState>(), cctx);
       return InvokerResult{book.SerializeAsString(), ffi::kStatusOk, true};
@@ -245,11 +256,11 @@ class Router {
   static Invoker RejectionInvoker(typename AggregateDispatch<TState>::RejectionFn fn) {
     return [fn](Session& s, const std::string&, const std::string&, const std::string& aux) {
       abi::RejectionAux rax;
-      rax.ParseFromString(aux);
+      ParseOrThrow(rax, aux, "RejectionAux");
       pb::Notification n;
-      n.ParseFromString(rax.notification());
+      ParseOrThrow(n, rax.notification(), "Notification");
       pb::RejectionNotification rej;
-      rej.ParseFromString(rax.rejection());
+      ParseOrThrow(rej, rax.rejection(), "RejectionNotification");
       CommandContext cctx{};
       if (rax.has_cctx()) {
         cctx.next_sequence = rax.cctx().next_sequence();
@@ -264,7 +275,7 @@ class Router {
   static Invoker ProjectorFinishInvoker(typename ProjectorDispatch<TState>::FinishFn fn) {
     return [fn](Session& s, const std::string&, const std::string& payload, const std::string&) {
       pb::EventBook book;
-      book.ParseFromString(payload);
+      ParseOrThrow(book, payload, "EventBook");
       auto proj = fn(s.EnsureState<TState>(), book);
       return InvokerResult{proj.SerializeAsString(), ffi::kStatusOk, true};
     };
@@ -274,7 +285,7 @@ class Router {
     return
         [fn](Session&, const std::string& tu, const std::string& payload, const std::string& aux) {
           abi::SagaEventAux sax;
-          sax.ParseFromString(aux);
+          ParseOrThrow(sax, aux, "SagaEventAux");
           std::map<std::string, uint32_t> seqs;
           for (const auto& kv : sax.destination_sequences()) seqs[kv.first] = kv.second;
           Destinations dests(std::move(seqs));
@@ -289,11 +300,11 @@ class Router {
   static Invoker SagaRejectionInvoker(SagaDispatch::RejectionFn fn) {
     return [fn](Session&, const std::string&, const std::string&, const std::string& aux) {
       abi::RejectionAux rax;
-      rax.ParseFromString(aux);
+      ParseOrThrow(rax, aux, "RejectionAux");
       pb::Notification n;
-      n.ParseFromString(rax.notification());
+      ParseOrThrow(n, rax.notification(), "Notification");
       pb::RejectionNotification rej;
-      rej.ParseFromString(rax.rejection());
+      ParseOrThrow(rej, rax.rejection(), "RejectionNotification");
       pb::SagaResponse resp;
       for (auto& e : fn(n, rej)) *resp.add_events() = e;
       return InvokerResult{resp.SerializeAsString(), ffi::kStatusOk, true};
@@ -305,7 +316,7 @@ class Router {
     return [fn](Session& s, const std::string& tu, const std::string& payload,
                 const std::string& aux) {
       abi::PmEventAux pax;
-      pax.ParseFromString(aux);
+      ParseOrThrow(pax, aux, "PmEventAux");
       std::map<std::string, uint32_t> seqs;
       for (const auto& kv : pax.destination_sequences()) seqs[kv.first] = kv.second;
       Destinations dests(std::move(seqs));
@@ -318,11 +329,11 @@ class Router {
   static Invoker PmRejectionInvoker(typename ProcessManagerDispatch<TState>::RejectionFn fn) {
     return [fn](Session& s, const std::string&, const std::string&, const std::string& aux) {
       abi::RejectionAux rax;
-      rax.ParseFromString(aux);
+      ParseOrThrow(rax, aux, "RejectionAux");
       pb::Notification n;
-      n.ParseFromString(rax.notification());
+      ParseOrThrow(n, rax.notification(), "Notification");
       pb::RejectionNotification rej;
-      rej.ParseFromString(rax.rejection());
+      ParseOrThrow(rej, rax.rejection(), "RejectionNotification");
       auto r = fn(n, rej, s.EnsureState<TState>());
       pb::ProcessManagerHandleResponse resp;
       for (auto& e : r.process_events) *resp.add_process_events() = e;
