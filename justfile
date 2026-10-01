@@ -244,6 +244,9 @@ java-binding-test: build (_java_container "java-binding-test")
 # Lint + format check the Java binding
 java-binding-lint: (_java_container "java-binding-lint")
 
+# Auto-format the Java binding (spotless)
+java-binding-format: (_java_container "java-binding-format")
+
 # --- C# binding (bindings/csharp) ----------------------------------------
 # Runs in the C# image; the router-ffi cdylib is built in the rust image
 # (`build`) and carried forward via the shared target/ mount — loaded in-process

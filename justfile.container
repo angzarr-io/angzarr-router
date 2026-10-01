@@ -133,6 +133,10 @@ java-binding-test: java-binding-gen
 java-binding-lint: java-binding-gen
     cd {{TOP}}/bindings/java && gradle --no-daemon --console=plain spotlessCheck
 
+# Auto-format the Java binding (spotless; generated code excluded).
+java-binding-format: java-binding-gen
+    cd {{TOP}}/bindings/java && gradle --no-daemon --console=plain spotlessApply
+
 # --- C# binding (bindings/csharp) ----------------------------------------
 # Run in the C# image. P/Invoke loads the router-ffi cdylib, built in the rust
 # image and carried forward in target/debug (the host `build` step runs first);
