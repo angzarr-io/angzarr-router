@@ -111,6 +111,18 @@ impl FfiRouter {
                 [],
             )
         })?;
+        // Commands route by domain, so a second aggregate for a domain could
+        // never receive a command: refuse the claim at registration (C-0010).
+        if self.aggregates.iter().any(|(d, _)| *d == desc.domain) {
+            return Err(CodedError::invalid_argument(
+                codes::DUPLICATE_REGISTRATION,
+                "an aggregate is already registered for this domain",
+                [(
+                    angzarr_router::error::extras::DOMAIN.to_string(),
+                    desc.domain.clone(),
+                )],
+            ));
+        }
 
         let mut rebuilder: Rebuilder<()> = Rebuilder::new(|| ());
         for applier in &desc.appliers {
@@ -216,6 +228,15 @@ impl FfiRouter {
                 [],
             )
         })?;
+        // A projector dispatch returns one Projection per EventBook, so a
+        // router hosts at most one projector.
+        if !self.projectors.is_empty() {
+            return Err(CodedError::invalid_argument(
+                codes::DUPLICATE_REGISTRATION,
+                "a projector is already registered on this router",
+                [],
+            ));
+        }
 
         let mut dispatch = ProjectorDispatch::new(desc.name.clone(), || ());
         if !desc.domains.is_empty() {
@@ -224,14 +245,16 @@ impl FfiRouter {
         for event in &desc.events {
             let id = event.callback_id;
             dispatch = dispatch.on_event(&event.fq_type, move |_, any| {
-                let (ret, _) = invoke(cb, id, &any.type_url, &any.value, &[]);
+                let (ret, bytes) = invoke(cb, id, &any.type_url, &any.value, &[]);
                 if ret < 0 {
-                    return Err(HandlerError::Other("host fold failed".to_string()));
+                    return Err(host_error(ret, bytes));
                 }
                 Ok(())
             });
         }
         if let Some(id) = desc.unknown_callback_id {
+            // The unknown-event hook is an observer: its status is not part
+            // of the projection outcome.
             dispatch = dispatch.on_unknown(move |type_url| {
                 invoke(cb, id, type_url, &[], &[]);
             });

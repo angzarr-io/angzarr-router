@@ -56,6 +56,7 @@ const CB_PM_EVENT: u64 = 12;
 const CB_PM_COMP: u64 = 13;
 const CB_PM2_EVENT: u64 = 14;
 const CB_PM2_COMP: u64 = 15;
+const CB_PROJ_FOLD_REJECTS: u64 = 16;
 
 const FQ_ORDER_CREATED: &str = "test.order.OrderCreated";
 const FQ_RESERVE_STOCK: &str = "test.order.ReserveStock";
@@ -187,6 +188,13 @@ unsafe extern "C" fn host_cb(
             }
             with_session(key, |s| s.counter += 1);
             STATUS_OK_EMPTY
+        }
+        CB_PROJ_FOLD_REJECTS => {
+            host_fill(
+                out,
+                &rejection_status(9, "PROJECTION_STALE", "projection is stale"),
+            );
+            -9
         }
         CB_PROJ_FINISH => {
             // Pack the folded count into the wire Projection. The core hands
@@ -1470,4 +1478,68 @@ fn uncovered_process_state_fans_the_trigger_out_in_registration_order() {
         command_domains(&resp),
         vec!["inventory".to_string(), "pm2-target".to_string()]
     );
+}
+
+// --- registration-time claims + host fold status
+
+#[test]
+fn second_aggregate_for_a_domain_is_refused_at_registration() {
+    let router = Router::with_counter();
+    let desc = descriptor_bytes();
+    let ret =
+        unsafe { angzarr_router_register_aggregate(router.0, desc.as_ptr(), desc.len(), host_cb) };
+    assert_eq!(ret, -3, "a duplicate domain claim is an invalid argument");
+    // The first registration still serves the domain.
+    let (ret, _) = router.dispatch(
+        next_session(),
+        &command_req(FQ_INCREASE_BY, IncreaseBy { n: 1 }.encode_to_vec(), None),
+    );
+    assert_eq!(ret, 0);
+}
+
+#[test]
+fn aggregates_for_distinct_domains_both_register() {
+    let router = Router::with_counter();
+    let mut other = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
+    other.domain = "other".to_string();
+    let desc = other.encode_to_vec();
+    let ret =
+        unsafe { angzarr_router_register_aggregate(router.0, desc.as_ptr(), desc.len(), host_cb) };
+    assert_eq!(ret, 0);
+}
+
+#[test]
+fn second_projector_is_refused_at_registration() {
+    let router = Router::with_projector();
+    let desc = projector_descriptor_bytes();
+    let ret =
+        unsafe { angzarr_router_register_projector(router.0, desc.as_ptr(), desc.len(), host_cb) };
+    assert_eq!(ret, -3, "one projector per router");
+    let (ret, _) = router.dispatch_projector(next_session(), &book_in_domain("counter", 2));
+    assert_eq!(ret, 0, "the registered projector still claims every book");
+}
+
+#[test]
+fn projector_fold_failure_keeps_the_host_status() {
+    let r = angzarr_router_new();
+    let desc = abi_pb::ProjectorDescriptor {
+        name: "Rejecting".to_string(),
+        domains: vec!["counter".to_string()],
+        events: vec![abi_pb::CallbackEntry {
+            fq_type: FQ_INCREASED.to_string(),
+            callback_id: CB_PROJ_FOLD_REJECTS,
+        }],
+        finish_callback_id: Some(CB_PROJ_FINISH),
+        unknown_callback_id: None,
+    }
+    .encode_to_vec();
+    assert_eq!(
+        unsafe { angzarr_router_register_projector(r, desc.as_ptr(), desc.len(), host_cb) },
+        0
+    );
+    let router = Router(r);
+    let (ret, bytes) = router.dispatch_projector(next_session(), &book_in_domain("counter", 1));
+    assert_eq!(ret, -9, "the host's gRPC code survives");
+    let (_, reason) = decode_status(&bytes);
+    assert_eq!(reason, "PROJECTION_STALE");
 }
