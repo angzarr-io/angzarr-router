@@ -138,7 +138,9 @@ class PageContext:
     """Where the event or command a handler is handling sits: the cover of
     its book (None when the book carries none) and the page's explicit
     sequence (0 when the page carries none, and for commands, sagas and
-    process-manager triggers, whose callbacks carry no page sequence)."""
+    process-manager triggers, whose callbacks carry no page sequence).
+    Projector folds and aggregate / process-manager appliers see the
+    folded event's own book cover and page sequence."""
 
     cover: types_pb2.Cover | None = None
     sequence: int = 0
@@ -169,7 +171,8 @@ def current_page() -> PageContext:
     sets it for every callback it makes: an aggregate command, compensation
     or undo handler sees its command's cover, a fact handler the facts'
     cover, a saga handler the source cover, a process-manager handler the
-    trigger cover, a projector fold its book's cover and page sequence.
+    trigger cover, a projector fold or an aggregate / process-manager applier
+    its event's book cover and page sequence.
     Raises RuntimeError outside a dispatch."""
     ctx = _CURRENT_PAGE.get()
     if ctx is None:
@@ -198,12 +201,14 @@ def _command_context(cax) -> CommandContext:
 
 # Thunk shapes (host-supplied business logic):
 #   applier:   (state, payload: Any) -> None            (folds; raises on corrupt)
+#   context applier: (state, payload: Any, ctx: PageContext) -> None
 #   command:   (cmd: Any, state, cctx) -> EventBook|None (raises CodedError to reject)
 #   rejection: (notification, rejection, state, cctx) -> BusinessResponse|None
 #   undo:      (notification, compensate, state, cctx) -> BusinessResponse|None
 #   fact:      (fact: Any, state) -> Message|Any|None    (the fact to record;
 #                                                         None = unchanged)
 ApplierThunk = Callable[[object, any_pb2.Any], None]
+ApplierContextThunk = Callable[[object, any_pb2.Any, PageContext], None]
 CommandThunk = Callable[[any_pb2.Any, object, CommandContext], object | None]
 RejectionThunk = Callable[[object, object, object, CommandContext], object | None]
 UndoThunk = Callable[[object, object, object, CommandContext], object | None]
@@ -222,6 +227,17 @@ class Rebuilder:
     def apply(self, full_name: str, thunk: ApplierThunk) -> Rebuilder:
         """Register an applier for one fully-qualified event type."""
         self.appliers[full_name] = thunk
+        return self
+
+    def apply_with_context(self, full_name: str, thunk: ApplierContextThunk) -> Rebuilder:
+        """Register an applier for one fully-qualified event type that also
+        receives the event's :class:`PageContext` (its book's cover and the
+        page's sequence)."""
+
+        def fold(state, event):
+            thunk(state, event, current_page())
+
+        self.appliers[full_name] = fold
         return self
 
     def with_snapshot(self, thunk: ApplierThunk) -> Rebuilder:
@@ -534,6 +550,20 @@ Invoker = Callable[[_Session, str, bytes, bytes], tuple[bytes | None, int]]
 
 
 def _applier_invoker(key: int, factory, thunk: ApplierThunk) -> Invoker:
+    # The applier aux is a ProjectorEventAux: the folded event's book cover
+    # and page sequence, current while the applier runs.
+    def inv(session, type_url, payload, aux):
+        pax = abi_pb2.ProjectorEventAux()
+        pax.ParseFromString(aux)
+        state = session.ensure_state(key, factory)
+        with _handling(PageContext(cover=_cover_of(pax, "cover"), sequence=pax.sequence)):
+            thunk(state, any_pb2.Any(type_url=type_url, value=payload))
+        return None, _STATUS_OK
+
+    return inv
+
+
+def _snapshot_invoker(key: int, factory, thunk: ApplierThunk) -> Invoker:
     def inv(session, type_url, payload, _aux):
         state = session.ensure_state(key, factory)
         thunk(state, any_pb2.Any(type_url=type_url, value=payload))
@@ -873,7 +903,7 @@ class Router:
                 desc.appliers.append(abi_pb2.CallbackEntry(fq_type=fq, callback_id=cid))
             if dispatch.rebuilder.snapshot is not None:
                 desc.snapshot_callback_id = self._assign(
-                    _applier_invoker(key, factory, dispatch.rebuilder.snapshot)
+                    _snapshot_invoker(key, factory, dispatch.rebuilder.snapshot)
                 )
             for fq, thunk in dispatch.commands.items():
                 cid = self._assign(_command_invoker(key, factory, thunk))
@@ -935,9 +965,10 @@ class Router:
     def dispatch_replay(self, domain: str, replay_request) -> object:
         """Replay a ReplayRequest (a base snapshot, then events) through the
         aggregate registered for ``domain`` (empty selects a sole registered
-        aggregate) and return the ReplayResponse carrying its rebuilt state,
-        packed. An aggregate whose state is not a protobuf message does not
-        support Replay (NO_HANDLER_REGISTERED). Raises a CodedError decoded
+        aggregate), or the process manager whose own domain it is when no
+        aggregate claims it, and return the ReplayResponse carrying its
+        rebuilt state, packed. A component whose state is not a protobuf
+        message does not support Replay (NO_HANDLER_REGISTERED). Raises a CodedError decoded
         from the core's failure."""
         call = abi_pb2.ReplayCall(domain=domain)
         call.request.CopyFrom(replay_request)
@@ -1030,7 +1061,8 @@ class Router:
 
     def register_process_manager(self, dispatch: ProcessManagerDispatch) -> None:
         """Register one process-manager component: assign callback ids to every
-        applier/snapshot/event/rejection thunk, serialize the
+        applier/snapshot/event/rejection thunk (plus a state packer for Replay
+        when the state is a protobuf message), serialize the
         ProcessManagerDescriptor, and hand it to the core with the shared
         trampoline."""
         with self._lock:
@@ -1046,7 +1078,7 @@ class Router:
                 desc.appliers.append(abi_pb2.CallbackEntry(fq_type=fq, callback_id=cid))
             if dispatch.rebuilder.snapshot is not None:
                 desc.snapshot_callback_id = self._assign(
-                    _applier_invoker(key, factory, dispatch.rebuilder.snapshot)
+                    _snapshot_invoker(key, factory, dispatch.rebuilder.snapshot)
                 )
             for input_domain, by_type in dispatch.handlers.items():
                 for fq, thunk in by_type.items():
@@ -1060,6 +1092,8 @@ class Router:
                     cid = self._assign(_pm_rejection_invoker(key, factory, thunk))
                     entry.callback_ids.append(cid)
                 desc.rejections.append(entry)
+            if isinstance(factory(), Message):
+                desc.state_callback_id = self._assign(_state_invoker(key, factory))
 
             desc_bytes = desc.SerializeToString()
             ret = lib.angzarr_router_register_process_manager(

@@ -2,7 +2,7 @@
 ``conformance/features/context.feature`` against the ledger aggregate, the
 reserving process-manager and the tracking projector built through the
 binding's hand-written APIs (``on_fact``, ``dispatch_fact``,
-``dispatch_replay``, ``CommandContext.cover``, ``on_event_with_cover``, a
+``dispatch_replay``, ``apply_with_context``, ``CommandContext.cover``, ``on_event_with_cover``, a
 full-response PM compensator, ``on_event_with_context``)."""
 
 from __future__ import annotations
@@ -53,14 +53,15 @@ def _reserve_to(domain: str, fq: str = FQ_RESERVE):
 # --- the hand-built components ---
 
 
-def _ledger_aggregate(covers: list) -> AggregateDispatch:
+def _ledger_aggregate(covers: list, applied: list) -> AggregateDispatch:
     """The ledger aggregate (domain "ledger") over CounterState: Increased
-    folds count += 1; a snapshot loads CounterState; IncreaseBy records the
+    folds count += 1 and records the page sequence it applied; a snapshot loads CounterState; IncreaseBy records the
     handled cover and emits nothing; an Increased fact is annotated as a
     CounterState carrying the folded count."""
 
-    def apply_increased(state, _event):
+    def apply_increased(state, _event, ctx: PageContext):
         state.count += 1
+        applied.append(ctx.sequence)
 
     def load_snapshot(state, snapshot):
         state.ParseFromString(snapshot.value)
@@ -73,7 +74,7 @@ def _ledger_aggregate(covers: list) -> AggregateDispatch:
 
     rebuilder = (
         Rebuilder(factory=counter_pb2.CounterState)
-        .apply(FQ_INCREASED, apply_increased)
+        .apply_with_context(FQ_INCREASED, apply_increased)
         .with_snapshot(load_snapshot)
     )
     return (
@@ -85,9 +86,13 @@ def _ledger_aggregate(covers: list) -> AggregateDispatch:
 
 def _reserving_pm(covers: list) -> ProcessManagerDispatch:
     """The reserving process-manager (domain "reserving-pm", target
-    "inventory") over CounterState: an Increased trigger from "counter" records
+    "inventory") over CounterState (Increased folds count += 1): an Increased
+    trigger from "counter" records
     the trigger cover and emits nothing; a rejected Reserve is compensated
     with a Release command to "inventory"."""
+
+    def apply_increased(state, _event):
+        state.count += 1
 
     def on_increased(_event, _state, _dests, trigger_cover):
         covers.append(trigger_cover)
@@ -102,7 +107,7 @@ def _reserving_pm(covers: list) -> ProcessManagerDispatch:
         ProcessManagerDispatch(
             "Reserving",
             "reserving-pm",
-            Rebuilder(factory=counter_pb2.CounterState),
+            Rebuilder(factory=counter_pb2.CounterState).apply(FQ_INCREASED, apply_increased),
             ["inventory"],
         )
         .on_event_with_cover("counter", FQ_INCREASED, on_increased)
@@ -141,6 +146,13 @@ def _replay_request(count: int, events: int):
     req.base_snapshot.state.CopyFrom(pack(counter_pb2.CounterState(count=count)))
     for i in range(events):
         req.events.append(_increased_page(2 + i))
+    return req
+
+
+def _events_replay_request(events: int):
+    req = command_handler_pb2.ReplayRequest()
+    for i in range(events):
+        req.events.append(_increased_page(i))
     return req
 
 
@@ -186,6 +198,7 @@ class _World:
     def __init__(self):
         self.router = Router()
         self.covers: list = []
+        self.applied: list = []
         self.pages: list = []
         self.facts = None
         self.replayed = None
@@ -204,7 +217,7 @@ def world():
 
 @given("a ledger aggregate")
 def _ledger(world):
-    world.router.register_aggregate(_ledger_aggregate(world.covers))
+    world.router.register_aggregate(_ledger_aggregate(world.covers, world.applied))
 
 
 @given("a reserving process-manager")
@@ -240,6 +253,22 @@ def _replay(world, count, events):
     resp = world.router.dispatch_replay("ledger", _replay_request(int(count), int(events)))
     assert fq_from_url(resp.state.type_url) == "test.counter.CounterState"
     world.replayed = counter_pb2.CounterState.FromString(resp.state.value)
+
+
+@when(parsers.re(r"the reserving process-manager replays (?P<events>\d+) Increased events"))
+def _pm_replay(world, events):
+    resp = world.router.dispatch_replay("reserving-pm", _events_replay_request(int(events)))
+    assert fq_from_url(resp.state.type_url) == "test.counter.CounterState"
+    world.replayed = counter_pb2.CounterState.FromString(resp.state.value)
+
+
+@then(
+    parsers.re(
+        r"the ledger applied Increased events at sequences (?P<first>\d+) and (?P<second>\d+)"
+    )
+)
+def _applied_at(world, first, second):
+    assert world.applied == [int(first), int(second)]
 
 
 @when(parsers.re(r'an IncreaseBy command for ledger root "(?P<label>[^"]*)" is dispatched'))

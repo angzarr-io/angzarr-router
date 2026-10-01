@@ -273,6 +273,74 @@ def test_replay_of_an_aggregate_with_non_message_state_is_not_supported():
     assert exc.value.code == "NO_HANDLER_REGISTERED"
 
 
+# --- applier page context ---
+
+
+def test_appliers_read_each_event_cover_and_sequence_by_argument_and_accessor():
+    seen = []
+
+    def apply_rich(state, _event, ctx: PageContext):
+        seen.append(("rich", ctx.cover.root.value, ctx.sequence))
+
+    def apply_plain(state, _event):
+        page = current_page()
+        seen.append(("plain", page.cover.root.value, page.sequence))
+
+    rebuilder = (
+        Rebuilder(factory=counter_pb2.CounterState)
+        .apply_with_context(builders.FQ_INCREASED, apply_rich)
+        .apply("test.counter.Reserve", apply_plain)
+    )
+    dispatch = AggregateDispatch("Ledger", "ledger", rebuilder)
+    dispatch.on_command(builders.FQ_INCREASE_BY, lambda _cmd, _state, _cctx: None)
+    cc = _ledger_command("ledger-1")
+    cc.events.cover.CopyFrom(builders.cover_of("ledger", "history-1"))
+    cc.events.pages.append(_increased_page(4))
+    reserve = cc.events.pages.add()
+    reserve.header.sequence = 5
+    reserve.event.CopyFrom(pack(counter_pb2.Reserve()))
+    cc.events.next_sequence = 6
+    with Router() as router:
+        router.register_aggregate(dispatch)
+        router.dispatch(cc)
+
+    history = builders.root_of("history-1")
+    assert seen == [("rich", history, 4), ("plain", history, 5)]
+
+
+def test_process_manager_replays_its_state_by_its_own_domain():
+    def apply_increased(state, _event):
+        state.count += 1
+
+    pm = ProcessManagerDispatch(
+        "Reserving",
+        "reserving-pm",
+        Rebuilder(factory=counter_pb2.CounterState).apply(builders.FQ_INCREASED, apply_increased),
+        ["inventory"],
+    )
+    req = command_handler_pb2.ReplayRequest()
+    for i in range(3):
+        req.events.append(_increased_page(i))
+    with Router() as router:
+        router.register_process_manager(pm)
+        resp = router.dispatch_replay("reserving-pm", req)
+
+    assert resp.state.type_url == "/test.counter.CounterState"
+    assert counter_pb2.CounterState.FromString(resp.state.value).count == 3
+
+
+def test_replay_of_a_process_manager_with_non_message_state_is_not_supported():
+    pm = ProcessManagerDispatch(
+        "Reserving", "reserving-pm", Rebuilder(factory=lambda: None), ["inventory"]
+    )
+    with Router() as router:
+        router.register_process_manager(pm)
+        with pytest.raises(CodedError) as exc:
+            router.dispatch_replay("reserving-pm", command_handler_pb2.ReplayRequest())
+
+    assert exc.value.code == "NO_HANDLER_REGISTERED"
+
+
 # --- process-manager trigger cover ---
 
 
