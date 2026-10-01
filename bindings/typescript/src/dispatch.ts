@@ -8,9 +8,13 @@ import {
   type ProjectorFinishThunk,
   type ProjectorUnknownThunk,
   type RejectionThunk,
+  type SagaEventContextThunk,
   type SagaEventThunk,
   type UndoThunk,
 } from "./thunks";
+
+/** A projector domain that consumes every domain. */
+export const WILDCARD_DOMAIN = "*";
 
 /**
  * One aggregate component's registration: its name, domain, rebuilder, command
@@ -65,7 +69,7 @@ export class AggregateDispatch<T> {
  * stateless — no rebuilder, no state — and receives no rejections.
  */
 export class SagaDispatch {
-  readonly events = new Map<string, SagaEventThunk>();
+  readonly events = new Map<string, SagaEventContextThunk>();
 
   constructor(
     readonly name: string,
@@ -75,6 +79,15 @@ export class SagaDispatch {
 
   /** Registers the translation thunk for a fully-qualified event type. */
   onEvent(fullName: string, thunk: SagaEventThunk): this {
+    return this.onEventWithContext(fullName, (event, dests, source) =>
+      thunk(event, dests, source.cover),
+    );
+  }
+
+  /** Registers the translation thunk for a fully-qualified event type; the
+   * thunk receives the triggering event's page context (source cover and
+   * sequence). */
+  onEventWithContext(fullName: string, thunk: SagaEventContextThunk): this {
     this.events.set(fullName, thunk);
     return this;
   }
@@ -96,7 +109,8 @@ export class ProjectorDispatch<T> {
     readonly factory: () => T,
   ) {}
 
-  /** Declares the domains this projector folds. */
+  /** Declares the domains this projector folds; WILDCARD_DOMAIN folds every
+   * domain. */
   forDomains(...domains: string[]): this {
     this.domains = domains;
     return this;

@@ -4,7 +4,7 @@ import { create, equals } from "@bufbuild/protobuf";
 import { AnySchema } from "@bufbuild/protobuf/wkt";
 import { After, Before, Given, Then, When } from "@cucumber/cucumber";
 
-import { CodedError, Router } from "@angzarr/router";
+import { CodedError, Router, WILDCARD_DOMAIN } from "@angzarr/router";
 import { ContextualCommandSchema } from "@angzarr/router";
 import type {
   AngzarrDeferredSequence,
@@ -20,9 +20,12 @@ import type {
 } from "@angzarr/router";
 import { registerAuditProcessManager } from "../gen/test/counter/audit_process_manager_angzarr";
 import { registerCounterAggregate } from "../gen/test/counter/counter_aggregate_angzarr";
-import { registerCounterProjector } from "../gen/test/counter/counter_projector_angzarr";
+import {
+  newCounterProjectorDispatch,
+  registerCounterProjector,
+} from "../gen/test/counter/counter_projector_angzarr";
 import { registerOrderProcessManager } from "../gen/test/counter/order_process_manager_angzarr";
-import { registerOrderSaga } from "../gen/test/counter/order_saga_angzarr";
+import { newOrderSagaDispatch } from "../gen/test/counter/order_saga_angzarr";
 import * as B from "./builders";
 import {
   AUDIT_MARK,
@@ -46,12 +49,13 @@ interface Ctx {
   proj?: Projection;
   err?: CodedError;
   observed: Observation[];
+  sagaSeen: number[];
 }
 
 let ctx: Ctx;
 
 Before(() => {
-  ctx = { observed: [] };
+  ctx = { observed: [], sagaSeen: [] };
 });
 
 After(() => {
@@ -300,7 +304,13 @@ function lastObserved(): Observation {
 Given("an order saga delivering to {string}", function (_target: string) {
   ctx.kind = "saga";
   ctx.router = new Router();
-  registerOrderSaga(ctx.router, new SagaFixture());
+  const saga = newOrderSagaDispatch(new SagaFixture());
+  const generated = saga.events.get("test.counter.Increased")!;
+  saga.onEventWithContext("test.counter.Increased", (event, dests, source) => {
+    ctx.sagaSeen.push(source.sequence);
+    return generated(event, dests, source);
+  });
+  ctx.router.registerSaga(saga);
 });
 
 function dispatchSaga(req: Parameters<Router["dispatchSaga"]>[0]): void {
@@ -342,6 +352,11 @@ Then("the saga emits one command to {string}", function (target: string) {
   );
 });
 
+Then("the saga handler saw source sequence {int}", function (seq: number) {
+  assert.equal(ctx.err, undefined, "dispatch unexpectedly failed");
+  assert.deepEqual(ctx.sagaSeen, [seq]);
+});
+
 Then("the saga emits no commands", function () {
   assert.equal(ctx.err, undefined, "dispatch unexpectedly failed");
   assert.equal(ctx.sagaResp!.commands.length, 0, "expected no commands");
@@ -358,6 +373,16 @@ Given("a counter projection", function () {
   ctx.kind = "projector";
   ctx.router = new Router();
   registerCounterProjector(ctx.router, new ProjectorFixture());
+});
+
+Given("a counter projection over every domain", function () {
+  ctx.kind = "projector";
+  ctx.router = new Router();
+  ctx.router.registerProjector(
+    newCounterProjectorDispatch(new ProjectorFixture()).forDomains(
+      WILDCARD_DOMAIN,
+    ),
+  );
 });
 
 function dispatchProjector(book: EventBook): void {
@@ -559,6 +584,13 @@ Then("only the audit process-manager compensates", function () {
 Then("the process-manager emits one process event", function () {
   assert.equal(ctx.err, undefined, "dispatch unexpectedly failed");
   assert.equal(ctx.pmResp!.processEvents.length, 1, "process events");
+});
+
+Then("the process event is addressed to {string}", function (domain: string) {
+  assert.equal(ctx.err, undefined, "dispatch unexpectedly failed");
+  const events = ctx.pmResp!.processEvents;
+  assert.equal(events.length, 1, "exactly one process event");
+  assert.equal(events[0].cover?.domain, domain);
 });
 
 Then("the process-manager escalates", function () {

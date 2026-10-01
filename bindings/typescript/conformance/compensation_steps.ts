@@ -33,7 +33,7 @@ After(() => {
 });
 
 function build(agg: AggregateDispatch<object>): void {
-  cctx.router = new Router();
+  cctx.router ??= new Router();
   cctx.router.registerAggregate(agg);
 }
 
@@ -65,6 +65,13 @@ function fqOf(page: EventPage): string {
 
 Given(
   "a payment aggregate compensating Reserve from any domain with {word}",
+  function (event: string) {
+    build(paymentAggregate([["test.counter.Reserve", event]]));
+  },
+);
+
+Given(
+  "a second payment aggregate compensating Reserve from any domain with {word}",
   function (event: string) {
     build(paymentAggregate([["test.counter.Reserve", event]]));
   },
@@ -115,6 +122,29 @@ Then("the aggregate emits one {word} event", function (event: string) {
   assert.equal(got.length, 1, "exactly one event");
   assert.equal(fqOf(got[0]), `test.counter.${event}`);
 });
+
+Then(
+  "the aggregates emit {word} at sequence {int} then {word} at sequence {int}",
+  function (
+    first: string,
+    firstSeq: number,
+    second: string,
+    secondSeq: number,
+  ) {
+    const got = pages().map((page) => {
+      assert.equal(
+        page.header?.sequenceType.case,
+        "sequence",
+        "explicit sequence",
+      );
+      return [fqOf(page), page.header?.sequenceType.value];
+    });
+    assert.deepEqual(got, [
+      [`test.counter.${first}`, firstSeq],
+      [`test.counter.${second}`, secondSeq],
+    ]);
+  },
+);
 
 Then("the aggregate emits nothing", function () {
   assert.equal(pages().length, 0, "no events");

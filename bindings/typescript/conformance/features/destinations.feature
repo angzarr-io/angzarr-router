@@ -2,7 +2,8 @@
 Feature: Declared-output destinations
 
   A saga or process-manager handler sees the component's declared output
-  domains, and nothing else, as its destinations. A process manager declares
+  domains, and nothing else, as its destinations; a saga handler also sees
+  the source book's cover. A process manager declares
   them through its constructor; one constructed without them has none.
 
   Scenario: a saga sees its declared target domains
@@ -10,6 +11,7 @@ Feature: Declared-output destinations
     When an order event is dispatched to the binding saga
     Then the handler's destinations are "inventory" and "billing"
     And the handler's destinations do not include "ledger"
+    And the saga handler saw the source cover of "order"
 
   Scenario: a process manager sees the target domains it was constructed with
     Given a binding process-manager targeting "inventory"

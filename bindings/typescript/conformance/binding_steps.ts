@@ -40,6 +40,7 @@ interface BindingCtx {
   err?: unknown;
   calls: string[];
   dests?: Destinations;
+  sourceCover?: Cover;
   covers: (Cover | undefined)[];
   facts?: EventBook;
   replayed?: ReplayResponse;
@@ -270,8 +271,9 @@ Given(
     bctx.router.registerSaga(
       new SagaDispatch("Binding", "order", [first, second]).onEvent(
         "test.counter.Increased",
-        (_event, dests) => {
+        (_event, dests, sourceCover) => {
           captureDests(dests);
+          bctx.sourceCover = sourceCover;
           return { commands: [], events: [] };
         },
       ),
@@ -322,6 +324,13 @@ Then(
   function (first: string, second: string) {
     assert.deepEqual(bctx.dests!.domains(), [first, second]);
     assert.ok(bctx.dests!.has(first) && bctx.dests!.has(second));
+  },
+);
+
+Then(
+  "the saga handler saw the source cover of {string}",
+  function (domain: string) {
+    assert.equal(bctx.sourceCover?.domain, domain);
   },
 );
 

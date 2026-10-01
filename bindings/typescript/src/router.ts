@@ -32,7 +32,7 @@ import {
   type ProjectorFinishThunk,
   type ProjectorUnknownThunk,
   type RejectionThunk,
-  type SagaEventThunk,
+  type SagaEventContextThunk,
   type UndoThunk,
 } from "./thunks";
 import {
@@ -616,10 +616,16 @@ function projectorUnknownInvoker(thunk: ProjectorUnknownThunk): Invoker {
   };
 }
 
-function sagaEventInvoker(dests: Destinations, thunk: SagaEventThunk): Invoker {
+function sagaEventInvoker(
+  dests: Destinations,
+  thunk: SagaEventContextThunk,
+): Invoker {
   return (_session, typeUrl, payload, aux) => {
     const sax = fromBinary(SagaEventAuxSchema, aux);
-    const emission = thunk(anyOf(typeUrl, payload), dests, sax.sourceCover);
+    const emission = thunk(anyOf(typeUrl, payload), dests, {
+      cover: sax.sourceCover,
+      sequence: sax.sourceSeq,
+    });
     const resp = create(SagaResponseSchema, {
       commands: emission.commands,
       events: emission.events,

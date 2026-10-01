@@ -9,6 +9,7 @@ export {
   ProcessManagerDispatch,
   ProjectorDispatch,
   SagaDispatch,
+  WILDCARD_DOMAIN,
 } from "./dispatch";
 export { Rebuilder } from "./rebuilder";
 export { Destinations } from "./destinations";
@@ -40,6 +41,7 @@ export {
   type ProjectorUnknownThunk,
   type RejectionThunk,
   type SagaEmission,
+  type SagaEventContextThunk,
   type SagaEventThunk,
   type UndoThunk,
 } from "./thunks";

@@ -107,6 +107,15 @@ export type SagaEventThunk = (
   sourceCover?: Cover,
 ) => SagaEmission;
 
+/** Translates one source event into a saga emission (stateless); `source` is
+ * the triggering event's page context: the source book's cover and the
+ * event's sequence (0 when the page carries none). */
+export type SagaEventContextThunk = (
+  event: Any,
+  dests: Destinations,
+  source: PageContext,
+) => SagaEmission;
+
 /** Handles one source event in a process manager. `triggerCover` is the
  * trigger book's cover. */
 export type PmEventThunk<T> = (
