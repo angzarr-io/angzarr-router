@@ -238,6 +238,27 @@ inline pb::ProcessManagerHandleRequest PmRejection(const std::string& fq_command
   return req;
 }
 
+// The rejection of fq_command issued by the PM owning issuer_domain: the trigger
+// cover is the issuer's domain and the rejected command's first page header
+// names it as the angzarr_deferred source.
+inline pb::ProcessManagerHandleRequest PmIssuedRejection(const std::string& fq_command,
+                                                         const std::string& issuer_domain) {
+  pb::RejectionNotification rejection;
+  auto* rc = rejection.mutable_rejected_command();
+  rc->mutable_cover()->set_domain("inventory");
+  auto* page = rc->add_pages();
+  SetAnyEmpty(page->mutable_command(), fq_command);
+  page->mutable_header()->mutable_angzarr_deferred()->mutable_source()->set_domain(issuer_domain);
+  pb::Notification n;
+  *n.mutable_payload() = angzarr::router::Pack::Wrap(rejection);
+
+  pb::ProcessManagerHandleRequest req;
+  auto* trigger = req.mutable_trigger();
+  trigger->mutable_cover()->set_domain(issuer_domain);
+  *trigger->add_pages()->mutable_event() = angzarr::router::Pack::Wrap(n);
+  return req;
+}
+
 inline pb::ProcessManagerHandleRequest PmNoTrigger() { return {}; }
 inline pb::ProcessManagerHandleRequest PmEmptyTrigger() {
   pb::ProcessManagerHandleRequest req;

@@ -82,11 +82,18 @@ struct PmRejection {
   std::optional<io::angzarr::v1::Notification> escalation;
 };
 
-// One dispatch's host-side state object, reached from callbacks via host_ctx.
-// The rebuilt state is created lazily by the first stateful callback. State is a
-// mutable protobuf message held as the base type; EnsureState<T> performs the
-// single erasing cast — guaranteed correct because the same TState's invokers
-// created it.
+// Identifies one registered component (aggregate, projector or process
+// manager) within a Router. Every invoker registered for a component captures
+// its key, so callbacks reach that component's state and no other.
+using ComponentKey = uint64_t;
+
+// One dispatch's host-side state, reached from callbacks via host_ctx. A single
+// dispatch may run several components (co-resident process managers subscribed
+// to one domain), so state is held per component key, each created lazily by
+// that component's first stateful callback. State is a mutable protobuf message
+// held as the base type; EnsureState<T> performs the single erasing cast —
+// correct because only the invokers of the component that owns the key (all
+// typed on that component's TState) create or reach its entry.
 class Session {
  public:
   explicit Session(Router& router) : router_(router) {}
@@ -94,16 +101,17 @@ class Session {
   Router& router() { return router_; }
 
   template <class TState>
-  TState& EnsureState() {
-    if (!state_) {
-      state_ = std::make_unique<TState>();
+  TState& EnsureState(ComponentKey key) {
+    auto& slot = states_[key];
+    if (!slot) {
+      slot = std::make_unique<TState>();
     }
-    return static_cast<TState&>(*state_);
+    return static_cast<TState&>(*slot);
   }
 
  private:
   Router& router_;
-  std::unique_ptr<google::protobuf::Message> state_;
+  std::map<ComponentKey, std::unique_ptr<google::protobuf::Message>> states_;
 };
 
 // A callback's outcome: response bytes (when has_response) and the ABI status.
