@@ -1,9 +1,8 @@
 package io.angzarr.router;
 
 /**
- * The numeric gRPC status code carried with a coded failure. Kept as a plain
- * enum over an int so the binding depends only on the protobuf runtime, not the
- * gRPC library.
+ * The numeric gRPC status code carried with a coded failure. Kept as a plain enum over an int so
+ * the binding depends only on the protobuf runtime, not the gRPC library.
  */
 public enum GrpcCode {
   INVALID_ARGUMENT(3),
@@ -19,8 +18,9 @@ public enum GrpcCode {
     this.value = value;
   }
 
-  /** Wire code → GrpcCode; unknown codes degrade to INTERNAL (an unmapped code
-   * is a binding bug). */
+  /**
+   * Wire code → GrpcCode; unknown codes degrade to INTERNAL (an unmapped code is a binding bug).
+   */
   public static GrpcCode fromWire(int code) {
     return switch (code) {
       case 3 -> INVALID_ARGUMENT;

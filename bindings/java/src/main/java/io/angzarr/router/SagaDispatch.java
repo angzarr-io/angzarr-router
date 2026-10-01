@@ -8,9 +8,9 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * One saga component's registration: its name, the input domain it consumes,
- * the domains it issues commands to, its event handlers, and ordered rejection
- * compensators. A saga is stateless — no rebuilder, no state.
+ * One saga component's registration: its name, the input domain it consumes, the domains it issues
+ * commands to, its event handlers, and ordered rejection compensators. A saga is stateless — no
+ * rebuilder, no state.
  */
 public final class SagaDispatch {
   final String name;
@@ -19,8 +19,7 @@ public final class SagaDispatch {
   final Map<String, SagaEventThunk> events = new LinkedHashMap<>();
   final Map<String, List<SagaRejectionThunk>> rejections = new LinkedHashMap<>();
 
-  /** Starts a saga registration translating inputDomain events into commands
-   * for targetDomains. */
+  /** Starts a saga registration translating inputDomain events into commands for targetDomains. */
   public SagaDispatch(String name, String inputDomain, List<String> targetDomains) {
     this.name = name;
     this.inputDomain = inputDomain;
@@ -33,8 +32,10 @@ public final class SagaDispatch {
     return this;
   }
 
-  /** Appends a compensator for one fully-qualified command type; repeated calls
-   * register an ordered fan-out. */
+  /**
+   * Appends a compensator for one fully-qualified command type; repeated calls register an ordered
+   * fan-out.
+   */
   public SagaDispatch onRejected(String fqCommand, SagaRejectionThunk thunk) {
     rejections.computeIfAbsent(fqCommand, k -> new ArrayList<>()).add(thunk);
     return this;

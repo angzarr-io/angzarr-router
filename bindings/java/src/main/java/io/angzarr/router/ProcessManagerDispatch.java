@@ -8,10 +8,9 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * One process-manager component's registration: its name, the domain it issues
- * commands to, its rebuilder, per-(source-domain, event) handlers, and ordered
- * rejection compensators. A PM is stateful — its appliers fold process state
- * before a handler runs, exactly as an aggregate does.
+ * One process-manager component's registration: its name, the domain it issues commands to, its
+ * rebuilder, per-(source-domain, event) handlers, and ordered rejection compensators. A PM is
+ * stateful — its appliers fold process state before a handler runs, exactly as an aggregate does.
  */
 public final class ProcessManagerDispatch {
   final String name;
@@ -33,8 +32,10 @@ public final class ProcessManagerDispatch {
     return this;
   }
 
-  /** Appends a compensator for one fully-qualified command type; repeated calls
-   * register an ordered fan-out. */
+  /**
+   * Appends a compensator for one fully-qualified command type; repeated calls register an ordered
+   * fan-out.
+   */
   public ProcessManagerDispatch onRejected(String fqCommand, PmRejectionThunk thunk) {
     rejections.computeIfAbsent(fqCommand, k -> new ArrayList<>()).add(thunk);
     return this;

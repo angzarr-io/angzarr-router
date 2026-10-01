@@ -14,9 +14,11 @@ import java.util.List;
 import test.counter.Counter;
 import test.counter.OrderProcessManagerAngzarr;
 
-/** The conformance OrderProcessManager fixture: the newest trigger reacts with a
- * stamped Reserve command plus one fact per rebuilt prior-state event; a
- * rejection injects one process event and escalates. */
+/**
+ * The conformance OrderProcessManager fixture: the newest trigger reacts with a stamped Reserve
+ * command plus one fact per rebuilt prior-state event; a rejection injects one process event and
+ * escalates.
+ */
 final class PMFixture implements OrderProcessManagerAngzarr.OrderProcessManagerHandler {
 
   @Override
@@ -34,14 +36,18 @@ final class PMFixture implements OrderProcessManagerAngzarr.OrderProcessManagerH
   }
 
   @Override
-  public void applyIncreased(Counter.OrderProcessManagerState.Builder state, Counter.Increased event) {
+  public void applyIncreased(
+      Counter.OrderProcessManagerState.Builder state, Counter.Increased event) {
     state.setCount(state.getCount() + 1);
   }
 
   @Override
   public PmRejection onReserveRejected(
-      Notification n, RejectionNotification rejection, Counter.OrderProcessManagerState.Builder state) {
-    Notification escalation = Notification.newBuilder().setCover(Cover.newBuilder().setDomain("escalated")).build();
+      Notification n,
+      RejectionNotification rejection,
+      Counter.OrderProcessManagerState.Builder state) {
+    Notification escalation =
+        Notification.newBuilder().setCover(Cover.newBuilder().setDomain("escalated")).build();
     return new PmRejection(List.of(Builders.oneFact()), escalation);
   }
 }

@@ -13,11 +13,10 @@ import io.angzarr.RejectionNotification;
 import java.util.List;
 
 /**
- * The typed business thunks the dispatch builders hold and the generated wiring
- * provides. State is a {@link Message.Builder} (protobuf-java is immutable;
- * appliers fold events into the builder); the generated lambdas cast it to the
- * concrete builder type. A thunk throws to fail — the trampoline catches and
- * codes it.
+ * The typed business thunks the dispatch builders hold and the generated wiring provides. State is
+ * a {@link Message.Builder} (protobuf-java is immutable; appliers fold events into the builder);
+ * the generated lambdas cast it to the concrete builder type. A thunk throws to fail — the
+ * trampoline catches and codes it.
  */
 public final class Thunks {
   private Thunks() {}
@@ -61,8 +60,10 @@ public final class Thunks {
 
   @FunctionalInterface
   public interface SagaEventThunk {
-    /** sourceCover is the source book's cover, so the saga can route emitted
-     * commands by the trigger's identity (root, ext). */
+    /**
+     * sourceCover is the source book's cover, so the saga can route emitted commands by the
+     * trigger's identity (root, ext).
+     */
     SagaEmission translate(Any event, Destinations dests, Cover sourceCover) throws Exception;
   }
 
@@ -88,7 +89,9 @@ public final class Thunks {
   /** A saga event's emission: commands to issue + fact events to inject. */
   public record SagaEmission(List<CommandBook> commands, List<EventBook> events) {}
 
-  /** A PM rejection's result: process events to fold + an optional escalation
-   * notification (null for none). */
+  /**
+   * A PM rejection's result: process events to fold + an optional escalation notification (null for
+   * none).
+   */
   public record PmRejection(List<EventBook> processEvents, Notification escalation) {}
 }

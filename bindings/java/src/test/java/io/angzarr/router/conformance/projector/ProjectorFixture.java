@@ -5,8 +5,10 @@ import io.angzarr.Projection;
 import test.counter.Counter;
 import test.counter.CounterProjectorAngzarr;
 
-/** The conformance CounterProjector fixture: every delivered event folds into
- * one projection; the finisher carries the cover and the folded count. */
+/**
+ * The conformance CounterProjector fixture: every delivered event folds into one projection; the
+ * finisher carries the cover and the folded count.
+ */
 final class ProjectorFixture implements CounterProjectorAngzarr.CounterProjectorHandler {
 
   @Override

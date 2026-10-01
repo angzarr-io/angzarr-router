@@ -1,6 +1,5 @@
 package io.angzarr.router.conformance.counter;
 
-import io.angzarr.router.conformance.Builders;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -8,9 +7,10 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import com.google.protobuf.Any;
 import io.angzarr.ContextualCommand;
 import io.angzarr.EventBook;
-import io.angzarr.router.conformance.counter.CounterFixture.Observation;
 import io.angzarr.router.CodedError;
 import io.angzarr.router.Router;
+import io.angzarr.router.conformance.Builders;
+import io.angzarr.router.conformance.counter.CounterFixture.Observation;
 import io.cucumber.java.After;
 import io.cucumber.java.Before;
 import io.cucumber.java.en.Given;
@@ -21,9 +21,9 @@ import java.util.List;
 import test.counter.CounterAggregateAngzarr;
 
 /**
- * Step definitions for counter.feature — the shared cross-language behavior
- * suite, run against the Java binding via Cucumber-JVM. Only this step layer is
- * new; the features and fixtures are the same the Rust harness runs.
+ * Step definitions for counter.feature — the shared cross-language behavior suite, run against the
+ * Java binding via Cucumber-JVM. Only this step layer is new; the features and fixtures are the
+ * same the Rust harness runs.
  */
 public class CounterSteps {
 
@@ -149,7 +149,8 @@ public class CounterSteps {
     EventBook book = resp.getEvents();
     assertEquals(count, book.getPagesCount(), "recorded events");
     for (int i = 0; i < count; i++) {
-      assertEquals(start + i, book.getPages(i).getHeader().getSequence(), "event " + i + " sequence");
+      assertEquals(
+          start + i, book.getPages(i).getHeader().getSequence(), "event " + i + " sequence");
     }
   }
 
@@ -190,7 +191,8 @@ public class CounterSteps {
     List<String> want = List.of("test.counter.CompensatedFirst", "test.counter.CompensatedSecond");
     assertEquals(want.size(), book.getPagesCount(), "compensation events");
     for (int i = 0; i < want.size(); i++) {
-      assertEquals(want.get(i), fqFromUrl(book.getPages(i).getEvent().getTypeUrl()), "compensation " + i);
+      assertEquals(
+          want.get(i), fqFromUrl(book.getPages(i).getEvent().getTypeUrl()), "compensation " + i);
     }
   }
 

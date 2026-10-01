@@ -7,9 +7,9 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * The coordinator-supplied next-sequences for command stamping. Sagas and
- * process managers are translators — they stamp emitted commands, they do not
- * rebuild destination state to make decisions.
+ * The coordinator-supplied next-sequences for command stamping. Sagas and process managers are
+ * translators — they stamp emitted commands, they do not rebuild destination state to make
+ * decisions.
  */
 public final class Destinations {
   private final Map<String, Integer> sequences;
@@ -35,9 +35,9 @@ public final class Destinations {
   }
 
   /**
-   * Returns a copy of {@code cmd} with every page stamped with the next sequence
-   * for {@code domain}. A domain with no supplied sequence is the coded {@code
-   * MISSING_DESTINATION_SEQUENCE} (check output_domains config).
+   * Returns a copy of {@code cmd} with every page stamped with the next sequence for {@code
+   * domain}. A domain with no supplied sequence is the coded {@code MISSING_DESTINATION_SEQUENCE}
+   * (check output_domains config).
    */
   public CommandBook stampCommand(CommandBook cmd, String domain) {
     Integer seq = sequences.get(domain);

@@ -10,9 +10,8 @@ import java.util.Map;
 import java.util.function.Supplier;
 
 /**
- * One projector component's registration: its name, projection-state factory,
- * the domains it folds, per-event fold thunks, and the finisher that carries the
- * cover onto the Projection.
+ * One projector component's registration: its name, projection-state factory, the domains it folds,
+ * per-event fold thunks, and the finisher that carries the cover onto the Projection.
  */
 public final class ProjectorDispatch {
   final String name;

@@ -8,9 +8,9 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * One aggregate component's registration: its name, domain, rebuilder, command
- * handlers, and ordered rejection compensators. The shape mirrors the engine's
- * so generated wiring targets it with minimal emitter changes.
+ * One aggregate component's registration: its name, domain, rebuilder, command handlers, and
+ * ordered rejection compensators. The shape mirrors the engine's so generated wiring targets it
+ * with minimal emitter changes.
  */
 public final class AggregateDispatch {
   final String name;
@@ -31,8 +31,10 @@ public final class AggregateDispatch {
     return this;
   }
 
-  /** Appends a compensator for one fully-qualified command type; repeated calls
-   * register an ordered fan-out. */
+  /**
+   * Appends a compensator for one fully-qualified command type; repeated calls register an ordered
+   * fan-out.
+   */
   public AggregateDispatch onRejected(String fqCommand, RejectionThunk thunk) {
     rejections.computeIfAbsent(fqCommand, k -> new ArrayList<>()).add(thunk);
     return this;

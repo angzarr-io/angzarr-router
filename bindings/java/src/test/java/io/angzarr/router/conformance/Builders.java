@@ -6,6 +6,7 @@ import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.Message;
 import com.google.protobuf.TextFormat;
 import com.google.protobuf.TypeRegistry;
+import io.angzarr.AngzarrDeferredSequence;
 import io.angzarr.CommandBook;
 import io.angzarr.CommandPage;
 import io.angzarr.ContextualCommand;
@@ -26,11 +27,10 @@ import test.counter.Counter;
 
 /**
  * The shared conformance fixtures — the same orthogonal envelope skeletons
- * (conformance/fixtures/*.txtpb) the Rust cucumber-rs harness parses. Every
- * builder PARSES the skeleton first, then sets the scenario's salient data BY
- * FIELD on the structured message; the textproto is never string-templated.
- * Envelopes that have no skeleton (rejection, prior history, snapshot) are
- * constructed by field, exactly as the Go binding does.
+ * (conformance/fixtures/*.txtpb) the Rust cucumber-rs harness parses. Every builder PARSES the
+ * skeleton first, then sets the scenario's salient data BY FIELD on the structured message; the
+ * textproto is never string-templated. Envelopes that have no skeleton (rejection, prior history,
+ * snapshot) are constructed by field, exactly as the Go binding does.
  */
 public final class Builders {
   private Builders() {}
@@ -89,8 +89,10 @@ public final class Builders {
     return load("command_unhandled.txtpb", ContextualCommand.newBuilder()).build();
   }
 
-  /** Wraps a rejection Notification for fqCommand into a ContextualCommand —
-   * the core detects the notification type and takes the compensation path. */
+  /**
+   * Wraps a rejection Notification for fqCommand into a ContextualCommand — the core detects the
+   * notification type and takes the compensation path.
+   */
   public static ContextualCommand rejectionCommand(String fqCommand) {
     Cover cover = Cover.newBuilder().setDomain("counter").build();
     RejectionNotification rejection =
@@ -129,8 +131,10 @@ public final class Builders {
     return cc.build();
   }
 
-  /** An opaque fill-only ext stamped on a command's cover, used to prove ext
-   * propagation onto emitted events. */
+  /**
+   * An opaque fill-only ext stamped on a command's cover, used to prove ext propagation onto
+   * emitted events.
+   */
   public static Any parentLinkage() {
     return Any.newBuilder()
         .setTypeUrl(typeUrl("test.counter.Parent"))
@@ -152,21 +156,26 @@ public final class Builders {
     return book.build();
   }
 
-  /** One Increased page whose payload is overwritten with an undecodable varint
-   * (PERSISTED_EVENT_CORRUPT on fold). */
+  /**
+   * One Increased page whose payload is overwritten with an undecodable varint
+   * (PERSISTED_EVENT_CORRUPT on fold).
+   */
   public static EventBook corruptHistory() {
     EventPage page = increasedPageAt(0);
     EventPage corrupt =
         page.toBuilder()
             .setEvent(
                 page.getEvent().toBuilder()
-                    .setValue(ByteString.copyFrom(new byte[] {(byte) 0xff, (byte) 0xff, (byte) 0xff})))
+                    .setValue(
+                        ByteString.copyFrom(new byte[] {(byte) 0xff, (byte) 0xff, (byte) 0xff})))
             .build();
     return EventBook.newBuilder().addPages(corrupt).setNextSequence(1).build();
   }
 
-  /** Seeds count 10 at sequence 10, plus a covered page (10, skipped) and an
-   * uncovered page (11, applied) — a rebuild observes 11. */
+  /**
+   * Seeds count 10 at sequence 10, plus a covered page (10, skipped) and an uncovered page (11,
+   * applied) — a rebuild observes 11.
+   */
   public static EventBook snapshotHistory() {
     return EventBook.newBuilder()
         .setSnapshot(
@@ -188,8 +197,7 @@ public final class Builders {
 
   // --- saga / process-manager shared fixtures -----------------------------
 
-  /** The one-page Reserve command the saga and PM emit for the "inventory"
-   * domain. */
+  /** The one-page Reserve command the saga and PM emit for the "inventory" domain. */
   public static CommandBook reserveCommand() {
     return CommandBook.newBuilder()
         .setCover(Cover.newBuilder().setDomain("inventory"))
@@ -206,8 +214,10 @@ public final class Builders {
 
   // --- saga dispatch requests (no skeleton — built by field) --------------
 
-  /** A SagaHandleRequest whose source carries one event of fq in the "order"
-   * domain, plus the coordinator's destination-sequence map. */
+  /**
+   * A SagaHandleRequest whose source carries one event of fq in the "order" domain, plus the
+   * coordinator's destination-sequence map.
+   */
   public static SagaHandleRequest sagaEventSource(String fq, Map<String, Integer> dest) {
     SagaHandleRequest.Builder b =
         SagaHandleRequest.newBuilder()
@@ -222,8 +232,10 @@ public final class Builders {
     return b.build();
   }
 
-  /** A SagaHandleRequest whose source is a rejection Notification for fqCommand
-   * — routes to the compensation path. */
+  /**
+   * A SagaHandleRequest whose source is a rejection Notification for fqCommand — routes to the
+   * compensation path.
+   */
   public static SagaHandleRequest sagaRejectionSource(String fqCommand) {
     RejectionNotification rejection =
         RejectionNotification.newBuilder()
@@ -273,12 +285,15 @@ public final class Builders {
 
   // --- process-manager triggers (no skeleton — built by field) ------------
 
-  /** A request whose trigger carries the given event pages in domain, plus the
-   * PM's prior state and a destination map. Trigger event pages are built by
-   * field (the fq list includes types with no skeleton, e.g. Unwatched). */
+  /**
+   * A request whose trigger carries the given event pages in domain, plus the PM's prior state and
+   * a destination map. Trigger event pages are built by field (the fq list includes types with no
+   * skeleton, e.g. Unwatched).
+   */
   public static ProcessManagerHandleRequest pmTrigger(
       String domain, java.util.List<String> fqs, EventBook state, Map<String, Integer> dest) {
-    EventBook.Builder trigger = EventBook.newBuilder().setCover(Cover.newBuilder().setDomain(domain));
+    EventBook.Builder trigger =
+        EventBook.newBuilder().setCover(Cover.newBuilder().setDomain(domain));
     for (String fq : fqs) {
       trigger.addPages(EventPage.newBuilder().setEvent(Any.newBuilder().setTypeUrl(typeUrl(fq))));
     }
@@ -302,22 +317,53 @@ public final class Builders {
     return book.build();
   }
 
+  /**
+   * A prior-state book of n Increased events owned by pmDomain (its cover addresses the owning PM).
+   */
+  public static EventBook pmStateIn(String pmDomain, int n) {
+    return pmStateOf(n).toBuilder().setCover(Cover.newBuilder().setDomain(pmDomain)).build();
+  }
+
   /** A trigger whose newest page is a rejection Notification for fqCommand. */
   public static ProcessManagerHandleRequest pmRejection(String fqCommand) {
+    return pmRejectionRequest(fqCommand, "counter", PageHeader.getDefaultInstance());
+  }
+
+  /**
+   * A rejection of fqCommand that the PM owning issuerDomain issued: the trigger cover is the
+   * issuer's domain and the rejected command's first page header names the issuer as its
+   * angzarr_deferred source.
+   */
+  public static ProcessManagerHandleRequest pmIssuedRejection(
+      String fqCommand, String issuerDomain) {
+    PageHeader header =
+        PageHeader.newBuilder()
+            .setAngzarrDeferred(
+                AngzarrDeferredSequence.newBuilder()
+                    .setSource(Cover.newBuilder().setDomain(issuerDomain)))
+            .build();
+    return pmRejectionRequest(fqCommand, issuerDomain, header);
+  }
+
+  private static ProcessManagerHandleRequest pmRejectionRequest(
+      String fqCommand, String triggerDomain, PageHeader commandHeader) {
+    CommandPage.Builder page =
+        CommandPage.newBuilder().setCommand(Any.newBuilder().setTypeUrl(typeUrl(fqCommand)));
+    if (!commandHeader.equals(PageHeader.getDefaultInstance())) {
+      page.setHeader(commandHeader);
+    }
     RejectionNotification rejection =
         RejectionNotification.newBuilder()
             .setRejectedCommand(
                 CommandBook.newBuilder()
                     .setCover(Cover.newBuilder().setDomain("inventory"))
-                    .addPages(
-                        CommandPage.newBuilder()
-                            .setCommand(Any.newBuilder().setTypeUrl(typeUrl(fqCommand)))))
+                    .addPages(page))
             .build();
     Notification notification = Notification.newBuilder().setPayload(Pack.pack(rejection)).build();
     return ProcessManagerHandleRequest.newBuilder()
         .setTrigger(
             EventBook.newBuilder()
-                .setCover(Cover.newBuilder().setDomain("counter"))
+                .setCover(Cover.newBuilder().setDomain(triggerDomain))
                 .addPages(EventPage.newBuilder().setEvent(Pack.pack(notification))))
         .build();
   }
@@ -327,6 +373,8 @@ public final class Builders {
   }
 
   public static ProcessManagerHandleRequest pmEmptyTrigger() {
-    return ProcessManagerHandleRequest.newBuilder().setTrigger(EventBook.getDefaultInstance()).build();
+    return ProcessManagerHandleRequest.newBuilder()
+        .setTrigger(EventBook.getDefaultInstance())
+        .build();
   }
 }

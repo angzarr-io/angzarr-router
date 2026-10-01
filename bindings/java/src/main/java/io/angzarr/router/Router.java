@@ -34,16 +34,17 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 
 /**
- * The Java binding's router: wraps the native router plus the host-side callback
- * registry the core reaches through the single callback gateway. Register a
- * component (assigning callback ids to its thunks and handing the core a
- * serialized descriptor), then dispatch books/commands through it.
+ * The Java binding's router: wraps the native router plus the host-side callback registry the core
+ * reaches through the single callback gateway. Register a component (assigning callback ids to its
+ * thunks and handing the core a serialized descriptor), then dispatch books/commands through it.
  */
 public final class Router implements AutoCloseable {
 
   private final MemorySegment ptr;
   private final ConcurrentHashMap<Long, Invoker> registry = new ConcurrentHashMap<>();
   private final AtomicLong nextId = new AtomicLong(0);
+  // Each registered component's key into the per-dispatch Session state map.
+  private final AtomicLong nextComponent = new AtomicLong(0);
 
   public Router() {
     this.ptr = Ffi.routerNew();
@@ -73,24 +74,26 @@ public final class Router implements AutoCloseable {
 
   public synchronized void registerAggregate(AggregateDispatch d) {
     Supplier<Message.Builder> factory = d.rebuilder.factory;
+    long component = nextComponent.incrementAndGet();
     Abi.AggregateDescriptor.Builder desc =
         Abi.AggregateDescriptor.newBuilder().setName(d.name).setDomain(d.domain);
 
     for (Map.Entry<String, ApplierThunk> e : d.rebuilder.appliers.entrySet()) {
-      long id = assign(applierInvoker(factory, e.getValue()));
+      long id = assign(applierInvoker(component, factory, e.getValue()));
       desc.addAppliers(callbackEntry(e.getKey(), id));
     }
     if (d.rebuilder.snapshot != null) {
-      desc.setSnapshotCallbackId(assign(applierInvoker(factory, d.rebuilder.snapshot)));
+      desc.setSnapshotCallbackId(assign(applierInvoker(component, factory, d.rebuilder.snapshot)));
     }
     for (Map.Entry<String, CommandThunk> e : d.commands.entrySet()) {
-      long id = assign(commandInvoker(factory, e.getValue()));
+      long id = assign(commandInvoker(component, factory, e.getValue()));
       desc.addCommands(callbackEntry(e.getKey(), id));
     }
     for (Map.Entry<String, List<RejectionThunk>> e : d.rejections.entrySet()) {
-      Abi.RejectionEntry.Builder entry = Abi.RejectionEntry.newBuilder().setFqCommandType(e.getKey());
+      Abi.RejectionEntry.Builder entry =
+          Abi.RejectionEntry.newBuilder().setFqCommandType(e.getKey());
       for (RejectionThunk thunk : e.getValue()) {
-        entry.addCallbackIds(assign(rejectionInvoker(factory, thunk)));
+        entry.addCallbackIds(assign(rejectionInvoker(component, factory, thunk)));
       }
       desc.addRejections(entry);
     }
@@ -99,18 +102,19 @@ public final class Router implements AutoCloseable {
 
   public synchronized void registerProjector(ProjectorDispatch d) {
     Supplier<Message.Builder> factory = d.factory;
+    long component = nextComponent.incrementAndGet();
     Abi.ProjectorDescriptor.Builder desc =
         Abi.ProjectorDescriptor.newBuilder().setName(d.name).addAllDomains(d.domains);
 
     for (Map.Entry<String, ProjectorEventThunk> e : d.events.entrySet()) {
-      long id = assign(projectorEventInvoker(factory, e.getValue()));
+      long id = assign(projectorEventInvoker(component, factory, e.getValue()));
       desc.addEvents(callbackEntry(e.getKey(), id));
     }
     if (d.unknown != null) {
       desc.setUnknownCallbackId(assign(projectorUnknownInvoker(d.unknown)));
     }
     if (d.finish != null) {
-      desc.setFinishCallbackId(assign(projectorFinishInvoker(factory, d.finish)));
+      desc.setFinishCallbackId(assign(projectorFinishInvoker(component, factory, d.finish)));
     }
     check(Ffi.registerProjector(ptr, desc.build().toByteArray()));
   }
@@ -127,7 +131,8 @@ public final class Router implements AutoCloseable {
       desc.addEvents(callbackEntry(e.getKey(), id));
     }
     for (Map.Entry<String, List<SagaRejectionThunk>> e : d.rejections.entrySet()) {
-      Abi.RejectionEntry.Builder entry = Abi.RejectionEntry.newBuilder().setFqCommandType(e.getKey());
+      Abi.RejectionEntry.Builder entry =
+          Abi.RejectionEntry.newBuilder().setFqCommandType(e.getKey());
       for (SagaRejectionThunk thunk : e.getValue()) {
         entry.addCallbackIds(assign(sagaRejectionInvoker(thunk)));
       }
@@ -138,19 +143,20 @@ public final class Router implements AutoCloseable {
 
   public synchronized void registerProcessManager(ProcessManagerDispatch d) {
     Supplier<Message.Builder> factory = d.rebuilder.factory;
+    long component = nextComponent.incrementAndGet();
     Abi.ProcessManagerDescriptor.Builder desc =
         Abi.ProcessManagerDescriptor.newBuilder().setName(d.name).setPmDomain(d.pmDomain);
 
     for (Map.Entry<String, ApplierThunk> e : d.rebuilder.appliers.entrySet()) {
-      long id = assign(applierInvoker(factory, e.getValue()));
+      long id = assign(applierInvoker(component, factory, e.getValue()));
       desc.addAppliers(callbackEntry(e.getKey(), id));
     }
     if (d.rebuilder.snapshot != null) {
-      desc.setSnapshotCallbackId(assign(applierInvoker(factory, d.rebuilder.snapshot)));
+      desc.setSnapshotCallbackId(assign(applierInvoker(component, factory, d.rebuilder.snapshot)));
     }
     for (Map.Entry<String, Map<String, PmEventThunk>> byDomain : d.handlers.entrySet()) {
       for (Map.Entry<String, PmEventThunk> e : byDomain.getValue().entrySet()) {
-        long id = assign(pmEventInvoker(factory, e.getValue()));
+        long id = assign(pmEventInvoker(component, factory, e.getValue()));
         desc.addEvents(
             Abi.PmEventEntry.newBuilder()
                 .setInputDomain(byDomain.getKey())
@@ -159,9 +165,10 @@ public final class Router implements AutoCloseable {
       }
     }
     for (Map.Entry<String, List<PmRejectionThunk>> e : d.rejections.entrySet()) {
-      Abi.RejectionEntry.Builder entry = Abi.RejectionEntry.newBuilder().setFqCommandType(e.getKey());
+      Abi.RejectionEntry.Builder entry =
+          Abi.RejectionEntry.newBuilder().setFqCommandType(e.getKey());
       for (PmRejectionThunk thunk : e.getValue()) {
-        entry.addCallbackIds(assign(pmRejectionInvoker(factory, thunk)));
+        entry.addCallbackIds(assign(pmRejectionInvoker(component, factory, thunk)));
       }
       desc.addRejections(entry);
     }
@@ -236,20 +243,23 @@ public final class Router implements AutoCloseable {
     return Any.newBuilder().setTypeUrl(typeUrl).setValue(ByteString.copyFrom(payload)).build();
   }
 
-  private static Invoker applierInvoker(Supplier<Message.Builder> factory, ApplierThunk thunk) {
+  private static Invoker applierInvoker(
+      long component, Supplier<Message.Builder> factory, ApplierThunk thunk) {
     return (session, typeUrl, payload, aux) -> {
-      thunk.apply(session.ensureState(factory), anyOf(typeUrl, payload));
+      thunk.apply(session.ensureState(component, factory), anyOf(typeUrl, payload));
       return new Invoker.Result(null, Ffi.STATUS_OK);
     };
   }
 
-  private static Invoker commandInvoker(Supplier<Message.Builder> factory, CommandThunk thunk) {
+  private static Invoker commandInvoker(
+      long component, Supplier<Message.Builder> factory, CommandThunk thunk) {
     return (session, typeUrl, payload, aux) -> {
       Abi.CommandContextAux cax = Abi.CommandContextAux.parseFrom(aux);
       CommandContext cctx =
           new CommandContext(
               Integer.toUnsignedLong(cax.getNextSequence()), cax.getHadPriorEvents());
-      EventBook book = thunk.handle(anyOf(typeUrl, payload), session.ensureState(factory), cctx);
+      EventBook book =
+          thunk.handle(anyOf(typeUrl, payload), session.ensureState(component, factory), cctx);
       if (book == null) {
         return new Invoker.Result(null, Ffi.STATUS_OK_EMPTY);
       }
@@ -257,7 +267,8 @@ public final class Router implements AutoCloseable {
     };
   }
 
-  private static Invoker rejectionInvoker(Supplier<Message.Builder> factory, RejectionThunk thunk) {
+  private static Invoker rejectionInvoker(
+      long component, Supplier<Message.Builder> factory, RejectionThunk thunk) {
     return (session, typeUrl, payload, aux) -> {
       Abi.RejectionAux rax = Abi.RejectionAux.parseFrom(aux);
       Notification n = Notification.parseFrom(rax.getNotification());
@@ -268,7 +279,8 @@ public final class Router implements AutoCloseable {
                   Integer.toUnsignedLong(rax.getCctx().getNextSequence()),
                   rax.getCctx().getHadPriorEvents())
               : new CommandContext(0, false);
-      BusinessResponse resp = thunk.compensate(n, rej, session.ensureState(factory), cctx);
+      BusinessResponse resp =
+          thunk.compensate(n, rej, session.ensureState(component, factory), cctx);
       if (resp == null) {
         return new Invoker.Result(null, Ffi.STATUS_OK_EMPTY);
       }
@@ -277,18 +289,18 @@ public final class Router implements AutoCloseable {
   }
 
   private static Invoker projectorEventInvoker(
-      Supplier<Message.Builder> factory, ProjectorEventThunk thunk) {
+      long component, Supplier<Message.Builder> factory, ProjectorEventThunk thunk) {
     return (session, typeUrl, payload, aux) -> {
-      thunk.fold(session.ensureState(factory), anyOf(typeUrl, payload));
+      thunk.fold(session.ensureState(component, factory), anyOf(typeUrl, payload));
       return new Invoker.Result(null, Ffi.STATUS_OK);
     };
   }
 
   private static Invoker projectorFinishInvoker(
-      Supplier<Message.Builder> factory, ProjectorFinishThunk thunk) {
+      long component, Supplier<Message.Builder> factory, ProjectorFinishThunk thunk) {
     return (session, typeUrl, payload, aux) -> {
       EventBook book = EventBook.parseFrom(payload);
-      Projection proj = thunk.finish(session.ensureState(factory), book);
+      Projection proj = thunk.finish(session.ensureState(component, factory), book);
       return new Invoker.Result(proj.toByteArray(), Ffi.STATUS_OK);
     };
   }
@@ -324,23 +336,24 @@ public final class Router implements AutoCloseable {
     };
   }
 
-  private static Invoker pmEventInvoker(Supplier<Message.Builder> factory, PmEventThunk thunk) {
+  private static Invoker pmEventInvoker(
+      long component, Supplier<Message.Builder> factory, PmEventThunk thunk) {
     return (session, typeUrl, payload, aux) -> {
       Abi.PmEventAux pax = Abi.PmEventAux.parseFrom(aux);
       Destinations dests = new Destinations(pax.getDestinationSequencesMap());
       ProcessManagerHandleResponse resp =
-          thunk.handle(anyOf(typeUrl, payload), session.ensureState(factory), dests);
+          thunk.handle(anyOf(typeUrl, payload), session.ensureState(component, factory), dests);
       return new Invoker.Result(resp.toByteArray(), Ffi.STATUS_OK);
     };
   }
 
   private static Invoker pmRejectionInvoker(
-      Supplier<Message.Builder> factory, PmRejectionThunk thunk) {
+      long component, Supplier<Message.Builder> factory, PmRejectionThunk thunk) {
     return (session, typeUrl, payload, aux) -> {
       Abi.RejectionAux rax = Abi.RejectionAux.parseFrom(aux);
       Notification n = Notification.parseFrom(rax.getNotification());
       RejectionNotification rej = RejectionNotification.parseFrom(rax.getRejection());
-      Thunks.PmRejection r = thunk.compensate(n, rej, session.ensureState(factory));
+      Thunks.PmRejection r = thunk.compensate(n, rej, session.ensureState(component, factory));
       ProcessManagerHandleResponse.Builder resp =
           ProcessManagerHandleResponse.newBuilder().addAllProcessEvents(r.processEvents());
       if (r.escalation() != null) {

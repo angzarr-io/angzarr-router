@@ -1,6 +1,5 @@
 package io.angzarr.router.conformance.saga;
 
-import io.angzarr.router.conformance.Builders;
 import io.angzarr.CommandBook;
 import io.angzarr.Cover;
 import io.angzarr.EventBook;
@@ -8,13 +7,16 @@ import io.angzarr.Notification;
 import io.angzarr.RejectionNotification;
 import io.angzarr.router.Destinations;
 import io.angzarr.router.Thunks.SagaEmission;
+import io.angzarr.router.conformance.Builders;
 import java.util.List;
 import test.counter.Counter;
 import test.counter.OrderSagaAngzarr;
 
-/** The conformance OrderSaga fixture, implementing the generated seam: a
- * declared source event emits a Reserve command stamped with the supplied
- * destination sequence; a rejection injects one fact event. */
+/**
+ * The conformance OrderSaga fixture, implementing the generated seam: a declared source event emits
+ * a Reserve command stamped with the supplied destination sequence; a rejection injects one fact
+ * event.
+ */
 final class SagaFixture implements OrderSagaAngzarr.OrderSagaHandler {
 
   @Override
