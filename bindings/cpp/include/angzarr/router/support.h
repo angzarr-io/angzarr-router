@@ -26,11 +26,22 @@ namespace angzarr::router {
 
 class Router;  // defined in router.h
 
-// The historical-state evidence a command handler sees. Host state never crosses
-// the FFI, so the core reconstructs this from the prior-events book.
+// The historical-state evidence a command handler (or compensator, or undo
+// handler) sees. Host state never crosses the FFI, so the core reconstructs
+// this from the prior-events book.
 struct CommandContext {
   uint32_t next_sequence = 0;
   bool had_prior_events = false;
+  // The cover of the command (or notification delivery) being handled: the
+  // aggregate's own domain and root.
+  io::angzarr::v1::Cover cover;
+};
+
+// Where a projected event sits: its book's cover and the page's explicit
+// sequence (0 when absent).
+struct PageContext {
+  io::angzarr::v1::Cover cover;
+  uint32_t sequence = 0;
 };
 
 // The declared output domains of one saga or process manager (its command

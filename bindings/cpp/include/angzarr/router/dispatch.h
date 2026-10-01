@@ -20,8 +20,11 @@
 
 namespace angzarr::router {
 
-// A command handler or compensator returning std::nullopt produced no result
-// (STATUS_OK_EMPTY): the core answers with an empty book / no compensation.
+// A command handler, compensator or undo handler returning std::nullopt
+// produced no result (STATUS_OK_EMPTY): the core answers with an empty book / no
+// compensation. A fact handler returning std::nullopt records the fact
+// unchanged. Every aggregate also answers Replay: its state message is packed
+// as the replayed state.
 template <class TState>
 class AggregateDispatch {
  public:
@@ -30,6 +33,11 @@ class AggregateDispatch {
   using RejectionFn = std::function<std::optional<io::angzarr::v1::BusinessResponse>(
       const io::angzarr::v1::Notification&, const io::angzarr::v1::RejectionNotification&, TState&,
       const CommandContext&)>;
+  using UndoFn = std::function<std::optional<io::angzarr::v1::BusinessResponse>(
+      const io::angzarr::v1::Notification&, const io::angzarr::v1::Compensate&, TState&,
+      const CommandContext&)>;
+  using FactFn = std::function<std::optional<google::protobuf::Any>(const google::protobuf::Any&,
+                                                                    const TState&)>;
 
   AggregateDispatch(std::string name, std::string domain, Rebuilder<TState> rebuilder)
       : name(std::move(name)), domain(std::move(domain)), rebuilder(std::move(rebuilder)) {}
@@ -46,12 +54,26 @@ class AggregateDispatch {
     rejections[compensates].push_back(std::move(fn));
     return *this;
   }
+  // Undoes an executed command: a Compensate whose command_type is fq_command
+  // reaches fn with the rebuilt state.
+  AggregateDispatch& OnUndo(std::string fq_command, UndoFn fn) {
+    undoes.emplace_back(std::move(fq_command), std::move(fn));
+    return *this;
+  }
+  // Handles a fact of type fq_fact against the rebuilt state, returning the fact
+  // to record (an annotation) or std::nullopt to record it unchanged.
+  AggregateDispatch& OnFact(std::string fq_fact, FactFn fn) {
+    facts.emplace_back(std::move(fq_fact), std::move(fn));
+    return *this;
+  }
 
   std::string name;
   std::string domain;
   Rebuilder<TState> rebuilder;
   std::vector<std::pair<std::string, CommandFn>> commands;
   std::map<std::string, std::vector<RejectionFn>> rejections;
+  std::vector<std::pair<std::string, UndoFn>> undoes;
+  std::vector<std::pair<std::string, FactFn>> facts;
 };
 
 // A stateless translator: declared source events emit commands (deferred; the
@@ -85,6 +107,9 @@ template <class TState>
 class ProjectorDispatch {
  public:
   using EventFn = std::function<void(TState&, const google::protobuf::Any&)>;
+  // A fold that also reads where the event sits (its book's cover and sequence).
+  using EventWithContextFn =
+      std::function<void(TState&, const google::protobuf::Any&, const PageContext&)>;
   using FinishFn =
       std::function<io::angzarr::v1::Projection(TState&, const io::angzarr::v1::EventBook&)>;
   using UnknownFn = ProjectorUnknownFn;
@@ -96,6 +121,12 @@ class ProjectorDispatch {
     return *this;
   }
   ProjectorDispatch& OnEvent(std::string full_name, EventFn fn) {
+    events.emplace_back(std::move(full_name),
+                        [fn = std::move(fn)](TState& projection, const google::protobuf::Any& event,
+                                             const PageContext&) { fn(projection, event); });
+    return *this;
+  }
+  ProjectorDispatch& OnEventWithContext(std::string full_name, EventWithContextFn fn) {
     events.emplace_back(std::move(full_name), std::move(fn));
     return *this;
   }
@@ -110,7 +141,7 @@ class ProjectorDispatch {
 
   std::string name;
   std::vector<std::string> domains;
-  std::vector<std::pair<std::string, EventFn>> events;
+  std::vector<std::pair<std::string, EventWithContextFn>> events;
   FinishFn finish;
   UnknownFn unknown;
 };
@@ -120,14 +151,22 @@ class ProcessManagerDispatch {
  public:
   using EventFn = std::function<io::angzarr::v1::ProcessManagerHandleResponse(
       const google::protobuf::Any&, TState&, const Destinations&)>;
+  // An event handler that also reads the trigger book's cover.
+  using EventWithCoverFn = std::function<io::angzarr::v1::ProcessManagerHandleResponse(
+      const google::protobuf::Any&, TState&, const Destinations&, const io::angzarr::v1::Cover&)>;
   using RejectionFn =
       std::function<PmRejection(const io::angzarr::v1::Notification&,
                                 const io::angzarr::v1::RejectionNotification&, TState&)>;
+  // A compensator returning a full response: process events, commands
+  // (deferred by the router), facts and escalation.
+  using RejectionResponseFn = std::function<io::angzarr::v1::ProcessManagerHandleResponse(
+      const io::angzarr::v1::Notification&, const io::angzarr::v1::RejectionNotification&,
+      TState&)>;
 
   struct Handler {
     std::string source_domain;
     std::string full_name;
-    EventFn fn;
+    EventWithCoverFn fn;
   };
 
   ProcessManagerDispatch(std::string name, std::string pm_domain, Rebuilder<TState> rebuilder)
@@ -142,11 +181,32 @@ class ProcessManagerDispatch {
         rebuilder(std::move(rebuilder)) {}
 
   ProcessManagerDispatch& OnEvent(std::string source_domain, std::string full_name, EventFn fn) {
+    return OnEventWithCover(
+        std::move(source_domain), std::move(full_name),
+        [fn = std::move(fn)](const google::protobuf::Any& event, TState& state,
+                             const Destinations& dests,
+                             const io::angzarr::v1::Cover&) { return fn(event, state, dests); });
+  }
+  ProcessManagerDispatch& OnEventWithCover(std::string source_domain, std::string full_name,
+                                           EventWithCoverFn fn) {
     handlers.push_back({std::move(source_domain), std::move(full_name), std::move(fn)});
     return *this;
   }
   // compensates is "fq.Type" or "domain:fq.Type", as for aggregates.
   ProcessManagerDispatch& OnRejected(std::string compensates, RejectionFn fn) {
+    return OnRejectedWithResponse(
+        std::move(compensates),
+        [fn = std::move(fn)](const io::angzarr::v1::Notification& n,
+                             const io::angzarr::v1::RejectionNotification& rejection,
+                             TState& state) {
+          PmRejection r = fn(n, rejection, state);
+          io::angzarr::v1::ProcessManagerHandleResponse resp;
+          for (auto& e : r.process_events) *resp.add_process_events() = std::move(e);
+          if (r.escalation) *resp.mutable_notification() = std::move(*r.escalation);
+          return resp;
+        });
+  }
+  ProcessManagerDispatch& OnRejectedWithResponse(std::string compensates, RejectionResponseFn fn) {
     rejections[compensates].push_back(std::move(fn));
     return *this;
   }
@@ -156,7 +216,7 @@ class ProcessManagerDispatch {
   std::vector<std::string> targets;
   Rebuilder<TState> rebuilder;
   std::vector<Handler> handlers;
-  std::map<std::string, std::vector<RejectionFn>> rejections;
+  std::map<std::string, std::vector<RejectionResponseFn>> rejections;
 };
 
 }  // namespace angzarr::router
