@@ -152,6 +152,20 @@ func (w *counterWorld) eventsCarryParentLinkage() error {
 	return nil
 }
 
+func (w *counterWorld) eventsCarryNoParentLinkage() error {
+	if w.err != nil {
+		return fmt.Errorf("dispatch failed: %w", w.err)
+	}
+	book := w.resp.GetEvents()
+	if len(book.GetPages()) == 0 {
+		return errors.New("no events were recorded")
+	}
+	if ext := book.GetCover().GetExt(); ext != nil {
+		return fmt.Errorf("cover ext = %v, want none", ext)
+	}
+	return nil
+}
+
 func (w *counterWorld) compensationsFirstThenSecond() error {
 	if w.err != nil {
 		return fmt.Errorf("dispatch failed: %w", w.err)
@@ -261,6 +275,7 @@ func initializeScenario(sc *godog.ScenarioContext) {
 	sc.Step(`^the command fails with ([A-Z_]+)$`, w.failsWith)
 	sc.Step(`^no events are recorded$`, w.noEventsRecorded)
 	sc.Step(`^the recorded events carry the parent linkage$`, w.eventsCarryParentLinkage)
+	sc.Step(`^the recorded events carry no parent linkage$`, w.eventsCarryNoParentLinkage)
 	sc.Step(`^the compensations run first then second$`, w.compensationsFirstThenSecond)
 	sc.Step(`^no compensation is recorded$`, w.noCompensation)
 	sc.Step(`^the handler saw (no )?prior history, at next sequence (\d+)$`, w.handlerSawHistory)

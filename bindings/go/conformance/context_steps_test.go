@@ -73,7 +73,8 @@ func seqPtr(seq uint32) *uint32 { return &seq }
 // ledgerAggregate is the "ledger" aggregate over CounterState: Increased folds
 // count += 1 and records the page sequence it applied; a snapshot loads
 // CounterState; IncreaseBy records the handled
-// cover and emits nothing; the only declared fact, Increased, is recorded as
+// cover and emits one Increased whose cover carries the ledger's own linkage
+// (ledgerLinkage); the only declared fact, Increased, is recorded as
 // received and flagged by a CounterState carrying the count it brings the
 // ledger to.
 func ledgerAggregate(seen *[]*pb.Cover, applied *[]uint32) *AggregateDispatch[*counter.CounterState] {
@@ -89,7 +90,10 @@ func ledgerAggregate(seen *[]*pb.Cover, applied *[]uint32) *AggregateDispatch[*c
 	return NewAggregateDispatch("Ledger", "ledger", rebuilder).
 		OnCommand(fqIncreaseBy, func(_ *anypb.Any, _ *counter.CounterState, cctx CommandContext) (*pb.EventBook, error) {
 			*seen = append(*seen, cctx.Cover)
-			return nil, nil
+			return &pb.EventBook{
+				Cover: &pb.Cover{Ext: ledgerLinkage()},
+				Pages: []*pb.EventPage{{Payload: &pb.EventPage_Event{Event: increasedAny()}}},
+			}, nil
 		}).
 		OnFact(fqIncreased, func(fact *anypb.Any, state *counter.CounterState) (FactRecord, error) {
 			flag, err := Pack(&counter.CounterState{Count: state.Count + 1})
@@ -186,6 +190,19 @@ func eventsReplayRequest(events uint32) *pb.ReplayRequest {
 	return &pb.ReplayRequest{Events: pages}
 }
 
+// ledgerLinkage is the parent linkage the ledger sets on its own events.
+func ledgerLinkage() *anypb.Any {
+	return &anypb.Any{TypeUrl: typeURL("test.counter.Parent"), Value: []byte{4, 5, 6}}
+}
+
+// ledgerCommandWithLinkage is ledgerCommand on behalf of a parent
+// (parentLinkage on the command cover).
+func ledgerCommandWithLinkage(label string) *pb.ContextualCommand {
+	cc := ledgerCommand(label)
+	cc.Command.Cover.Ext = parentLinkage()
+	return cc
+}
+
 // ledgerCommand is an IncreaseBy command for the ledger root of label.
 func ledgerCommand(label string) *pb.ContextualCommand {
 	return &pb.ContextualCommand{Command: &pb.CommandBook{
@@ -244,6 +261,7 @@ type contextWorld struct {
 	facts    *pb.EventBook
 	replayed *pb.ReplayResponse
 	pm       *pb.ProcessManagerHandleResponse
+	command  *pb.BusinessResponse
 	err      error
 }
 
@@ -287,7 +305,11 @@ func (w *contextWorld) pmReplay(events int) {
 }
 
 func (w *contextWorld) ledgerCommand(label string) {
-	_, w.err = w.router.Dispatch(ledgerCommand(label))
+	w.command, w.err = w.router.Dispatch(ledgerCommand(label))
+}
+
+func (w *contextWorld) ledgerCommandOnBehalf(label string) {
+	w.command, w.err = w.router.Dispatch(ledgerCommandWithLinkage(label))
 }
 
 func (w *contextWorld) reservingTrigger(label string, seq int) {
@@ -396,6 +418,20 @@ func (w *contextWorld) sawRoot(label string) error {
 	return nil
 }
 
+func (w *contextWorld) carriesLedgerLinkage() error {
+	if w.err != nil {
+		return fmt.Errorf("dispatch failed: %w", w.err)
+	}
+	book := w.command.GetEvents()
+	if n := len(book.GetPages()); n != 1 {
+		return fmt.Errorf("recorded %d events, want 1", n)
+	}
+	if ext := book.GetCover().GetExt(); !proto.Equal(ext, ledgerLinkage()) {
+		return fmt.Errorf("cover ext = %v, want the ledger's own linkage", ext)
+	}
+	return nil
+}
+
 func (w *contextWorld) release(seq int) error {
 	if w.err != nil {
 		return fmt.Errorf("PM dispatch failed: %w", w.err)
@@ -454,6 +490,8 @@ func initializeContextScenario(sc *godog.ScenarioContext) {
 	sc.Step(`^the ledger replays a snapshot of (\d+) then (\d+) Increased events$`, w.replay)
 	sc.Step(`^the reserving process-manager replays (\d+) Increased events$`, w.pmReplay)
 	sc.Step(`^an IncreaseBy command for ledger root "([^"]*)" is dispatched$`, w.ledgerCommand)
+	sc.Step(`^an IncreaseBy command for ledger root "([^"]*)" on behalf of a parent is dispatched$`, w.ledgerCommandOnBehalf)
+	sc.Step(`^the recorded event carries the ledger's own linkage$`, w.carriesLedgerLinkage)
 	sc.Step(`^an Increased trigger of counter root "([^"]*)" at sequence (\d+) is dispatched to the reserving process-manager$`, w.reservingTrigger)
 	sc.Step(`^a rejection of Reserve sent to "([^"]*)" at sequence (\d+) is dispatched to the reserving process-manager$`, w.reservingRejection)
 	sc.Step(`^Increased events of counter root "([^"]*)" at sequences (\d+) and (\d+) are projected$`, w.projected)

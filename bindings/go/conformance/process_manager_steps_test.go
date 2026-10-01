@@ -233,6 +233,16 @@ func (w *pmWorld) commandIsDeferred(seq, index int) error {
 	return assertDeferred(w.resp.GetCommands()[0], "counter", seq, index)
 }
 
+func (w *pmWorld) leavesSourceComponent() error {
+	if w.err != nil {
+		return fmt.Errorf("dispatch failed: %w", w.err)
+	}
+	if len(w.resp.GetCommands()) == 0 {
+		return errors.New("no command emitted")
+	}
+	return assertNoSourceComponent(w.resp.GetCommands()[0])
+}
+
 func (w *pmWorld) emitsNoCommands() error {
 	if w.err != nil {
 		return fmt.Errorf("dispatch failed: %w", w.err)
@@ -389,6 +399,7 @@ func initializeProcessManagerScenario(sc *godog.ScenarioContext) {
 	sc.Step(`^a rejection of Reserve is dispatched$`, w.rejectionReserve)
 	sc.Step(`^the process-manager emits one command to "([^"]*)"$`, w.emitsOneCommand)
 	sc.Step(`^the command is deferred from source sequence (\d+) at command index (\d+)$`, w.commandIsDeferred)
+	sc.Step(`^the command leaves its source component to the coordinator$`, w.leavesSourceComponent)
 	sc.Step(`^the process-manager emits no commands$`, w.emitsNoCommands)
 	sc.Step(`^the process-manager rebuilt (\d+) prior state events$`, w.rebuiltN)
 	sc.Step(`^the process-manager emits one process event$`, w.emitsOneProcessEvent)
