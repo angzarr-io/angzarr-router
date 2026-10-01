@@ -26,12 +26,19 @@ namespace Angzarr.Router;
 /// </summary>
 public sealed class Router : IDisposable
 {
-    private readonly IntPtr _ptr;
+    private readonly RouterHandle _handle;
     private readonly ConcurrentDictionary<ulong, Invoker> _registry = new();
     private readonly object _lock = new();
     private long _nextId;
 
-    public Router() => _ptr = Ffi.RouterNew();
+    public Router()
+    {
+        _handle = Ffi.RouterNew();
+        if (_handle.IsInvalid)
+        {
+            throw new InvalidOperationException("angzarr_router_new returned null");
+        }
+    }
 
     /// <summary>The router-ffi ABI version this binding requires; a loaded
     /// library reporting any other version is refused at load.</summary>
@@ -40,7 +47,23 @@ public sealed class Router : IDisposable
     /// <summary>The ABI version the loaded router-ffi library reports.</summary>
     public static int AbiVersion() => (int)Ffi.AbiVersion();
 
-    public void Dispose() => Ffi.RouterFree(_ptr);
+    /// <summary>True once <see cref="Dispose"/> has released the native
+    /// router.</summary>
+    public bool IsDisposed => _handle.IsClosed;
+
+    /// <summary>Releases the native router. Idempotent; registering or
+    /// dispatching afterwards throws <see cref="ObjectDisposedException"/>. A
+    /// router never disposed is released by its handle's finalizer.</summary>
+    public void Dispose() => _handle.Dispose();
+
+    private RouterHandle Handle()
+    {
+        if (_handle.IsClosed)
+        {
+            throw new ObjectDisposedException(nameof(Router));
+        }
+        return _handle;
+    }
 
     internal Invoker? InvokerFor(ulong callbackId) =>
         _registry.TryGetValue(callbackId, out var inv) ? inv : null;
@@ -89,7 +112,7 @@ public sealed class Router : IDisposable
                 }
                 desc.Rejections.Add(entry);
             }
-            Check(Ffi.RegisterAggregate(_ptr, desc.ToByteArray()));
+            Check(Ffi.RegisterAggregate(Handle(), desc.ToByteArray()));
         }
     }
 
@@ -118,7 +141,7 @@ public sealed class Router : IDisposable
                     ProjectorFinishInvoker(component, factory, d.FinishThunk)
                 );
             }
-            Check(Ffi.RegisterProjector(_ptr, desc.ToByteArray()));
+            Check(Ffi.RegisterProjector(Handle(), desc.ToByteArray()));
         }
     }
 
@@ -141,7 +164,7 @@ public sealed class Router : IDisposable
                 }
                 desc.Rejections.Add(entry);
             }
-            Check(Ffi.RegisterSaga(_ptr, desc.ToByteArray()));
+            Check(Ffi.RegisterSaga(Handle(), desc.ToByteArray()));
         }
     }
 
@@ -188,7 +211,7 @@ public sealed class Router : IDisposable
                 }
                 desc.Rejections.Add(entry);
             }
-            Check(Ffi.RegisterProcessManager(_ptr, desc.ToByteArray()));
+            Check(Ffi.RegisterProcessManager(Handle(), desc.ToByteArray()));
         }
     }
 
@@ -225,13 +248,14 @@ public sealed class Router : IDisposable
 
     private Ffi.Dispatched DispatchVia(
         IMessage request,
-        Func<IntPtr, IntPtr, byte[], Ffi.Dispatched> call
+        Func<RouterHandle, IntPtr, byte[], Ffi.Dispatched> call
     )
     {
+        var router = Handle();
         var handle = GCHandle.Alloc(new Session(this));
         try
         {
-            return call(_ptr, GCHandle.ToIntPtr(handle), request.ToByteArray());
+            return call(router, GCHandle.ToIntPtr(handle), request.ToByteArray());
         }
         finally
         {
