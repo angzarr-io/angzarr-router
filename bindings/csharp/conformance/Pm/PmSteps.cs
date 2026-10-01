@@ -1,4 +1,3 @@
-using System.Collections.Generic;
 using System.Linq;
 using Angzarr;
 using Angzarr.Router;
@@ -55,18 +54,12 @@ public sealed class PmSteps
         TC.AuditProcessManagerAngzarr.RegisterAuditProcessManager(_router, new AuditPmFixture());
     }
 
-    [When(
-        "an Increased trigger in domain {string} is dispatched with destination inventory sequence {int}"
-    )]
-    public void IncreasedWithDestination(string domain, int seq) =>
-        Dispatch(
-            Builders.PmTrigger(
-                domain,
-                new[] { "test.counter.Increased" },
-                null,
-                new Dictionary<string, uint> { ["inventory"] = (uint)seq }
-            )
-        );
+    [When("an Increased trigger in domain {string} at sequence {int} is dispatched")]
+    public void IncreasedAt(string domain, int seq) =>
+        Dispatch(Builders.PmTrigger(domain, new[] { "test.counter.Increased" }, null, (uint)seq));
+
+    [When("a Compensate for Reserve is dispatched to the order process-manager")]
+    public void CompensateForReserve() => Dispatch(Builders.PmCompensate("Reserve"));
 
     [When("an Increased trigger in domain {string} is dispatched")]
     public void IncreasedInDomain(string domain) =>
@@ -126,9 +119,9 @@ public sealed class PmSteps
         Assert.That(_resp.Commands[0].Cover.Domain, Is.EqualTo(target), "command target");
     }
 
-    [Then("the command carries destination sequence {int}")]
-    public void CommandCarriesSequence(int seq) =>
-        Assert.That((int)_resp!.Commands[0].Pages[0].Header.Sequence, Is.EqualTo(seq));
+    [Then("the command is deferred from source sequence {int} at command index {int}")]
+    public void CommandIsDeferred(int seq, int index) =>
+        Steps.AssertDeferred(Succeeded().Commands[0], "counter", seq, index);
 
     [Then("the process-manager emits no commands")]
     public void EmitsNoCommands()

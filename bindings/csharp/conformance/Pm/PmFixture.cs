@@ -5,7 +5,7 @@ using TC = Test.Counter;
 namespace Angzarr.Router.Conformance.Pm;
 
 /// <summary>The conformance OrderProcessManager fixture: the newest trigger
-/// reacts with a stamped Reserve command plus one fact per rebuilt prior-state
+/// reacts with a Reserve command (stamped deferred by the router) plus one fact per rebuilt prior-state
 /// event; a rejection injects one process event and escalates.</summary>
 internal sealed class PmFixture : TC.OrderProcessManagerAngzarr.OrderProcessManagerHandler
 {
@@ -15,13 +15,8 @@ internal sealed class PmFixture : TC.OrderProcessManagerAngzarr.OrderProcessMana
         Destinations dests
     )
     {
-        var cmd = Builders.ReserveCommand();
-        if (dests.Has("inventory"))
-        {
-            cmd = dests.StampCommand(cmd, "inventory");
-        }
         var resp = new ProcessManagerHandleResponse();
-        resp.Commands.Add(cmd);
+        resp.Commands.Add(Builders.ReserveCommand());
         for (uint i = 0; i < state.Count; i++)
         {
             resp.Facts.Add(Builders.OneFact());

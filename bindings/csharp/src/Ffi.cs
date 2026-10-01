@@ -16,7 +16,7 @@ internal struct AngzarrBuf
 }
 
 /// <summary>
-/// The raw C-ABI layer over the router-ffi cdylib, via P/Invoke. Holds the 11
+/// The raw C-ABI layer over the router-ffi cdylib, via P/Invoke. Holds the 15
 /// exported downcalls, the <see cref="AngzarrBuf"/> layout, and the single
 /// <c>[UnmanagedCallersOnly]</c> upcall trampoline the core calls for every host
 /// callback.
@@ -61,7 +61,7 @@ internal static unsafe class Ffi
     }
 
     /// <summary>The router-ffi ABI version this binding is written against.</summary>
-    internal const uint ExpectedAbiVersion = 1;
+    internal const uint ExpectedAbiVersion = 2;
 
     /// <summary>Refuses a router-ffi library whose ABI version differs from
     /// <see cref="ExpectedAbiVersion"/>.</summary>
@@ -99,7 +99,7 @@ internal static unsafe class Ffi
         return NativeLibrary.Load(path);
     }
 
-    // --- the 11 downcalls ---------------------------------------------------
+    // --- the 15 downcalls ---------------------------------------------------
 
     [DllImport(Lib)]
     private static extern uint angzarr_abi_version();
@@ -177,6 +177,24 @@ internal static unsafe class Ffi
 
     [DllImport(Lib)]
     private static extern int angzarr_router_dispatch_process_manager(
+        RouterHandle r,
+        IntPtr hostCtx,
+        byte* request,
+        nuint len,
+        AngzarrBuf* outBuf
+    );
+
+    [DllImport(Lib)]
+    private static extern int angzarr_router_dispatch_fact(
+        RouterHandle r,
+        IntPtr hostCtx,
+        byte* request,
+        nuint len,
+        AngzarrBuf* outBuf
+    );
+
+    [DllImport(Lib)]
+    private static extern int angzarr_router_dispatch_replay(
         RouterHandle r,
         IntPtr hostCtx,
         byte* request,
@@ -283,6 +301,28 @@ internal static unsafe class Ffi
                 (nuint)request.Length,
                 &outBuf
             );
+        }
+        return new Dispatched(ConsumeOut(&outBuf), ret);
+    }
+
+    internal static Dispatched DispatchFact(RouterHandle r, IntPtr hostCtx, byte[] request)
+    {
+        AngzarrBuf outBuf = default;
+        int ret;
+        fixed (byte* p = request)
+        {
+            ret = angzarr_router_dispatch_fact(r, hostCtx, p, (nuint)request.Length, &outBuf);
+        }
+        return new Dispatched(ConsumeOut(&outBuf), ret);
+    }
+
+    internal static Dispatched DispatchReplay(RouterHandle r, IntPtr hostCtx, byte[] request)
+    {
+        AngzarrBuf outBuf = default;
+        int ret;
+        fixed (byte* p = request)
+        {
+            ret = angzarr_router_dispatch_replay(r, hostCtx, p, (nuint)request.Length, &outBuf);
         }
         return new Dispatched(ConsumeOut(&outBuf), ret);
     }

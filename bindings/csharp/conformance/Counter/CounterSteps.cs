@@ -63,6 +63,12 @@ public sealed class CounterSteps
     [Given("a counter that has already recorded {int} increase(s)")]
     public void RecordedIncreases(int n) => _prior = Builders.PriorIncreases(n);
 
+    [Given(
+        "a counter that has already recorded {int} increases under the {string} type-URL prefix"
+    )]
+    public void RecordedIncreasesUnderPrefix(int n, string prefix) =>
+        _prior = Builders.WithTypeUrlPrefix(Builders.PriorIncreases(n), prefix);
+
     [Given("a counter whose history holds a corrupt event")]
     public void HistoryHoldsCorrupt() => _prior = Builders.CorruptHistory();
 
@@ -73,6 +79,10 @@ public sealed class CounterSteps
 
     [When("the operator increases the counter by {int}")]
     public void IncreaseByN(int n) => Dispatch(Builders.IncreaseCommand(n));
+
+    [When("the operator increases the counter by {int} under the {string} type-URL prefix")]
+    public void IncreaseByNUnderPrefix(int n, string prefix) =>
+        Dispatch(Builders.WithTypeUrlPrefix(Builders.IncreaseCommand(n), prefix));
 
     [When("the operator increases the counter by {int} on behalf of a parent")]
     public void IncreaseOnBehalf(int n) => Dispatch(Builders.IncreaseCommandWithLinkage(n));
@@ -208,9 +218,5 @@ public sealed class CounterSteps
         return _observed[^1];
     }
 
-    private static string FqFromUrl(string url)
-    {
-        var i = url.LastIndexOf('/');
-        return i >= 0 ? url[(i + 1)..] : url;
-    }
+    private static string FqFromUrl(string url) => TypeNames.FromUrl(url);
 }

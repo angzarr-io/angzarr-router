@@ -85,4 +85,66 @@ public sealed class AggregateDispatchTests
             new CodedError("ZERO_GRPC", "m", (GrpcCode)0, null).Grpc,
             Is.EqualTo(GrpcCode.InvalidArgument)
         );
+
+    [Test]
+    public void ACompensatorReadsTheCoverItIsHandling()
+    {
+        Cover? seen = null;
+        var dispatch = Counter()
+            .OnRejected(
+                Reserve,
+                (n, rej, state, cctx) =>
+                {
+                    seen = cctx.Cover;
+                    return null;
+                }
+            );
+        using var router = new Router();
+        router.RegisterAggregate(dispatch);
+
+        router.Dispatch(Builders.RejectionCommand(Reserve));
+
+        Assert.That(seen?.Domain, Is.EqualTo("counter"));
+    }
+
+    [Test]
+    public void AnUndoHandlerReturningNothingEmitsNothing()
+    {
+        Compensate? seen = null;
+        var dispatch = new AggregateDispatch<TC.CounterState>(
+            "Inventory",
+            "inventory",
+            new Rebuilder<TC.CounterState>(() => new TC.CounterState())
+        ).OnUndo(
+            "test.counter.AdjustStock",
+            (n, compensate, state, cctx) =>
+            {
+                seen = compensate;
+                return null;
+            }
+        );
+        using var router = new Router();
+        router.RegisterAggregate(dispatch);
+
+        var resp = router.Dispatch(Builders.CompensateFor("AdjustStock"));
+
+        Assert.That(seen?.CommandType, Is.EqualTo("test.counter.AdjustStock"));
+        Assert.That(seen!.Reason, Is.EqualTo("aborted"));
+        Assert.That(resp.Events?.Pages.Count ?? 0, Is.EqualTo(0), "no events");
+    }
+
+    [Test]
+    public void AGeneratedAggregateReplaysWithoutDeclaringAStatePacker()
+    {
+        using var router = new Router();
+        TC.CounterAggregateAngzarr.RegisterCounterAggregate(
+            router,
+            new Counter.CounterFixture(new List<Counter.CounterFixture.Observation>())
+        );
+
+        var resp = router.DispatchReplay("", Builders.ReplayOf(4, 3));
+
+        Assert.That(TypeNames.FromUrl(resp.State.TypeUrl), Is.EqualTo("test.counter.CounterState"));
+        Assert.That(TC.CounterState.Parser.ParseFrom(resp.State.Value).Count, Is.EqualTo(7u));
+    }
 }

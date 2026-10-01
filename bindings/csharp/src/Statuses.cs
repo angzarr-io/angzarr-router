@@ -15,6 +15,7 @@ internal static class Statuses
 {
     private const string ErrorInfoDomain = "angzarr.io";
     private const string ErrorInfoTypeUrl = "type.googleapis.com/google.rpc.ErrorInfo";
+    private const string ErrorInfoFullName = "google.rpc.ErrorInfo";
 
     internal static byte[] ToStatusBytes(CodedError err)
     {
@@ -73,7 +74,7 @@ internal static class Statuses
         IReadOnlyDictionary<string, string> extras = new Dictionary<string, string>();
         foreach (var detail in status.Details)
         {
-            if (detail.TypeUrl == ErrorInfoTypeUrl)
+            if (TypeNames.FromUrl(detail.TypeUrl) == ErrorInfoFullName)
             {
                 try
                 {

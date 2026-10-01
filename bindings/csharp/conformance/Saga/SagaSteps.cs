@@ -1,4 +1,3 @@
-using System.Collections.Generic;
 using Angzarr;
 using Angzarr.Router;
 using NUnit.Framework;
@@ -50,14 +49,9 @@ public sealed class SagaSteps
         // is part of the declaration the generated wiring already carries.
     }
 
-    [When("an Increased event is dispatched with destination inventory sequence {int}")]
-    public void IncreasedWithDestination(int seq) =>
-        Dispatch(
-            Builders.SagaEventSource(
-                "test.counter.Increased",
-                new Dictionary<string, uint> { ["inventory"] = (uint)seq }
-            )
-        );
+    [When("an Increased event at sequence {int} is dispatched")]
+    public void IncreasedAt(int seq) =>
+        Dispatch(Builders.SagaEventSource("test.counter.Increased", (uint)seq));
 
     [When("a Reserve event is dispatched")]
     public void ReserveEvent() => Dispatch(Builders.SagaEventSource("test.counter.Reserve", null));
@@ -72,10 +66,6 @@ public sealed class SagaSteps
     public void RejectionReserve() =>
         Dispatch(Builders.SagaRejectionSource("test.counter.Reserve"));
 
-    [When("a rejection of Unwatched is dispatched")]
-    public void RejectionUnwatched() =>
-        Dispatch(Builders.SagaRejectionSource("test.counter.Unwatched"));
-
     [Then("the saga emits one command to {string}")]
     public void EmitsOneCommand(string target)
     {
@@ -84,9 +74,12 @@ public sealed class SagaSteps
         Assert.That(_resp.Commands[0].Cover.Domain, Is.EqualTo(target), "command target");
     }
 
-    [Then("the command carries destination sequence {int}")]
-    public void CommandCarriesSequence(int seq) =>
-        Assert.That((int)_resp!.Commands[0].Pages[0].Header.Sequence, Is.EqualTo(seq));
+    [Then("the command is deferred from source sequence {int} at command index {int}")]
+    public void CommandIsDeferred(int seq, int index)
+    {
+        Assert.That(_err, Is.Null, "dispatch unexpectedly failed");
+        Steps.AssertDeferred(_resp!.Commands[0], "order", seq, index);
+    }
 
     [Then("the saga emits no commands")]
     public void EmitsNoCommands()
@@ -100,13 +93,6 @@ public sealed class SagaSteps
     {
         Assert.That(_err, Is.Not.Null, "expected coded error " + code);
         Assert.That(_err!.Code, Is.EqualTo(code));
-    }
-
-    [Then("the saga injects one fact event")]
-    public void InjectsOneEvent()
-    {
-        Assert.That(_err, Is.Null, "dispatch unexpectedly failed");
-        Assert.That(_resp!.Events.Count, Is.EqualTo(1), "injected events");
     }
 
     [Then("the saga injects no events")]
