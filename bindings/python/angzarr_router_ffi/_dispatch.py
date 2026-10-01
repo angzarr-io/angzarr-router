@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import enum
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import TYPE_CHECKING
 
 from google.protobuf import any_pb2
+from google.protobuf.message import DecodeError
 from google.rpc import error_details_pb2, status_pb2
 
 from ._abi import ffi, lib
@@ -28,6 +30,9 @@ from .gen.io.angzarr.v1 import (
     saga_pb2,
     types_pb2,
 )
+
+if TYPE_CHECKING:
+    from typing_extensions import Self
 
 # --- ABI status codes (mirror crates/router-ffi/src/abi.rs) ---
 _STATUS_OK = 0  # success with a payload in `out`
@@ -75,7 +80,7 @@ class CodedError(Exception):
         code: str = "",
         message: str = "",
         grpc: int = GrpcCode.INTERNAL,
-        extras: Optional[dict[str, str]] = None,
+        extras: dict[str, str] | None = None,
     ):
         self.code = code
         self.message = message
@@ -128,8 +133,8 @@ class CommandContext:
 #   command:   (cmd: Any, state, cctx) -> EventBook|None (raises CodedError to reject)
 #   rejection: (notification, rejection, state, cctx) -> BusinessResponse|None
 ApplierThunk = Callable[[object, any_pb2.Any], None]
-CommandThunk = Callable[[any_pb2.Any, object, CommandContext], Optional[object]]
-RejectionThunk = Callable[[object, object, object, CommandContext], Optional[object]]
+CommandThunk = Callable[[any_pb2.Any, object, CommandContext], object | None]
+RejectionThunk = Callable[[object, object, object, CommandContext], object | None]
 
 
 @dataclass
@@ -139,14 +144,14 @@ class Rebuilder:
 
     factory: Callable[[], object]
     appliers: dict[str, ApplierThunk] = field(default_factory=dict)
-    snapshot: Optional[ApplierThunk] = None
+    snapshot: ApplierThunk | None = None
 
-    def apply(self, full_name: str, thunk: ApplierThunk) -> "Rebuilder":
+    def apply(self, full_name: str, thunk: ApplierThunk) -> Rebuilder:
         """Register an applier for one fully-qualified event type."""
         self.appliers[full_name] = thunk
         return self
 
-    def with_snapshot(self, thunk: ApplierThunk) -> "Rebuilder":
+    def with_snapshot(self, thunk: ApplierThunk) -> Rebuilder:
         """Register the snapshot loader that seeds state before pages."""
         self.snapshot = thunk
         return self
@@ -163,12 +168,12 @@ class AggregateDispatch:
     commands: dict[str, CommandThunk] = field(default_factory=dict)
     rejections: dict[str, list[RejectionThunk]] = field(default_factory=dict)
 
-    def on_command(self, full_name: str, thunk: CommandThunk) -> "AggregateDispatch":
+    def on_command(self, full_name: str, thunk: CommandThunk) -> AggregateDispatch:
         """Register a handler for one fully-qualified command type."""
         self.commands[full_name] = thunk
         return self
 
-    def on_rejected(self, fq_command: str, thunk: RejectionThunk) -> "AggregateDispatch":
+    def on_rejected(self, fq_command: str, thunk: RejectionThunk) -> AggregateDispatch:
         """Append a compensator for one fully-qualified command type; repeated
         calls register an ordered fan-out."""
         self.rejections.setdefault(fq_command, []).append(thunk)
@@ -195,26 +200,26 @@ class ProjectorDispatch:
     factory: Callable[[], object]
     domains: list[str] = field(default_factory=list)
     events: dict[str, ProjectorEventThunk] = field(default_factory=dict)
-    unknown: Optional[ProjectorUnknownThunk] = None
-    finisher: Optional[ProjectorFinishThunk] = None
+    unknown: ProjectorUnknownThunk | None = None
+    finisher: ProjectorFinishThunk | None = None
 
-    def for_domains(self, *domains: str) -> "ProjectorDispatch":
+    def for_domains(self, *domains: str) -> ProjectorDispatch:
         """Restrict folding to books whose cover carries one of these domains.
         Unset (the default) consumes every domain."""
         self.domains = list(domains)
         return self
 
-    def on_event(self, full_name: str, thunk: ProjectorEventThunk) -> "ProjectorDispatch":
+    def on_event(self, full_name: str, thunk: ProjectorEventThunk) -> ProjectorDispatch:
         """Register the fold thunk for a fully-qualified event type name."""
         self.events[full_name] = thunk
         return self
 
-    def on_unknown(self, thunk: ProjectorUnknownThunk) -> "ProjectorDispatch":
+    def on_unknown(self, thunk: ProjectorUnknownThunk) -> ProjectorDispatch:
         """Register a catch-all for events with no fold thunk."""
         self.unknown = thunk
         return self
 
-    def finish(self, thunk: ProjectorFinishThunk) -> "ProjectorDispatch":
+    def finish(self, thunk: ProjectorFinishThunk) -> ProjectorDispatch:
         """Register the finisher that packs the folded instance into the wire
         Projection."""
         self.finisher = thunk
@@ -228,10 +233,10 @@ class Destinations:
 
     __slots__ = ("_sequences",)
 
-    def __init__(self, sequences: Optional[dict[str, int]] = None):
+    def __init__(self, sequences: dict[str, int] | None = None):
         self._sequences = dict(sequences) if sequences else {}
 
-    def sequence_for(self, domain: str) -> Optional[int]:
+    def sequence_for(self, domain: str) -> int | None:
         """The next sequence for a domain, or None when none was supplied."""
         return self._sequences.get(domain)
 
@@ -281,12 +286,12 @@ class SagaDispatch:
     events: dict[str, SagaEventThunk] = field(default_factory=dict)
     rejections: dict[str, list[SagaRejectionThunk]] = field(default_factory=dict)
 
-    def on_event(self, full_name: str, thunk: SagaEventThunk) -> "SagaDispatch":
+    def on_event(self, full_name: str, thunk: SagaEventThunk) -> SagaDispatch:
         """Register the translation thunk for a fully-qualified event type."""
         self.events[full_name] = thunk
         return self
 
-    def on_rejected(self, fq_command: str, thunk: SagaRejectionThunk) -> "SagaDispatch":
+    def on_rejected(self, fq_command: str, thunk: SagaRejectionThunk) -> SagaDispatch:
         """Append a compensator for one fully-qualified command type; repeated
         calls register an ordered fan-out (C-0042)."""
         self.rejections.setdefault(fq_command, []).append(thunk)
@@ -296,8 +301,8 @@ class SagaDispatch:
 # Process-manager thunk shapes (a PM is stateful — it sees rebuilt state):
 #   event:     (event: Any, state, dests) -> ProcessManagerHandleResponse
 #   rejection: (notification, rejection, state) -> (process_events, escalation|None)
-PMEventThunk = Callable[[any_pb2.Any, object, "Destinations"], object]
-PMRejectionThunk = Callable[[object, object, object], tuple[list, Optional[object]]]
+PMEventThunk = Callable[[any_pb2.Any, object, Destinations], object]
+PMRejectionThunk = Callable[[object, object, object], tuple[list, object | None]]
 
 
 @dataclass
@@ -315,12 +320,12 @@ class ProcessManagerDispatch:
 
     def on_event(
         self, input_domain: str, full_name: str, thunk: PMEventThunk
-    ) -> "ProcessManagerDispatch":
+    ) -> ProcessManagerDispatch:
         """Register the thunk for (input domain, fully-qualified event type)."""
         self.handlers.setdefault(input_domain, {})[full_name] = thunk
         return self
 
-    def on_rejected(self, fq_command: str, thunk: PMRejectionThunk) -> "ProcessManagerDispatch":
+    def on_rejected(self, fq_command: str, thunk: PMRejectionThunk) -> ProcessManagerDispatch:
         """Append a compensator for one fully-qualified command type; repeated
         calls register an ordered fan-out (C-0042)."""
         self.rejections.setdefault(fq_command, []).append(thunk)
@@ -330,7 +335,7 @@ class ProcessManagerDispatch:
 # --- error model: CodedError <-> google.rpc.Status bytes ---
 
 
-def _build_status_bytes(grpc: int, message: str, code: str, extras: Optional[dict]) -> bytes:
+def _build_status_bytes(grpc: int, message: str, code: str, extras: dict | None) -> bytes:
     """Serialize a coded failure as google.rpc.Status bytes carrying an
     ErrorInfo detail — the exact shape the core decodes (and gRPC puts on the
     wire). ErrorInfo Any uses the type.googleapis.com prefix the ABI pins."""
@@ -354,7 +359,7 @@ def _error_status(exc: BaseException) -> tuple[bytes, int]:
     )
 
 
-def _decode_status(data: Optional[bytes], ret: int) -> CodedError:
+def _decode_status(data: bytes | None, ret: int) -> CodedError:
     """Turn google.rpc.Status bytes (with an ErrorInfo detail) back into a
     CodedError. ``ret`` (the negative callback/dispatch return) is the gRPC
     fallback when the bytes are absent or undecodable."""
@@ -366,7 +371,7 @@ def _decode_status(data: Optional[bytes], ret: int) -> CodedError:
         status = status_pb2.Status()
         try:
             status.ParseFromString(data)
-        except Exception:
+        except DecodeError:
             return CodedError(grpc=grpc)
         message = status.message
         if status.code != 0:
@@ -390,9 +395,9 @@ class _Session:
     created lazily by the first callback (all callbacks in one dispatch belong
     to the same aggregate, so the factory is consistent)."""
 
-    __slots__ = ("router", "_state", "_has_state")
+    __slots__ = ("_has_state", "_state", "router")
 
-    def __init__(self, router: "Router"):
+    def __init__(self, router: Router):
         self.router = router
         self._state: object = None
         self._has_state = False
@@ -407,7 +412,7 @@ class _Session:
 # An invoker bridges a callback_id to a registered typed thunk: it receives
 # the live session and the marshaled inputs and returns (out_bytes, status).
 # Thunk exceptions are NOT caught here — the trampoline catches them once.
-Invoker = Callable[["_Session", str, bytes, bytes], tuple[Optional[bytes], int]]
+Invoker = Callable[[_Session, str, bytes, bytes], tuple[bytes | None, int]]
 
 
 def _applier_invoker(factory, thunk: ApplierThunk) -> Invoker:
@@ -563,7 +568,7 @@ def _c_bytes(ptr, n) -> bytes:
     return bytes(ffi.buffer(ptr, n))
 
 
-def _write_out(out, data: Optional[bytes]) -> None:
+def _write_out(out, data: bytes | None) -> None:
     """Fill a router-allocated out buffer (host allocates via
     angzarr_buf_alloc; the router consumes and frees it). Empty leaves
     out null/zero."""
@@ -653,7 +658,7 @@ class Router:
             lib.angzarr_router_free(self._ptr)
             self._ptr = None
 
-    def __enter__(self) -> "Router":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *_exc) -> None:
