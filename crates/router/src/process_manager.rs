@@ -239,6 +239,158 @@ impl<S> ProcessManagerDispatch<S> {
     }
 }
 
+/// The routing view of one process-manager component: its identity and the
+/// input domains it consumes. Implemented by every [`ProcessManagerDispatch`]
+/// regardless of its state type, so co-resident PMs with different state types
+/// route through one selection.
+pub trait ProcessManagerRoute {
+    /// The registered component name (matched against
+    /// `AngzarrDeferredSequence.source_component`).
+    fn name(&self) -> &str;
+    /// The PM's own domain (matched against the process-state cover and the
+    /// rejection's source cover).
+    fn pm_domain(&self) -> &str;
+    /// True when the PM declares a handler for some event of `domain`.
+    fn consumes(&self, domain: &str) -> bool;
+}
+
+impl<S> ProcessManagerRoute for ProcessManagerDispatch<S> {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn pm_domain(&self) -> &str {
+        &self.pm_domain
+    }
+
+    fn consumes(&self, domain: &str) -> bool {
+        self.handlers.contains_key(domain)
+    }
+}
+
+/// Selects which of several co-resident process managers a request is
+/// addressed to, as indices into `pms` in registration order.
+///
+/// A process-state book belongs to exactly one PM, and a rejection belongs to
+/// the PM that issued the rejected command, so identity routes first:
+///
+/// - Rejection Notification trigger: the PM named by the rejected command's
+///   `angzarr_deferred.source_component`; else the PM owning its
+///   `angzarr_deferred.source` domain; else the PM owning the trigger's cover
+///   domain (where the coordinator delivers a PM's rejections). An unaddressed
+///   rejection reaches a sole registered PM and otherwise no PM — it never
+///   fans out across every subscriber.
+/// - Event trigger: the PM owning the process-state cover domain; when the
+///   state carries no identity (a new workflow) or names no registered PM,
+///   every PM consuming the trigger's domain.
+///
+/// A missing or page-less trigger selects nothing; the caller reports those
+/// shapes before routing.
+pub fn select_process_managers(
+    pms: &[&dyn ProcessManagerRoute],
+    req: &pb::ProcessManagerHandleRequest,
+) -> Vec<usize> {
+    let Some(trigger) = req.trigger.as_ref() else {
+        return Vec::new();
+    };
+    let Some(newest) = trigger.pages.last() else {
+        return Vec::new();
+    };
+    let trigger_domain = trigger.cover.as_ref().map_or("", |c| c.domain.as_str());
+    let matching = |pred: &dyn Fn(&dyn ProcessManagerRoute) -> bool| -> Vec<usize> {
+        pms.iter()
+            .enumerate()
+            .filter(|(_, pm)| pred(**pm))
+            .map(|(i, _)| i)
+            .collect()
+    };
+
+    let notification =
+        crate::page_event(newest).filter(|any| crate::is_notification_type_url(&any.type_url));
+    if let Some(any) = notification {
+        let (component, source_domain) = rejection_issuer(any);
+        if !component.is_empty() {
+            let named = matching(&|pm| pm.name() == component);
+            if !named.is_empty() {
+                return named;
+            }
+        }
+        for domain in [source_domain.as_str(), trigger_domain] {
+            if domain.is_empty() {
+                continue;
+            }
+            let owners = matching(&|pm| pm.pm_domain() == domain);
+            if !owners.is_empty() {
+                return owners;
+            }
+        }
+        return if pms.len() == 1 { vec![0] } else { Vec::new() };
+    }
+
+    let state_domain = req
+        .process_state
+        .as_ref()
+        .and_then(|s| s.cover.as_ref())
+        .map_or("", |c| c.domain.as_str());
+    if !state_domain.is_empty() {
+        let owners = matching(&|pm| pm.pm_domain() == state_domain);
+        if !owners.is_empty() {
+            return owners;
+        }
+    }
+    matching(&|pm| pm.consumes(trigger_domain))
+}
+
+/// The issuing component name and source domain recorded on a rejection
+/// Notification's rejected command (`angzarr_deferred`), or empty strings when
+/// the notification carries no decodable provenance.
+fn rejection_issuer(notification_any: &Any) -> (String, String) {
+    let Ok(notification) = pb::Notification::decode(notification_any.value.as_slice()) else {
+        return (String::new(), String::new());
+    };
+    let Some(rejection) = notification
+        .payload
+        .as_ref()
+        .and_then(|p| pb::RejectionNotification::decode(p.value.as_slice()).ok())
+    else {
+        return (String::new(), String::new());
+    };
+    let deferred = rejection
+        .rejected_command
+        .as_ref()
+        .and_then(|cmd| cmd.pages.first())
+        .and_then(|page| page.header.as_ref())
+        .and_then(|h| match h.sequence_type.as_ref() {
+            Some(pb::page_header::SequenceType::AngzarrDeferred(d)) => Some(d),
+            _ => None,
+        });
+    match deferred {
+        Some(d) => (
+            d.source_component.clone(),
+            d.source
+                .as_ref()
+                .map(|c| c.domain.clone())
+                .unwrap_or_default(),
+        ),
+        None => (String::new(), String::new()),
+    }
+}
+
+/// Folds one co-resident PM's response into the merged response: process
+/// events, commands and facts concatenate in dispatch order; the first
+/// escalation Notification wins.
+pub fn merge_response(
+    acc: &mut pb::ProcessManagerHandleResponse,
+    resp: pb::ProcessManagerHandleResponse,
+) {
+    acc.process_events.extend(resp.process_events);
+    acc.commands.extend(resp.commands);
+    acc.facts.extend(resp.facts);
+    if acc.notification.is_none() {
+        acc.notification = resp.notification;
+    }
+}
+
 #[cfg(test)]
 #[path = "process_manager.test.rs"]
 mod process_manager_tests;

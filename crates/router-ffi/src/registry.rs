@@ -9,7 +9,9 @@ use prost::Message;
 
 use angzarr_router::aggregate::AggregateDispatch;
 use angzarr_router::error::{codes, messages, CodedError, HandlerError};
-use angzarr_router::process_manager::ProcessManagerDispatch;
+use angzarr_router::process_manager::{
+    merge_response, select_process_managers, ProcessManagerDispatch, ProcessManagerRoute,
+};
 use angzarr_router::projector::ProjectorDispatch;
 use angzarr_router::rebuild::Rebuilder;
 use angzarr_router::saga::SagaDispatch;
@@ -446,24 +448,27 @@ impl FfiRouter {
 
         // Route by the source book's domain and merge: every saga consuming
         // that domain runs, each skipping event types it does not declare
-        // (spec C-0051). This lets one router host multiple sagas — the
-        // in-process coordinator the poker example needs — instead of the
-        // single-saga special case. The route-and-merge loop is shared with the
-        // PM path (route_and_merge); only the tail differs.
-        let domain = source.cover.as_ref().map(|c| c.domain.as_str()).unwrap_or("");
+        // (spec C-0051), so one router can host several sagas.
+        let domain = source
+            .cover
+            .as_ref()
+            .map(|c| c.domain.as_str())
+            .unwrap_or("");
         let _guard = HostCtxGuard::set(host_ctx);
-        let (merged, matched) = route_and_merge(
-            &self.sagas,
-            domain,
-            |dispatch, dom| dispatch.input_domain() == dom,
-            |dispatch| dispatch.dispatch(&req),
-            |acc: &mut pb::SagaResponse, resp| {
-                acc.commands.extend(resp.commands);
-                acc.events.extend(resp.events);
-            },
-        )?;
-        // Saga tail: a source domain no saga consumes is NO_HANDLER_REGISTERED.
-        // (The PM tail treats an unconsumed domain as a no-op per C-0022.)
+        let mut merged = pb::SagaResponse::default();
+        let mut matched = false;
+        for (_, saga) in self
+            .sagas
+            .iter()
+            .filter(|(_, s)| s.input_domain() == domain)
+        {
+            matched = true;
+            let resp = saga.dispatch(&req)?;
+            merged.commands.extend(resp.commands);
+            merged.events.extend(resp.events);
+        }
+        // A source domain no saga consumes is NO_HANDLER_REGISTERED (a PM
+        // trigger no PM consumes is a no-op instead, C-0022).
         if !matched {
             return Err(CodedError::invalid_argument(
                 codes::NO_HANDLER_REGISTERED,
@@ -518,32 +523,36 @@ impl FfiRouter {
 
         for event in &desc.events {
             let id = event.callback_id;
-            dispatch = dispatch.on_event(&event.input_domain, &event.fq_type, move |any, _state, dests| {
-                let destination_sequences = dests
-                    .domains()
-                    .into_iter()
-                    .filter_map(|d| dests.sequence_for(&d).map(|s| (d, s)))
-                    .collect();
-                let aux = abi_pb::PmEventAux {
-                    destination_sequences,
-                }
-                .encode_to_vec();
-                let (ret, bytes) = invoke(cb, id, &any.type_url, &any.value, &aux);
-                match ret {
-                    STATUS_OK => pb::ProcessManagerHandleResponse::decode(
-                        bytes.unwrap_or_default().as_slice(),
-                    )
-                    .map_err(|_| {
-                        HandlerError::Other(
-                            "host PM handler returned undecodable \
-                             ProcessManagerHandleResponse bytes"
-                                .to_string(),
+            dispatch = dispatch.on_event(
+                &event.input_domain,
+                &event.fq_type,
+                move |any, _state, dests| {
+                    let destination_sequences = dests
+                        .domains()
+                        .into_iter()
+                        .filter_map(|d| dests.sequence_for(&d).map(|s| (d, s)))
+                        .collect();
+                    let aux = abi_pb::PmEventAux {
+                        destination_sequences,
+                    }
+                    .encode_to_vec();
+                    let (ret, bytes) = invoke(cb, id, &any.type_url, &any.value, &aux);
+                    match ret {
+                        STATUS_OK => pb::ProcessManagerHandleResponse::decode(
+                            bytes.unwrap_or_default().as_slice(),
                         )
-                    }),
-                    STATUS_OK_EMPTY => Ok(pb::ProcessManagerHandleResponse::default()),
-                    _ => Err(host_error(ret, bytes)),
-                }
-            });
+                        .map_err(|_| {
+                            HandlerError::Other(
+                                "host PM handler returned undecodable \
+                             ProcessManagerHandleResponse bytes"
+                                    .to_string(),
+                            )
+                        }),
+                        STATUS_OK_EMPTY => Ok(pb::ProcessManagerHandleResponse::default()),
+                        _ => Err(host_error(ret, bytes)),
+                    }
+                },
+            );
         }
 
         for rejection in &desc.rejections {
@@ -584,9 +593,11 @@ impl FfiRouter {
         Ok(())
     }
 
-    /// Decodes ProcessManagerHandleRequest bytes, routes to the registered PM
-    /// (sole PM claims the trigger), and runs the core dispatch with the host
-    /// session installed.
+    /// Decodes ProcessManagerHandleRequest bytes, routes to the addressed
+    /// co-resident PMs, and runs each core dispatch with the host session
+    /// installed. Every selected PM runs under the same host_ctx; the host keys
+    /// its lazily created state per component (by callback id), so no PM ever
+    /// folds into another's state.
     pub fn dispatch_process_manager(
         &self,
         host_ctx: *mut c_void,
@@ -618,55 +629,23 @@ impl FfiRouter {
             ));
         }
 
-        // Route by the trigger's domain and merge: every PM subscribed to that
-        // domain runs, each no-opping on event types it does not declare
-        // (C-0022), so one router can host multiple PMs (e.g. hand-flow and
-        // reservation both consume `table`). The route-and-merge loop is shared
-        // with the saga path (route_and_merge).
-        let domain = trigger.cover.as_ref().map(|c| c.domain.as_str()).unwrap_or("");
+        // Route by identity, then by subscription (select_process_managers):
+        // a process-state book and a rejection each belong to one PM; a new
+        // workflow's trigger reaches every PM consuming its domain, each
+        // no-opping on event types it does not declare (C-0022). Responses
+        // merge in registration order (merge_response).
+        let routes: Vec<&dyn ProcessManagerRoute> = self
+            .process_managers
+            .iter()
+            .map(|(_, pm)| pm as &dyn ProcessManagerRoute)
+            .collect();
+        let selected = select_process_managers(&routes, &req);
         let _guard = HostCtxGuard::set(host_ctx);
-        let (merged, _matched) = route_and_merge(
-            &self.process_managers,
-            domain,
-            |dispatch, dom| dispatch.subscriptions().contains_key(dom),
-            |dispatch| dispatch.dispatch(&req),
-            |acc: &mut pb::ProcessManagerHandleResponse, resp| {
-                acc.process_events.extend(resp.process_events);
-                acc.commands.extend(resp.commands);
-                acc.facts.extend(resp.facts);
-                // First escalation wins (mirrors the compensation merge).
-                if acc.notification.is_none() {
-                    acc.notification = resp.notification;
-                }
-            },
-        )?;
+        let mut merged = pb::ProcessManagerHandleResponse::default();
+        for index in selected {
+            merge_response(&mut merged, self.process_managers[index].1.dispatch(&req)?);
+        }
         // PM tail: an unconsumed trigger domain is a no-op (C-0022), not an error.
         Ok(merged.encode_to_vec())
     }
-}
-
-/// Routes an incoming book to every registered component subscribed to `domain`,
-/// merging each component's response, and reports whether any component claimed
-/// the domain. Each component's own dispatch no-ops on event types it does not
-/// declare, so merging is safe across co-resident components — multiple sagas, or
-/// several process managers sharing a source domain. Shared by `dispatch_saga`
-/// and `dispatch_process_manager`; the callers differ only in the match
-/// predicate, the per-response merge, and what an unmatched domain means (a saga
-/// reports NO_HANDLER_REGISTERED; a PM treats it as a no-op, C-0022).
-fn route_and_merge<C, R: Default>(
-    components: &[(String, C)],
-    domain: &str,
-    subscribes: impl Fn(&C, &str) -> bool,
-    dispatch_one: impl Fn(&C) -> Result<R, CodedError>,
-    mut merge: impl FnMut(&mut R, R),
-) -> Result<(R, bool), CodedError> {
-    let mut merged = R::default();
-    let mut matched = false;
-    for (_, component) in components {
-        if subscribes(component, domain) {
-            matched = true;
-            merge(&mut merged, dispatch_one(component)?);
-        }
-    }
-    Ok((merged, matched))
 }

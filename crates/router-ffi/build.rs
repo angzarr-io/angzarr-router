@@ -4,7 +4,8 @@ fn main() {
     let repo_proto = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../proto");
     // abi.proto imports io/angzarr/v1/types.proto (for Cover); the shared
     // framework protos live in the angzarr-project submodule.
-    let project_proto = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../angzarr-project/proto");
+    let project_proto =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../angzarr-project/proto");
     println!("cargo:rerun-if-changed={}", repo_proto.display());
 
     prost_build::Config::new()

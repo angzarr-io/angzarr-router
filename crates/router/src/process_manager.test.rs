@@ -466,3 +466,261 @@ fn accessors_report_name_domain_and_sources() {
         Some(&vec![FQ_SHIPPED.to_string()])
     );
 }
+
+// --- co-resident routing (select_process_managers / merge_response) --------
+
+use crate::process_manager::{merge_response, select_process_managers, ProcessManagerRoute};
+
+/// A PM named `name` owning `pm_domain`, consuming FQ_SHIPPED from `source`.
+fn routed_pm(name: &str, pm_domain: &str, source: &str) -> ProcessManagerDispatch<TestState> {
+    ProcessManagerDispatch::new(name, pm_domain, fresh_rebuilder()).on_event(
+        source,
+        FQ_SHIPPED,
+        |_e, _s, _d| Ok(pb::ProcessManagerHandleResponse::default()),
+    )
+}
+
+/// A rejection Notification page whose rejected command carries an
+/// angzarr_deferred header naming the issuing component and its domain.
+fn issued_notification_page(source_component: &str, source_domain: &str) -> pb::EventPage {
+    let rejection = pb::RejectionNotification {
+        rejected_command: Some(pb::CommandBook {
+            cover: Some(pb::Cover {
+                domain: "inventory".to_string(),
+                ..Default::default()
+            }),
+            pages: vec![pb::CommandPage {
+                header: Some(pb::PageHeader {
+                    sequence_type: Some(pb::page_header::SequenceType::AngzarrDeferred(
+                        pb::AngzarrDeferredSequence {
+                            source: Some(pb::Cover {
+                                domain: source_domain.to_string(),
+                                ..Default::default()
+                            }),
+                            source_component: source_component.to_string(),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                }),
+                payload: Some(pb::command_page::Payload::Command(Any {
+                    type_url: type_url(FQ_RESERVE),
+                    value: Vec::new(),
+                })),
+                ..Default::default()
+            }],
+        }),
+        ..Default::default()
+    };
+    let notification = pb::Notification {
+        payload: Some(Any {
+            type_url: type_url("io.angzarr.v1.RejectionNotification"),
+            value: prost::Message::encode_to_vec(&rejection),
+        }),
+        ..Default::default()
+    };
+    event_page(Any {
+        type_url: type_url("io.angzarr.v1.Notification"),
+        value: prost::Message::encode_to_vec(&notification),
+    })
+}
+
+fn state_in(domain: &str) -> pb::EventBook {
+    pb::EventBook {
+        cover: Some(pb::Cover {
+            domain: domain.to_string(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+fn select(
+    pms: &[&ProcessManagerDispatch<TestState>],
+    req: &pb::ProcessManagerHandleRequest,
+) -> Vec<usize> {
+    let routes: Vec<&dyn ProcessManagerRoute> =
+        pms.iter().map(|p| *p as &dyn ProcessManagerRoute).collect();
+    select_process_managers(&routes, req)
+}
+
+#[test]
+fn event_trigger_without_state_identity_selects_every_subscriber_in_order() {
+    let a = routed_pm("a", "a-pm", IN_DOMAIN);
+    let other = routed_pm("x", "x-pm", "billing");
+    let b = routed_pm("b", "b-pm", IN_DOMAIN);
+    let req = request(Some(trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED)])), None, &[]);
+    assert_eq!(select(&[&a, &other, &b], &req), vec![0, 2]);
+}
+
+#[test]
+fn event_trigger_with_uncovered_state_selects_subscribers() {
+    let a = routed_pm("a", "a-pm", IN_DOMAIN);
+    let b = routed_pm("b", "b-pm", IN_DOMAIN);
+    let req = request(
+        Some(trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED)])),
+        Some(pb::EventBook::default()),
+        &[],
+    );
+    assert_eq!(select(&[&a, &b], &req), vec![0, 1]);
+}
+
+#[test]
+fn process_state_cover_addresses_its_own_process_manager_only() {
+    let a = routed_pm("a", "a-pm", IN_DOMAIN);
+    let b = routed_pm("b", "b-pm", IN_DOMAIN);
+    let req = request(
+        Some(trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED)])),
+        Some(state_in("b-pm")),
+        &[],
+    );
+    assert_eq!(select(&[&a, &b], &req), vec![1]);
+}
+
+#[test]
+fn process_state_cover_matching_no_process_manager_falls_back_to_subscribers() {
+    let a = routed_pm("a", "a-pm", IN_DOMAIN);
+    let b = routed_pm("b", "b-pm", "billing");
+    let req = request(
+        Some(trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED)])),
+        Some(state_in("unknown-pm")),
+        &[],
+    );
+    assert_eq!(select(&[&a, &b], &req), vec![0]);
+}
+
+#[test]
+fn rejection_routes_to_the_issuing_component_by_name() {
+    let a = routed_pm("a", "a-pm", IN_DOMAIN);
+    let b = routed_pm("b", "b-pm", IN_DOMAIN);
+    // The trigger cover names a's domain, but the deferred provenance names b.
+    let req = request(
+        Some(trigger("a-pm", vec![issued_notification_page("b", "")])),
+        None,
+        &[],
+    );
+    assert_eq!(select(&[&a, &b], &req), vec![1]);
+}
+
+#[test]
+fn rejection_routes_to_the_issuing_domain_when_the_component_is_unknown() {
+    let a = routed_pm("a", "a-pm", IN_DOMAIN);
+    let b = routed_pm("b", "b-pm", IN_DOMAIN);
+    let req = request(
+        Some(trigger(
+            IN_DOMAIN,
+            vec![issued_notification_page("gone", "b-pm")],
+        )),
+        None,
+        &[],
+    );
+    assert_eq!(select(&[&a, &b], &req), vec![1]);
+}
+
+#[test]
+fn rejection_without_provenance_routes_by_the_trigger_cover_domain() {
+    let a = routed_pm("a", "a-pm", IN_DOMAIN);
+    let b = routed_pm("b", "b-pm", IN_DOMAIN);
+    let req = request(
+        Some(trigger("a-pm", vec![notification_page_for(FQ_RESERVE)])),
+        None,
+        &[],
+    );
+    assert_eq!(select(&[&a, &b], &req), vec![0]);
+}
+
+#[test]
+fn unaddressed_rejection_never_fans_out_across_subscribers() {
+    let a = routed_pm("a", "a-pm", IN_DOMAIN);
+    let b = routed_pm("b", "b-pm", IN_DOMAIN);
+    let req = request(
+        Some(trigger(IN_DOMAIN, vec![notification_page_for(FQ_RESERVE)])),
+        None,
+        &[],
+    );
+    assert!(select(&[&a, &b], &req).is_empty());
+}
+
+#[test]
+fn unaddressed_rejection_reaches_a_sole_process_manager() {
+    let a = routed_pm("a", "a-pm", IN_DOMAIN);
+    let req = request(
+        Some(trigger(IN_DOMAIN, vec![notification_page_for(FQ_RESERVE)])),
+        None,
+        &[],
+    );
+    assert_eq!(select(&[&a], &req), vec![0]);
+}
+
+#[test]
+fn undecodable_rejection_reaches_only_a_sole_process_manager() {
+    let a = routed_pm("a", "a-pm", IN_DOMAIN);
+    let b = routed_pm("b", "b-pm", IN_DOMAIN);
+    let garbage = event_page(Any {
+        type_url: type_url("io.angzarr.v1.Notification"),
+        value: vec![0xff, 0xff, 0xff],
+    });
+    let req = request(Some(trigger("a-pm", vec![garbage.clone()])), None, &[]);
+    // The trigger cover still addresses a; the PM's own dispatch reports the
+    // decode failure.
+    assert_eq!(select(&[&a, &b], &req), vec![0]);
+    let req = request(Some(trigger(IN_DOMAIN, vec![garbage])), None, &[]);
+    assert!(select(&[&a, &b], &req).is_empty());
+    assert_eq!(select(&[&a], &req), vec![0]);
+}
+
+#[test]
+fn missing_or_empty_trigger_selects_nothing_to_route() {
+    let a = routed_pm("a", "a-pm", IN_DOMAIN);
+    assert!(select(&[&a], &request(None, None, &[])).is_empty());
+    assert!(select(&[&a], &request(Some(trigger(IN_DOMAIN, vec![])), None, &[])).is_empty());
+}
+
+#[test]
+fn route_view_reports_identity_and_consumption() {
+    let a = routed_pm("a", "a-pm", IN_DOMAIN);
+    let route: &dyn ProcessManagerRoute = &a;
+    assert_eq!(route.name(), "a");
+    assert_eq!(route.pm_domain(), "a-pm");
+    assert!(route.consumes(IN_DOMAIN));
+    assert!(!route.consumes("billing"));
+}
+
+#[test]
+fn merge_concatenates_in_order_and_the_first_escalation_wins() {
+    let mut acc = pb::ProcessManagerHandleResponse::default();
+    merge_response(
+        &mut acc,
+        pb::ProcessManagerHandleResponse {
+            process_events: vec![tagged_book("p1")],
+            commands: vec![command_to("c1")],
+            facts: vec![tagged_book("f1")],
+            notification: None,
+        },
+    );
+    merge_response(
+        &mut acc,
+        pb::ProcessManagerHandleResponse {
+            process_events: vec![tagged_book("p2")],
+            commands: vec![command_to("c2")],
+            facts: vec![tagged_book("f2")],
+            notification: Some(escalation("first")),
+        },
+    );
+    merge_response(
+        &mut acc,
+        pb::ProcessManagerHandleResponse {
+            notification: Some(escalation("second")),
+            ..Default::default()
+        },
+    );
+    assert_eq!(book_domains(&acc.process_events), vec!["p1", "p2"]);
+    assert_eq!(book_domains(&acc.facts), vec!["f1", "f2"]);
+    let cmd_domains: Vec<_> = acc
+        .commands
+        .iter()
+        .map(|c| c.cover.as_ref().unwrap().domain.clone())
+        .collect();
+    assert_eq!(cmd_domains, vec!["c1", "c2"]);
+    assert_eq!(acc.notification, Some(escalation("first")));
+}

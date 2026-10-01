@@ -33,7 +33,9 @@ async fn an_order_pm(_w: &mut ProcessManagerWorld) {
     // Each dispatch builds a fresh PM; nothing to seed.
 }
 
-#[when(regex = r#"^an Increased trigger in domain "([^"]*)" is dispatched with destination inventory sequence (\d+)$"#)]
+#[when(
+    regex = r#"^an Increased trigger in domain "([^"]*)" is dispatched with destination inventory sequence (\d+)$"#
+)]
 async fn increased_with_destination(w: &mut ProcessManagerWorld, domain: String, seq: u32) {
     w.dispatch(conf::pm_trigger_request(
         &domain,
@@ -93,13 +95,20 @@ async fn rejection_reserve(w: &mut ProcessManagerWorld) {
 async fn emits_one_command(w: &mut ProcessManagerWorld, target: String) {
     let resp = w.response();
     assert_eq!(resp.commands.len(), 1, "exactly one command emitted");
-    assert_eq!(resp.commands[0].cover.as_ref().expect("cover").domain, target);
+    assert_eq!(
+        resp.commands[0].cover.as_ref().expect("cover").domain,
+        target
+    );
 }
 
 #[then(regex = r"^the command carries destination sequence (\d+)$")]
 async fn command_carries_sequence(w: &mut ProcessManagerWorld, seq: u32) {
     let cmd = &w.response().commands[0];
-    let got = match cmd.pages[0].header.as_ref().and_then(|h| h.sequence_type.as_ref()) {
+    let got = match cmd.pages[0]
+        .header
+        .as_ref()
+        .and_then(|h| h.sequence_type.as_ref())
+    {
         Some(pb::page_header::SequenceType::Sequence(s)) => *s,
         _ => panic!("command page carries no explicit sequence"),
     };
@@ -127,7 +136,10 @@ async fn emits_one_process_event(w: &mut ProcessManagerWorld) {
 
 #[then("the process-manager escalates")]
 async fn escalates(w: &mut ProcessManagerWorld) {
-    assert!(w.response().notification.is_some(), "an escalation was raised");
+    assert!(
+        w.response().notification.is_some(),
+        "an escalation was raised"
+    );
 }
 
 #[then(regex = r"^the dispatch fails with ([A-Z_]+)$")]

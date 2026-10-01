@@ -54,6 +54,8 @@ const CB_SAGA_EVENT: u64 = 10;
 const CB_SAGA_COMP: u64 = 11;
 const CB_PM_EVENT: u64 = 12;
 const CB_PM_COMP: u64 = 13;
+const CB_PM2_EVENT: u64 = 14;
+const CB_PM2_COMP: u64 = 15;
 
 const FQ_ORDER_CREATED: &str = "test.order.OrderCreated";
 const FQ_RESERVE_STOCK: &str = "test.order.ReserveStock";
@@ -293,6 +295,36 @@ unsafe extern "C" fn host_cb(
                     }),
                     ..Default::default()
                 }),
+                ..Default::default()
+            };
+            host_fill(out, &resp.encode_to_vec());
+            STATUS_OK
+        }
+        CB_PM2_EVENT => {
+            // The second PM reacts with one command to "pm2-target".
+            let resp = pb::ProcessManagerHandleResponse {
+                commands: vec![pb::CommandBook {
+                    cover: Some(pb::Cover {
+                        domain: "pm2-target".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            host_fill(out, &resp.encode_to_vec());
+            STATUS_OK
+        }
+        CB_PM2_COMP => {
+            // The second PM compensates with one process event in "pm2".
+            let resp = pb::ProcessManagerHandleResponse {
+                process_events: vec![pb::EventBook {
+                    cover: Some(pb::Cover {
+                        domain: "pm2".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
                 ..Default::default()
             };
             host_fill(out, &resp.encode_to_vec());
@@ -1124,8 +1156,9 @@ impl Router {
     fn with_process_manager() -> Self {
         let r = angzarr_router_new();
         let desc = pm_descriptor_bytes();
-        let ret =
-            unsafe { angzarr_router_register_process_manager(r, desc.as_ptr(), desc.len(), host_cb) };
+        let ret = unsafe {
+            angzarr_router_register_process_manager(r, desc.as_ptr(), desc.len(), host_cb)
+        };
         assert_eq!(ret, 0, "process-manager registration failed");
         Router(r)
     }
@@ -1161,7 +1194,11 @@ impl Router {
 }
 
 /// A PM request over a trigger book in `domain` carrying the given pages.
-fn pm_request(domain: &str, pages: Vec<pb::EventPage>, dest: &[(&str, u32)]) -> pb::ProcessManagerHandleRequest {
+fn pm_request(
+    domain: &str,
+    pages: Vec<pb::EventPage>,
+    dest: &[(&str, u32)],
+) -> pb::ProcessManagerHandleRequest {
     pb::ProcessManagerHandleRequest {
         trigger: Some(pb::EventBook {
             cover: Some(pb::Cover {
@@ -1183,12 +1220,20 @@ fn pm_emits_stamped_command_through_the_abi() {
     // one command stamped with the destination sequence.
     let router = Router::with_process_manager();
     let session = next_session();
-    let req = pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)], &[("inventory", 4)]);
+    let req = pm_request(
+        "orders",
+        vec![event_page_of(FQ_ORDER_SHIPPED)],
+        &[("inventory", 4)],
+    );
     let (ret, bytes) = router.dispatch_process_manager(session, &req);
     assert_eq!(ret, 0);
     let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
     assert_eq!(resp.commands.len(), 1);
-    let seq = match resp.commands[0].pages[0].header.as_ref().and_then(|h| h.sequence_type.as_ref()) {
+    let seq = match resp.commands[0].pages[0]
+        .header
+        .as_ref()
+        .and_then(|h| h.sequence_type.as_ref())
+    {
         Some(pb::page_header::SequenceType::Sequence(s)) => *s,
         _ => panic!("command not stamped"),
     };
@@ -1202,14 +1247,20 @@ fn pm_compensator_runs_through_the_abi() {
     let router = Router::with_process_manager();
     let session = next_session();
     let notification_page = pb::EventPage {
-        payload: Some(pb::event_page::Payload::Event(notification_command(FQ_RESERVE_STOCK))),
+        payload: Some(pb::event_page::Payload::Event(notification_command(
+            FQ_RESERVE_STOCK,
+        ))),
         ..Default::default()
     };
     let req = pm_request("orders", vec![notification_page], &[]);
     let (ret, bytes) = router.dispatch_process_manager(session, &req);
     assert_eq!(ret, 0);
     let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
-    assert_eq!(resp.process_events.len(), 1, "compensator emitted one process event");
+    assert_eq!(
+        resp.process_events.len(),
+        1,
+        "compensator emitted one process event"
+    );
     assert_eq!(
         resp.notification.expect("escalation").cover.unwrap().domain,
         "escalated"
@@ -1246,7 +1297,11 @@ fn two_process_managers_share_a_source_domain_route_by_type() {
     );
     let router = Router(r);
     let session = next_session();
-    let req = pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)], &[("inventory", 4)]);
+    let req = pm_request(
+        "orders",
+        vec![event_page_of(FQ_ORDER_SHIPPED)],
+        &[("inventory", 4)],
+    );
     let (ret, bytes) = router.dispatch_process_manager(session, &req);
     assert_eq!(ret, 0, "multi-PM routing should not report NO_HANDLER");
     let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
@@ -1283,4 +1338,136 @@ fn pm_empty_trigger_through_the_abi_is_empty_pm_trigger() {
     assert_eq!(ret, -3, "invalid argument, negated");
     let (_, reason) = decode_status(&bytes);
     assert_eq!(reason, angzarr_router::error::codes::EMPTY_PM_TRIGGER);
+}
+
+/// A second PM ("pm2", domain "other-pm") consuming the same `orders`
+/// OrderShipped trigger and compensating the same rejected command.
+fn pm2_descriptor_bytes() -> Vec<u8> {
+    abi_pb::ProcessManagerDescriptor {
+        name: "Pm2".to_string(),
+        pm_domain: "other-pm".to_string(),
+        appliers: Vec::new(),
+        snapshot_callback_id: None,
+        events: vec![abi_pb::PmEventEntry {
+            input_domain: "orders".to_string(),
+            fq_type: FQ_ORDER_SHIPPED.to_string(),
+            callback_id: CB_PM2_EVENT,
+        }],
+        rejections: vec![abi_pb::RejectionEntry {
+            fq_command_type: FQ_RESERVE_STOCK.to_string(),
+            callback_ids: vec![CB_PM2_COMP],
+        }],
+    }
+    .encode_to_vec()
+}
+
+impl Router {
+    fn with_two_process_managers() -> Self {
+        let r = angzarr_router_new();
+        for desc in [pm_descriptor_bytes(), pm2_descriptor_bytes()] {
+            let ret = unsafe {
+                angzarr_router_register_process_manager(r, desc.as_ptr(), desc.len(), host_cb)
+            };
+            assert_eq!(ret, 0, "process-manager registration failed");
+        }
+        Router(r)
+    }
+}
+
+fn notification_page(fq_command: &str) -> pb::EventPage {
+    pb::EventPage {
+        payload: Some(pb::event_page::Payload::Event(notification_command(
+            fq_command,
+        ))),
+        ..Default::default()
+    }
+}
+
+fn command_domains(resp: &pb::ProcessManagerHandleResponse) -> Vec<String> {
+    resp.commands
+        .iter()
+        .map(|c| {
+            c.cover
+                .as_ref()
+                .map(|c| c.domain.clone())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+#[test]
+fn pm_rejection_addressed_to_its_own_domain_reaches_its_compensator() {
+    // The coordinator delivers a PM-issued command's rejection to the PM's own
+    // domain, which is not one of its input domains.
+    let router = Router::with_process_manager();
+    let req = pm_request("order-pm", vec![notification_page(FQ_RESERVE_STOCK)], &[]);
+    let (ret, bytes) = router.dispatch_process_manager(next_session(), &req);
+    assert_eq!(ret, 0);
+    let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
+    assert_eq!(resp.process_events.len(), 1, "the PM's compensator ran");
+    assert!(resp.notification.is_some(), "its escalation crossed back");
+}
+
+#[test]
+fn co_resident_rejection_reaches_only_the_addressed_pm() {
+    let router = Router::with_two_process_managers();
+    let req = pm_request("other-pm", vec![notification_page(FQ_RESERVE_STOCK)], &[]);
+    let (ret, bytes) = router.dispatch_process_manager(next_session(), &req);
+    assert_eq!(ret, 0);
+    let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
+    let domains: Vec<_> = resp
+        .process_events
+        .iter()
+        .map(|b| {
+            b.cover
+                .as_ref()
+                .map(|c| c.domain.clone())
+                .unwrap_or_default()
+        })
+        .collect();
+    assert_eq!(domains, vec!["pm2".to_string()], "only pm2 compensated");
+    assert!(
+        resp.notification.is_none(),
+        "the order PM's escalation did not run"
+    );
+}
+
+#[test]
+fn co_resident_rejection_on_a_shared_input_domain_runs_no_compensator() {
+    let router = Router::with_two_process_managers();
+    let req = pm_request("orders", vec![notification_page(FQ_RESERVE_STOCK)], &[]);
+    let (ret, bytes) = router.dispatch_process_manager(next_session(), &req);
+    assert_eq!(ret, 0);
+    let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
+    assert_eq!(resp, pb::ProcessManagerHandleResponse::default());
+}
+
+#[test]
+fn process_state_cover_routes_the_trigger_to_its_own_pm() {
+    let router = Router::with_two_process_managers();
+    let mut req = pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)], &[]);
+    req.process_state = Some(pb::EventBook {
+        cover: Some(pb::Cover {
+            domain: "other-pm".to_string(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let (ret, bytes) = router.dispatch_process_manager(next_session(), &req);
+    assert_eq!(ret, 0);
+    let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
+    assert_eq!(command_domains(&resp), vec!["pm2-target".to_string()]);
+}
+
+#[test]
+fn uncovered_process_state_fans_the_trigger_out_in_registration_order() {
+    let router = Router::with_two_process_managers();
+    let req = pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)], &[]);
+    let (ret, bytes) = router.dispatch_process_manager(next_session(), &req);
+    assert_eq!(ret, 0);
+    let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
+    assert_eq!(
+        command_domains(&resp),
+        vec!["inventory".to_string(), "pm2-target".to_string()]
+    );
 }
