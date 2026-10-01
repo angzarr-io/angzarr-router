@@ -108,6 +108,10 @@ void Register(StepRegistry& r, CompensationWorld& w) {
        [&w](const StepArgs& a) {
          w.router.RegisterAggregate(PaymentAggregate({{"test.counter.Reserve", a[0]}}));
        });
+  r.On("a second payment aggregate compensating Reserve from any domain with {word}",
+       [&w](const StepArgs& a) {
+         w.router.RegisterAggregate(PaymentAggregate({{"test.counter.Reserve", a[0]}}));
+       });
   r.On(
       "a payment aggregate compensating Reserve from {string} with {word} and from {string} with "
       "{word}",
@@ -148,6 +152,19 @@ void Register(StepRegistry& r, CompensationWorld& w) {
     REQUIRE(book.pages(0).header().sequence_type_case() == pb::PageHeader::kSequence);
     REQUIRE(static_cast<int>(book.pages(0).header().sequence()) == std::stoi(a[0]));
   });
+  r.On("the aggregates emit {word} at sequence {int} then {word} at sequence {int}",
+       [&w](const StepArgs& a) {
+         const auto& book = w.Book();
+         std::vector<std::pair<std::string, int>> got;
+         for (const auto& page : book.pages()) {
+           REQUIRE(page.header().sequence_type_case() == pb::PageHeader::kSequence);
+           got.emplace_back(FqFromUrl(page.event().type_url()),
+                            static_cast<int>(page.header().sequence()));
+         }
+         const std::vector<std::pair<std::string, int>> want{
+             {"test.counter." + a[0], std::stoi(a[1])}, {"test.counter." + a[2], std::stoi(a[3])}};
+         REQUIRE(got == want);
+       });
   r.On("the dispatch fails with {word} as UNIMPLEMENTED", [&w](const StepArgs& a) {
     REQUIRE(w.err.has_value());
     REQUIRE(w.err->code == a[0]);

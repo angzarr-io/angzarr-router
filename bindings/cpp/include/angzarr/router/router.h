@@ -400,13 +400,15 @@ class Router {
     };
   }
 
-  static Invoker SagaEventInvoker(std::vector<std::string> targets, SagaDispatch::EventFn fn) {
+  static Invoker SagaEventInvoker(std::vector<std::string> targets,
+                                  SagaDispatch::EventWithContextFn fn) {
     return
         [dests = Destinations(std::move(targets)), fn](
             Session&, const std::string& tu, const std::string& payload, const std::string& aux) {
           abi::SagaEventAux sax;
           sax.ParseFromString(aux);
-          auto emission = fn(AnyOf(tu, payload), dests, sax.source_cover());
+          auto emission =
+              fn(AnyOf(tu, payload), dests, PageContext{sax.source_cover(), sax.source_seq()});
           pb::SagaResponse resp;
           for (auto& c : emission.commands) *resp.add_commands() = c;
           for (auto& e : emission.events) *resp.add_events() = e;

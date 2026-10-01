@@ -1,6 +1,7 @@
 #include <catch2/catch.hpp>
 #include <optional>
 #include <string>
+#include <utility>
 
 #include "builders.h"
 #include "gherkin.h"
@@ -33,8 +34,6 @@ struct ProjectorWorld {
   std::optional<pb::Projection> proj;
   std::optional<CodedError> err;
 
-  ProjectorWorld() { tc::RegisterCounterProjector(router, fixture); }
-
   void Dispatch(pb::EventBook book) {
     try {
       proj = router.DispatchProjector(book);
@@ -47,7 +46,13 @@ struct ProjectorWorld {
 };
 
 void Register(StepRegistry& r, ProjectorWorld& w) {
-  r.On("a counter projection", [](const StepArgs&) {});
+  r.On("a counter projection",
+       [&w](const StepArgs&) { tc::RegisterCounterProjector(w.router, w.fixture); });
+  r.On("a counter projection over every domain", [&w](const StepArgs&) {
+    auto dispatch = tc::NewCounterProjectorDispatch(w.fixture);
+    dispatch.ForDomains({"*"});
+    w.router.RegisterProjector(std::move(dispatch));
+  });
   r.On("{int} events are delivered in domain {string}",
        [&w](const StepArgs& a) { w.Dispatch(DeliveryBook(a[1], std::stoi(a[0]))); });
   r.On("a delivery arrives with no cover",

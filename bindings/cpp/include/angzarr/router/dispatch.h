@@ -85,11 +85,18 @@ class SagaDispatch {
   // commands by the trigger's identity (root, ext).
   using EventFn = std::function<SagaEmission(const google::protobuf::Any&, const Destinations&,
                                              const io::angzarr::v1::Cover&)>;
+  // A handler that also reads where the triggering event sits: the source
+  // book's cover and the event's sequence (0 when the page carries none).
+  using EventWithContextFn = std::function<SagaEmission(const google::protobuf::Any&,
+                                                        const Destinations&, const PageContext&)>;
 
   SagaDispatch(std::string name, std::string input_domain, std::vector<std::string> targets)
       : name(std::move(name)), input_domain(std::move(input_domain)), targets(std::move(targets)) {}
 
   SagaDispatch& OnEvent(std::string full_name, EventFn fn) {
+    return OnEventWithContext(std::move(full_name), CoverOnly{std::move(fn)});
+  }
+  SagaDispatch& OnEventWithContext(std::string full_name, EventWithContextFn fn) {
     events.emplace_back(std::move(full_name), std::move(fn));
     return *this;
   }
@@ -97,7 +104,17 @@ class SagaDispatch {
   std::string name;
   std::string input_domain;
   std::vector<std::string> targets;
-  std::vector<std::pair<std::string, EventFn>> events;
+  std::vector<std::pair<std::string, EventWithContextFn>> events;
+
+ private:
+  // A cover-only handler in the context-taking shape.
+  struct CoverOnly {
+    EventFn fn;
+    SagaEmission operator()(const google::protobuf::Any& event, const Destinations& dests,
+                            const PageContext& source) const {
+      return fn(event, dests, source.cover);
+    }
+  };
 };
 
 // Observes the type URL of a delivered event that has no projector fold.

@@ -182,6 +182,11 @@ void Register(StepRegistry& r, PmWorld& w) {
     REQUIRE_FALSE(w.err.has_value());
     REQUIRE(w.resp->process_events_size() == 1);
   });
+  r.On("the process event is addressed to {string}", [&w](const StepArgs& a) {
+    REQUIRE_FALSE(w.err.has_value());
+    REQUIRE(w.resp->process_events_size() == 1);
+    REQUIRE(w.resp->process_events(0).cover().domain() == a[0]);
+  });
   r.On("the process-manager escalates", [&w](const StepArgs&) {
     REQUIRE_FALSE(w.err.has_value());
     REQUIRE(w.resp->has_notification());
