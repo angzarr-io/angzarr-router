@@ -2,6 +2,7 @@ package ffirouter
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	pb "github.com/angzarr-io/angzarr-router/bindings/go/gen/io/angzarr/v1"
@@ -27,5 +28,22 @@ func TestAnyDecodeError_IsInvalidArgumentWithTypeURL(t *testing.T) {
 	}
 	if err.Extras["type_url"] != "/io.angzarr.v1.Notification" {
 		t.Errorf("Extras[type_url] = %q, want the type URL", err.Extras["type_url"])
+	}
+}
+
+func TestCheckAbiVersion_AcceptsTheExpectedVersion(t *testing.T) {
+	if err := checkAbiVersion(ExpectedAbiVersion); err != nil {
+		t.Fatalf("checkAbiVersion(%d) = %v, want nil", ExpectedAbiVersion, err)
+	}
+}
+
+func TestCheckAbiVersion_RefusesADriftedLibraryNamingBothVersions(t *testing.T) {
+	err := checkAbiVersion(ExpectedAbiVersion + 1)
+	if err == nil {
+		t.Fatal("checkAbiVersion accepted a mismatched ABI version")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "expects ABI version 1") || !strings.Contains(msg, "reports ABI version 2") {
+		t.Errorf("error %q does not name expected (1) and actual (2) versions", msg)
 	}
 }

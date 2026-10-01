@@ -28,6 +28,21 @@ const frameworkAnyPrefix = "/"
 // boundary emits (distinct from the io.angzarr proto package).
 const errorInfoDomain = "angzarr.io"
 
+// ExpectedAbiVersion is the router-ffi ABI version this binding is written
+// against (crates/router-ffi ABI_VERSION).
+const ExpectedAbiVersion uint32 = 1
+
+// checkAbiVersion refuses a router-ffi library whose ABI version differs from
+// the one this binding marshals for.
+func checkAbiVersion(actual uint32) error {
+	if actual != ExpectedAbiVersion {
+		return fmt.Errorf(
+			"angzarr-router: binding expects ABI version %d but the linked router-ffi library reports ABI version %d; rebuild the binding and library from the same release",
+			ExpectedAbiVersion, actual)
+	}
+	return nil
+}
+
 // GrpcCode is the numeric gRPC status code carried with a coded error.
 // Kept as a plain int32 so the binding depends only on the protobuf
 // runtime, not the gRPC library.

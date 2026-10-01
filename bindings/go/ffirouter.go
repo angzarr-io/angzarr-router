@@ -112,11 +112,14 @@ import (
 const statusOKEmpty = 1
 
 // AbiVersion reports the ABI version the linked router-ffi exposes.
-// Bindings check it at load so a binding and a router-ffi artifact that
-// have drifted refuse each other instead of marshaling garbage.
 func AbiVersion() uint32 {
 	return uint32(C.angzarr_abi_version())
 }
+
+// abiCheck verifies the linked library's ABI version once per process, so a
+// binding and a router-ffi artifact that have drifted refuse each other
+// instead of marshaling garbage.
+var abiCheck = sync.OnceValue(func() error { return checkAbiVersion(AbiVersion()) })
 
 // invoker is the type-erased bridge from a callback_id to a registered
 // typed thunk. It receives the live dispatch session (holding the host
@@ -160,8 +163,12 @@ type Router struct {
 	nextComponent componentKey
 }
 
-// NewRouter creates an empty router. Close it when done.
+// NewRouter creates an empty router. Close it when done. It panics if the
+// linked router-ffi library's ABI version is not ExpectedAbiVersion.
 func NewRouter() *Router {
+	if err := abiCheck(); err != nil {
+		panic(err)
+	}
 	return &Router{
 		ptr:      C.angzarr_router_new(),
 		registry: make(map[uint64]invoker),
