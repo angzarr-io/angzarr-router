@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 
-import { fromBinary } from "@bufbuild/protobuf";
+import { equals, fromBinary } from "@bufbuild/protobuf";
+import { AnySchema } from "@bufbuild/protobuf/wkt";
 import { After, Before, Given, Then, When } from "@cucumber/cucumber";
 
 import {
+  type BusinessResponse,
   CodedError,
   type Cover,
   type EventBook,
@@ -28,6 +30,7 @@ interface ContextCtx {
   refusal?: unknown;
   replayed?: ReplayResponse;
   pm?: ProcessManagerHandleResponse;
+  command?: BusinessResponse;
 }
 
 let xctx: ContextCtx;
@@ -107,9 +110,29 @@ Then(
 When(
   "an IncreaseBy command for ledger root {string} is dispatched",
   function (label: string) {
-    router().dispatch(B.ledgerCommand(label));
+    xctx.command = router().dispatch(B.ledgerCommand(label));
   },
 );
+
+When(
+  "an IncreaseBy command for ledger root {string} on behalf of a parent is dispatched",
+  function (label: string) {
+    xctx.command = router().dispatch(B.ledgerCommandWithLinkage(label));
+  },
+);
+
+Then("the recorded event carries the ledger's own linkage", function () {
+  const result = xctx.command?.result;
+  assert.equal(result?.case, "events", "the command recorded events");
+  const book = result!.value as EventBook;
+  assert.equal(book.pages.length, 1, "one event");
+  const ext = book.cover?.ext;
+  assert.ok(ext, "cover ext present");
+  assert.ok(
+    equals(AnySchema, ext, B.ledgerLinkage()),
+    "the handler-set linkage is kept over the command's",
+  );
+});
 
 When(
   "an Increased trigger of counter root {string} at sequence {int} is dispatched to the reserving process-manager",

@@ -1,11 +1,22 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 
-import { create, equals } from "@bufbuild/protobuf";
+import { create, equals, toBinary } from "@bufbuild/protobuf";
 import { AnySchema } from "@bufbuild/protobuf/wkt";
 import { After, Before, Given, Then, When } from "@cucumber/cucumber";
 
-import { CodedError, Router, WILDCARD_DOMAIN } from "@angzarr/router";
-import { ContextualCommandSchema } from "@angzarr/router";
+import {
+  CodedError,
+  GrpcCode,
+  Router,
+  SagaDispatch,
+  WILDCARD_DOMAIN,
+} from "@angzarr/router";
+import {
+  CommandBookSchema,
+  ContextualCommandSchema,
+  CoverSchema,
+} from "@angzarr/router";
 import type {
   AngzarrDeferredSequence,
   BusinessResponse,
@@ -18,6 +29,10 @@ import type {
   Projection,
   SagaResponse,
 } from "@angzarr/router";
+import {
+  RejectionEntrySchema,
+  SagaDescriptorSchema,
+} from "../gen/io/angzarr/router/ffi/v1/abi_pb";
 import { registerAuditProcessManager } from "../gen/test/counter/audit_process_manager_angzarr";
 import { registerCounterAggregate } from "../gen/test/counter/counter_aggregate_angzarr";
 import {
@@ -50,6 +65,8 @@ interface Ctx {
   err?: CodedError;
   observed: Observation[];
   sagaSeen: number[];
+  registration?: unknown;
+  registered?: boolean;
 }
 
 let ctx: Ctx;
@@ -238,6 +255,13 @@ Then("the recorded events carry the parent linkage", function () {
   );
 });
 
+Then("the recorded events carry no parent linkage", function () {
+  assert.equal(ctx.err, undefined, "dispatch unexpectedly failed");
+  const book = counterEvents();
+  assert.ok(book && book.pages.length > 0, "events were recorded");
+  assert.equal(book.cover?.ext, undefined, "no cover ext");
+});
+
 Then("the compensations run first then second", function () {
   assert.equal(ctx.err, undefined, "dispatch unexpectedly failed");
   const book = counterEvents();
@@ -313,6 +337,20 @@ Given("an order saga delivering to {string}", function (_target: string) {
   ctx.router.registerSaga(saga);
 });
 
+Given("a parity saga emitting the parity command twice", function () {
+  ctx.kind = "saga";
+  ctx.router = new Router();
+  ctx.router.registerSaga(
+    new SagaDispatch("parity-saga", "order", ["inventory"]).onEvent(
+      "test.counter.Increased",
+      () => ({
+        commands: [B.parityCommand(), B.parityCommand()],
+        events: [],
+      }),
+    ),
+  );
+});
+
 function dispatchSaga(req: Parameters<Router["dispatchSaga"]>[0]): void {
   try {
     ctx.sagaResp = ctx.router!.dispatchSaga(req);
@@ -329,6 +367,85 @@ When(
     dispatchSaga(B.sagaEventSource("test.counter.Increased", seq));
   },
 );
+
+When(
+  "an Increased event of order root {string} at sequence {int} is dispatched",
+  function (label: string, seq: number) {
+    dispatchSaga(B.sagaRootedSource(label, seq));
+  },
+);
+
+When(
+  "the parity source event at sequence {int} is dispatched",
+  function (seq: number) {
+    dispatchSaga(B.paritySource(seq));
+  },
+);
+
+// The typed SagaDispatch has no way to declare a rejection handler, so the
+// descriptor goes through the binding's low-level registration entry point.
+When("a saga declaring a compensation for Reserve is registered", function () {
+  const router = new Router();
+  try {
+    router.registerSagaDescriptor(
+      create(SagaDescriptorSchema, {
+        name: "order-saga",
+        inputDomain: "order",
+        targetDomains: ["inventory"],
+        rejections: [
+          create(RejectionEntrySchema, {
+            compensates: "test.counter.Reserve",
+            callbackIds: [1n],
+          }),
+        ],
+      }),
+    );
+    ctx.registration = undefined;
+  } catch (e) {
+    ctx.registration = e;
+  } finally {
+    router.close();
+  }
+  ctx.registered = true;
+});
+
+Then(
+  "the command is deferred from order root {string}",
+  function (label: string) {
+    assert.equal(ctx.err, undefined, "dispatch unexpectedly failed");
+    assert.equal(ctx.sagaResp!.commands.length, 1, "emitted commands");
+    for (const page of ctx.sagaResp!.commands[0].pages) {
+      const st = page.header?.sequenceType;
+      assert.equal(st?.case, "angzarrDeferred", "command page is deferred");
+      const source = (st!.value as AngzarrDeferredSequence).source;
+      assert.ok(source, "deferred source present");
+      assert.ok(
+        equals(CoverSchema, source, B.coverOf("order", label)),
+        "the source is the triggering book's whole cover",
+      );
+    }
+  },
+);
+
+Then(
+  "the command at index {int} hashes to SHA-256 {string}",
+  function (index: number, digest: string) {
+    assert.equal(ctx.err, undefined, "dispatch unexpectedly failed");
+    const command = ctx.sagaResp!.commands[index];
+    assert.ok(command, `a command at index ${index}`);
+    const encoded = toBinary(CommandBookSchema, command, {
+      writeUnknownFields: false,
+    });
+    assert.equal(createHash("sha256").update(encoded).digest("hex"), digest);
+  },
+);
+
+Then("the registration is refused as INVALID_ARGUMENT", function () {
+  assert.ok(ctx.registered, "a saga registration was attempted");
+  const err = ctx.registration;
+  assert.ok(err instanceof CodedError, `expected a coded refusal, got ${err}`);
+  assert.equal(err.grpc, GrpcCode.InvalidArgument, "gRPC code");
+});
 
 When("a Reserve event is dispatched", function () {
   dispatchSaga(B.sagaEventSource("test.counter.Reserve"));
@@ -634,5 +751,22 @@ Then(
     }
   },
 );
+
+Then("the command leaves its source component to the coordinator", function () {
+  assert.equal(ctx.err, undefined, "dispatch unexpectedly failed");
+  const commands: CommandBook[] =
+    ctx.kind === "saga" ? ctx.sagaResp!.commands : ctx.pmResp!.commands;
+  assert.ok(commands.length > 0, "a command was emitted");
+  assert.ok(commands[0].pages.length > 0, "the command has pages");
+  for (const page of commands[0].pages) {
+    const st = page.header?.sequenceType;
+    assert.equal(st?.case, "angzarrDeferred", "command page is deferred");
+    assert.equal(
+      (st!.value as AngzarrDeferredSequence).sourceComponent,
+      "",
+      "the coordinator stamps the component",
+    );
+  }
+});
 
 Then("the dispatch fails with {word}", failsWith);

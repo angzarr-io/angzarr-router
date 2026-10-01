@@ -265,6 +265,54 @@ export function sagaEventSource(fq: string, seq?: number): SagaHandleRequest {
   });
 }
 
+/** {@link sagaEventSource} of one Increased event of order root `label` at
+ * sequence `seq`. */
+export function sagaRootedSource(
+  label: string,
+  seq: number,
+): SagaHandleRequest {
+  const req = sagaEventSource("test.counter.Increased", seq);
+  req.source!.cover = coverOf("order", label);
+  return req;
+}
+
+/** The bytes lo, lo+1, ..., hi. */
+function byteRange(lo: number, hi: number): Uint8Array {
+  return Uint8Array.from({ length: hi - lo + 1 }, (_, i) => lo + i);
+}
+
+/** The parity command: cover "inventory", root bytes 10..1f, correlation
+ * "corr-1"; one page whose command is "/example.Foo" carrying 01020304. */
+export function parityCommand(): CommandBook {
+  return create(CommandBookSchema, {
+    cover: create(CoverSchema, {
+      domain: "inventory",
+      root: create(UUIDSchema, { value: byteRange(0x10, 0x1f) }),
+      correlationId: "corr-1",
+    }),
+    pages: [
+      singleCommandPage(
+        create(AnySchema, {
+          typeUrl: "/example.Foo",
+          value: new Uint8Array([1, 2, 3, 4]),
+        }),
+      ),
+    ],
+  });
+}
+
+/** The parity source: one Increased event at sequence `seq` under cover
+ * "order", root bytes 00..0f, correlation "corr-1". */
+export function paritySource(seq: number): SagaHandleRequest {
+  const req = sagaEventSource("test.counter.Increased", seq);
+  req.source!.cover = create(CoverSchema, {
+    domain: "order",
+    root: create(UUIDSchema, { value: byteRange(0x00, 0x0f) }),
+    correlationId: "corr-1",
+  });
+  return req;
+}
+
 export function sagaRejectionSource(fqCommand: string): SagaHandleRequest {
   return create(SagaHandleRequestSchema, {
     source: create(EventBookSchema, {
@@ -628,6 +676,18 @@ export function eventsReplayRequest(events: number): ReplayRequest {
   return create(ReplayRequestSchema, {
     events: Array.from({ length: events }, (_, i) => increasedPage(i)),
   });
+}
+
+/** The parent linkage the ledger sets on its own events. */
+export function ledgerLinkage(): Any {
+  return anyOf("test.counter.Parent", new Uint8Array([4, 5, 6]));
+}
+
+/** {@link ledgerCommand} on behalf of a parent ({@link parentLinkage}). */
+export function ledgerCommandWithLinkage(label: string): ContextualCommand {
+  const cc = ledgerCommand(label);
+  cc.command!.cover!.ext = parentLinkage();
+  return cc;
 }
 
 /** An IncreaseBy command for the ledger root `label`. */
