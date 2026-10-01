@@ -408,3 +408,18 @@ fn a_router_refuses_dispatch_of_another_kind() {
         codes::NO_HANDLER_REGISTERED
     );
 }
+
+#[test]
+fn an_ambiguous_process_manager_fails_the_build() {
+    let pm = ProcessManagerDispatch::new("pm", "pm", ["inventory"], fresh_rebuilder())
+        .on_rejected("test.Reserve", |_, _, _| {
+            Ok(pb::ProcessManagerHandleResponse::default())
+        })
+        .on_rejected("inventory:test.Reserve", |_, _, _| {
+            Ok(pb::ProcessManagerHandleResponse::default())
+        });
+    assert_eq!(
+        build_err(RouterBuilder::new().process_manager(pm)),
+        codes::AMBIGUOUS_COMPENSATION
+    );
+}
