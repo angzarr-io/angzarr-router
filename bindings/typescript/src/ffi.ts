@@ -7,11 +7,15 @@
 // router-allocated and released here (angzarr_buf_release). The trampoline never
 // lets an exception unwind across the boundary — the per-dispatch Session it
 // reaches is parked in a module-level map whose integer id the core carries as
-// host_ctx (declared uint64, the cdylib treats it opaquely).
+// host_ctx. host_ctx is a void* the cdylib treats opaquely; it is declared
+// uintptr_t (pointer-sized, passed exactly as a pointer) because koffi accepts
+// only a real pointer object for a void* argument, never an integer id.
 
 import koffi from "koffi";
 
 import { type Session } from "./session";
+import { unhandled } from "./codedError";
+import { errorResult, type Outcome } from "./statuses";
 
 const ABI_VERSION = 1;
 const LIB_ENV = "ANGZARR_ROUTER_LIB";
@@ -36,7 +40,7 @@ const AngzarrBuf = koffi.struct("AngzarrBuf", {
 
 // The single host-callback gateway signature; host_ctx is the opaque session id.
 const AngzarrCb = koffi.proto(
-  "int32_t AngzarrCb(uint64_t host_ctx, uint64_t callback_id, uint8_t* type_url, size_t type_url_len, uint8_t* payload, size_t payload_len, uint8_t* aux, size_t aux_len, _Out_ AngzarrBuf* out)",
+  "int32_t AngzarrCb(uintptr_t host_ctx, uint64_t callback_id, uint8_t* type_url, size_t type_url_len, uint8_t* payload, size_t payload_len, uint8_t* aux, size_t aux_len, _Out_ AngzarrBuf* out)",
 );
 
 // --- downcalls ---------------------------------------------------------------
@@ -66,16 +70,16 @@ const registerFns = {
 
 const dispatchFns = {
   aggregate: lib.func(
-    "int32_t angzarr_router_dispatch(void* r, uint64_t host_ctx, uint8_t* request, size_t len, _Out_ AngzarrBuf* out)",
+    "int32_t angzarr_router_dispatch(void* r, uintptr_t host_ctx, uint8_t* request, size_t len, _Out_ AngzarrBuf* out)",
   ),
   projector: lib.func(
-    "int32_t angzarr_router_dispatch_projector(void* r, uint64_t host_ctx, uint8_t* request, size_t len, _Out_ AngzarrBuf* out)",
+    "int32_t angzarr_router_dispatch_projector(void* r, uintptr_t host_ctx, uint8_t* request, size_t len, _Out_ AngzarrBuf* out)",
   ),
   saga: lib.func(
-    "int32_t angzarr_router_dispatch_saga(void* r, uint64_t host_ctx, uint8_t* request, size_t len, _Out_ AngzarrBuf* out)",
+    "int32_t angzarr_router_dispatch_saga(void* r, uintptr_t host_ctx, uint8_t* request, size_t len, _Out_ AngzarrBuf* out)",
   ),
   processManager: lib.func(
-    "int32_t angzarr_router_dispatch_process_manager(void* r, uint64_t host_ctx, uint8_t* request, size_t len, _Out_ AngzarrBuf* out)",
+    "int32_t angzarr_router_dispatch_process_manager(void* r, uintptr_t host_ctx, uint8_t* request, size_t len, _Out_ AngzarrBuf* out)",
   ),
 };
 
@@ -133,9 +137,27 @@ function consumeOut(out: unknown): Uint8Array {
 
 // --- the trampoline (called by the core, on the dispatching thread) -----------
 
+/** Routes one host callback to the session parked under `hostCtx`, returning
+ * the response bytes + ABI status the trampoline hands back to the core. */
+export function hostCallback(
+  hostCtx: number | bigint,
+  callbackId: number | bigint,
+  typeUrl: string,
+  payload: Uint8Array,
+  aux: Uint8Array,
+): Outcome {
+  const session = sessions.get(Number(hostCtx));
+  if (!session) {
+    return errorResult(
+      unhandled(`no dispatch session for host_ctx ${hostCtx}`),
+    );
+  }
+  return session.handleCallback(Number(callbackId), typeUrl, payload, aux);
+}
+
 const callback = koffi.register(
   (
-    hostCtx: bigint,
+    hostCtx: number | bigint,
     callbackId: bigint,
     typeUrl: unknown,
     typeUrlLen: number | bigint,
@@ -146,25 +168,25 @@ const callback = koffi.register(
     out: unknown,
   ): number => {
     try {
-      const session = sessions.get(Number(hostCtx));
-      if (!session) {
-        // No status payload — the core's negative-return fallback classifies it.
-        writeOut(out, null);
-        return -13;
-      }
-      const result = session.handleCallback(
-        Number(callbackId),
+      const result = hostCallback(
+        hostCtx,
+        callbackId,
         decoder.decode(readBytes(typeUrl, Number(typeUrlLen))),
         readBytes(payload, Number(payloadLen)),
         readBytes(aux, Number(auxLen)),
       );
       writeOut(out, result.response);
       return result.status;
-    } catch {
+    } catch (e) {
       // Defense in depth: handleCallback owns the firewall and should never
       // throw. If it somehow does, fail closed without unwinding into Rust.
-      writeOut(out, null);
-      return -13;
+      const failed = errorResult(unhandled(`host callback failed: ${e}`));
+      try {
+        writeOut(out, failed.response);
+      } catch {
+        // `out` stays the core's empty buffer; the status still classifies it.
+      }
+      return failed.status;
     }
   },
   koffi.pointer(AngzarrCb),

@@ -19,6 +19,8 @@ import {
   type CounterState,
   CounterStateSchema,
 } from "../gen/test/counter/counter_pb";
+import { hostCallback } from "../src/ffi";
+import { fromStatusBytes, type Outcome } from "../src/statuses";
 import * as B from "./builders";
 
 // Binding-local scenarios (bindings/typescript/conformance/features): behavior
@@ -186,3 +188,29 @@ Then(
     ]);
   },
 );
+
+// --- callback trampoline ----------------------------------------------------
+
+let callbackOutcome: Outcome | undefined;
+
+When("the host callback runs for an unregistered host context", function () {
+  callbackOutcome = hostCallback(
+    0n,
+    1n,
+    "/test.counter.Increased",
+    new Uint8Array(0),
+    new Uint8Array(0),
+  );
+});
+
+Then("the callback fails INTERNAL with {word}", function (code: string) {
+  const outcome = callbackOutcome!;
+  assert.equal(outcome.status, -GrpcCode.Internal, "callback status");
+  assert.ok(
+    outcome.response && outcome.response.length > 0,
+    "callback carried a Status payload",
+  );
+  const err = fromStatusBytes(outcome.response, outcome.status);
+  assert.equal(err.code, code, "Status ErrorInfo reason");
+  assert.equal(err.grpc, GrpcCode.Internal, "Status code");
+});
