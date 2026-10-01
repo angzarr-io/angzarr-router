@@ -16,12 +16,15 @@ import type {
   Projection,
   SagaResponse,
 } from "@angzarr/router";
+import { registerAuditProcessManager } from "../gen/test/counter/audit_process_manager_angzarr";
 import { registerCounterAggregate } from "../gen/test/counter/counter_aggregate_angzarr";
 import { registerCounterProjector } from "../gen/test/counter/counter_projector_angzarr";
 import { registerOrderProcessManager } from "../gen/test/counter/order_process_manager_angzarr";
 import { registerOrderSaga } from "../gen/test/counter/order_saga_angzarr";
 import * as B from "./builders";
 import {
+  AUDIT_MARK,
+  AuditPmFixture,
   CounterFixture,
   type Observation,
   PmFixture,
@@ -384,6 +387,13 @@ Given("an order process-manager", function () {
   registerOrderProcessManager(ctx.router, new PmFixture());
 });
 
+Given("co-resident order and audit process-managers", function () {
+  ctx.kind = "pm";
+  ctx.router = new Router();
+  registerOrderProcessManager(ctx.router, new PmFixture());
+  registerAuditProcessManager(ctx.router, new AuditPmFixture());
+});
+
 function dispatchPm(
   req: Parameters<Router["dispatchProcessManager"]>[0],
 ): void {
@@ -435,6 +445,22 @@ When(
   },
 );
 
+When(
+  "an Increased trigger is dispatched over a prior {string} state of {int} events",
+  function (owner: string, n: number) {
+    dispatchPm(
+      B.pmTrigger("counter", ["test.counter.Increased"], B.pmStateIn(owner, n)),
+    );
+  },
+);
+
+When(
+  "a rejection of Reserve issued by {string} is dispatched",
+  function (issuer: string) {
+    dispatchPm(B.pmIssuedRejection("test.counter.Reserve", issuer));
+  },
+);
+
 When("a request with no trigger is dispatched", function () {
   dispatchPm(B.pmNoTrigger());
 });
@@ -468,6 +494,50 @@ Then(
     assert.equal(ctx.pmResp!.facts.length, n, "rebuilt prior state events");
   },
 );
+
+/** Counts the PM response's facts emitted by the audit PM (cover domain
+ * AUDIT_MARK) when `audit`, else those emitted by the order PM. */
+function factsMarked(audit: boolean): number {
+  assert.equal(ctx.err, undefined, "dispatch unexpectedly failed");
+  return ctx.pmResp!.facts.filter(
+    (f) => (f.cover?.domain === AUDIT_MARK) === audit,
+  ).length;
+}
+
+Then(
+  "the order process-manager rebuilt {int} prior state events",
+  function (n: number) {
+    assert.equal(factsMarked(false), n, "order PM facts = its rebuilt events");
+  },
+);
+
+Then(
+  "the audit process-manager rebuilt {int} prior state events",
+  function (n: number) {
+    assert.equal(factsMarked(true), n, "audit PM facts = its rebuilt events");
+  },
+);
+
+Then("the order process-manager did not react", function () {
+  assert.equal(factsMarked(false), 0, "the order PM emitted no fact");
+  assert.equal(
+    ctx.pmResp!.commands.length,
+    0,
+    "the order PM emitted no command",
+  );
+});
+
+Then("only the audit process-manager compensates", function () {
+  assert.equal(ctx.err, undefined, "dispatch unexpectedly failed");
+  const resp = ctx.pmResp!;
+  assert.equal(resp.processEvents.length, 1, "exactly one compensation");
+  assert.equal(
+    resp.processEvents[0].cover?.domain,
+    AUDIT_MARK,
+    "the audit PM compensated",
+  );
+  assert.equal(resp.notification, undefined, "the order PM did not escalate");
+});
 
 Then("the process-manager emits one process event", function () {
   assert.equal(ctx.err, undefined, "dispatch unexpectedly failed");

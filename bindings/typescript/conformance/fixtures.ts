@@ -22,11 +22,13 @@ import {
   type SagaEmission,
   reject,
 } from "@angzarr/router";
+import { type AuditProcessManagerHandler } from "../gen/test/counter/audit_process_manager_angzarr";
 import { type CounterAggregateHandler } from "../gen/test/counter/counter_aggregate_angzarr";
 import { type CounterProjectorHandler } from "../gen/test/counter/counter_projector_angzarr";
 import { type OrderProcessManagerHandler } from "../gen/test/counter/order_process_manager_angzarr";
 import { type OrderSagaHandler } from "../gen/test/counter/order_saga_angzarr";
 import {
+  type AuditProcessManagerState,
   type CounterProjectorState,
   type CounterState,
   type FailHard,
@@ -180,5 +182,42 @@ export class PmFixture implements OrderProcessManagerHandler {
         cover: create(CoverSchema, { domain: "escalated" }),
       }),
     };
+  }
+}
+
+/** The cover domain marking every book the audit process-manager emits. */
+export const AUDIT_MARK = "audit";
+
+function auditBook(): EventBook {
+  return create(EventBookSchema, {
+    cover: create(CoverSchema, { domain: AUDIT_MARK }),
+  });
+}
+
+/** The conformance AuditProcessManager fixture, co-resident with the order PM
+ * over the same trigger and rejected command but over its own state type: it
+ * reacts with one "audit" fact per rebuilt prior-state event and no commands,
+ * and compensates with one "audit" process event and no escalation. */
+export class AuditPmFixture implements AuditProcessManagerHandler {
+  increased(
+    _ev: Increased,
+    state: AuditProcessManagerState,
+    _dests: Destinations,
+  ): ProcessManagerHandleResponse {
+    return create(ProcessManagerHandleResponseSchema, {
+      facts: state.seen.map(() => auditBook()),
+    });
+  }
+
+  applyIncreased(state: AuditProcessManagerState, _ev: Increased): void {
+    state.seen.push("Increased");
+  }
+
+  onReserveRejected(
+    _n: Notification,
+    _rejection: RejectionNotification,
+    _state: AuditProcessManagerState,
+  ): PmRejection {
+    return { processEvents: [auditBook()] };
   }
 }

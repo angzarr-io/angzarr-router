@@ -1,7 +1,8 @@
-import { create, toBinary } from "@bufbuild/protobuf";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { type Any, AnySchema } from "@bufbuild/protobuf/wkt";
 
 import {
+  AngzarrDeferredSequenceSchema,
   type CommandBook,
   CommandBookSchema,
   CommandPageSchema,
@@ -323,6 +324,52 @@ export function pmTrigger(
 export function pmStateOf(n: number): EventBook {
   return create(EventBookSchema, {
     pages: Array.from({ length: n }, () => increasedEventPage()),
+  });
+}
+
+/** A PM process-state book of `n` Increased events owned by `pmDomain` (its
+ * cover addresses the owning PM). */
+export function pmStateIn(pmDomain: string, n: number): EventBook {
+  const book = pmStateOf(n);
+  book.cover = create(CoverSchema, { domain: pmDomain });
+  return book;
+}
+
+/** A PM request delivering the rejection of `fqCommand` that the PM owning
+ * `issuerDomain` issued: the trigger cover is the issuer's domain and the
+ * rejected command's angzarr_deferred header names it as the source. */
+export function pmIssuedRejection(
+  fqCommand: string,
+  issuerDomain: string,
+): ProcessManagerHandleRequest {
+  const rejection = rejectionNotificationFor(fqCommand, "inventory");
+  const rejected = fromBinary(
+    RejectionNotificationSchema,
+    rejection.payload!.value,
+  );
+  rejected.rejectedCommand!.pages[0].header = create(PageHeaderSchema, {
+    sequenceType: {
+      case: "angzarrDeferred",
+      value: create(AngzarrDeferredSequenceSchema, {
+        source: create(CoverSchema, { domain: issuerDomain }),
+      }),
+    },
+  });
+  const notification = create(NotificationSchema, {
+    payload: Pack.wrap(RejectionNotificationSchema, rejected),
+  });
+  return create(ProcessManagerHandleRequestSchema, {
+    trigger: create(EventBookSchema, {
+      cover: create(CoverSchema, { domain: issuerDomain }),
+      pages: [
+        create(EventPageSchema, {
+          payload: {
+            case: "event",
+            value: Pack.wrap(NotificationSchema, notification),
+          },
+        }),
+      ],
+    }),
   });
 }
 

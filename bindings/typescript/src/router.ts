@@ -91,6 +91,7 @@ export class Router {
   private readonly ptr: unknown;
   private readonly registry = new Map<number, Invoker>();
   private nextId = 0;
+  private nextComponent = 0;
 
   constructor() {
     if (!abiChecked) {
@@ -114,6 +115,11 @@ export class Router {
     return this.registry.get(callbackId);
   }
 
+  /** A fresh key identifying one registered component's host state. */
+  private component(): number {
+    return ++this.nextComponent;
+  }
+
   private assign(invoker: Invoker): bigint {
     const id = ++this.nextId;
     this.registry.set(id, invoker);
@@ -123,7 +129,7 @@ export class Router {
   // --- registration ----------------------------------------------------------
 
   registerAggregate<T>(d: AggregateDispatch<T>): void {
-    const factory = d.rebuilder.factory;
+    const state = stateOf(this.component(), d.rebuilder.factory);
     const desc = create(AggregateDescriptorSchema, {
       name: d.name,
       domain: d.domain,
@@ -132,27 +138,27 @@ export class Router {
       desc.appliers.push(
         create(CallbackEntrySchema, {
           fqType: fq,
-          callbackId: this.assign(applierInvoker(factory, thunk)),
+          callbackId: this.assign(applierInvoker(state, thunk)),
         }),
       );
     }
     if (d.rebuilder.snapshot) {
       desc.snapshotCallbackId = this.assign(
-        applierInvoker(factory, d.rebuilder.snapshot),
+        applierInvoker(state, d.rebuilder.snapshot),
       );
     }
     for (const [fq, thunk] of d.commands) {
       desc.commands.push(
         create(CallbackEntrySchema, {
           fqType: fq,
-          callbackId: this.assign(commandInvoker(factory, thunk)),
+          callbackId: this.assign(commandInvoker(state, thunk)),
         }),
       );
     }
     for (const [cmd, thunks] of d.rejections) {
       const entry = create(RejectionEntrySchema, { fqCommandType: cmd });
       for (const thunk of thunks) {
-        entry.callbackIds.push(this.assign(rejectionInvoker(factory, thunk)));
+        entry.callbackIds.push(this.assign(rejectionInvoker(state, thunk)));
       }
       desc.rejections.push(entry);
     }
@@ -192,14 +198,14 @@ export class Router {
   }
 
   registerProjector<T>(d: ProjectorDispatch<T>): void {
-    const factory = d.factory;
+    const state = stateOf(this.component(), d.factory);
     const desc = create(ProjectorDescriptorSchema, { name: d.name });
     desc.domains.push(...d.domains);
     for (const [fq, thunk] of d.events) {
       desc.events.push(
         create(CallbackEntrySchema, {
           fqType: fq,
-          callbackId: this.assign(projectorEventInvoker(factory, thunk)),
+          callbackId: this.assign(projectorEventInvoker(state, thunk)),
         }),
       );
     }
@@ -208,7 +214,7 @@ export class Router {
     }
     if (d.finisher) {
       desc.finishCallbackId = this.assign(
-        projectorFinishInvoker(factory, d.finisher),
+        projectorFinishInvoker(state, d.finisher),
       );
     }
     this.check(
@@ -221,7 +227,7 @@ export class Router {
   }
 
   registerProcessManager<T>(d: ProcessManagerDispatch<T>): void {
-    const factory = d.rebuilder.factory;
+    const state = stateOf(this.component(), d.rebuilder.factory);
     const desc = create(ProcessManagerDescriptorSchema, {
       name: d.name,
       pmDomain: d.pmDomain,
@@ -230,13 +236,13 @@ export class Router {
       desc.appliers.push(
         create(CallbackEntrySchema, {
           fqType: fq,
-          callbackId: this.assign(applierInvoker(factory, thunk)),
+          callbackId: this.assign(applierInvoker(state, thunk)),
         }),
       );
     }
     if (d.rebuilder.snapshot) {
       desc.snapshotCallbackId = this.assign(
-        applierInvoker(factory, d.rebuilder.snapshot),
+        applierInvoker(state, d.rebuilder.snapshot),
       );
     }
     for (const [sourceDomain, byType] of d.handlers) {
@@ -245,7 +251,7 @@ export class Router {
           create(PmEventEntrySchema, {
             inputDomain: sourceDomain,
             fqType: fq,
-            callbackId: this.assign(pmEventInvoker(factory, thunk)),
+            callbackId: this.assign(pmEventInvoker(state, thunk)),
           }),
         );
       }
@@ -253,7 +259,7 @@ export class Router {
     for (const [cmd, thunks] of d.rejections) {
       const entry = create(RejectionEntrySchema, { fqCommandType: cmd });
       for (const thunk of thunks) {
-        entry.callbackIds.push(this.assign(pmRejectionInvoker(factory, thunk)));
+        entry.callbackIds.push(this.assign(pmRejectionInvoker(state, thunk)));
       }
       desc.rejections.push(entry);
     }
@@ -339,21 +345,20 @@ export class Router {
 
 /**
  * One dispatch's host-side state object, reached from callbacks via host_ctx.
- * The rebuilt state is created lazily by the first stateful callback (all
- * callbacks in one dispatch share it).
+ * Rebuilt state is keyed per component: each component's state is created
+ * lazily by its first stateful callback and reached only by that component's
+ * callbacks, so co-resident components in one dispatch never share state.
  */
 class DispatchSession implements Session {
-  private state: unknown;
-  private hasState = false;
+  private readonly states = new Map<number, unknown>();
 
   constructor(readonly router: Router) {}
 
-  ensureState<T>(factory: () => T): T {
-    if (!this.hasState) {
-      this.state = factory();
-      this.hasState = true;
+  ensureState<T>(component: number, factory: () => T): T {
+    if (!this.states.has(component)) {
+      this.states.set(component, factory());
     }
-    return this.state as T;
+    return this.states.get(component) as T;
   }
 
   handleCallback(
@@ -382,25 +387,36 @@ function anyOf(typeUrl: string, payload: Uint8Array): Any {
   return create(AnySchema, { typeUrl, value: payload });
 }
 
+/** One registered component's state identity: the key its host state lives
+ * under in a dispatch session, and the factory that creates it. */
+interface StateOf<T> {
+  component: number;
+  factory: () => T;
+}
+
+function stateOf<T>(component: number, factory: () => T): StateOf<T> {
+  return { component, factory };
+}
+
+function ensure<T>(session: DispatchSession, state: StateOf<T>): T {
+  return session.ensureState(state.component, state.factory);
+}
+
 const OK: Outcome = { response: null, status: Ffi.STATUS_OK };
 const OK_EMPTY: Outcome = { response: null, status: Ffi.STATUS_OK_EMPTY };
 
-function applierInvoker<T>(factory: () => T, thunk: ApplierThunk<T>): Invoker {
+function applierInvoker<T>(state: StateOf<T>, thunk: ApplierThunk<T>): Invoker {
   return (session, typeUrl, payload) => {
-    thunk(session.ensureState(factory), anyOf(typeUrl, payload));
+    thunk(ensure(session, state), anyOf(typeUrl, payload));
     return OK;
   };
 }
 
-function commandInvoker<T>(factory: () => T, thunk: CommandThunk<T>): Invoker {
+function commandInvoker<T>(state: StateOf<T>, thunk: CommandThunk<T>): Invoker {
   return (session, typeUrl, payload, aux) => {
     const cax = fromBinary(CommandContextAuxSchema, aux);
     const cctx = new CommandContext(cax.nextSequence, cax.hadPriorEvents);
-    const book = thunk(
-      anyOf(typeUrl, payload),
-      session.ensureState(factory),
-      cctx,
-    );
+    const book = thunk(anyOf(typeUrl, payload), ensure(session, state), cctx);
     return book === undefined
       ? OK_EMPTY
       : { response: toBinary(EventBookSchema, book), status: Ffi.STATUS_OK };
@@ -408,7 +424,7 @@ function commandInvoker<T>(factory: () => T, thunk: CommandThunk<T>): Invoker {
 }
 
 function rejectionInvoker<T>(
-  factory: () => T,
+  state: StateOf<T>,
   thunk: RejectionThunk<T>,
 ): Invoker {
   return (session, _typeUrl, _payload, aux) => {
@@ -419,7 +435,7 @@ function rejectionInvoker<T>(
       rax.cctx?.nextSequence ?? 0,
       rax.cctx?.hadPriorEvents ?? false,
     );
-    const resp = thunk(n, rej, session.ensureState(factory), cctx);
+    const resp = thunk(n, rej, ensure(session, state), cctx);
     return resp === undefined
       ? OK_EMPTY
       : {
@@ -430,17 +446,17 @@ function rejectionInvoker<T>(
 }
 
 function projectorEventInvoker<T>(
-  factory: () => T,
+  state: StateOf<T>,
   thunk: ProjectorEventThunk<T>,
 ): Invoker {
   return (session, typeUrl, payload) => {
-    thunk(session.ensureState(factory), anyOf(typeUrl, payload));
+    thunk(ensure(session, state), anyOf(typeUrl, payload));
     return OK;
   };
 }
 
 function projectorFinishInvoker<T>(
-  factory: () => T,
+  state: StateOf<T>,
   thunk: ProjectorFinishThunk<T>,
 ): Invoker {
   return (session, _typeUrl, payload) => {
@@ -448,7 +464,7 @@ function projectorFinishInvoker<T>(
       payload.length > 0
         ? fromBinary(EventBookSchema, payload)
         : create(EventBookSchema);
-    const proj = thunk(session.ensureState(factory), book);
+    const proj = thunk(ensure(session, state), book);
     return {
       response: toBinary(ProjectionSchema, proj),
       status: Ffi.STATUS_OK,
@@ -492,15 +508,11 @@ function sagaRejectionInvoker(thunk: SagaRejectionThunk): Invoker {
   };
 }
 
-function pmEventInvoker<T>(factory: () => T, thunk: PmEventThunk<T>): Invoker {
+function pmEventInvoker<T>(state: StateOf<T>, thunk: PmEventThunk<T>): Invoker {
   return (session, typeUrl, payload, aux) => {
     const pax = fromBinary(PmEventAuxSchema, aux);
     const dests = new Destinations(pax.destinationSequences);
-    const resp = thunk(
-      anyOf(typeUrl, payload),
-      session.ensureState(factory),
-      dests,
-    );
+    const resp = thunk(anyOf(typeUrl, payload), ensure(session, state), dests);
     return {
       response: toBinary(ProcessManagerHandleResponseSchema, resp),
       status: Ffi.STATUS_OK,
@@ -509,14 +521,14 @@ function pmEventInvoker<T>(factory: () => T, thunk: PmEventThunk<T>): Invoker {
 }
 
 function pmRejectionInvoker<T>(
-  factory: () => T,
+  state: StateOf<T>,
   thunk: PmRejectionThunk<T>,
 ): Invoker {
   return (session, _typeUrl, _payload, aux) => {
     const rax = fromBinary(RejectionAuxSchema, aux);
     const n = fromBinary(NotificationSchema, rax.notification);
     const rej = fromBinary(RejectionNotificationSchema, rax.rejection);
-    const r = thunk(n, rej, session.ensureState(factory));
+    const r = thunk(n, rej, ensure(session, state));
     const resp = create(ProcessManagerHandleResponseSchema, {
       processEvents: r.processEvents,
     });
