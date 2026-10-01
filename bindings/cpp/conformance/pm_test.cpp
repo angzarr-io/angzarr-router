@@ -147,6 +147,10 @@ void Register(StepRegistry& r, PmWorld& w) {
   });
   r.On("the command is deferred from source sequence {int} at command index {int}",
        [&w](const StepArgs& a) { RequireDeferred(w.resp->commands(0), "counter", a); });
+  r.On("the command leaves its source component to the coordinator", [&w](const StepArgs&) {
+    REQUIRE_FALSE(w.err.has_value());
+    RequireNoSourceComponent(w.resp->commands(0));
+  });
   r.On("the process-manager emits no commands", [&w](const StepArgs&) {
     REQUIRE_FALSE(w.err.has_value());
     REQUIRE(w.resp->commands_size() == 0);

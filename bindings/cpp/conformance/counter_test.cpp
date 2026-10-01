@@ -142,6 +142,12 @@ void Register(StepRegistry& r, CounterWorld& w) {
     REQUIRE(w.resp->events().cover().ext().SerializeAsString() ==
             ParentLinkage().SerializeAsString());
   });
+  r.On("the recorded events carry no parent linkage", [&w](const StepArgs&) {
+    REQUIRE_FALSE(w.err.has_value());
+    REQUIRE(w.resp.has_value());
+    REQUIRE(w.resp->events().pages_size() > 0);
+    REQUIRE_FALSE(w.resp->events().cover().has_ext());
+  });
   r.On("the compensations run first then second", [&w](const StepArgs&) {
     REQUIRE_FALSE(w.err.has_value());
     const auto& book = w.resp->events();

@@ -23,14 +23,6 @@ using angzarr::router::ProcessManagerDispatch;
 using angzarr::router::ProjectorDispatch;
 using angzarr::router::Rebuilder;
 
-// A cover in domain with the root for label.
-pb::Cover CoverOf(const std::string& domain, const std::string& label) {
-  pb::Cover cover;
-  cover.set_domain(domain);
-  cover.mutable_root()->set_value(RootOf(label));
-  return cover;
-}
-
 pb::EventPage IncreasedAt(uint32_t seq) {
   pb::EventPage page;
   page.mutable_header()->set_sequence(seq);
@@ -47,12 +39,14 @@ struct ContextWorld {
   std::optional<CodedError> fact_err;
   std::optional<pb::ReplayResponse> replayed;
   std::optional<pb::ProcessManagerHandleResponse> pm;
+  std::optional<pb::BusinessResponse> command;
 
   // The ledger aggregate (domain "ledger") over CounterState: Increased folds
   // count += 1 and records the page sequence it applied; a snapshot loads
-  // CounterState; IncreaseBy records the handled cover and emits nothing; the
-  // only declared fact, Increased, is recorded as received and flagged by a
-  // CounterState carrying the count it brings the ledger to.
+  // CounterState; IncreaseBy records the handled cover and emits one Increased
+  // whose cover carries the ledger's own linkage; the only declared fact,
+  // Increased, is recorded as received and flagged by a CounterState carrying
+  // the count it brings the ledger to.
   void RegisterLedger() {
     Rebuilder<tc::CounterState> rebuilder;
     rebuilder
@@ -70,7 +64,10 @@ struct ContextWorld {
                   [this](const google::protobuf::Any&, tc::CounterState&,
                          const CommandContext& cctx) -> std::optional<pb::EventBook> {
                     covers.push_back(cctx.cover);
-                    return std::nullopt;
+                    pb::EventBook book;
+                    *book.mutable_cover()->mutable_ext() = LedgerLinkage();
+                    SetAnyEmpty(book.add_pages()->mutable_event(), "test.counter.Increased");
+                    return book;
                   })
         .OnFact("test.counter.Increased",
                 [](const google::protobuf::Any& fact, const tc::CounterState& state) {
@@ -174,15 +171,25 @@ void Register(StepRegistry& r, ContextWorld& w) {
     }
     w.replayed = w.router.DispatchReplay("reserving-pm", req);
   });
-  r.On("an IncreaseBy command for ledger root {string} is dispatched", [&w](const StepArgs& a) {
+  auto ledger_command = [](const std::string& label) {
     pb::ContextualCommand cc;
     auto* book = cc.mutable_command();
-    *book->mutable_cover() = CoverOf("ledger", a[0]);
+    *book->mutable_cover() = CoverOf("ledger", label);
     tc::IncreaseBy ib;
     ib.set_n(1);
     SetAny(book->add_pages()->mutable_command(), "test.counter.IncreaseBy", ib.SerializeAsString());
-    w.router.Dispatch(cc);
-  });
+    return cc;
+  };
+  r.On("an IncreaseBy command for ledger root {string} is dispatched",
+       [&w, ledger_command](const StepArgs& a) {
+         w.command = w.router.Dispatch(ledger_command(a[0]));
+       });
+  r.On("an IncreaseBy command for ledger root {string} on behalf of a parent is dispatched",
+       [&w, ledger_command](const StepArgs& a) {
+         auto cc = ledger_command(a[0]);
+         *cc.mutable_command()->mutable_cover()->mutable_ext() = ParentLinkage();
+         w.command = w.router.Dispatch(cc);
+       });
   r.On(
       "an Increased trigger of counter root {string} at sequence {int} is dispatched to the "
       "reserving process-manager",
@@ -260,6 +267,13 @@ void Register(StepRegistry& r, ContextWorld& w) {
     const std::vector<uint32_t> want = {static_cast<uint32_t>(std::stoi(a[0])),
                                         static_cast<uint32_t>(std::stoi(a[1]))};
     REQUIRE(w.applied == want);
+  });
+  r.On("the recorded event carries the ledger's own linkage", [&w](const StepArgs&) {
+    REQUIRE(w.command.has_value());
+    REQUIRE(w.command->has_events());
+    REQUIRE(w.command->events().pages_size() == 1);
+    REQUIRE(w.command->events().cover().ext().SerializeAsString() ==
+            LedgerLinkage().SerializeAsString());
   });
   auto saw_root = [&w](const std::string& label) {
     REQUIRE(w.covers.size() == 1);
