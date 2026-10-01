@@ -67,7 +67,7 @@ class CounterAggregate:
 class OrderSaga:
     """Implements order_saga_angzarr.OrderSagaHandler."""
 
-    def increased(self, event, dests):
+    def increased(self, event, dests, source_cover):
         cmd = _reserve_command()
         if dests.has("inventory"):
             dests.stamp_command(cmd, "inventory")
