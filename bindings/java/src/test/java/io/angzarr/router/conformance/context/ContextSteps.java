@@ -15,6 +15,8 @@ import io.angzarr.ProcessManagerHandleRequest;
 import io.angzarr.ProcessManagerHandleResponse;
 import io.angzarr.router.AggregateDispatch;
 import io.angzarr.router.CodedError;
+import io.angzarr.router.FactRecord;
+import io.angzarr.router.GrpcCode;
 import io.angzarr.router.Pack;
 import io.angzarr.router.ProcessManagerDispatch;
 import io.angzarr.router.ProjectorDispatch;
@@ -97,10 +99,12 @@ public class ContextSteps {
             .onFact(
                 INCREASED,
                 (fact, state) ->
-                    Pack.pack(
-                        Counter.CounterState.newBuilder()
-                            .setCount(((Counter.CounterState.Builder) state).getCount())
-                            .build())));
+                    FactRecord.of(
+                        fact,
+                        Pack.pack(
+                            Counter.CounterState.newBuilder()
+                                .setCount(((Counter.CounterState.Builder) state).getCount() + 1)
+                                .build()))));
   }
 
   @Given("a reserving process-manager")
@@ -149,12 +153,22 @@ public class ContextSteps {
 
   @When("{int} Increased facts are handled over {int} prior Increased events")
   public void increasedFacts(int n, int prior) {
-    facts = router.dispatchFact(Builders.factRequest("Increased", n, prior));
+    dispatchFacts("Increased", n, prior);
   }
 
   @When("a Reserve fact is handled over no prior events")
   public void reserveFact() {
-    facts = router.dispatchFact(Builders.factRequest("Reserve", 1, 0));
+    dispatchFacts("Reserve", 1, 0);
+  }
+
+  private void dispatchFacts(String fact, int n, int prior) {
+    try {
+      facts = router.dispatchFact(Builders.factRequest(fact, n, prior));
+      err = null;
+    } catch (CodedError e) {
+      err = e;
+      facts = null;
+    }
   }
 
   @When("the ledger replays a snapshot of {int} then {int} Increased events")
@@ -208,24 +222,37 @@ public class ContextSteps {
 
   // --- assertions ------------------------------------------------------------
 
-  @Then("{int} facts are recorded, each annotated with a count of {int}")
-  public void annotated(int n, int count) throws Exception {
+  /** A recorded event: its fully-qualified type and, for a CounterState, its count. */
+  record Recorded(String type, Integer count) {}
+
+  @Then("each Increased fact is recorded, flagged by the counts {int} and {int}")
+  public void recordedAndFlagged(int first, int second) throws Exception {
+    assertNull(err, () -> "fact dispatch failed: " + err);
     assertNotNull(facts, "facts were handled");
-    assertEquals(n, facts.getPagesCount(), "recorded facts");
+    List<Recorded> recorded = new ArrayList<>();
     for (EventPage page : facts.getPagesList()) {
-      assertEquals(
-          "test.counter.CounterState", Builders.fqOf(page.getEvent().getTypeUrl()), "fact type");
-      assertEquals(
-          count, Counter.CounterState.parseFrom(page.getEvent().getValue()).getCount(), "count");
+      String type = Builders.fqOf(page.getEvent().getTypeUrl());
+      Integer count =
+          type.equals("test.counter.CounterState")
+              ? Counter.CounterState.parseFrom(page.getEvent().getValue()).getCount()
+              : null;
+      recorded.add(new Recorded(type, count));
     }
+    assertEquals(
+        List.of(
+            new Recorded(INCREASED, null),
+            new Recorded("test.counter.CounterState", first),
+            new Recorded(INCREASED, null),
+            new Recorded("test.counter.CounterState", second)),
+        recorded);
   }
 
-  @Then("the fact is recorded unchanged")
-  public void unchanged() {
-    assertNotNull(facts, "facts were handled");
-    assertEquals(1, facts.getPagesCount(), "recorded facts");
-    assertEquals(
-        "test.counter.Reserve", Builders.fqOf(facts.getPages(0).getEvent().getTypeUrl()), "fact");
+  @Then("the facts are refused with {word} as INVALID_ARGUMENT")
+  public void factsRefused(String code) {
+    assertNull(facts, "nothing is recorded");
+    assertNotNull(err, "the facts are refused");
+    assertEquals(code, err.code, "code");
+    assertEquals(GrpcCode.INVALID_ARGUMENT, err.grpc, "grpc");
   }
 
   @Then("the replayed state has a count of {int}")

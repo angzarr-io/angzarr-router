@@ -55,8 +55,8 @@ public final class AggregateDispatch {
   }
 
   /**
-   * Registers the fact handler for one fully-qualified fact (event) type; a fact with no handler is
-   * recorded unchanged.
+   * Registers the fact handler for one fully-qualified fact (event) type: a declared fact. The
+   * router refuses a fact of an undeclared type with NO_FACT_HANDLER before any handler runs.
    */
   public AggregateDispatch onFact(String fqFactType, FactThunk thunk) {
     facts.put(fqFactType, thunk);

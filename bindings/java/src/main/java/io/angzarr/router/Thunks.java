@@ -67,10 +67,10 @@ public final class Thunks {
   @FunctionalInterface
   public interface FactThunk {
     /**
-     * Returns the fact to record (an annotated replacement), or null to record it unchanged. State
-     * is the aggregate's rebuilt state.
+     * Returns the fact to record (as received, or annotated) and the events that flag it. State is
+     * the aggregate's rebuilt state.
      */
-    Any handle(Any fact, Message.Builder state) throws Exception;
+    FactRecord handle(Any fact, Message.Builder state) throws Exception;
   }
 
   @FunctionalInterface

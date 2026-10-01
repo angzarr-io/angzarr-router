@@ -2,6 +2,7 @@ package io.angzarr.router;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.angzarr.BusinessResponse;
@@ -16,8 +17,8 @@ import org.junit.jupiter.api.Test;
 import test.counter.Counter;
 
 /**
- * The "no result" shapes of the undo, fact and PM-compensator handlers, the replay state packer
- * registered for every aggregate, and CommandContext's cover defaults.
+ * The "no result" shapes of the undo and PM-compensator handlers, the fact record shapes, the
+ * replay state packer registered for every aggregate, and CommandContext's cover defaults.
  */
 class HandlerResultTest {
 
@@ -51,7 +52,7 @@ class HandlerResultTest {
   }
 
   @Test
-  void aFactHandlerReturningNullRecordsTheFactUnchanged() {
+  void aFactRecordOfTheFactAloneRecordsItAsReceived() {
     List<Integer> sawCount = new ArrayList<>();
     AggregateDispatch ledger =
         new AggregateDispatch("Ledger", "ledger", counterRebuilder())
@@ -59,18 +60,90 @@ class HandlerResultTest {
                 "test.counter.Increased",
                 (fact, state) -> {
                   sawCount.add(((Counter.CounterState.Builder) state).getCount());
-                  return null;
+                  return FactRecord.of(fact);
                 });
     try (Router router = new Router()) {
       router.registerAggregate(ledger);
-      EventBook recorded = router.dispatchFact(Builders.factRequest("Increased", 1, 2));
-      assertEquals(1, recorded.getPagesCount(), "recorded facts");
-      assertEquals(
-          "test.counter.Increased",
-          Builders.fqOf(recorded.getPages(0).getEvent().getTypeUrl()),
-          "the fact is unchanged");
+      EventBook recorded = router.dispatchFact(Builders.factRequest("Increased", 2, 2));
+      assertEquals(2, recorded.getPagesCount(), "recorded facts, no flags");
+      for (var page : recorded.getPagesList()) {
+        assertEquals(
+            "test.counter.Increased",
+            Builders.fqOf(page.getEvent().getTypeUrl()),
+            "the fact as received");
+      }
     }
-    assertEquals(List.of(2), sawCount, "the handler saw the rebuilt state");
+    assertEquals(List.of(2, 3), sawCount, "each fact folds into the state the next fact sees");
+  }
+
+  @Test
+  void aFactHandlerReplacesTheFactAndAppendsItsFlagsInOrder() throws Exception {
+    AggregateDispatch ledger =
+        new AggregateDispatch("Ledger", "ledger", counterRebuilder())
+            .onFact(
+                "test.counter.Increased",
+                (fact, state) ->
+                    FactRecord.of(
+                        Pack.pack(Counter.CounterState.newBuilder().setCount(7).build()),
+                        Pack.pack(Counter.Reserve.getDefaultInstance()),
+                        Pack.pack(Counter.CounterState.newBuilder().setCount(9).build())));
+    try (Router router = new Router()) {
+      router.registerAggregate(ledger);
+      EventBook recorded = router.dispatchFact(Builders.factRequest("Increased", 1, 0));
+      List<String> types = new ArrayList<>();
+      for (var page : recorded.getPagesList()) {
+        types.add(Builders.fqOf(page.getEvent().getTypeUrl()));
+      }
+      assertEquals(
+          List.of("test.counter.CounterState", "test.counter.Reserve", "test.counter.CounterState"),
+          types);
+      assertEquals(
+          7, Counter.CounterState.parseFrom(recorded.getPages(0).getEvent().getValue()).getCount());
+      assertEquals(
+          9, Counter.CounterState.parseFrom(recorded.getPages(2).getEvent().getValue()).getCount());
+    }
+  }
+
+  @Test
+  void aFactHandlerReturningNullIsAnUnhandledError() {
+    AggregateDispatch ledger =
+        new AggregateDispatch("Ledger", "ledger", counterRebuilder())
+            .onFact("test.counter.Increased", (fact, state) -> null);
+    try (Router router = new Router()) {
+      router.registerAggregate(ledger);
+      CodedError e =
+          assertThrows(
+              CodedError.class, () -> router.dispatchFact(Builders.factRequest("Increased", 1, 0)));
+      assertEquals(CodedError.UNHANDLED_HANDLER_ERROR, e.code);
+      assertEquals(GrpcCode.INTERNAL, e.grpc);
+    }
+  }
+
+  @Test
+  void aFactOfAnUndeclaredTypeIsRefusedBeforeAnyHandlerRuns() {
+    List<String> ran = new ArrayList<>();
+    AggregateDispatch ledger =
+        new AggregateDispatch("Ledger", "ledger", counterRebuilder())
+            .onFact(
+                "test.counter.Increased",
+                (fact, state) -> {
+                  ran.add("Increased");
+                  return FactRecord.of(fact);
+                });
+    try (Router router = new Router()) {
+      router.registerAggregate(ledger);
+      CodedError e =
+          assertThrows(
+              CodedError.class, () -> router.dispatchFact(Builders.factRequest("Reserve", 1, 0)));
+      assertEquals("NO_FACT_HANDLER", e.code);
+      assertEquals(GrpcCode.INVALID_ARGUMENT, e.grpc);
+    }
+    assertEquals(List.of(), ran);
+  }
+
+  @Test
+  void aFactRecordRequiresTheFact() {
+    assertThrows(NullPointerException.class, () -> FactRecord.of(null));
   }
 
   @Test

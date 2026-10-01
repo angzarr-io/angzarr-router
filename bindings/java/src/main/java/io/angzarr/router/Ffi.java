@@ -106,7 +106,7 @@ final class Ffi {
   private static final AtomicLong NEXT_SESSION = new AtomicLong(1);
 
   /** The router-ffi ABI version this binding is built against. */
-  static final int EXPECTED_ABI_VERSION = 2;
+  static final int EXPECTED_ABI_VERSION = 3;
 
   static {
     checkAbiVersion(abiVersion());

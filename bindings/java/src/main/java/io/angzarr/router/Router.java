@@ -393,11 +393,17 @@ public final class Router implements AutoCloseable {
   private static Invoker factInvoker(
       long component, Supplier<Message.Builder> factory, FactThunk thunk) {
     return (session, typeUrl, payload, aux) -> {
-      Any recorded = thunk.handle(anyOf(typeUrl, payload), session.ensureState(component, factory));
+      FactRecord recorded =
+          thunk.handle(anyOf(typeUrl, payload), session.ensureState(component, factory));
       if (recorded == null) {
-        return new Invoker.Result(null, Ffi.STATUS_OK_EMPTY);
+        throw new IllegalStateException("a fact handler must return a FactRecord");
       }
-      return new Invoker.Result(recorded.toByteArray(), Ffi.STATUS_OK);
+      Abi.FactRecord reply =
+          Abi.FactRecord.newBuilder()
+              .setFact(recorded.fact())
+              .addAllFlags(recorded.flags())
+              .build();
+      return new Invoker.Result(reply.toByteArray(), Ffi.STATUS_OK);
     };
   }
 
