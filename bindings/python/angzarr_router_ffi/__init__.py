@@ -9,7 +9,7 @@ Public surface (engine-shaped, so the unit-6 generator targets it):
     from angzarr_router_ffi import (
         Router, AggregateDispatch, Rebuilder, ProjectorDispatch,
         SagaDispatch, ProcessManagerDispatch, Destinations,
-        CommandContext, PageContext, current_cover, current_page,
+        CommandContext, FactRecord, PageContext, current_cover, current_page,
         CodedError, reject, GrpcCode, abi_version, AbiVersionError,
         WILDCARD_DOMAIN,
     )
@@ -22,6 +22,7 @@ from ._dispatch import (
     CodedError,
     CommandContext,
     Destinations,
+    FactRecord,
     GrpcCode,
     PageContext,
     ProcessManagerDispatch,
@@ -44,6 +45,7 @@ __all__ = [
     "CodedError",
     "CommandContext",
     "Destinations",
+    "FactRecord",
     "GrpcCode",
     "PageContext",
     "ProcessManagerDispatch",

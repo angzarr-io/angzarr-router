@@ -120,6 +120,37 @@ def pack(msg) -> any_pb2.Any:
     )
 
 
+def _as_any(msg) -> any_pb2.Any:
+    """``msg`` itself when it is an Any, otherwise ``msg`` packed."""
+    return msg if isinstance(msg, any_pb2.Any) else pack(msg)
+
+
+@dataclass(frozen=True)
+class FactRecord:
+    """What a fact handler records for one fact: the fact itself (as
+    received, or annotated) followed by the events that flag it. The fact
+    and each flag are a message (packed with the framework type-URL prefix)
+    or an Any. Each flag is recorded with no header and the fact's
+    created_at, and folds into the state the next fact sees."""
+
+    fact: object
+    flags: tuple = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "flags", tuple(self.flags))
+
+    @classmethod
+    def as_received(cls, fact) -> FactRecord:
+        """The record of ``fact`` as received, with no flags."""
+        return cls(fact)
+
+    def to_abi(self) -> abi_pb2.FactRecord:
+        """The ABI FactRecord the fact callback replies with."""
+        return abi_pb2.FactRecord(
+            fact=_as_any(self.fact), flags=[_as_any(flag) for flag in self.flags]
+        )
+
+
 @dataclass
 class CommandContext:
     """The historical-state evidence a handler sees, and the cover it is
@@ -207,14 +238,14 @@ def _command_context(cax) -> CommandContext:
 #   command:   (cmd: Any, state, cctx) -> EventBook|None (raises CodedError to reject)
 #   rejection: (notification, rejection, state, cctx) -> BusinessResponse|None
 #   undo:      (notification, compensate, state, cctx) -> BusinessResponse|None
-#   fact:      (fact: Any, state) -> Message|Any|None    (the fact to record;
-#                                                         None = unchanged)
+#   fact:      (fact: Any, state) -> FactRecord          (the fact to record
+#                                                         and its flags)
 ApplierThunk = Callable[[object, any_pb2.Any], None]
 ApplierContextThunk = Callable[[object, any_pb2.Any, PageContext], None]
 CommandThunk = Callable[[any_pb2.Any, object, CommandContext], object | None]
 RejectionThunk = Callable[[object, object, object, CommandContext], object | None]
 UndoThunk = Callable[[object, object, object, CommandContext], object | None]
-FactThunk = Callable[[any_pb2.Any, object], object | None]
+FactThunk = Callable[[any_pb2.Any, object], "FactRecord"]
 
 
 @dataclass
@@ -289,9 +320,11 @@ class AggregateDispatch:
 
     def on_fact(self, fq_fact: str, thunk: FactThunk) -> AggregateDispatch:
         """Register the fact handler for a fully-qualified fact (event) type.
-        The handler receives (fact Any, rebuilt state) and returns the fact to
-        record: a message (packed with the framework type-URL prefix), an
-        Any, or None to record the fact unchanged. A fact cannot be refused."""
+        The handler receives (fact Any, rebuilt state) and returns the
+        :class:`FactRecord` to record (``FactRecord.as_received(fact)`` keeps
+        the fact as received, with no flags). A fact cannot be refused; the
+        core refuses a fact of an undeclared type with NO_FACT_HANDLER
+        (INVALID_ARGUMENT) before any handler runs."""
         self.facts[fq_fact] = thunk
         return self
 
@@ -652,12 +685,12 @@ def _fact_invoker(key: int, factory, thunk: FactThunk) -> Invoker:
     # sets; the fact callback carries no aux.
     def inv(session, type_url, payload, _aux):
         state = session.ensure_state(key, factory)
-        recorded = thunk(any_pb2.Any(type_url=type_url, value=payload), state)
-        if recorded is None:
-            return None, _STATUS_OK_EMPTY
-        if not isinstance(recorded, any_pb2.Any):
-            recorded = pack(recorded)
-        return recorded.SerializeToString(), _STATUS_OK
+        record = thunk(any_pb2.Any(type_url=type_url, value=payload), state)
+        if not isinstance(record, FactRecord):
+            raise TypeError(
+                f"fact handler for {type_url!r} returned {type(record).__name__}, not a FactRecord"
+            )
+        return record.to_abi().SerializeToString(), _STATUS_OK
 
     return inv
 

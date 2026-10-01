@@ -11,6 +11,7 @@ import pytest
 from .. import (
     AggregateDispatch,
     CodedError,
+    FactRecord,
     GrpcCode,
     PageContext,
     ProcessManagerDispatch,
@@ -205,40 +206,92 @@ def _fact_request(fq: str, facts: int, prior: int):
     return req
 
 
-def test_fact_handler_annotates_against_rebuilt_state_with_a_message_or_any():
-    def annotate_message(fact, state):
-        return counter_pb2.CounterState(count=state.count)
+def _recorded(book) -> list:
+    def one(page):
+        name = builders.fq_from_url(page.event.type_url)
+        if name == "test.counter.CounterState":
+            return name, counter_pb2.CounterState.FromString(page.event.value).count
+        return name, None
 
-    def annotate_any(fact, state):
-        return pack(counter_pb2.CounterState(count=state.count + 100))
-
-    for handler, want in ((annotate_message, 3), (annotate_any, 103)):
-        dispatch = AggregateDispatch("Ledger", "ledger", _ledger_rebuilder())
-        dispatch.on_fact(builders.FQ_INCREASED, handler)
-        with Router() as router:
-            router.register_aggregate(dispatch)
-            book = router.dispatch_fact(_fact_request(builders.FQ_INCREASED, 2, 3))
-
-        assert len(book.pages) == 2
-        for page in book.pages:
-            assert builders.fq_from_url(page.event.type_url) == "test.counter.CounterState"
-            assert counter_pb2.CounterState.FromString(page.event.value).count == want
+    return [one(p) for p in book.pages]
 
 
-def test_fact_handler_returning_none_records_the_fact_unchanged():
+def _handle_facts(handler, req):
+    dispatch = AggregateDispatch("Ledger", "ledger", _ledger_rebuilder())
+    dispatch.on_fact(builders.FQ_INCREASED, handler)
+    with Router() as router:
+        router.register_aggregate(dispatch)
+        return router.dispatch_fact(req)
+
+
+def test_a_fact_record_annotates_the_fact_and_flags_it_with_messages_or_anys():
+    def annotate_with_messages(fact, state):
+        return FactRecord(
+            counter_pb2.CounterState(count=state.count),
+            [counter_pb2.Increased(), counter_pb2.CounterState(count=state.count + 10)],
+        )
+
+    def annotate_with_anys(fact, state):
+        return FactRecord(
+            pack(counter_pb2.CounterState(count=state.count)),
+            (pack(counter_pb2.Increased()), pack(counter_pb2.CounterState(count=state.count + 10))),
+        )
+
+    for handler in (annotate_with_messages, annotate_with_anys):
+        book = _handle_facts(handler, _fact_request(builders.FQ_INCREASED, 2, 3))
+
+        # Each Increased flag folds, so the second fact sees one more event.
+        assert _recorded(book) == [
+            ("test.counter.CounterState", 3),
+            (builders.FQ_INCREASED, None),
+            ("test.counter.CounterState", 13),
+            ("test.counter.CounterState", 4),
+            (builders.FQ_INCREASED, None),
+            ("test.counter.CounterState", 14),
+        ]
+        assert not book.pages[1].HasField("header"), "a flag carries no header"
+
+
+def test_a_fact_record_as_received_records_the_fact_with_no_flags():
     seen = []
 
     def observe(fact, state):
         seen.append(builders.fq_from_url(fact.type_url))
+        return FactRecord.as_received(fact)
 
-    dispatch = AggregateDispatch("Ledger", "ledger", _ledger_rebuilder())
-    dispatch.on_fact(builders.FQ_INCREASED, observe)
-    with Router() as router:
-        router.register_aggregate(dispatch)
-        book = router.dispatch_fact(_fact_request(builders.FQ_INCREASED, 1, 0))
+    book = _handle_facts(observe, _fact_request(builders.FQ_INCREASED, 1, 0))
 
     assert seen == [builders.FQ_INCREASED]
-    assert [builders.fq_from_url(p.event.type_url) for p in book.pages] == [builders.FQ_INCREASED]
+    assert _recorded(book) == [(builders.FQ_INCREASED, None)]
+    assert FactRecord.as_received(pack(counter_pb2.Increased())).flags == ()
+
+
+def test_a_fact_handler_returning_anything_but_a_fact_record_is_an_unhandled_error():
+    def bare_any(fact, state):
+        return fact
+
+    with pytest.raises(CodedError) as exc:
+        _handle_facts(bare_any, _fact_request(builders.FQ_INCREASED, 1, 0))
+
+    assert exc.value.code == "UNHANDLED_HANDLER_ERROR"
+    assert exc.value.grpc == GrpcCode.INTERNAL
+
+
+def test_an_undeclared_fact_is_refused_before_any_fact_handler_runs():
+    seen = []
+
+    def observe(fact, state):
+        seen.append(fact.type_url)
+        return FactRecord.as_received(fact)
+
+    req = _fact_request(builders.FQ_INCREASED, 1, 2)
+    req.facts.pages.add().event.type_url = builders.type_url(builders.FQ_RESERVE)
+    with pytest.raises(CodedError) as exc:
+        _handle_facts(observe, req)
+
+    assert exc.value.code == "NO_FACT_HANDLER"
+    assert exc.value.grpc == GrpcCode.INVALID_ARGUMENT
+    assert seen == []
 
 
 # --- replay ---

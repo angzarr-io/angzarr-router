@@ -90,7 +90,7 @@ def _library_path() -> str:
 
 # The router-ffi ABI version this binding is written against
 # (crates/router-ffi/src/abi.rs ABI_VERSION).
-EXPECTED_ABI_VERSION = 2
+EXPECTED_ABI_VERSION = 3
 
 
 class AbiVersionError(ImportError):

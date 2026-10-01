@@ -12,6 +12,9 @@ from pytest_bdd import given, parsers, scenarios, then, when
 
 from ... import (
     AggregateDispatch,
+    CodedError,
+    FactRecord,
+    GrpcCode,
     PageContext,
     ProcessManagerDispatch,
     ProjectorDispatch,
@@ -56,8 +59,9 @@ def _reserve_to(domain: str, fq: str = FQ_RESERVE):
 def _ledger_aggregate(covers: list, applied: list) -> AggregateDispatch:
     """The ledger aggregate (domain "ledger") over CounterState: Increased
     folds count += 1 and records the page sequence it applied; a snapshot loads CounterState; IncreaseBy records the
-    handled cover and emits nothing; an Increased fact is annotated as a
-    CounterState carrying the folded count."""
+    handled cover and emits nothing; the only declared fact, Increased, is
+    recorded as received and flagged by a CounterState carrying the count it
+    brings the ledger to."""
 
     def apply_increased(state, _event, ctx: PageContext):
         state.count += 1
@@ -69,8 +73,8 @@ def _ledger_aggregate(covers: list, applied: list) -> AggregateDispatch:
     def increase_by(_cmd, _state, cctx):
         covers.append(cctx.cover)
 
-    def annotate(_fact, state):
-        return counter_pb2.CounterState(count=state.count)
+    def record_increased(fact, state):
+        return FactRecord(fact, [counter_pb2.CounterState(count=state.count + 1)])
 
     rebuilder = (
         Rebuilder(factory=counter_pb2.CounterState)
@@ -80,7 +84,7 @@ def _ledger_aggregate(covers: list, applied: list) -> AggregateDispatch:
     return (
         AggregateDispatch("Ledger", "ledger", rebuilder)
         .on_command(FQ_INCREASE_BY, increase_by)
-        .on_fact(FQ_INCREASED, annotate)
+        .on_fact(FQ_INCREASED, record_increased)
     )
 
 
@@ -201,6 +205,7 @@ class _World:
         self.applied: list = []
         self.pages: list = []
         self.facts = None
+        self.refusal = None
         self.replayed = None
         self.pm = None
 
@@ -241,7 +246,9 @@ def _increased_facts(world, facts, prior):
 
 @when("a Reserve fact is handled over no prior events")
 def _reserve_fact(world):
-    world.facts = world.router.dispatch_fact(_fact_request("Reserve", 1, 0))
+    with pytest.raises(CodedError) as exc:
+        world.router.dispatch_fact(_fact_request("Reserve", 1, 0))
+    world.refusal = exc.value
 
 
 @when(
@@ -307,19 +314,29 @@ def _projected(world, label, first, second):
 
 
 @then(
-    parsers.re(r"(?P<facts>\d+) facts are recorded, each annotated with a count of (?P<count>\d+)")
+    parsers.re(
+        r"each Increased fact is recorded, flagged by the counts (?P<first>\d+) and (?P<second>\d+)"
+    )
 )
-def _annotated(world, facts, count):
-    assert len(world.facts.pages) == int(facts)
-    for page in world.facts.pages:
-        assert fq_from_url(page.event.type_url) == "test.counter.CounterState"
-        assert counter_pb2.CounterState.FromString(page.event.value).count == int(count)
+def _recorded_and_flagged(world, first, second):
+    def recorded(page):
+        name = fq_from_url(page.event.type_url)
+        if name == "test.counter.CounterState":
+            return name, counter_pb2.CounterState.FromString(page.event.value).count
+        return name, None
+
+    assert [recorded(p) for p in world.facts.pages] == [
+        (FQ_INCREASED, None),
+        ("test.counter.CounterState", int(first)),
+        (FQ_INCREASED, None),
+        ("test.counter.CounterState", int(second)),
+    ]
 
 
-@then("the fact is recorded unchanged")
-def _unchanged(world):
-    assert len(world.facts.pages) == 1
-    assert fq_from_url(world.facts.pages[0].event.type_url) == "test.counter.Reserve"
+@then(parsers.re(r"the facts are refused with (?P<code>[A-Z_]+) as INVALID_ARGUMENT"))
+def _facts_refused(world, code):
+    assert world.refusal.code == code
+    assert world.refusal.grpc == GrpcCode.INVALID_ARGUMENT
 
 
 @then(parsers.re(r"the replayed state has a count of (?P<count>\d+)"))
