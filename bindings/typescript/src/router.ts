@@ -16,36 +16,51 @@ import {
   SagaDispatch,
 } from "./dispatch";
 import { Ffi, type Dispatched, type Surface } from "./ffi";
+import { Pack } from "./pack";
 import { type Session } from "./session";
 import { errorResult, fromStatusBytes, type Outcome } from "./statuses";
 import { CommandContext } from "./thunks";
 import {
   type ApplierThunk,
   type CommandThunk,
+  type FactThunk,
   type PmEventThunk,
+  type PmRejection,
   type PmRejectionThunk,
   type ProjectorEventThunk,
   type ProjectorFinishThunk,
   type ProjectorUnknownThunk,
   type RejectionThunk,
   type SagaEventThunk,
-  type SagaRejectionThunk,
+  type UndoThunk,
 } from "./thunks";
 import {
   AggregateDescriptorSchema,
   CallbackEntrySchema,
+  type CommandContextAux,
   CommandContextAuxSchema,
   PmEventAuxSchema,
   PmEventEntrySchema,
   ProcessManagerDescriptorSchema,
   ProjectorDescriptorSchema,
+  ProjectorEventAuxSchema,
   RejectionAuxSchema,
   RejectionEntrySchema,
+  ReplayCallSchema,
   SagaDescriptorSchema,
   SagaEventAuxSchema,
+  UndoAuxSchema,
 } from "../gen/io/angzarr/router/ffi/v1/abi_pb";
-import { BusinessResponseSchema } from "../gen/io/angzarr/v1/command_handler_pb";
 import {
+  BusinessResponseSchema,
+  type FactRequest,
+  FactRequestSchema,
+  type ReplayRequest,
+  type ReplayResponse,
+  ReplayResponseSchema,
+} from "../gen/io/angzarr/v1/command_handler_pb";
+import {
+  CompensateSchema,
   type ContextualCommand,
   ContextualCommandSchema,
   type EventBook,
@@ -102,9 +117,9 @@ export class Router {
     this.ptr = Ffi.routerNew();
   }
 
-  /** The ABI version a compatible loaded cdylib reports. */
+  /** The ABI version the loaded router-ffi library reports. */
   static abiVersion(): number {
-    return 1;
+    return Ffi.abiVersion();
   }
 
   /** Frees the underlying native router exactly once; closing a closed router
@@ -171,12 +186,32 @@ export class Router {
         }),
       );
     }
-    for (const [cmd, thunks] of d.rejections) {
-      const entry = create(RejectionEntrySchema, { fqCommandType: cmd });
+    for (const [compensates, thunks] of d.rejections) {
+      const entry = create(RejectionEntrySchema, { compensates });
       for (const thunk of thunks) {
         entry.callbackIds.push(this.assign(rejectionInvoker(state, thunk)));
       }
       desc.rejections.push(entry);
+    }
+    for (const [fq, thunk] of d.undoes) {
+      desc.undoes.push(
+        create(CallbackEntrySchema, {
+          fqType: fq,
+          callbackId: this.assign(undoInvoker(state, thunk)),
+        }),
+      );
+    }
+    for (const [fq, thunk] of d.facts) {
+      desc.facts.push(
+        create(CallbackEntrySchema, {
+          fqType: fq,
+          callbackId: this.assign(factInvoker(state, thunk)),
+        }),
+      );
+    }
+    const schema = d.rebuilder.stateSchema;
+    if (schema) {
+      desc.stateCallbackId = this.assign(stateInvoker(state, schema));
     }
     this.check(
       Ffi.register(
@@ -193,20 +228,14 @@ export class Router {
       inputDomain: d.inputDomain,
     });
     desc.targetDomains.push(...d.targets);
+    const dests = new Destinations(d.targets);
     for (const [fq, thunk] of d.events) {
       desc.events.push(
         create(CallbackEntrySchema, {
           fqType: fq,
-          callbackId: this.assign(sagaEventInvoker(thunk)),
+          callbackId: this.assign(sagaEventInvoker(dests, thunk)),
         }),
       );
-    }
-    for (const [cmd, thunks] of d.rejections) {
-      const entry = create(RejectionEntrySchema, { fqCommandType: cmd });
-      for (const thunk of thunks) {
-        entry.callbackIds.push(this.assign(sagaRejectionInvoker(thunk)));
-      }
-      desc.rejections.push(entry);
     }
     this.check(
       Ffi.register("saga", this.native(), toBinary(SagaDescriptorSchema, desc)),
@@ -248,6 +277,8 @@ export class Router {
       name: d.name,
       pmDomain: d.pmDomain,
     });
+    desc.targetDomains.push(...d.targets);
+    const dests = new Destinations(d.targets);
     for (const [fq, thunk] of d.rebuilder.appliers) {
       desc.appliers.push(
         create(CallbackEntrySchema, {
@@ -267,13 +298,13 @@ export class Router {
           create(PmEventEntrySchema, {
             inputDomain: sourceDomain,
             fqType: fq,
-            callbackId: this.assign(pmEventInvoker(state, thunk)),
+            callbackId: this.assign(pmEventInvoker(state, dests, thunk)),
           }),
         );
       }
     }
-    for (const [cmd, thunks] of d.rejections) {
-      const entry = create(RejectionEntrySchema, { fqCommandType: cmd });
+    for (const [compensates, thunks] of d.rejections) {
+      const entry = create(RejectionEntrySchema, { compensates });
       for (const thunk of thunks) {
         entry.callbackIds.push(this.assign(pmRejectionInvoker(state, thunk)));
       }
@@ -332,6 +363,28 @@ export class Router {
       ),
       ProcessManagerHandleResponseSchema,
       "ProcessManagerHandleResponse",
+    );
+  }
+
+  /** Handles facts through the aggregate claiming the facts' cover domain;
+   * returns the EventBook of facts to record. */
+  dispatchFact(request: FactRequest): EventBook {
+    return this.parse(
+      this.dispatchVia("fact", toBinary(FactRequestSchema, request)),
+      EventBookSchema,
+      "EventBook",
+    );
+  }
+
+  /** Replays history into the state of the aggregate claiming `domain` (empty
+   * selects a sole registered aggregate); the response carries the state
+   * packed as an Any. */
+  dispatchReplay(domain: string, request: ReplayRequest): ReplayResponse {
+    const call = create(ReplayCallSchema, { domain, request });
+    return this.parse(
+      this.dispatchVia("replay", toBinary(ReplayCallSchema, call)),
+      ReplayResponseSchema,
+      "ReplayResponse",
     );
   }
 
@@ -433,10 +486,28 @@ function applierInvoker<T>(state: StateOf<T>, thunk: ApplierThunk<T>): Invoker {
   };
 }
 
+function commandContext(cax: CommandContextAux | undefined): CommandContext {
+  return new CommandContext(
+    cax?.nextSequence ?? 0,
+    cax?.hadPriorEvents ?? false,
+    cax?.cover,
+  );
+}
+
+function businessOutcome(
+  resp: MessageShape<typeof BusinessResponseSchema> | undefined,
+): Outcome {
+  return resp === undefined
+    ? OK_EMPTY
+    : {
+        response: toBinary(BusinessResponseSchema, resp),
+        status: Ffi.STATUS_OK,
+      };
+}
+
 function commandInvoker<T>(state: StateOf<T>, thunk: CommandThunk<T>): Invoker {
   return (session, typeUrl, payload, aux) => {
-    const cax = fromBinary(CommandContextAuxSchema, aux);
-    const cctx = new CommandContext(cax.nextSequence, cax.hadPriorEvents);
+    const cctx = commandContext(fromBinary(CommandContextAuxSchema, aux));
     const book = thunk(anyOf(typeUrl, payload), ensure(session, state), cctx);
     return book === undefined
       ? OK_EMPTY
@@ -452,17 +523,37 @@ function rejectionInvoker<T>(
     const rax = fromBinary(RejectionAuxSchema, aux);
     const n = fromBinary(NotificationSchema, rax.notification);
     const rej = fromBinary(RejectionNotificationSchema, rax.rejection);
-    const cctx = new CommandContext(
-      rax.cctx?.nextSequence ?? 0,
-      rax.cctx?.hadPriorEvents ?? false,
-    );
-    const resp = thunk(n, rej, ensure(session, state), cctx);
-    return resp === undefined
+    const cctx = commandContext(rax.cctx);
+    return businessOutcome(thunk(n, rej, ensure(session, state), cctx));
+  };
+}
+
+function undoInvoker<T>(state: StateOf<T>, thunk: UndoThunk<T>): Invoker {
+  return (session, _typeUrl, _payload, aux) => {
+    const uax = fromBinary(UndoAuxSchema, aux);
+    const n = fromBinary(NotificationSchema, uax.notification);
+    const compensate = fromBinary(CompensateSchema, uax.compensate);
+    const cctx = commandContext(uax.cctx);
+    return businessOutcome(thunk(n, compensate, ensure(session, state), cctx));
+  };
+}
+
+function factInvoker<T>(state: StateOf<T>, thunk: FactThunk<T>): Invoker {
+  return (session, typeUrl, payload) => {
+    const recorded = thunk(anyOf(typeUrl, payload), ensure(session, state));
+    return recorded === undefined
       ? OK_EMPTY
-      : {
-          response: toBinary(BusinessResponseSchema, resp),
-          status: Ffi.STATUS_OK,
-        };
+      : { response: toBinary(AnySchema, recorded), status: Ffi.STATUS_OK };
+  };
+}
+
+function stateInvoker<T>(state: StateOf<T>, schema: DescMessage): Invoker {
+  return (session) => {
+    const packed = Pack.wrap(
+      schema,
+      ensure(session, state) as MessageShape<DescMessage>,
+    );
+    return { response: toBinary(AnySchema, packed), status: Ffi.STATUS_OK };
   };
 }
 
@@ -470,8 +561,12 @@ function projectorEventInvoker<T>(
   state: StateOf<T>,
   thunk: ProjectorEventThunk<T>,
 ): Invoker {
-  return (session, typeUrl, payload) => {
-    thunk(ensure(session, state), anyOf(typeUrl, payload));
+  return (session, typeUrl, payload, aux) => {
+    const pax = fromBinary(ProjectorEventAuxSchema, aux);
+    thunk(ensure(session, state), anyOf(typeUrl, payload), {
+      cover: pax.cover,
+      sequence: pax.sequence,
+    });
     return OK;
   };
 }
@@ -500,10 +595,9 @@ function projectorUnknownInvoker(thunk: ProjectorUnknownThunk): Invoker {
   };
 }
 
-function sagaEventInvoker(thunk: SagaEventThunk): Invoker {
+function sagaEventInvoker(dests: Destinations, thunk: SagaEventThunk): Invoker {
   return (_session, typeUrl, payload, aux) => {
     const sax = fromBinary(SagaEventAuxSchema, aux);
-    const dests = new Destinations(sax.destinationSequences);
     const emission = thunk(anyOf(typeUrl, payload), dests, sax.sourceCover);
     const resp = create(SagaResponseSchema, {
       commands: emission.commands,
@@ -516,24 +610,19 @@ function sagaEventInvoker(thunk: SagaEventThunk): Invoker {
   };
 }
 
-function sagaRejectionInvoker(thunk: SagaRejectionThunk): Invoker {
-  return (_session, _typeUrl, _payload, aux) => {
-    const rax = fromBinary(RejectionAuxSchema, aux);
-    const n = fromBinary(NotificationSchema, rax.notification);
-    const rej = fromBinary(RejectionNotificationSchema, rax.rejection);
-    const resp = create(SagaResponseSchema, { events: thunk(n, rej) });
-    return {
-      response: toBinary(SagaResponseSchema, resp),
-      status: Ffi.STATUS_OK,
-    };
-  };
-}
-
-function pmEventInvoker<T>(state: StateOf<T>, thunk: PmEventThunk<T>): Invoker {
+function pmEventInvoker<T>(
+  state: StateOf<T>,
+  dests: Destinations,
+  thunk: PmEventThunk<T>,
+): Invoker {
   return (session, typeUrl, payload, aux) => {
     const pax = fromBinary(PmEventAuxSchema, aux);
-    const dests = new Destinations(pax.destinationSequences);
-    const resp = thunk(anyOf(typeUrl, payload), ensure(session, state), dests);
+    const resp = thunk(
+      anyOf(typeUrl, payload),
+      ensure(session, state),
+      dests,
+      pax.triggerCover,
+    );
     return {
       response: toBinary(ProcessManagerHandleResponseSchema, resp),
       status: Ffi.STATUS_OK,
@@ -549,16 +638,28 @@ function pmRejectionInvoker<T>(
     const rax = fromBinary(RejectionAuxSchema, aux);
     const n = fromBinary(NotificationSchema, rax.notification);
     const rej = fromBinary(RejectionNotificationSchema, rax.rejection);
-    const r = thunk(n, rej, ensure(session, state));
-    const resp = create(ProcessManagerHandleResponseSchema, {
-      processEvents: r.processEvents,
-    });
-    if (r.escalation) {
-      resp.notification = r.escalation;
-    }
+    const resp = pmCompensation(thunk(n, rej, ensure(session, state)));
     return {
       response: toBinary(ProcessManagerHandleResponseSchema, resp),
       status: Ffi.STATUS_OK,
     };
   };
+}
+
+/** A PM compensator's result as the full response: a
+ * ProcessManagerHandleResponse passes through whole; the PmRejection shape
+ * becomes its process events + escalation. */
+function pmCompensation(
+  r: PmRejection | ProcessManagerHandleResponse,
+): ProcessManagerHandleResponse {
+  if ("$typeName" in r) {
+    return r;
+  }
+  const resp = create(ProcessManagerHandleResponseSchema, {
+    processEvents: r.processEvents,
+  });
+  if (r.escalation) {
+    resp.notification = r.escalation;
+  }
+  return resp;
 }

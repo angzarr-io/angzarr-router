@@ -29,6 +29,8 @@ export {
   CommandContext,
   type ApplierThunk,
   type CommandThunk,
+  type FactThunk,
+  type PageContext,
   type PmEventThunk,
   type PmRejection,
   type PmRejectionThunk,
@@ -38,7 +40,7 @@ export {
   type RejectionThunk,
   type SagaEmission,
   type SagaEventThunk,
-  type SagaRejectionThunk,
+  type UndoThunk,
 } from "./thunks";
 
 // Framework message types + protobuf-es schemas the seam and host handlers use.

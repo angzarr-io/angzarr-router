@@ -1,4 +1,4 @@
-// The raw C-ABI layer over the router-ffi cdylib, via koffi. Holds the 11
+// The raw C-ABI layer over the router-ffi cdylib, via koffi. Holds the 15
 // exported downcalls, the AngzarrBuf layout, and the single registered callback
 // trampoline the core calls for every host callback.
 //
@@ -17,7 +17,8 @@ import { type Session } from "./session";
 import { unhandled } from "./codedError";
 import { errorResult, type Outcome } from "./statuses";
 
-const ABI_VERSION = 1;
+/** The router-ffi ABI version this binding speaks. */
+export const ABI_VERSION = 2;
 const LIB_ENV = "ANGZARR_ROUTER_LIB";
 
 function libraryPath(): string {
@@ -81,7 +82,22 @@ const dispatchFns = {
   processManager: lib.func(
     "int32_t angzarr_router_dispatch_process_manager(void* r, uintptr_t host_ctx, uint8_t* request, size_t len, _Out_ AngzarrBuf* out)",
   ),
+  fact: lib.func(
+    "int32_t angzarr_router_dispatch_fact(void* r, uintptr_t host_ctx, uint8_t* request, size_t len, _Out_ AngzarrBuf* out)",
+  ),
+  replay: lib.func(
+    "int32_t angzarr_router_dispatch_replay(void* r, uintptr_t host_ctx, uint8_t* request, size_t len, _Out_ AngzarrBuf* out)",
+  ),
 };
+
+/** Refuses a router-ffi library whose ABI version is not {@link ABI_VERSION}. */
+export function checkAbiVersion(actual: number): void {
+  if (actual !== ABI_VERSION) {
+    throw new Error(
+      `router-ffi ABI version mismatch: expected ${ABI_VERSION}, actual ${actual}`,
+    );
+  }
+}
 
 // --- session registry (host_ctx ↔ Session) -----------------------------------
 
@@ -199,17 +215,28 @@ export interface Dispatched {
   status: number;
 }
 
-export type Surface = "aggregate" | "projector" | "saga" | "processManager";
+export type Surface =
+  | "aggregate"
+  | "projector"
+  | "saga"
+  | "processManager"
+  | "fact"
+  | "replay";
+
+/** The registration entry points (one per component kind). */
+export type RegisterSurface = keyof typeof registerFns;
 
 export const Ffi = {
   STATUS_OK: 0,
   STATUS_OK_EMPTY: 1,
 
+  /** The ABI version the loaded router-ffi library reports. */
+  abiVersion(): number {
+    return Number(angzarr_abi_version());
+  },
+
   init(): void {
-    const v = Number(angzarr_abi_version());
-    if (v !== ABI_VERSION) {
-      throw new Error(`router-ffi ABI version ${v} != ${ABI_VERSION}`);
-    }
+    checkAbiVersion(Ffi.abiVersion());
   },
 
   routerNew(): unknown {
@@ -220,7 +247,11 @@ export const Ffi = {
     angzarr_router_free(ptr);
   },
 
-  register(surface: Surface, ptr: unknown, descriptor: Uint8Array): number {
+  register(
+    surface: RegisterSurface,
+    ptr: unknown,
+    descriptor: Uint8Array,
+  ): number {
     return registerFns[surface](ptr, descriptor, descriptor.length, callback);
   },
 

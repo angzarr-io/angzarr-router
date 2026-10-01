@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 
-import { create } from "@bufbuild/protobuf";
+import { create, fromBinary } from "@bufbuild/protobuf";
 import { AnySchema } from "@bufbuild/protobuf/wkt";
 import { After, Before, Given, Then, When } from "@cucumber/cucumber";
 
@@ -9,17 +9,26 @@ import {
   type BusinessResponse,
   BusinessResponseSchema,
   CodedError,
+  type Cover,
+  type Destinations,
+  type EventBook,
   EventBookSchema,
   EventPageSchema,
   GrpcCode,
+  ProcessManagerDispatch,
+  ProcessManagerHandleResponseSchema,
   Rebuilder,
+  type ReplayResponse,
   Router,
+  SagaDispatch,
 } from "@angzarr/router";
+import { newCounterAggregateDispatch } from "../gen/test/counter/counter_aggregate_angzarr";
 import {
   type CounterState,
   CounterStateSchema,
 } from "../gen/test/counter/counter_pb";
-import { hostCallback } from "../src/ffi";
+import { checkAbiVersion, hostCallback } from "../src/ffi";
+import { CounterFixture } from "./fixtures";
 import { fromStatusBytes, type Outcome } from "../src/statuses";
 import * as B from "./builders";
 
@@ -30,12 +39,16 @@ interface BindingCtx {
   resp?: BusinessResponse;
   err?: unknown;
   calls: string[];
+  dests?: Destinations;
+  covers: (Cover | undefined)[];
+  facts?: EventBook;
+  replayed?: ReplayResponse;
 }
 
 let bctx: BindingCtx;
 
 Before({ tags: "@binding" }, () => {
-  bctx = { calls: [] };
+  bctx = { calls: [], covers: [] };
 });
 
 After({ tags: "@binding" }, () => {
@@ -213,4 +226,236 @@ Then("the callback fails INTERNAL with {word}", function (code: string) {
   const err = fromStatusBytes(outcome.response, outcome.status);
   assert.equal(err.code, code, "Status ErrorInfo reason");
   assert.equal(err.grpc, GrpcCode.Internal, "Status code");
+});
+
+// --- ABI version ------------------------------------------------------------
+
+let abiFailure: unknown;
+
+Then("the router reports ABI version {int}", function (version: number) {
+  assert.equal(Router.abiVersion(), version);
+});
+
+When(
+  "the binding checks a library reporting ABI version {int}",
+  function (actual: number) {
+    abiFailure = undefined;
+    try {
+      checkAbiVersion(actual);
+    } catch (e) {
+      abiFailure = e;
+    }
+  },
+);
+
+Then(
+  "the check fails naming expected version {int} and actual version {int}",
+  function (expected: number, actual: number) {
+    assert.ok(abiFailure instanceof Error, "the drifted library was refused");
+    assert.match(abiFailure.message, new RegExp(`expected ${expected}\\b`));
+    assert.match(abiFailure.message, new RegExp(`actual ${actual}\\b`));
+  },
+);
+
+// --- declared-output destinations -------------------------------------------
+
+function captureDests(dests: Destinations): void {
+  bctx.dests = dests;
+}
+
+Given(
+  "a binding saga targeting {string} and {string}",
+  function (first: string, second: string) {
+    bctx.router = new Router();
+    bctx.router.registerSaga(
+      new SagaDispatch("Binding", "order", [first, second]).onEvent(
+        "test.counter.Increased",
+        (_event, dests) => {
+          captureDests(dests);
+          return { commands: [], events: [] };
+        },
+      ),
+    );
+  },
+);
+
+function bindingPm(targets?: string[]): ProcessManagerDispatch<CounterState> {
+  return new ProcessManagerDispatch<CounterState>(
+    "Binding",
+    "binding-pm",
+    new Rebuilder(() => create(CounterStateSchema)),
+    targets,
+  ).onEvent("counter", "test.counter.Increased", (_event, _state, dests) => {
+    captureDests(dests);
+    return create(ProcessManagerHandleResponseSchema);
+  });
+}
+
+Given(
+  "a binding process-manager targeting {string}",
+  function (target: string) {
+    bctx.router = new Router();
+    bctx.router.registerProcessManager(bindingPm([target]));
+  },
+);
+
+Given("a binding process-manager with no targets", function () {
+  bctx.router = new Router();
+  bctx.router.registerProcessManager(bindingPm());
+});
+
+When("an order event is dispatched to the binding saga", function () {
+  bctx.router!.dispatchSaga(B.sagaEventSource("test.counter.Increased", 1));
+});
+
+When(
+  "a counter trigger is dispatched to the binding process-manager",
+  function () {
+    bctx.router!.dispatchProcessManager(
+      B.pmTrigger("counter", ["test.counter.Increased"], undefined, 1),
+    );
+  },
+);
+
+Then(
+  "the handler's destinations are {string} and {string}",
+  function (first: string, second: string) {
+    assert.deepEqual(bctx.dests!.domains(), [first, second]);
+    assert.ok(bctx.dests!.has(first) && bctx.dests!.has(second));
+  },
+);
+
+Then("the handler's destinations are {string}", function (only: string) {
+  assert.deepEqual(bctx.dests!.domains(), [only]);
+  assert.ok(bctx.dests!.has(only));
+});
+
+Then(
+  "the handler's destinations do not include {string}",
+  function (domain: string) {
+    assert.equal(bctx.dests!.has(domain), false);
+  },
+);
+
+Then("the handler has no destinations", function () {
+  assert.ok(bctx.dests, "the handler ran");
+  assert.deepEqual(bctx.dests.domains(), []);
+  assert.equal(bctx.dests.has("inventory"), false);
+});
+
+// --- handler results ----------------------------------------------------------
+
+Given(
+  "a binding inventory aggregate whose AdjustStock undo returns nothing",
+  function () {
+    bctx.router = new Router();
+    bctx.router.registerAggregate(
+      new AggregateDispatch<object>(
+        "Inventory",
+        "inventory",
+        new Rebuilder(() => ({})),
+      ).onUndo("test.counter.AdjustStock", (_n, compensate, _s, cctx) => {
+        bctx.calls.push(compensate.commandType);
+        bctx.covers.push(cctx.cover);
+        return undefined;
+      }),
+    );
+  },
+);
+
+When(
+  "a Compensate for AdjustStock is dispatched through the binding router",
+  function () {
+    capture(() => bctx.router!.dispatch(B.compensateFor("AdjustStock")));
+  },
+);
+
+Then("the binding dispatch records no events", function () {
+  assert.equal(bctx.err, undefined, `dispatch failed: ${bctx.err}`);
+  assert.deepEqual(bctx.calls, ["test.counter.AdjustStock"], "undo ran once");
+  const r = bctx.resp!;
+  const pages = r.result.case === "events" ? r.result.value.pages : [];
+  assert.equal(pages.length, 0, "no events recorded");
+});
+
+Then("the undo handler saw the {string} cover", function (domain: string) {
+  assert.equal(bctx.covers.length, 1, "the undo handler ran once");
+  assert.equal(bctx.covers[0]?.domain, domain);
+});
+
+Given(
+  "a binding ledger aggregate whose Increased fact handler returns nothing",
+  function () {
+    bctx.router = new Router();
+    bctx.router.registerAggregate(
+      new AggregateDispatch<CounterState>(
+        "Ledger",
+        "ledger",
+        new Rebuilder(() => create(CounterStateSchema)),
+      ).onFact("test.counter.Increased", (fact) => {
+        bctx.calls.push(fact.typeUrl);
+        return undefined;
+      }),
+    );
+  },
+);
+
+When("an Increased fact is dispatched through the binding router", function () {
+  bctx.facts = bctx.router!.dispatchFact(B.factRequest("Increased", 1, 0));
+});
+
+Then("the binding router records one Increased fact", function () {
+  assert.deepEqual(bctx.calls, ["/test.counter.Increased"], "handler ran");
+  const pages = bctx.facts!.pages;
+  assert.equal(pages.length, 1, "one fact recorded");
+  const p = pages[0].payload;
+  assert.equal(p.case, "event");
+  assert.equal(
+    p.case === "event" ? p.value.typeUrl : "",
+    "/test.counter.Increased",
+  );
+});
+
+Given(
+  "a generated counter aggregate with its state schema attached",
+  function () {
+    bctx.router = new Router();
+    const dispatch = newCounterAggregateDispatch(new CounterFixture([]));
+    dispatch.rebuilder.withStateSchema(CounterStateSchema);
+    bctx.router.registerAggregate(dispatch);
+  },
+);
+
+Given("a generated counter aggregate", function () {
+  bctx.router = new Router();
+  bctx.router.registerAggregate(
+    newCounterAggregateDispatch(new CounterFixture([])),
+  );
+});
+
+When(
+  "the binding router replays a snapshot of {int} then {int} Increased events",
+  function (count: number, events: number) {
+    try {
+      bctx.replayed = bctx.router!.dispatchReplay(
+        "counter",
+        B.replayRequest(count, events),
+      );
+      bctx.err = undefined;
+    } catch (e) {
+      bctx.err = e;
+    }
+  },
+);
+
+Then("the binding replay yields a counter of {int}", function (n: number) {
+  assert.equal(bctx.err, undefined, `replay failed: ${bctx.err}`);
+  const state = bctx.replayed!.state!;
+  assert.equal(state.typeUrl, "/test.counter.CounterState");
+  assert.equal(fromBinary(CounterStateSchema, state.value).count, n);
+});
+
+Then("the binding replay fails with {word}", function (code: string) {
+  // NO_HANDLER_REGISTERED is UNIMPLEMENTED on the wire.
+  assertCoded(bctx.err, code, GrpcCode.Unimplemented);
 });

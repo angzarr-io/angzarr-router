@@ -108,27 +108,15 @@ function marker(name: string) {
   });
 }
 
-/** The conformance OrderSaga fixture: a declared source event emits a Reserve
- * command stamped with the supplied destination sequence; a rejection injects
- * one fact event. */
+/** The conformance OrderSaga fixture: a declared source event emits one
+ * Reserve command for "inventory" (the router stamps it deferred). */
 export class SagaFixture implements OrderSagaHandler {
   increased(
     _ev: Increased,
-    dests: Destinations,
+    _dests: Destinations,
     _sourceCover?: Cover,
   ): SagaEmission {
-    let cmd = reserveCommand();
-    if (dests.has("inventory")) {
-      cmd = dests.stampCommand(cmd, "inventory");
-    }
-    return { commands: [cmd], events: [] };
-  }
-
-  onReserveRejected(
-    _n: Notification,
-    _rejection: RejectionNotification,
-  ): EventBook[] {
-    return [oneFact()];
+    return { commands: [reserveCommand()], events: [] };
   }
 }
 
@@ -149,20 +137,16 @@ export class ProjectorFixture implements CounterProjectorHandler {
 }
 
 /** The conformance OrderProcessManager fixture: the newest trigger reacts with a
- * stamped Reserve command plus one fact per rebuilt prior-state event; a
- * rejection injects one process event and escalates. */
+ * Reserve command (the router stamps it deferred) plus one fact per rebuilt
+ * prior-state event; a rejection injects one process event and escalates. */
 export class PmFixture implements OrderProcessManagerHandler {
   increased(
     _ev: Increased,
     state: OrderProcessManagerState,
-    dests: Destinations,
+    _dests: Destinations,
   ): ProcessManagerHandleResponse {
-    let cmd = reserveCommand();
-    if (dests.has("inventory")) {
-      cmd = dests.stampCommand(cmd, "inventory");
-    }
     return create(ProcessManagerHandleResponseSchema, {
-      commands: [cmd],
+      commands: [reserveCommand()],
       facts: Array.from({ length: state.count }, () => oneFact()),
     });
   }

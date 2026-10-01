@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 
-import { equals } from "@bufbuild/protobuf";
+import { create, equals } from "@bufbuild/protobuf";
 import { AnySchema } from "@bufbuild/protobuf/wkt";
 import { After, Before, Given, Then, When } from "@cucumber/cucumber";
 
 import { CodedError, Router } from "@angzarr/router";
+import { ContextualCommandSchema } from "@angzarr/router";
 import type {
+  AngzarrDeferredSequence,
   BusinessResponse,
   CommandBook,
   ContextualCommand,
@@ -136,6 +138,25 @@ function startCounter(): void {
 When("the operator increases the counter by {int}", function (n: number) {
   dispatchCounter(B.increaseCommand(n));
 });
+
+Given(
+  "a counter that has already recorded {int} increases under the {string} type-URL prefix",
+  function (n: number, prefix: string) {
+    startCounter();
+    const carrier = B.withTypeUrlPrefix(
+      create(ContextualCommandSchema, { events: B.priorIncreases(n) }),
+      prefix,
+    );
+    ctx.prior = carrier.events;
+  },
+);
+
+When(
+  "the operator increases the counter by {int} under the {string} type-URL prefix",
+  function (n: number, prefix: string) {
+    dispatchCounter(B.withTypeUrlPrefix(B.increaseCommand(n), prefix));
+  },
+);
 
 When(
   "the operator increases the counter by {int} on behalf of a parent",
@@ -293,11 +314,9 @@ function dispatchSaga(req: Parameters<Router["dispatchSaga"]>[0]): void {
 }
 
 When(
-  "an Increased event is dispatched with destination inventory sequence {int}",
+  "an Increased event at sequence {int} is dispatched",
   function (seq: number) {
-    dispatchSaga(
-      B.sagaEventSource("test.counter.Increased", { inventory: seq }),
-    );
+    dispatchSaga(B.sagaEventSource("test.counter.Increased", seq));
   },
 );
 
@@ -326,11 +345,6 @@ Then("the saga emits one command to {string}", function (target: string) {
 Then("the saga emits no commands", function () {
   assert.equal(ctx.err, undefined, "dispatch unexpectedly failed");
   assert.equal(ctx.sagaResp!.commands.length, 0, "expected no commands");
-});
-
-Then("the saga injects one fact event", function () {
-  assert.equal(ctx.err, undefined, "dispatch unexpectedly failed");
-  assert.equal(ctx.sagaResp!.events.length, 1, "injected events");
 });
 
 Then("the saga injects no events", function () {
@@ -407,13 +421,16 @@ function dispatchPm(
 }
 
 When(
-  "an Increased trigger in domain {string} is dispatched with destination inventory sequence {int}",
+  "an Increased trigger in domain {string} at sequence {int} is dispatched",
   function (domain: string, seq: number) {
-    dispatchPm(
-      B.pmTrigger(domain, ["test.counter.Increased"], undefined, {
-        inventory: seq,
-      }),
-    );
+    dispatchPm(B.pmTrigger(domain, ["test.counter.Increased"], undefined, seq));
+  },
+);
+
+When(
+  "a Compensate for Reserve is dispatched to the order process-manager",
+  function () {
+    dispatchPm(B.pmCompensateRequest("Reserve"));
   },
 );
 
@@ -560,10 +577,30 @@ When("a rejection of {word} is dispatched", function (cmd: string) {
   }
 });
 
-Then("the command carries destination sequence {int}", function (seq: number) {
-  const commands: CommandBook[] | undefined =
-    ctx.sagaResp?.commands ?? ctx.pmResp?.commands;
-  assert.equal(sequenceOf(commands![0].pages[0].header), seq);
-});
+Then(
+  "the command is deferred from source sequence {int} at command index {int}",
+  function (seq: number, index: number) {
+    assert.equal(ctx.err, undefined, "dispatch unexpectedly failed");
+    const commands: CommandBook[] =
+      ctx.kind === "saga" ? ctx.sagaResp!.commands : ctx.pmResp!.commands;
+    const sourceDomain = ctx.kind === "saga" ? "order" : "counter";
+    for (const page of commands[0].pages) {
+      const st = page.header?.sequenceType;
+      assert.equal(st?.case, "angzarrDeferred", "command page is deferred");
+      const d = st!.value as AngzarrDeferredSequence;
+      assert.equal(d.sourceSeq, seq, "source_seq is the trigger's");
+      assert.equal(
+        d.commandIndex,
+        index,
+        "command_index is the emission position",
+      );
+      assert.equal(
+        d.source?.domain,
+        sourceDomain,
+        "source cover is the trigger book's",
+      );
+    }
+  },
+);
 
 Then("the dispatch fails with {word}", failsWith);
