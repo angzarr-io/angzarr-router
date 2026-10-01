@@ -30,7 +30,7 @@ const errorInfoDomain = "angzarr.io"
 
 // ExpectedAbiVersion is the router-ffi ABI version this binding is written
 // against (crates/router-ffi ABI_VERSION).
-const ExpectedAbiVersion uint32 = 2
+const ExpectedAbiVersion uint32 = 3
 
 // checkAbiVersion refuses a router-ffi library whose ABI version differs from
 // the one this binding marshals for.
@@ -149,10 +149,24 @@ type RejectionThunk[S any] func(n *pb.Notification, rejection *pb.RejectionNotif
 // returns the compensating events (a nil response emits nothing).
 type UndoThunk[S any] func(n *pb.Notification, compensate *pb.Compensate, state S, cctx CommandContext) (*pb.BusinessResponse, error)
 
+// FactRecord is what a fact handler records for one fact: the fact itself
+// (as received, or annotated) followed by the events that flag it. A nil
+// Fact records the fact as received. Each flag is recorded with no header
+// and the fact's created_at, and folds into the state the next fact sees.
+type FactRecord struct {
+	Fact  *anypb.Any
+	Flags []*anypb.Any
+}
+
+// FactAsReceived is the record of fact as received, with no flags.
+func FactAsReceived(fact *anypb.Any) FactRecord {
+	return FactRecord{Fact: fact}
+}
+
 // FactThunk handles one fact (an external reality the aggregate records but
-// cannot refuse) against the rebuilt state, returning the fact to record. A
-// nil Any records the fact unchanged.
-type FactThunk[S any] func(fact *anypb.Any, state S) (*anypb.Any, error)
+// cannot refuse) against the rebuilt state, returning the FactRecord to
+// record. An error fails the whole fact request.
+type FactThunk[S any] func(fact *anypb.Any, state S) (FactRecord, error)
 
 // Rebuilder folds an aggregate's prior events (and optional snapshot) into
 // state before a command runs.
@@ -241,7 +255,8 @@ func (d *AggregateDispatch[S]) OnUndo(fqCommandType string, thunk UndoThunk[S]) 
 }
 
 // OnFact registers the fact handler for one fully-qualified fact (event)
-// type. Facts with no handler are recorded unchanged.
+// type, declaring that type. The core refuses a fact of an undeclared type
+// with NO_FACT_HANDLER (INVALID_ARGUMENT) before any handler runs.
 func (d *AggregateDispatch[S]) OnFact(fqFactType string, thunk FactThunk[S]) *AggregateDispatch[S] {
 	d.facts[fqFactType] = thunk
 	return d

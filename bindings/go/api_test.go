@@ -43,8 +43,8 @@ func TestCheckAbiVersion_RefusesADriftedLibraryNamingBothVersions(t *testing.T) 
 		t.Fatal("checkAbiVersion accepted a mismatched ABI version")
 	}
 	msg := err.Error()
-	if !strings.Contains(msg, "expects ABI version 2") || !strings.Contains(msg, "reports ABI version 3") {
-		t.Errorf("error %q does not name expected (2) and actual (3) versions", msg)
+	if !strings.Contains(msg, "expects ABI version 3") || !strings.Contains(msg, "reports ABI version 4") {
+		t.Errorf("error %q does not name expected (3) and actual (4) versions", msg)
 	}
 }
 

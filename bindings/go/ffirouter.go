@@ -727,16 +727,13 @@ func undoInvoker[S any](key componentKey, factory func() S, thunk UndoThunk[S]) 
 func factInvoker[S any](key componentKey, factory func() S, thunk FactThunk[S]) invoker {
 	return func(s *session, typeURL string, payload, _ []byte) ([]byte, int32) {
 		st := ensureState(s, key, factory)
-		recorded, err := thunk(&anypb.Any{TypeUrl: typeURL, Value: payload}, st)
+		record, err := thunk(&anypb.Any{TypeUrl: typeURL, Value: payload}, st)
 		if err != nil {
 			return errorStatus(err)
 		}
-		if recorded == nil {
-			return nil, statusOKEmpty
-		}
-		b, err := proto.Marshal(recorded)
+		b, err := proto.Marshal(&abipb.FactRecord{Fact: record.Fact, Flags: record.Flags})
 		if err != nil {
-			return errorStatus(fmt.Errorf("marshal fact Any: %w", err))
+			return errorStatus(fmt.Errorf("marshal FactRecord: %w", err))
 		}
 		return b, 0
 	}

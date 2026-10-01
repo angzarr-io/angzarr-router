@@ -73,8 +73,9 @@ func seqPtr(seq uint32) *uint32 { return &seq }
 // ledgerAggregate is the "ledger" aggregate over CounterState: Increased folds
 // count += 1 and records the page sequence it applied; a snapshot loads
 // CounterState; IncreaseBy records the handled
-// cover and emits nothing; an Increased fact is annotated as a CounterState
-// carrying the folded count.
+// cover and emits nothing; the only declared fact, Increased, is recorded as
+// received and flagged by a CounterState carrying the count it brings the
+// ledger to.
 func ledgerAggregate(seen *[]*pb.Cover, applied *[]uint32) *AggregateDispatch[*counter.CounterState] {
 	rebuilder := NewRebuilder(func() *counter.CounterState { return &counter.CounterState{} }).
 		ApplyWithContext(fqIncreased, func(state *counter.CounterState, _ *anypb.Any, ctx PageContext) error {
@@ -90,8 +91,14 @@ func ledgerAggregate(seen *[]*pb.Cover, applied *[]uint32) *AggregateDispatch[*c
 			*seen = append(*seen, cctx.Cover)
 			return nil, nil
 		}).
-		OnFact(fqIncreased, func(_ *anypb.Any, state *counter.CounterState) (*anypb.Any, error) {
-			return Pack(&counter.CounterState{Count: state.Count})
+		OnFact(fqIncreased, func(fact *anypb.Any, state *counter.CounterState) (FactRecord, error) {
+			flag, err := Pack(&counter.CounterState{Count: state.Count + 1})
+			if err != nil {
+				return FactRecord{}, err
+			}
+			record := FactAsReceived(fact)
+			record.Flags = []*anypb.Any{flag}
+			return record, nil
 		})
 }
 
@@ -307,40 +314,46 @@ func (w *contextWorld) recorded() (*pb.EventBook, error) {
 	return w.facts, nil
 }
 
-func (w *contextWorld) annotated(facts, count int) error {
+func (w *contextWorld) recordedAndFlagged(first, second int) error {
 	book, err := w.recorded()
 	if err != nil {
 		return err
 	}
-	if len(book.GetPages()) != facts {
-		return fmt.Errorf("recorded %d facts, want %d", len(book.GetPages()), facts)
-	}
+	got := make([]string, len(book.GetPages()))
 	for i, page := range book.GetPages() {
 		event := page.GetEvent()
-		if got := fqFromURL(event.GetTypeUrl()); got != "test.counter.CounterState" {
-			return fmt.Errorf("fact %d recorded as %s, want test.counter.CounterState", i, got)
+		name := fqFromURL(event.GetTypeUrl())
+		got[i] = name
+		if name == "test.counter.CounterState" {
+			var state counter.CounterState
+			if err := proto.Unmarshal(event.GetValue(), &state); err != nil {
+				return fmt.Errorf("page %d: decode CounterState: %w", i, err)
+			}
+			got[i] = fmt.Sprintf("%s(%d)", name, state.Count)
 		}
-		var state counter.CounterState
-		if err := proto.Unmarshal(event.GetValue(), &state); err != nil {
-			return fmt.Errorf("fact %d: decode CounterState: %w", i, err)
-		}
-		if state.Count != uint32(count) {
-			return fmt.Errorf("fact %d annotated with count %d, want %d", i, state.Count, count)
-		}
+	}
+	want := []string{
+		fqIncreased,
+		fmt.Sprintf("test.counter.CounterState(%d)", first),
+		fqIncreased,
+		fmt.Sprintf("test.counter.CounterState(%d)", second),
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		return fmt.Errorf("recorded %v, want %v", got, want)
 	}
 	return nil
 }
 
-func (w *contextWorld) unchanged() error {
-	book, err := w.recorded()
-	if err != nil {
-		return err
+func (w *contextWorld) factsRefused(code string) error {
+	var ce *CodedError
+	if !errors.As(w.err, &ce) {
+		return fmt.Errorf("expected coded error %s, got %v (recorded %v)", code, w.err, w.facts)
 	}
-	if len(book.GetPages()) != 1 {
-		return fmt.Errorf("recorded %d facts, want 1", len(book.GetPages()))
+	if ce.Code != code {
+		return fmt.Errorf("code = %s, want %s", ce.Code, code)
 	}
-	if got := fqFromURL(book.GetPages()[0].GetEvent().GetTypeUrl()); got != fqReserve {
-		return fmt.Errorf("fact recorded as %s, want %s", got, fqReserve)
+	if ce.Grpc != GrpcInvalidArgument {
+		return fmt.Errorf("gRPC code = %d, want INVALID_ARGUMENT (%d)", ce.Grpc, GrpcInvalidArgument)
 	}
 	return nil
 }
@@ -444,8 +457,8 @@ func initializeContextScenario(sc *godog.ScenarioContext) {
 	sc.Step(`^an Increased trigger of counter root "([^"]*)" at sequence (\d+) is dispatched to the reserving process-manager$`, w.reservingTrigger)
 	sc.Step(`^a rejection of Reserve sent to "([^"]*)" at sequence (\d+) is dispatched to the reserving process-manager$`, w.reservingRejection)
 	sc.Step(`^Increased events of counter root "([^"]*)" at sequences (\d+) and (\d+) are projected$`, w.projected)
-	sc.Step(`^(\d+) facts are recorded, each annotated with a count of (\d+)$`, w.annotated)
-	sc.Step(`^the fact is recorded unchanged$`, w.unchanged)
+	sc.Step(`^each Increased fact is recorded, flagged by the counts (\d+) and (\d+)$`, w.recordedAndFlagged)
+	sc.Step(`^the facts are refused with ([A-Z_]+) as INVALID_ARGUMENT$`, w.factsRefused)
 	sc.Step(`^the replayed state has a count of (\d+)$`, w.replayedCount)
 	sc.Step(`^the ledger applied Increased events at sequences (\d+) and (\d+)$`, w.appliedAt)
 	sc.Step(`^the ledger handler saw root "([^"]*)"$`, w.sawRoot)
