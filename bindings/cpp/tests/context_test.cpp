@@ -85,26 +85,92 @@ TEST_CASE("a compensator reads the handled cover", "[compensation]") {
   REQUIRE(domains == std::vector<std::string>{"counter"});
 }
 
-TEST_CASE("a fact handler returning no result records the fact unchanged", "[fact]") {
+namespace {
+
+AggregateDispatch<tc::CounterState> Ledger() {
+  Rebuilder<tc::CounterState> rebuilder;
+  rebuilder.Apply("test.counter.Increased",
+                  [](tc::CounterState& state, const google::protobuf::Any&) {
+                    state.set_count(state.count() + 1);
+                  });
+  return AggregateDispatch<tc::CounterState>("Ledger", "ledger", std::move(rebuilder));
+}
+
+pb::FactRequest FactsOf(const std::string& fq, int n) {
+  pb::FactRequest req;
+  req.mutable_facts()->mutable_cover()->set_domain("ledger");
+  for (int i = 0; i < n; ++i) *req.mutable_facts()->add_pages()->mutable_event() = EmptyAny(fq);
+  return req;
+}
+
+std::vector<std::string> TypesOf(const pb::EventBook& book) {
+  std::vector<std::string> types;
+  for (const auto& page : book.pages()) types.push_back(page.event().type_url());
+  return types;
+}
+
+}  // namespace
+
+TEST_CASE("a fact handler returning the fact records it as received", "[fact]") {
   Router router;
-  int handled = 0;
-  AggregateDispatch<tc::CounterState> d("Counter", "counter", Rebuilder<tc::CounterState>{});
+  std::vector<uint32_t> saw;
+  auto d = Ledger();
   d.OnFact("test.counter.Increased",
-           [&handled](const google::protobuf::Any& fact,
-                      const tc::CounterState&) -> std::optional<google::protobuf::Any> {
-             REQUIRE(fact.type_url() == "/test.counter.Increased");
-             ++handled;
-             return std::nullopt;
+           [&saw](const google::protobuf::Any& fact, const tc::CounterState& state) -> FactRecord {
+             saw.push_back(state.count());
+             return fact;
            });
   router.RegisterAggregate(std::move(d));
 
-  pb::FactRequest req;
-  req.mutable_facts()->mutable_cover()->set_domain("counter");
-  *req.mutable_facts()->add_pages()->mutable_event() = EmptyAny("test.counter.Increased");
-  auto book = router.DispatchFact(req);
-  REQUIRE(handled == 1);
-  REQUIRE(book.pages_size() == 1);
-  REQUIRE(book.pages(0).event().type_url() == "/test.counter.Increased");
+  auto book = router.DispatchFact(FactsOf("test.counter.Increased", 2));
+  REQUIRE(TypesOf(book) ==
+          std::vector<std::string>{"/test.counter.Increased", "/test.counter.Increased"});
+  REQUIRE(saw == std::vector<uint32_t>{0, 1});
+}
+
+TEST_CASE("a fact handler replaces the fact and appends its flags in order", "[fact]") {
+  Router router;
+  auto d = Ledger();
+  d.OnFact("test.counter.Increased", [](const google::protobuf::Any&, const tc::CounterState&) {
+    tc::CounterState annotated;
+    annotated.set_count(7);
+    tc::CounterState last;
+    last.set_count(9);
+    return FactRecord(Pack::Wrap(annotated), {EmptyAny("test.counter.Reserve"), Pack::Wrap(last)});
+  });
+  router.RegisterAggregate(std::move(d));
+
+  auto book = router.DispatchFact(FactsOf("test.counter.Increased", 1));
+  REQUIRE(TypesOf(book) == std::vector<std::string>{"/test.counter.CounterState",
+                                                    "/test.counter.Reserve",
+                                                    "/test.counter.CounterState"});
+  tc::CounterState first;
+  REQUIRE(first.ParseFromString(book.pages(0).event().value()));
+  REQUIRE(first.count() == 7);
+  tc::CounterState third;
+  REQUIRE(third.ParseFromString(book.pages(2).event().value()));
+  REQUIRE(third.count() == 9);
+}
+
+TEST_CASE("a fact of an undeclared type is refused before any handler runs", "[fact]") {
+  Router router;
+  int handled = 0;
+  auto d = Ledger();
+  d.OnFact("test.counter.Increased",
+           [&handled](const google::protobuf::Any& fact, const tc::CounterState&) -> FactRecord {
+             ++handled;
+             return fact;
+           });
+  router.RegisterAggregate(std::move(d));
+
+  try {
+    router.DispatchFact(FactsOf("test.counter.Reserve", 1));
+    FAIL("an undeclared fact was recorded");
+  } catch (const CodedError& e) {
+    REQUIRE(e.code == "NO_FACT_HANDLER");
+    REQUIRE(e.grpc == GrpcCode::kInvalidArgument);
+  }
+  REQUIRE(handled == 0);
 }
 
 TEST_CASE("replay packs the rebuilt state under the bare-slash type URL", "[replay]") {

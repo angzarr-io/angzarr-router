@@ -20,11 +20,24 @@
 
 namespace angzarr::router {
 
+// What a fact handler records: the fact (as received, or annotated) followed by
+// the events that flag it, in order. Each recorded event folds into the state
+// the next fact sees. A fact cannot be refused, so there is no way to record
+// nothing. An Any converts implicitly to the fact recorded as received, with no
+// flags.
+struct FactRecord {
+  FactRecord(google::protobuf::Any fact,  // NOLINT(google-explicit-constructor)
+             std::vector<google::protobuf::Any> flags = {})
+      : fact(std::move(fact)), flags(std::move(flags)) {}
+
+  google::protobuf::Any fact;
+  std::vector<google::protobuf::Any> flags;
+};
+
 // A command handler, compensator or undo handler returning std::nullopt
 // produced no result (STATUS_OK_EMPTY): the core answers with an empty book / no
-// compensation. A fact handler returning std::nullopt records the fact
-// unchanged. Every aggregate also answers Replay: its state message is packed
-// as the replayed state.
+// compensation. Every aggregate also answers Replay: its state message is
+// packed as the replayed state.
 template <class TState>
 class AggregateDispatch {
  public:
@@ -36,8 +49,7 @@ class AggregateDispatch {
   using UndoFn = std::function<std::optional<io::angzarr::v1::BusinessResponse>(
       const io::angzarr::v1::Notification&, const io::angzarr::v1::Compensate&, TState&,
       const CommandContext&)>;
-  using FactFn = std::function<std::optional<google::protobuf::Any>(const google::protobuf::Any&,
-                                                                    const TState&)>;
+  using FactFn = std::function<FactRecord(const google::protobuf::Any&, const TState&)>;
 
   AggregateDispatch(std::string name, std::string domain, Rebuilder<TState> rebuilder)
       : name(std::move(name)), domain(std::move(domain)), rebuilder(std::move(rebuilder)) {}
@@ -60,8 +72,9 @@ class AggregateDispatch {
     undoes.emplace_back(std::move(fq_command), std::move(fn));
     return *this;
   }
-  // Handles a fact of type fq_fact against the rebuilt state, returning the fact
-  // to record (an annotation) or std::nullopt to record it unchanged.
+  // Declares the fact type fq_fact: fn handles it against the rebuilt state,
+  // returning the fact to record and its flagging events. The router refuses a
+  // fact of an undeclared type with NO_FACT_HANDLER before any handler runs.
   AggregateDispatch& OnFact(std::string fq_fact, FactFn fn) {
     facts.emplace_back(std::move(fq_fact), std::move(fn));
     return *this;

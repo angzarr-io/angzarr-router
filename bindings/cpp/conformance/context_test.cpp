@@ -13,8 +13,11 @@
 namespace {
 using namespace angzarr::conformance;
 using angzarr::router::AggregateDispatch;
+using angzarr::router::CodedError;
 using angzarr::router::CommandContext;
 using angzarr::router::Destinations;
+using angzarr::router::FactRecord;
+using angzarr::router::GrpcCode;
 using angzarr::router::PageContext;
 using angzarr::router::ProcessManagerDispatch;
 using angzarr::router::ProjectorDispatch;
@@ -41,13 +44,15 @@ struct ContextWorld {
   std::vector<std::pair<std::string, uint32_t>> pages;
   std::vector<uint32_t> applied;
   std::optional<pb::EventBook> facts;
+  std::optional<CodedError> fact_err;
   std::optional<pb::ReplayResponse> replayed;
   std::optional<pb::ProcessManagerHandleResponse> pm;
 
   // The ledger aggregate (domain "ledger") over CounterState: Increased folds
   // count += 1 and records the page sequence it applied; a snapshot loads
-  // CounterState; IncreaseBy records the handled cover and emits nothing; an
-  // Increased fact is annotated as a CounterState carrying the folded count.
+  // CounterState; IncreaseBy records the handled cover and emits nothing; the
+  // only declared fact, Increased, is recorded as received and flagged by a
+  // CounterState carrying the count it brings the ledger to.
   void RegisterLedger() {
     Rebuilder<tc::CounterState> rebuilder;
     rebuilder
@@ -68,10 +73,10 @@ struct ContextWorld {
                     return std::nullopt;
                   })
         .OnFact("test.counter.Increased",
-                [](const google::protobuf::Any&, const tc::CounterState& state) {
-                  tc::CounterState annotated;
-                  annotated.set_count(state.count());
-                  return std::optional(angzarr::router::Pack::Wrap(annotated));
+                [](const google::protobuf::Any& fact, const tc::CounterState& state) {
+                  tc::CounterState flag;
+                  flag.set_count(state.count() + 1);
+                  return FactRecord(fact, {angzarr::router::Pack::Wrap(flag)});
                 });
     router.RegisterAggregate(std::move(agg));
   }
@@ -130,7 +135,13 @@ struct ContextWorld {
     auto* history = req.mutable_prior_events();
     for (int i = 0; i < prior; ++i) *history->add_pages() = IncreasedAt(static_cast<uint32_t>(i));
     history->set_next_sequence(static_cast<uint32_t>(prior));
-    facts = router.DispatchFact(req);
+    try {
+      facts = router.DispatchFact(req);
+      fact_err.reset();
+    } catch (const CodedError& e) {
+      fact_err = e;
+      facts.reset();
+    }
   }
 };
 
@@ -209,20 +220,34 @@ void Register(StepRegistry& r, ContextWorld& w) {
          w.router.DispatchProjector(book);
        });
 
-  r.On("{int} facts are recorded, each annotated with a count of {int}", [&w](const StepArgs& a) {
-    REQUIRE(w.facts.has_value());
-    REQUIRE(w.facts->pages_size() == std::stoi(a[0]));
-    for (const auto& page : w.facts->pages()) {
-      REQUIRE(FqFromUrl(page.event().type_url()) == "test.counter.CounterState");
-      tc::CounterState state;
-      REQUIRE(state.ParseFromString(page.event().value()));
-      REQUIRE(static_cast<int>(state.count()) == std::stoi(a[1]));
-    }
-  });
-  r.On("the fact is recorded unchanged", [&w](const StepArgs&) {
-    REQUIRE(w.facts.has_value());
-    REQUIRE(w.facts->pages_size() == 1);
-    REQUIRE(FqFromUrl(w.facts->pages(0).event().type_url()) == "test.counter.Reserve");
+  r.On("each Increased fact is recorded, flagged by the counts {int} and {int}",
+       [&w](const StepArgs& a) {
+         REQUIRE_FALSE(w.fact_err.has_value());
+         REQUIRE(w.facts.has_value());
+         std::vector<std::pair<std::string, int>> recorded;
+         for (const auto& page : w.facts->pages()) {
+           const std::string type = FqFromUrl(page.event().type_url());
+           int count = -1;
+           if (type == "test.counter.CounterState") {
+             tc::CounterState state;
+             REQUIRE(state.ParseFromString(page.event().value()));
+             count = static_cast<int>(state.count());
+           }
+           recorded.emplace_back(type, count);
+         }
+         const std::vector<std::pair<std::string, int>> expected{
+             {"test.counter.Increased", -1},
+             {"test.counter.CounterState", std::stoi(a[0])},
+             {"test.counter.Increased", -1},
+             {"test.counter.CounterState", std::stoi(a[1])},
+         };
+         REQUIRE(recorded == expected);
+       });
+  r.On("the facts are refused with {word} as INVALID_ARGUMENT", [&w](const StepArgs& a) {
+    REQUIRE_FALSE(w.facts.has_value());
+    REQUIRE(w.fact_err.has_value());
+    REQUIRE(w.fact_err->code == a[0]);
+    REQUIRE(w.fact_err->grpc == GrpcCode::kInvalidArgument);
   });
   r.On("the replayed state has a count of {int}", [&w](const StepArgs& a) {
     REQUIRE(w.replayed.has_value());

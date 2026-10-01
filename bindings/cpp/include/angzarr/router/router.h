@@ -195,7 +195,8 @@ class Router {
         "ProcessManagerHandleResponse");
   }
   // Handles facts through the aggregate claiming the facts' cover domain;
-  // returns the facts to record.
+  // returns the events to record (each fact and its flags). A fact of an
+  // undeclared type refuses the request with NO_FACT_HANDLER.
   pb::EventBook DispatchFact(const pb::FactRequest& request) {
     return ParseResponse<pb::EventBook>(DispatchVia(request, ffi::angzarr_router_dispatch_fact),
                                         "EventBook");
@@ -350,15 +351,17 @@ class Router {
     };
   }
 
-  // A fact handler: the fact to record as a serialized Any, or STATUS_OK_EMPTY
-  // to record the delivered fact unchanged.
+  // A fact handler: the fact to record and its flagging events as a serialized
+  // ABI FactRecord.
   template <class TState>
   static Invoker FactInvoker(ComponentKey key, typename AggregateDispatch<TState>::FactFn fn) {
     return [key, fn](Session& s, const std::string& tu, const std::string& payload,
                      const std::string&) {
-      auto fact = fn(AnyOf(tu, payload), s.EnsureState<TState>(key));
-      if (!fact) return InvokerResult{"", ffi::kStatusOkEmpty, false};
-      return InvokerResult{fact->SerializeAsString(), ffi::kStatusOk, true};
+      FactRecord recorded = fn(AnyOf(tu, payload), s.EnsureState<TState>(key));
+      abi::FactRecord reply;
+      *reply.mutable_fact() = std::move(recorded.fact);
+      for (auto& flag : recorded.flags) *reply.add_flags() = std::move(flag);
+      return InvokerResult{reply.SerializeAsString(), ffi::kStatusOk, true};
     };
   }
 

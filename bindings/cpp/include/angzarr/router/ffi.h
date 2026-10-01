@@ -53,7 +53,7 @@ int32_t angzarr_router_dispatch_replay(void* r, void* host_ctx, const uint8_t* r
 }  // extern "C"
 
 // The router-ffi ABI version this binding is written against.
-inline constexpr uint32_t kAbiVersion = 2;
+inline constexpr uint32_t kAbiVersion = 3;
 
 inline constexpr int32_t kStatusOk = 0;
 inline constexpr int32_t kStatusOkEmpty = 1;
