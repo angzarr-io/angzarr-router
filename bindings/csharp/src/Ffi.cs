@@ -57,12 +57,27 @@ internal static unsafe class Ffi
     static Ffi()
     {
         NativeLibrary.SetDllImportResolver(typeof(Ffi).Assembly, Resolve);
-        var v = angzarr_abi_version();
-        if (v != 1)
+        CheckAbiVersion(angzarr_abi_version());
+    }
+
+    /// <summary>The router-ffi ABI version this binding is written against.</summary>
+    internal const uint ExpectedAbiVersion = 1;
+
+    /// <summary>Refuses a router-ffi library whose ABI version differs from
+    /// <see cref="ExpectedAbiVersion"/>.</summary>
+    internal static void CheckAbiVersion(uint actual)
+    {
+        if (actual != ExpectedAbiVersion)
         {
-            throw new InvalidOperationException($"router-ffi ABI version {v} != 1");
+            throw new InvalidOperationException(
+                $"router-ffi ABI version mismatch: expected {ExpectedAbiVersion}, "
+                    + $"loaded library reports {actual}"
+            );
         }
     }
+
+    /// <summary>The ABI version the loaded router-ffi library reports.</summary>
+    internal static uint AbiVersion() => angzarr_abi_version();
 
     private static IntPtr Resolve(
         string libraryName,

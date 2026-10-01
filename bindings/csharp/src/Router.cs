@@ -33,9 +33,12 @@ public sealed class Router : IDisposable
 
     public Router() => _ptr = Ffi.RouterNew();
 
-    /// <summary>The ABI version the loaded cdylib reports (always 1 for a
-    /// compatible lib).</summary>
-    public static int AbiVersion() => 1;
+    /// <summary>The router-ffi ABI version this binding requires; a loaded
+    /// library reporting any other version is refused at load.</summary>
+    public const int ExpectedAbiVersion = (int)Ffi.ExpectedAbiVersion;
+
+    /// <summary>The ABI version the loaded router-ffi library reports.</summary>
+    public static int AbiVersion() => (int)Ffi.AbiVersion();
 
     public void Dispose() => Ffi.RouterFree(_ptr);
 
