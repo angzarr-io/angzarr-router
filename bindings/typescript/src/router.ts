@@ -7,7 +7,7 @@ import {
 } from "@bufbuild/protobuf";
 import { type Any, AnySchema } from "@bufbuild/protobuf/wkt";
 
-import { unhandled } from "./codedError";
+import { routerClosed, unhandled } from "./codedError";
 import { Destinations } from "./destinations";
 import {
   AggregateDispatch,
@@ -88,7 +88,8 @@ let abiChecked = false;
  * core a serialized descriptor), then dispatch books/commands through it.
  */
 export class Router {
-  private readonly ptr: unknown;
+  // The native router; null once closed.
+  private ptr: unknown;
   private readonly registry = new Map<number, Invoker>();
   private nextId = 0;
   private nextComponent = 0;
@@ -106,9 +107,24 @@ export class Router {
     return 1;
   }
 
-  /** Frees the underlying native router. */
+  /** Frees the underlying native router exactly once; closing a closed router
+   * is a no-op. A dispatch or registration on a closed router throws
+   * ROUTER_CLOSED. */
   close(): void {
-    Ffi.routerFree(this.ptr);
+    const ptr = this.ptr;
+    if (ptr === null) {
+      return;
+    }
+    this.ptr = null;
+    Ffi.routerFree(ptr);
+  }
+
+  /** The live native router; throws ROUTER_CLOSED once closed. */
+  private native(): unknown {
+    if (this.ptr === null) {
+      throw routerClosed();
+    }
+    return this.ptr;
   }
 
   invokerFor(callbackId: number): Invoker | undefined {
@@ -165,7 +181,7 @@ export class Router {
     this.check(
       Ffi.register(
         "aggregate",
-        this.ptr,
+        this.native(),
         toBinary(AggregateDescriptorSchema, desc),
       ),
     );
@@ -193,7 +209,7 @@ export class Router {
       desc.rejections.push(entry);
     }
     this.check(
-      Ffi.register("saga", this.ptr, toBinary(SagaDescriptorSchema, desc)),
+      Ffi.register("saga", this.native(), toBinary(SagaDescriptorSchema, desc)),
     );
   }
 
@@ -220,7 +236,7 @@ export class Router {
     this.check(
       Ffi.register(
         "projector",
-        this.ptr,
+        this.native(),
         toBinary(ProjectorDescriptorSchema, desc),
       ),
     );
@@ -266,7 +282,7 @@ export class Router {
     this.check(
       Ffi.register(
         "processManager",
-        this.ptr,
+        this.native(),
         toBinary(ProcessManagerDescriptorSchema, desc),
       ),
     );
@@ -320,7 +336,12 @@ export class Router {
   }
 
   private dispatchVia(surface: Surface, request: Uint8Array): Dispatched {
-    return Ffi.dispatch(surface, this.ptr, new DispatchSession(this), request);
+    return Ffi.dispatch(
+      surface,
+      this.native(),
+      new DispatchSession(this),
+      request,
+    );
   }
 
   private parse<Desc extends DescMessage>(

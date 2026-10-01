@@ -16,10 +16,12 @@ export { Pack } from "./pack";
 export {
   CodedError,
   CODE_ANY_DECODE_FAILED,
+  CODE_ROUTER_CLOSED,
   CODE_UNHANDLED_HANDLER_ERROR,
   anyDecodeError,
   parseAny,
   reject,
+  routerClosed,
   unhandled,
 } from "./codedError";
 export { GrpcCode, grpcFromWire } from "./grpcCode";
