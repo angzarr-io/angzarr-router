@@ -36,16 +36,23 @@ pub type AngzarrCb = unsafe extern "C" fn(
     out: *mut AngzarrBuf,
 ) -> i32;
 
-/// Allocates `len` zeroed bytes from the router's allocator. Returns null
-/// for `len == 0`.
+/// Allocates `len` zeroed bytes from the router's allocator as an
+/// exact-size boxed slice (its allocation size is `len`, by construction).
+/// Returns null for `len == 0`.
 pub fn alloc_bytes(len: usize) -> *mut u8 {
     if len == 0 {
         return std::ptr::null_mut();
     }
-    let mut v = vec![0u8; len];
-    let ptr = v.as_mut_ptr();
-    std::mem::forget(v);
-    ptr
+    Box::into_raw(vec![0u8; len].into_boxed_slice()).cast::<u8>()
+}
+
+/// Reclaims an `alloc_bytes(len)` allocation as its boxed slice.
+///
+/// # Safety
+/// `ptr`/`len` must be exactly a non-null `alloc_bytes(len)` result with
+/// `len > 0`, reclaimed once.
+unsafe fn reclaim(ptr: *mut u8, len: usize) -> Box<[u8]> {
+    Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len))
 }
 
 /// Frees bytes produced by `alloc_bytes` / handed out via `fill_out`.
@@ -54,7 +61,7 @@ pub fn alloc_bytes(len: usize) -> *mut u8 {
 /// `ptr`/`len` must be exactly an `alloc_bytes(len)` result, freed once.
 pub unsafe fn free_bytes(ptr: *mut u8, len: usize) {
     if !ptr.is_null() && len > 0 {
-        drop(Vec::from_raw_parts(ptr, len, len));
+        drop(reclaim(ptr, len));
     }
 }
 
@@ -82,7 +89,9 @@ pub fn consume_out(out: &mut AngzarrBuf) -> Option<Vec<u8>> {
     if out.data.is_null() || out.len == 0 {
         return None;
     }
-    let bytes = unsafe { Vec::from_raw_parts(out.data, out.len, out.len) };
+    // The host contract: `data` came from angzarr_buf_alloc(len) with `len`
+    // the requested size.
+    let bytes = unsafe { reclaim(out.data, out.len) }.into_vec();
     out.data = std::ptr::null_mut();
     out.len = 0;
     Some(bytes)
