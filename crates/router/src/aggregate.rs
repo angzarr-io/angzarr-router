@@ -2,23 +2,29 @@
 //!
 //! Envelope and command type validate BEFORE state is rebuilt (an unknown
 //! command must report NO_HANDLER_REGISTERED, not whatever the rebuild
-//! would surface); rejection routing keys on FULLY-QUALIFIED command type
-//! names; multiple compensators all run, in registration order, merging
-//! their compensation events into one response unless one escalates (the
-//! first escalation wins).
+//! would surface). A Notification command page carries one of two payloads:
+//! a RejectionNotification routes to the compensators keyed by the rejected
+//! command's FULLY-QUALIFIED type, optionally qualified by the domain it was
+//! sent to (`compensates`); multiple compensators all run, in registration
+//! order, merging their compensation events into one response unless one
+//! escalates (the first escalation wins). A Compensate routes to the undo
+//! handler registered for its `command_type` (`undoes`); none is
+//! NO_UNDO_HANDLER (UNIMPLEMENTED), never a silent drop. Events a
+//! compensator or undo handler returns are fill-only stamped like a
+//! command's, so they append after prior history.
 
 use std::collections::HashMap;
 
-use prost::Message;
 use prost_types::Any;
 
 use crate::error::{codes, extras, map_handler_error, messages, CodedError, HandlerError};
 use crate::pb;
 use crate::rebuild::Rebuilder;
+use crate::NotificationPayload;
 
 /// Per-dispatch facts the business method may need beyond its typed
 /// command and rebuilt state.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct CommandContext {
     /// The aggregate's next event sequence, derived from the prior-events
     /// book the coordinator supplied.
@@ -28,6 +34,9 @@ pub struct CommandContext {
     /// factories produce non-default zero states, so business code cannot
     /// infer existence from state.
     pub had_prior_events: bool,
+    /// The cover of the command (or notification delivery) being handled:
+    /// the aggregate's own domain and root.
+    pub cover: Option<pb::Cover>,
 }
 
 /// Handles one command against rebuilt state, emitting an event book (or
@@ -54,6 +63,24 @@ pub type RejectionFn<S> = Box<
         + Sync,
 >;
 
+/// Undoes a command this aggregate executed, against rebuilt state, given the
+/// Compensate notification (the produced event sequences and the reason).
+pub type UndoFn<S> = Box<
+    dyn Fn(
+            &pb::Notification,
+            &pb::Compensate,
+            &mut S,
+            CommandContext,
+        ) -> Result<pb::BusinessResponse, HandlerError>
+        + Send
+        + Sync,
+>;
+
+/// Validates (and may annotate) one fact against the rebuilt state, returning
+/// the fact to record. Generated thunks unmarshal to the typed fact and pack
+/// the typed result.
+pub type FactFn<S> = Box<dyn Fn(&Any, &S) -> Result<Any, HandlerError> + Send + Sync>;
+
 /// The dispatch table for one aggregate component.
 pub struct AggregateDispatch<S> {
     name: String,
@@ -61,6 +88,8 @@ pub struct AggregateDispatch<S> {
     rebuilder: Rebuilder<S>,
     handlers: HashMap<String, CommandFn<S>>,
     rejections: HashMap<String, Vec<RejectionFn<S>>>,
+    undoes: HashMap<String, UndoFn<S>>,
+    facts: HashMap<String, FactFn<S>>,
 }
 
 impl<S> AggregateDispatch<S> {
@@ -76,6 +105,8 @@ impl<S> AggregateDispatch<S> {
             rebuilder,
             handlers: HashMap::new(),
             rejections: HashMap::new(),
+            undoes: HashMap::new(),
+            facts: HashMap::new(),
         }
     }
 
@@ -92,15 +123,15 @@ impl<S> AggregateDispatch<S> {
         self
     }
 
-    /// Registers a compensation thunk keyed by the FULLY-QUALIFIED
-    /// rejected-command type name. Multiple registrations for the same
-    /// command all run, in registration order; their compensation events
-    /// merge into one response, and the first escalation (Revocation or
-    /// Notification) wins over events. Compensation books are returned as
-    /// the compensators built them (CommandContext supplies next_sequence).
+    /// Registers a compensation thunk under a `compensates` entry: the
+    /// rejected command's FULLY-QUALIFIED type (`"fq.Type"`, sent to any
+    /// domain) or `"domain:fq.Type"` (only when it was sent to that domain).
+    /// Multiple registrations for one entry all run, in registration order;
+    /// their compensation events merge into one response, and the first
+    /// escalation (Revocation or Notification) wins over events.
     pub fn on_rejected(
         mut self,
-        fq_command_type: &str,
+        compensates: &str,
         thunk: impl Fn(
                 &pb::Notification,
                 &pb::RejectionNotification,
@@ -112,10 +143,48 @@ impl<S> AggregateDispatch<S> {
             + 'static,
     ) -> Self {
         self.rejections
-            .entry(fq_command_type.to_string())
+            .entry(compensates.to_string())
             .or_default()
             .push(Box::new(thunk));
         self
+    }
+
+    /// Registers the undo handler for a FULLY-QUALIFIED command type this
+    /// aggregate executes (`undoes`): a Compensate whose `command_type` names
+    /// it runs this handler. One handler per command type; a later
+    /// registration replaces an earlier one.
+    pub fn on_undo(
+        mut self,
+        fq_command_type: &str,
+        thunk: impl Fn(
+                &pb::Notification,
+                &pb::Compensate,
+                &mut S,
+                CommandContext,
+            ) -> Result<pb::BusinessResponse, HandlerError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.undoes
+            .insert(fq_command_type.to_string(), Box::new(thunk));
+        self
+    }
+
+    /// Registers the fact handler for a FULLY-QUALIFIED fact (event) type.
+    pub fn on_fact(
+        mut self,
+        fq_fact_type: &str,
+        thunk: impl Fn(&Any, &S) -> Result<Any, HandlerError> + Send + Sync + 'static,
+    ) -> Self {
+        self.facts.insert(fq_fact_type.to_string(), Box::new(thunk));
+        self
+    }
+
+    /// Refuses a table whose `compensates` entries list one command type both
+    /// unqualified and domain-qualified (AMBIGUOUS_COMPENSATION).
+    pub fn validate(&self) -> Result<(), CodedError> {
+        crate::validate_compensation_keys(self.rejections.keys().map(String::as_str))
     }
 
     /// The component name.
@@ -169,7 +238,19 @@ impl<S> AggregateDispatch<S> {
 
         // Exact type-URL match only — suffix matching misroutes user types.
         if crate::is_notification_type_url(&command_any.type_url) {
-            return self.dispatch_rejection(command_any, req.events.as_ref());
+            let mut resp = self.dispatch_notification(
+                command_any,
+                req.events.as_ref(),
+                command_book.cover.as_ref(),
+            )?;
+            if let Some(pb::business_response::Result::Events(book)) = resp.result.as_mut() {
+                stamp_emitted_book(
+                    book,
+                    command_book.cover.as_ref(),
+                    crate::next_sequence(req.events.as_ref()),
+                );
+            }
+            return Ok(resp);
         }
 
         let Some(thunk) = self
@@ -191,6 +272,7 @@ impl<S> AggregateDispatch<S> {
             CommandContext {
                 next_sequence: next_seq,
                 had_prior_events: info.had_prior_events,
+                cover: command_book.cover.clone(),
             },
         )
         .map_err(map_handler_error)?;
@@ -206,36 +288,27 @@ impl<S> AggregateDispatch<S> {
         })
     }
 
-    /// Decodes a Notification command page and routes it to the FQ-keyed
-    /// compensation entry with rebuilt state.
-    fn dispatch_rejection(
+    /// Decodes a Notification command page and routes its payload with
+    /// rebuilt state: a RejectionNotification to the matching compensators,
+    /// a Compensate to the undo handler for its command type.
+    fn dispatch_notification(
         &self,
         command_any: &Any,
         events: Option<&pb::EventBook>,
+        cover: Option<&pb::Cover>,
     ) -> Result<pb::BusinessResponse, CodedError> {
-        let notification =
-            pb::Notification::decode(command_any.value.as_slice()).map_err(|_| {
-                CodedError::invalid_argument(
-                    codes::NOTIFICATION_DECODE_FAILED,
-                    messages::NOTIFICATION_DECODE_FAILED,
-                    [(extras::TYPE_URL.to_string(), command_any.type_url.clone())],
-                )
-            })?;
-        let rejection = match notification.payload.as_ref() {
-            Some(payload) => {
-                pb::RejectionNotification::decode(payload.value.as_slice()).map_err(|_| {
-                    CodedError::invalid_argument(
-                        codes::REJECTION_NOTIFICATION_DECODE_FAILED,
-                        messages::REJECTION_NOTIFICATION_DECODE_FAILED,
-                        [],
-                    )
-                })?
+        let (notification, payload) = crate::decode_notification(command_any)?;
+        let rejection = match payload {
+            NotificationPayload::Rejection(rejection) => rejection,
+            NotificationPayload::Compensate(compensate) => {
+                return self.dispatch_undo(&notification, &compensate, events, cover);
             }
-            None => pb::RejectionNotification::default(),
         };
 
-        let (_, fq_command) = crate::extract_rejection_key(&rejection);
-        let Some(thunks) = self.rejections.get(&fq_command) else {
+        let (target_domain, fq_command) = crate::extract_rejection_key(&rejection);
+        let Some(thunks) =
+            crate::compensation_lookup(&self.rejections, &target_domain, &fq_command)
+        else {
             // Undeclared: DelegateToFramework (by declaration, not accident).
             return Ok(pb::BusinessResponse::default());
         };
@@ -243,14 +316,84 @@ impl<S> AggregateDispatch<S> {
         let cctx = CommandContext {
             next_sequence: crate::next_sequence(events),
             had_prior_events: info.had_prior_events,
+            cover: cover.cloned(),
         };
         let mut merged: Option<pb::business_response::Result> = None;
         for thunk in thunks {
-            let resp =
-                thunk(&notification, &rejection, &mut state, cctx).map_err(map_handler_error)?;
+            let resp = thunk(&notification, &rejection, &mut state, cctx.clone())
+                .map_err(map_handler_error)?;
             merged = merge_compensation(merged, resp.result);
         }
         Ok(pb::BusinessResponse { result: merged })
+    }
+
+    /// Runs the undo handler for the Compensate's command type with rebuilt
+    /// state; a command type with no undo handler is NO_UNDO_HANDLER.
+    fn dispatch_undo(
+        &self,
+        notification: &pb::Notification,
+        compensate: &pb::Compensate,
+        events: Option<&pb::EventBook>,
+        cover: Option<&pb::Cover>,
+    ) -> Result<pb::BusinessResponse, CodedError> {
+        let Some(thunk) = self.undoes.get(&compensate.command_type) else {
+            return Err(CodedError::invalid_argument(
+                codes::NO_UNDO_HANDLER,
+                messages::NO_UNDO_HANDLER,
+                [(
+                    extras::COMMAND_TYPE.to_string(),
+                    compensate.command_type.clone(),
+                )],
+            ));
+        };
+        let (mut state, info) = self.rebuilder.rebuild(events)?;
+        let cctx = CommandContext {
+            next_sequence: crate::next_sequence(events),
+            had_prior_events: info.had_prior_events,
+            cover: cover.cloned(),
+        };
+        thunk(notification, compensate, &mut state, cctx).map_err(map_handler_error)
+    }
+
+    /// `CommandHandlerService.HandleFact`: rebuilds state from the prior
+    /// events, then walks the fact pages in order. A fact whose type has a
+    /// fact handler is replaced by what the handler returns (it may annotate
+    /// the fact, never refuse it short of an error); every recorded fact then
+    /// folds into the state the next fact sees. The facts' cover and page
+    /// headers are kept; the coordinator assigns real sequences.
+    pub fn handle_fact(&self, req: &pb::FactRequest) -> Result<pb::EventBook, CodedError> {
+        let (mut state, _) = self.rebuilder.rebuild(req.prior_events.as_ref())?;
+        let Some(facts) = req.facts.as_ref() else {
+            return Ok(pb::EventBook::default());
+        };
+        let mut out = pb::EventBook {
+            cover: facts.cover.clone(),
+            ..Default::default()
+        };
+        for page in &facts.pages {
+            let mut recorded = page.clone();
+            if let Some(event) = crate::page_event(page) {
+                if let Some(thunk) = self.facts.get(crate::type_name_from_url(&event.type_url)) {
+                    let annotated = thunk(event, &state).map_err(map_handler_error)?;
+                    recorded.payload = Some(pb::event_page::Payload::Event(annotated));
+                }
+            }
+            self.rebuilder.apply_page(&mut state, &recorded)?;
+            out.pages.push(recorded);
+        }
+        Ok(out)
+    }
+
+    /// `CommandHandlerService.Replay`: the state after folding the base
+    /// snapshot (when present) and then the events, in order. The caller packs
+    /// the state into the response's `Any`.
+    pub fn replay(&self, req: &pb::ReplayRequest) -> Result<S, CodedError> {
+        let book = pb::EventBook {
+            snapshot: req.base_snapshot.clone(),
+            pages: req.events.clone(),
+            ..Default::default()
+        };
+        Ok(self.rebuilder.rebuild(Some(&book))?.0)
     }
 }
 

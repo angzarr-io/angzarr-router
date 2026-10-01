@@ -35,9 +35,12 @@ pub mod codes {
     pub const MISSING_EVENT_BOOK_COVER: &str = "MISSING_EVENT_BOOK_COVER";
     pub const MISSING_SAGA_SOURCE: &str = "MISSING_SAGA_SOURCE";
     pub const EMPTY_SAGA_SOURCE: &str = "EMPTY_SAGA_SOURCE";
-    pub const MISSING_DESTINATION_SEQUENCE: &str = "MISSING_DESTINATION_SEQUENCE";
     pub const MISSING_PM_TRIGGER: &str = "MISSING_PM_TRIGGER";
     pub const DUPLICATE_REGISTRATION: &str = "DUPLICATE_REGISTRATION";
+    pub const AMBIGUOUS_COMPENSATION: &str = "AMBIGUOUS_COMPENSATION";
+    pub const NO_UNDO_HANDLER: &str = "NO_UNDO_HANDLER";
+    pub const UNKNOWN_NOTIFICATION_PAYLOAD: &str = "UNKNOWN_NOTIFICATION_PAYLOAD";
+    pub const COMPENSATE_DECODE_FAILED: &str = "COMPENSATE_DECODE_FAILED";
     pub const EMPTY_PM_TRIGGER: &str = "EMPTY_PM_TRIGGER";
     pub const MISSING_PM_EVENT_PAYLOAD: &str = "MISSING_PM_EVENT_PAYLOAD";
 }
@@ -53,16 +56,22 @@ pub mod messages {
     pub const MISSING_EVENT_BOOK_COVER: &str = "missing event book cover";
     pub const MISSING_SAGA_SOURCE: &str = "missing saga source";
     pub const EMPTY_SAGA_SOURCE: &str = "empty saga source";
-    pub const MISSING_DESTINATION_SEQUENCE: &str = "no sequence for destination domain";
     pub const MISSING_PM_TRIGGER: &str = "missing PM trigger";
     pub const EMPTY_PM_TRIGGER: &str = "empty PM trigger";
     pub const MISSING_PM_EVENT_PAYLOAD: &str = "missing event payload on PM trigger";
+    pub const AMBIGUOUS_COMPENSATION: &str =
+        "a command type is listed both unqualified and domain-qualified";
+    pub const NO_UNDO_HANDLER: &str = "no undo handler for the compensated command type";
+    pub const UNKNOWN_NOTIFICATION_PAYLOAD: &str =
+        "notification payload is neither a RejectionNotification nor a Compensate";
+    pub const COMPENSATE_DECODE_FAILED: &str = "failed to decode Compensate payload";
 }
 
 /// Cross-language detail-key constants.
 pub mod extras {
     pub const DOMAIN: &str = "domain";
     pub const TYPE_URL: &str = "type_url";
+    pub const COMMAND_TYPE: &str = "command_type";
 }
 
 /// A coded business/framework error: the form every failure takes before
@@ -112,8 +121,10 @@ impl CodedError {
     }
 
     /// A coded client error. The gRPC code is resolved from the single
-    /// mapping table: NO_HANDLER_REGISTERED → UNIMPLEMENTED (misrouted /
-    /// stale deployment), PERSISTED_EVENT_CORRUPT → DATA_LOSS
+    /// mapping table: NO_HANDLER_REGISTERED and NO_UNDO_HANDLER →
+    /// UNIMPLEMENTED (misrouted / stale deployment; the coordinator
+    /// dead-letters an undeliverable Compensate on UNIMPLEMENTED),
+    /// PERSISTED_EVENT_CORRUPT → DATA_LOSS
     /// (store-sourced, unrecoverable by retry), everything else →
     /// INVALID_ARGUMENT.
     pub fn invalid_argument(
@@ -122,7 +133,7 @@ impl CodedError {
         extras: impl IntoIterator<Item = (String, String)>,
     ) -> Self {
         let grpc = match code {
-            codes::NO_HANDLER_REGISTERED => GrpcCode::Unimplemented,
+            codes::NO_HANDLER_REGISTERED | codes::NO_UNDO_HANDLER => GrpcCode::Unimplemented,
             codes::PERSISTED_EVENT_CORRUPT => GrpcCode::DataLoss,
             _ => GrpcCode::InvalidArgument,
         };

@@ -2,16 +2,17 @@ Feature: Order saga dispatch
 
   The OrderSaga proves the translation-side dispatch mechanisms the shared
   router must implement identically in every language: a declared source
-  event emits a command stamped with the coordinator-supplied destination
-  sequence, an undeclared event emits nothing, a source missing or empty is
-  refused with a coded error, and a rejection notification routes to the
-  registered compensator while an unwatched rejection is ignored.
+  event emits a deferred command (angzarr_deferred provenance from the
+  triggering event, never an explicit sequence), an undeclared event emits
+  nothing, a source missing or empty is refused with a coded error, and a
+  rejection notification in a saga's source emits nothing (sagas receive no
+  rejections).
 
-  Scenario: a declared event emits a stamped command
+  Scenario: a declared event emits a deferred command
     Given an order saga delivering to "inventory"
-    When an Increased event is dispatched with destination inventory sequence 7
+    When an Increased event at sequence 7 is dispatched
     Then the saga emits one command to "inventory"
-    And the command carries destination sequence 7
+    And the command is deferred from source sequence 7 at command index 0
 
   Scenario: an undeclared event emits nothing
     Given an order saga delivering to "inventory"
@@ -28,12 +29,8 @@ Feature: Order saga dispatch
     When a request with no source is dispatched
     Then the dispatch fails with MISSING_SAGA_SOURCE
 
-  Scenario: a rejection routes to the compensator
+  Scenario: a rejection in the source is not a saga's to compensate
     Given an order saga delivering to "inventory"
     When a rejection of Reserve is dispatched
-    Then the saga injects one fact event
-
-  Scenario: an unwatched rejection is ignored
-    Given an order saga delivering to "inventory"
-    When a rejection of Unwatched is dispatched
-    Then the saga injects no events
+    Then the saga emits no commands
+    And the saga injects no events

@@ -190,7 +190,7 @@ pub fn counter_projector() -> ProjectorDispatch<ProjectorState> {
         .for_domains(["counter"])
         .on_event(
             "test.counter.Increased",
-            |state: &mut ProjectorState, event| {
+            |state: &mut ProjectorState, event, _ctx| {
                 // Decode so a corrupt event fails the fold, exactly as the
                 // aggregate applier does. Increased is empty — every
                 // well-formed event decodes and increments.
@@ -243,20 +243,13 @@ pub fn delivery_without_cover(n: u32) -> pb::EventBook {
 // ---------------------------------------------------------------------------
 
 /// Build the OrderSaga dispatch table: it translates each Increased source
-/// event into one Reserve command for "inventory" (stamped from the
-/// coordinator-supplied destination sequence when present), and compensates a
-/// rejected Reserve by injecting one fact event. Undeclared events and
-/// undeclared rejections are silently skipped (DelegateToFramework).
+/// event into one Reserve command for "inventory" (deferred: the router stamps
+/// its provenance). Undeclared events and Notification pages are skipped.
 pub fn order_saga() -> SagaDispatch {
     SagaDispatch::new("order-saga", "order", ["inventory"])
-        .on_event("test.counter.Increased", |_any, dests, _c| {
-            let mut cmd = reserve_command_to("inventory");
-            if dests.has("inventory") {
-                dests.stamp_command(&mut cmd, "inventory")?;
-            }
-            Ok((vec![cmd], Vec::new()))
+        .on_event("test.counter.Increased", |_any, _dests, _c| {
+            Ok((vec![reserve_command_to("inventory")], Vec::new()))
         })
-        .on_rejected("test.counter.Reserve", |_n, _r| Ok(vec![saga_fact_event()]))
 }
 
 fn reserve_command_to(domain: &str) -> pb::CommandBook {
@@ -275,18 +268,9 @@ fn reserve_command_to(domain: &str) -> pb::CommandBook {
     }
 }
 
-/// A single-page fact event the compensator injects — its presence (not its
-/// content) is what the rejection scenarios assert.
-fn saga_fact_event() -> pb::EventBook {
-    pb::EventBook {
-        pages: vec![pb::EventPage::default()],
-        ..Default::default()
-    }
-}
-
 /// A SagaHandleRequest whose source carries one event of `event_fq` in the
-/// "order" domain, plus the coordinator's destination-sequence map.
-pub fn saga_event_source(event_fq: &str, dest: &[(&str, u32)]) -> pb::SagaHandleRequest {
+/// "order" domain, at sequence `seq` when given.
+pub fn saga_event_source(event_fq: &str, seq: Option<u32>) -> pb::SagaHandleRequest {
     pb::SagaHandleRequest {
         source: Some(pb::EventBook {
             cover: Some(pb::Cover {
@@ -298,17 +282,25 @@ pub fn saga_event_source(event_fq: &str, dest: &[(&str, u32)]) -> pb::SagaHandle
                     type_url: angzarr_router::type_url(event_fq),
                     value: Vec::new(),
                 })),
+                header: seq.map(sequence_header),
                 ..Default::default()
             }],
             ..Default::default()
         }),
-        destination_sequences: dest.iter().map(|(d, s)| (d.to_string(), *s)).collect(),
+        ..Default::default()
+    }
+}
+
+/// A page header carrying an explicit sequence.
+pub fn sequence_header(seq: u32) -> pb::PageHeader {
+    pb::PageHeader {
+        sequence_type: Some(pb::page_header::SequenceType::Sequence(seq)),
         ..Default::default()
     }
 }
 
 /// A SagaHandleRequest whose source is a rejection Notification for
-/// `fq_command` — routes to the compensation path.
+/// `fq_command` (sagas receive no rejections, so it emits nothing).
 pub fn saga_rejection_source(fq_command: &str) -> pb::SagaHandleRequest {
     // The rejected command's type is what keys the compensator lookup.
     let mut rejected = reserve_command_to("inventory");
@@ -374,8 +366,7 @@ pub struct ProcessManagerState {
 
 /// Build the OrderProcessManager dispatch table: over the "counter" domain it
 /// reacts to the NEWEST Increased trigger by emitting one Reserve command for
-/// "inventory" (stamped from the destination sequence when present) plus a
-/// process event; a rejected Reserve compensates with a process event and an
+/// "inventory" (deferred) plus a process event; a rejected Reserve compensates with a process event and an
 /// escalation. Its own state counts prior Increased process events, so a
 /// rebuild is observable.
 pub fn order_pm() -> ProcessManagerDispatch<ProcessManagerState> {
@@ -388,15 +379,12 @@ pub fn order_pm() -> ProcessManagerDispatch<ProcessManagerState> {
         },
     );
 
-    ProcessManagerDispatch::new("order-pm", "order-pm", rebuilder)
+    ProcessManagerDispatch::new("order-pm", "order-pm", ["inventory"], rebuilder)
         .on_event(
             "counter",
             "test.counter.Increased",
-            |_event, state: &mut ProcessManagerState, dests| {
-                let mut cmd = reserve_command_to("inventory");
-                if dests.has("inventory") {
-                    dests.stamp_command(&mut cmd, "inventory")?;
-                }
+            |_event, state: &mut ProcessManagerState, _dests, _cover| {
+                let cmd = reserve_command_to("inventory");
                 // Emit one fact per prior state event so the rebuild is
                 // observable in the response.
                 let facts = (0..state.count).map(|_| pm_process_event()).collect();
@@ -408,7 +396,11 @@ pub fn order_pm() -> ProcessManagerDispatch<ProcessManagerState> {
             },
         )
         .on_rejected("test.counter.Reserve", |_n, _r, _state| {
-            Ok((vec![pm_process_event()], Some(pm_escalation())))
+            Ok(pb::ProcessManagerHandleResponse {
+                process_events: vec![pm_process_event()],
+                notification: Some(pm_escalation()),
+                ..Default::default()
+            })
         })
 }
 
@@ -438,21 +430,29 @@ pub fn audit_pm() -> ProcessManagerDispatch<AuditState> {
         },
     );
 
-    ProcessManagerDispatch::new("AuditProcessManager", "audit-pm", rebuilder)
-        .on_event(
-            "counter",
-            "test.counter.Increased",
-            |_event, state: &mut AuditState, _dests| {
-                let facts = state.seen.iter().map(|_| audit_book()).collect();
-                Ok(pb::ProcessManagerHandleResponse {
-                    facts,
-                    ..Default::default()
-                })
-            },
-        )
-        .on_rejected("test.counter.Reserve", |_n, _r, _state| {
-            Ok((vec![audit_book()], None))
+    ProcessManagerDispatch::new(
+        "AuditProcessManager",
+        "audit-pm",
+        Vec::<String>::new(),
+        rebuilder,
+    )
+    .on_event(
+        "counter",
+        "test.counter.Increased",
+        |_event, state: &mut AuditState, _dests, _cover| {
+            let facts = state.seen.iter().map(|_| audit_book()).collect();
+            Ok(pb::ProcessManagerHandleResponse {
+                facts,
+                ..Default::default()
+            })
+        },
+    )
+    .on_rejected("test.counter.Reserve", |_n, _r, _state| {
+        Ok(pb::ProcessManagerHandleResponse {
+            process_events: vec![audit_book()],
+            ..Default::default()
         })
+    })
 }
 
 fn audit_book() -> pb::EventBook {
@@ -536,13 +536,14 @@ fn pm_escalation() -> pb::Notification {
     }
 }
 
-/// A PM request whose trigger carries the given event pages in `domain`, plus
-/// the destination-sequence map. `process_state` is the PM's prior state book.
+/// A PM request whose trigger carries the given event pages in `domain`, the
+/// newest at sequence `newest_seq` when given. `process_state` is the PM's
+/// prior state book.
 pub fn pm_trigger_request(
     domain: &str,
     event_fqs: &[&str],
     process_state: Option<pb::EventBook>,
-    dest: &[(&str, u32)],
+    newest_seq: Option<u32>,
 ) -> pb::ProcessManagerHandleRequest {
     let pages = event_fqs
         .iter()
@@ -554,6 +555,10 @@ pub fn pm_trigger_request(
             ..Default::default()
         })
         .collect();
+    let mut pages: Vec<pb::EventPage> = pages;
+    if let (Some(seq), Some(last)) = (newest_seq, pages.last_mut()) {
+        last.header = Some(sequence_header(seq));
+    }
     pb::ProcessManagerHandleRequest {
         trigger: Some(pb::EventBook {
             cover: Some(pb::Cover {
@@ -564,7 +569,6 @@ pub fn pm_trigger_request(
             ..Default::default()
         }),
         process_state,
-        destination_sequences: dest.iter().map(|(d, s)| (d.to_string(), *s)).collect(),
     }
 }
 
@@ -602,7 +606,6 @@ pub fn pm_rejection_request(fq_command: &str) -> pb::ProcessManagerHandleRequest
             ..Default::default()
         }),
         process_state: None,
-        destination_sequences: Default::default(),
     }
 }
 
@@ -832,6 +835,188 @@ fn inner_command_any(cc: &mut pb::ContextualCommand) -> &mut prost_types::Any {
             panic!("conformance fixtures carry inline commands, not offloaded payloads")
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Compensation routing fixtures: hand-built aggregates over the core API.
+// ---------------------------------------------------------------------------
+
+/// A business response carrying one header-less event page of
+/// `test.counter.<name>`.
+pub fn one_event(name: &str) -> pb::BusinessResponse {
+    pb::BusinessResponse {
+        result: Some(pb::business_response::Result::Events(pb::EventBook {
+            pages: vec![pb::EventPage {
+                payload: Some(pb::event_page::Payload::Event(prost_types::Any {
+                    type_url: angzarr_router::type_url(&format!("test.counter.{name}")),
+                    value: Vec::new(),
+                })),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })),
+    }
+}
+
+/// The payment aggregate (domain "payment"): one compensation handler per
+/// `(compensates entry, emitted event name)` pair.
+pub fn payment_aggregate(entries: &[(&str, &str)]) -> AggregateDispatch<()> {
+    let mut agg = AggregateDispatch::new("Payment", "payment", Rebuilder::new(|| ()));
+    for (key, event) in entries {
+        let event = event.to_string();
+        agg = agg.on_rejected(key, move |_n, _r, _s: &mut (), _c| Ok(one_event(&event)));
+    }
+    agg
+}
+
+/// The inventory aggregate (domain "inventory"): undoes
+/// `test.counter.AdjustStock` with StockAdjustmentReverted and
+/// `test.counter.Reserve` with StockReleased.
+pub fn inventory_aggregate() -> AggregateDispatch<()> {
+    AggregateDispatch::new("Inventory", "inventory", Rebuilder::new(|| ()))
+        .on_undo("test.counter.AdjustStock", |_n, _c, _s: &mut (), _x| {
+            Ok(one_event("StockAdjustmentReverted"))
+        })
+        .on_undo("test.counter.Reserve", |_n, _c, _s: &mut (), _x| {
+            Ok(one_event("StockReleased"))
+        })
+}
+
+/// A Notification command (bare `/` type URL) wrapping `payload`, addressed
+/// to `domain`, over prior history whose next sequence is `next_sequence`
+/// when given.
+fn notification_command(
+    domain: &str,
+    payload: prost_types::Any,
+    next_sequence: Option<u32>,
+) -> pb::ContextualCommand {
+    let notification = pb::Notification {
+        payload: Some(payload),
+        ..Default::default()
+    };
+    pb::ContextualCommand {
+        command: Some(pb::CommandBook {
+            cover: Some(pb::Cover {
+                domain: domain.to_string(),
+                ..Default::default()
+            }),
+            pages: vec![pb::CommandPage {
+                payload: Some(pb::command_page::Payload::Command(prost_types::Any {
+                    type_url: angzarr_router::NOTIFICATION_TYPE_URL.to_string(),
+                    value: notification.encode_to_vec(),
+                })),
+                ..Default::default()
+            }],
+        }),
+        events: next_sequence.map(|next| pb::EventBook {
+            next_sequence: next,
+            pages: vec![pb::EventPage {
+                header: Some(sequence_header(next.saturating_sub(1))),
+                payload: Some(pb::event_page::Payload::Event(prost_types::Any {
+                    type_url: angzarr_router::type_url("test.counter.Unrelated"),
+                    value: Vec::new(),
+                })),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+    }
+}
+
+/// The rejection of a `test.counter.<command>` sent to `target_domain`,
+/// delivered to the payment aggregate.
+pub fn rejection_sent_to(
+    command: &str,
+    target_domain: &str,
+    next_sequence: Option<u32>,
+) -> pb::ContextualCommand {
+    let mut rejected = reserve_command_to(target_domain);
+    if let Some(pb::command_page::Payload::Command(any)) = rejected.pages[0].payload.as_mut() {
+        any.type_url = angzarr_router::type_url(&format!("test.counter.{command}"));
+    }
+    let rejection = pb::RejectionNotification {
+        rejected_command: Some(rejected),
+        ..Default::default()
+    };
+    notification_command(
+        "payment",
+        prost_types::Any {
+            type_url: angzarr_router::type_url(angzarr_router::REJECTION_NOTIFICATION_FULL_NAME),
+            value: rejection.encode_to_vec(),
+        },
+        next_sequence,
+    )
+}
+
+/// The Compensate payload for an executed `test.counter.<command>`.
+pub fn compensate_payload(command: &str) -> prost_types::Any {
+    prost_types::Any {
+        type_url: angzarr_router::type_url(angzarr_router::COMPENSATE_FULL_NAME),
+        value: pb::Compensate {
+            command_type: format!("test.counter.{command}"),
+            sequences: vec![0],
+            reason: "aborted".to_string(),
+        }
+        .encode_to_vec(),
+    }
+}
+
+/// A Compensate for an executed `test.counter.<command>`, delivered to the
+/// inventory aggregate.
+pub fn compensate_for(command: &str) -> pb::ContextualCommand {
+    notification_command("inventory", compensate_payload(command), None)
+}
+
+/// A PM request whose trigger (in the PM's own domain) is a Compensate for an
+/// executed `test.counter.<command>`.
+pub fn pm_compensate_request(command: &str) -> pb::ProcessManagerHandleRequest {
+    let notification = pb::Notification {
+        payload: Some(compensate_payload(command)),
+        ..Default::default()
+    };
+    pb::ProcessManagerHandleRequest {
+        trigger: Some(pb::EventBook {
+            cover: Some(pb::Cover {
+                domain: "order-pm".to_string(),
+                ..Default::default()
+            }),
+            pages: vec![pb::EventPage {
+                payload: Some(pb::event_page::Payload::Event(prost_types::Any {
+                    type_url: angzarr_router::NOTIFICATION_TYPE_URL.to_string(),
+                    value: notification.encode_to_vec(),
+                })),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        process_state: None,
+    }
+}
+
+/// Rewrites every Any type URL in `cmd` (the command) and its prior history
+/// (the events) to `prefix` + the fully-qualified name.
+pub fn with_type_url_prefix(mut cmd: pb::ContextualCommand, prefix: &str) -> pb::ContextualCommand {
+    let rewrite = |any: &mut prost_types::Any| {
+        any.type_url = format!(
+            "{prefix}{}",
+            angzarr_router::type_name_from_url(&any.type_url)
+        );
+    };
+    if let Some(book) = cmd.command.as_mut() {
+        for page in &mut book.pages {
+            if let Some(pb::command_page::Payload::Command(any)) = page.payload.as_mut() {
+                rewrite(any);
+            }
+        }
+    }
+    if let Some(book) = cmd.events.as_mut() {
+        for page in &mut book.pages {
+            if let Some(pb::event_page::Payload::Event(any)) = page.payload.as_mut() {
+                rewrite(any);
+            }
+        }
+    }
+    cmd
 }
 
 #[cfg(test)]

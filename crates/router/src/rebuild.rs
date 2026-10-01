@@ -123,6 +123,25 @@ impl<S> Rebuilder<S> {
     }
 }
 
+impl<S> Rebuilder<S> {
+    /// Folds one page into `state` through its applier, returning whether an
+    /// applier ran. A page with no event or an unapplied type is skipped; a
+    /// corrupt payload is PERSISTED_EVENT_CORRUPT.
+    pub fn apply_page(&self, state: &mut S, page: &pb::EventPage) -> Result<bool, CodedError> {
+        let Some(event) = crate::page_event(page) else {
+            return Ok(false);
+        };
+        let Some(thunk) = self
+            .appliers
+            .get(crate::type_name_from_url(&event.type_url))
+        else {
+            return Ok(false);
+        };
+        thunk(state, event).map_err(|_| CodedError::persisted_corrupt(&event.type_url))?;
+        Ok(true)
+    }
+}
+
 /// The page's explicit header sequence, when it carries one.
 fn explicit_sequence(page: &pb::EventPage) -> Option<u32> {
     match page.header.as_ref()?.sequence_type.as_ref()? {

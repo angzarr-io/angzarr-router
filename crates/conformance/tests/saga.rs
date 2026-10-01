@@ -33,17 +33,14 @@ async fn an_order_saga(_w: &mut SagaWorld, _target: String) {
     // Each dispatch builds a fresh saga; nothing to seed.
 }
 
-#[when(regex = r"^an Increased event is dispatched with destination inventory sequence (\d+)$")]
-async fn increased_with_destination(w: &mut SagaWorld, seq: u32) {
-    w.dispatch(conf::saga_event_source(
-        "test.counter.Increased",
-        &[("inventory", seq)],
-    ));
+#[when(regex = r"^an Increased event at sequence (\d+) is dispatched$")]
+async fn increased_at(w: &mut SagaWorld, seq: u32) {
+    w.dispatch(conf::saga_event_source("test.counter.Increased", Some(seq)));
 }
 
 #[when("a Reserve event is dispatched")]
 async fn reserve_event(w: &mut SagaWorld) {
-    w.dispatch(conf::saga_event_source("test.counter.Reserve", &[]));
+    w.dispatch(conf::saga_event_source("test.counter.Reserve", None));
 }
 
 #[when("a source with no pages is dispatched")]
@@ -61,11 +58,6 @@ async fn rejection_reserve(w: &mut SagaWorld) {
     w.dispatch(conf::saga_rejection_source("test.counter.Reserve"));
 }
 
-#[when("a rejection of Unwatched is dispatched")]
-async fn rejection_unwatched(w: &mut SagaWorld) {
-    w.dispatch(conf::saga_rejection_source("test.counter.Unwatched"));
-}
-
 #[then(regex = r#"^the saga emits one command to "([^"]*)"$"#)]
 async fn emits_one_command(w: &mut SagaWorld, target: String) {
     let resp = w.response();
@@ -76,28 +68,31 @@ async fn emits_one_command(w: &mut SagaWorld, target: String) {
     );
 }
 
-#[then(regex = r"^the command carries destination sequence (\d+)$")]
-async fn command_carries_sequence(w: &mut SagaWorld, seq: u32) {
+#[then(regex = r"^the command is deferred from source sequence (\d+) at command index (\d+)$")]
+async fn command_is_deferred(w: &mut SagaWorld, seq: u32, index: u32) {
     let cmd = &w.response().commands[0];
-    let got = match cmd.pages[0]
-        .header
-        .as_ref()
-        .and_then(|h| h.sequence_type.as_ref())
-    {
-        Some(pb::page_header::SequenceType::Sequence(s)) => *s,
-        _ => panic!("command page carries no explicit sequence"),
-    };
-    assert_eq!(got, seq, "command stamped with the destination sequence");
+    for page in &cmd.pages {
+        let Some(pb::page_header::SequenceType::AngzarrDeferred(d)) =
+            page.header.as_ref().and_then(|h| h.sequence_type.as_ref())
+        else {
+            panic!("command page is not deferred");
+        };
+        assert_eq!(d.source_seq, seq, "source_seq is the triggering event's");
+        assert_eq!(
+            d.command_index, index,
+            "command_index is the emission position"
+        );
+        assert_eq!(
+            d.source.as_ref().map(|c| c.domain.as_str()),
+            Some("order"),
+            "the source cover is the triggering book's"
+        );
+    }
 }
 
 #[then("the saga emits no commands")]
 async fn emits_no_commands(w: &mut SagaWorld) {
     assert!(w.response().commands.is_empty(), "no commands emitted");
-}
-
-#[then("the saga injects one fact event")]
-async fn injects_one_event(w: &mut SagaWorld) {
-    assert_eq!(w.response().events.len(), 1, "one fact event injected");
 }
 
 #[then("the saga injects no events")]

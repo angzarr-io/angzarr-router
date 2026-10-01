@@ -83,3 +83,14 @@ Feature: Counter aggregate dispatch
     Given a counter restored from a snapshot of 10 with one newer event
     When the operator increases the counter by 1
     Then the handler saw a counter of 11, at next sequence 12
+
+  Scenario Outline: commands and events route by fully-qualified name under any type-URL prefix
+    Given a counter that has already recorded 2 increases under the "<prefix>" type-URL prefix
+    When the operator increases the counter by 1 under the "<prefix>" type-URL prefix
+    Then the handler saw a counter of 2, at next sequence 2
+
+    Examples:
+      | prefix               |
+      | type.googleapis.com/ |
+      | /                    |
+      | example.com/types/   |

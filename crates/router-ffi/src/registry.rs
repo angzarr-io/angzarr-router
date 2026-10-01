@@ -7,7 +7,7 @@ use std::ffi::c_void;
 
 use prost::Message;
 
-use angzarr_router::aggregate::AggregateDispatch;
+use angzarr_router::aggregate::{AggregateDispatch, CommandContext};
 use angzarr_router::error::{codes, messages, CodedError, HandlerError};
 use angzarr_router::process_manager::{
     merge_response, select_process_managers, ProcessManagerDispatch, ProcessManagerRoute,
@@ -75,13 +75,30 @@ fn invoke(
     (ret, consume_out(&mut out))
 }
 
+fn command_context_aux(cctx: &CommandContext) -> abi_pb::CommandContextAux {
+    abi_pb::CommandContextAux {
+        next_sequence: cctx.next_sequence,
+        had_prior_events: cctx.had_prior_events,
+        cover: cctx.cover.clone(),
+    }
+}
+
 fn host_error(ret: i32, bytes: Option<Vec<u8>>) -> HandlerError {
     HandlerError::Coded(status_to_coded(bytes.as_deref(), ret))
 }
 
+/// One registered aggregate: its domain, dispatch table, the host callback
+/// that packs its state for Replay (when supported), and the host gateway.
+struct RegisteredAggregate {
+    domain: String,
+    dispatch: AggregateDispatch<()>,
+    state_callback: Option<u64>,
+    cb: AngzarrCb,
+}
+
 /// The registered tables behind an opaque router handle.
 pub struct FfiRouter {
-    aggregates: Vec<(String, AggregateDispatch<()>)>,
+    aggregates: Vec<RegisteredAggregate>,
     projectors: Vec<(String, ProjectorDispatch<()>)>,
     sagas: Vec<(String, SagaDispatch)>,
     process_managers: Vec<(String, ProcessManagerDispatch<()>)>,
@@ -113,7 +130,7 @@ impl FfiRouter {
         })?;
         // Commands route by domain, so a second aggregate for a domain could
         // never receive a command: refuse the claim at registration (C-0010).
-        if self.aggregates.iter().any(|(d, _)| *d == desc.domain) {
+        if self.aggregates.iter().any(|a| a.domain == desc.domain) {
             return Err(CodedError::invalid_argument(
                 codes::DUPLICATE_REGISTRATION,
                 "an aggregate is already registered for this domain",
@@ -151,11 +168,7 @@ impl FfiRouter {
         for command in &desc.commands {
             let id = command.callback_id;
             dispatch = dispatch.on_command(&command.fq_type, move |cmd, _, cctx| {
-                let aux = abi_pb::CommandContextAux {
-                    next_sequence: cctx.next_sequence,
-                    had_prior_events: cctx.had_prior_events,
-                }
-                .encode_to_vec();
+                let aux = command_context_aux(&cctx).encode_to_vec();
                 let (ret, bytes) = invoke(cb, id, &cmd.type_url, &cmd.value, &aux);
                 match ret {
                     STATUS_OK => {
@@ -176,15 +189,12 @@ impl FfiRouter {
         for rejection in &desc.rejections {
             for &id in &rejection.callback_ids {
                 dispatch = dispatch.on_rejected(
-                    &rejection.fq_command_type,
+                    &rejection.compensates,
                     move |notification, rejection, _, cctx| {
                         let aux = abi_pb::RejectionAux {
                             notification: notification.encode_to_vec(),
                             rejection: rejection.encode_to_vec(),
-                            cctx: Some(abi_pb::CommandContextAux {
-                                next_sequence: cctx.next_sequence,
-                                had_prior_events: cctx.had_prior_events,
-                            }),
+                            cctx: Some(command_context_aux(&cctx)),
                         }
                         .encode_to_vec();
                         let (ret, bytes) = invoke(cb, id, NOTIFICATION_TYPE_URL, &[], &aux);
@@ -209,7 +219,53 @@ impl FfiRouter {
             }
         }
 
-        self.aggregates.push((desc.domain, dispatch));
+        for undo in &desc.undoes {
+            let id = undo.callback_id;
+            dispatch = dispatch.on_undo(&undo.fq_type, move |notification, compensate, _, cctx| {
+                let aux = abi_pb::UndoAux {
+                    notification: notification.encode_to_vec(),
+                    compensate: compensate.encode_to_vec(),
+                    cctx: Some(command_context_aux(&cctx)),
+                }
+                .encode_to_vec();
+                let (ret, bytes) = invoke(cb, id, NOTIFICATION_TYPE_URL, &[], &aux);
+                match ret {
+                    STATUS_OK => pb::BusinessResponse::decode(bytes.unwrap_or_default().as_slice())
+                        .map_err(|_| {
+                            HandlerError::Other(
+                                "host undo handler returned undecodable BusinessResponse bytes"
+                                    .to_string(),
+                            )
+                        }),
+                    STATUS_OK_EMPTY => Ok(pb::BusinessResponse::default()),
+                    _ => Err(host_error(ret, bytes)),
+                }
+            });
+        }
+        for fact in &desc.facts {
+            let id = fact.callback_id;
+            dispatch = dispatch.on_fact(&fact.fq_type, move |any, _| {
+                let (ret, bytes) = invoke(cb, id, &any.type_url, &any.value, &[]);
+                match ret {
+                    STATUS_OK => prost_types::Any::decode(bytes.unwrap_or_default().as_slice())
+                        .map_err(|_| {
+                            HandlerError::Other(
+                                "host fact handler returned undecodable Any bytes".to_string(),
+                            )
+                        }),
+                    STATUS_OK_EMPTY => Ok(any.clone()),
+                    _ => Err(host_error(ret, bytes)),
+                }
+            });
+        }
+        dispatch.validate()?;
+
+        self.aggregates.push(RegisteredAggregate {
+            domain: desc.domain,
+            dispatch,
+            state_callback: desc.state_callback_id,
+            cb,
+        });
         Ok(())
     }
 
@@ -244,8 +300,13 @@ impl FfiRouter {
         }
         for event in &desc.events {
             let id = event.callback_id;
-            dispatch = dispatch.on_event(&event.fq_type, move |_, any| {
-                let (ret, bytes) = invoke(cb, id, &any.type_url, &any.value, &[]);
+            dispatch = dispatch.on_event(&event.fq_type, move |_, any, ctx| {
+                let aux = abi_pb::ProjectorEventAux {
+                    cover: ctx.cover.cloned(),
+                    sequence: ctx.sequence,
+                }
+                .encode_to_vec();
+                let (ret, bytes) = invoke(cb, id, &any.type_url, &any.value, &aux);
                 if ret < 0 {
                     return Err(host_error(ret, bytes));
                 }
@@ -298,24 +359,95 @@ impl FfiRouter {
             .and_then(|c| c.cover.as_ref())
             .map(|c| c.domain.as_str())
             .unwrap_or("");
-        let dispatch = match self.aggregates.iter().find(|(d, _)| d == domain) {
-            Some((_, dispatch)) => dispatch,
-            None if self.aggregates.len() == 1 => &self.aggregates[0].1,
-            None => {
-                return Err(CodedError::invalid_argument(
-                    codes::NO_HANDLER_REGISTERED,
-                    "no handler registered for the given (domain, type_url)",
-                    [(
-                        angzarr_router::error::extras::DOMAIN.to_string(),
-                        domain.to_string(),
-                    )],
-                ));
-            }
-        };
-
+        let dispatch = &self.aggregate_for(domain)?.dispatch;
         let _guard = HostCtxGuard::set(host_ctx);
         let resp = dispatch.dispatch(&req)?;
         Ok(resp.encode_to_vec())
+    }
+
+    /// The aggregate claiming `domain`: the one registered for it, else a sole
+    /// registered aggregate, else NO_HANDLER_REGISTERED.
+    fn aggregate_for(&self, domain: &str) -> Result<&RegisteredAggregate, CodedError> {
+        match self.aggregates.iter().find(|a| a.domain == domain) {
+            Some(entry) => Ok(entry),
+            None if self.aggregates.len() == 1 => Ok(&self.aggregates[0]),
+            None => Err(CodedError::invalid_argument(
+                codes::NO_HANDLER_REGISTERED,
+                "no handler registered for the given (domain, type_url)",
+                [(
+                    angzarr_router::error::extras::DOMAIN.to_string(),
+                    domain.to_string(),
+                )],
+            )),
+        }
+    }
+
+    /// Decodes FactRequest bytes, routes to the aggregate claiming the facts'
+    /// cover domain, and runs the core's fact handling with the host session
+    /// installed. Returns the EventBook of facts to record.
+    pub fn dispatch_fact(
+        &self,
+        host_ctx: *mut c_void,
+        request: &[u8],
+    ) -> Result<Vec<u8>, CodedError> {
+        let req = pb::FactRequest::decode(request).map_err(|_| {
+            CodedError::invalid_argument(
+                codes::ANY_DECODE_FAILED,
+                "failed to decode FactRequest",
+                [],
+            )
+        })?;
+        let domain = req
+            .facts
+            .as_ref()
+            .and_then(|f| f.cover.as_ref())
+            .map(|c| c.domain.as_str())
+            .unwrap_or("");
+        let dispatch = &self.aggregate_for(domain)?.dispatch;
+        let _guard = HostCtxGuard::set(host_ctx);
+        Ok(dispatch.handle_fact(&req)?.encode_to_vec())
+    }
+
+    /// Decodes ReplayCall bytes, routes to the aggregate claiming its domain,
+    /// rebuilds the host state through the appliers, and has the host pack it
+    /// (the state callback). Returns ReplayResponse bytes; an aggregate with no
+    /// state callback does not support Replay (NO_HANDLER_REGISTERED).
+    pub fn dispatch_replay(
+        &self,
+        host_ctx: *mut c_void,
+        request: &[u8],
+    ) -> Result<Vec<u8>, CodedError> {
+        let call = abi_pb::ReplayCall::decode(request).map_err(|_| {
+            CodedError::invalid_argument(
+                codes::ANY_DECODE_FAILED,
+                "failed to decode ReplayCall",
+                [],
+            )
+        })?;
+        let aggregate = self.aggregate_for(&call.domain)?;
+        let Some(id) = aggregate.state_callback else {
+            return Err(CodedError::invalid_argument(
+                codes::NO_HANDLER_REGISTERED,
+                "the aggregate does not support Replay",
+                [(
+                    angzarr_router::error::extras::DOMAIN.to_string(),
+                    call.domain.clone(),
+                )],
+            ));
+        };
+        let _guard = HostCtxGuard::set(host_ctx);
+        aggregate
+            .dispatch
+            .replay(&call.request.unwrap_or_default())?;
+        let (ret, bytes) = invoke(aggregate.cb, id, "", &[], &[]);
+        if ret < 0 {
+            return Err(status_to_coded(bytes.as_deref(), ret));
+        }
+        let state =
+            prost_types::Any::decode(bytes.unwrap_or_default().as_slice()).map_err(|_| {
+                CodedError::unhandled("host state packer returned undecodable Any bytes")
+            })?;
+        Ok(pb::ReplayResponse { state: Some(state) }.encode_to_vec())
     }
 
     /// Decodes EventBook bytes, routes to the registered projector (sole
@@ -347,9 +479,9 @@ impl FfiRouter {
     }
 
     /// Parses a SagaDescriptor and populates a core saga table with
-    /// callback-marshaling thunks. Event thunks pass the coordinator-supplied
-    /// destination sequences to the host (which stamps and returns a
-    /// SagaResponse); compensators run in registration order (C-0042).
+    /// callback-marshaling thunks. Event thunks pass the source cover to the
+    /// host, which returns a SagaResponse; the core stamps its commands
+    /// deferred.
     pub fn register_saga(&mut self, descriptor: &[u8], cb: AngzarrCb) -> Result<(), CodedError> {
         let desc = abi_pb::SagaDescriptor::decode(descriptor).map_err(|_| {
             CodedError::invalid_argument(
@@ -367,14 +499,8 @@ impl FfiRouter {
 
         for event in &desc.events {
             let id = event.callback_id;
-            dispatch = dispatch.on_event(&event.fq_type, move |any, dests, source_cover| {
-                let destination_sequences = dests
-                    .domains()
-                    .into_iter()
-                    .filter_map(|d| dests.sequence_for(&d).map(|s| (d, s)))
-                    .collect();
+            dispatch = dispatch.on_event(&event.fq_type, move |any, _dests, source_cover| {
                 let aux = abi_pb::SagaEventAux {
-                    destination_sequences,
                     source_cover: source_cover.cloned(),
                 }
                 .encode_to_vec();
@@ -394,39 +520,6 @@ impl FfiRouter {
                     _ => Err(host_error(ret, bytes)),
                 }
             });
-        }
-
-        for rejection in &desc.rejections {
-            for &id in &rejection.callback_ids {
-                dispatch = dispatch.on_rejected(
-                    &rejection.fq_command_type,
-                    move |notification, rejection| {
-                        let aux = abi_pb::RejectionAux {
-                            notification: notification.encode_to_vec(),
-                            rejection: rejection.encode_to_vec(),
-                            cctx: None, // sagas are stateless — no CommandContext
-                        }
-                        .encode_to_vec();
-                        let (ret, bytes) = invoke(cb, id, NOTIFICATION_TYPE_URL, &[], &aux);
-                        match ret {
-                            STATUS_OK => {
-                                let resp =
-                                    pb::SagaResponse::decode(bytes.unwrap_or_default().as_slice())
-                                        .map_err(|_| {
-                                            HandlerError::Other(
-                                                "host saga compensator returned undecodable \
-                                                 SagaResponse bytes"
-                                                    .to_string(),
-                                            )
-                                        })?;
-                                Ok(resp.events)
-                            }
-                            STATUS_OK_EMPTY => Ok(Vec::new()),
-                            _ => Err(host_error(ret, bytes)),
-                        }
-                    },
-                );
-            }
         }
 
         self.sagas.push((desc.name, dispatch));
@@ -504,8 +597,8 @@ impl FfiRouter {
 
     /// Parses a ProcessManagerDescriptor and populates a core PM table.
     /// Stateful: appliers/snapshot rebuild the PM's own state across the
-    /// callback (host owns the instance); event thunks pass destination
-    /// sequences to the host and return a ProcessManagerHandleResponse;
+    /// callback (host owns the instance); event thunks return a
+    /// ProcessManagerHandleResponse whose commands the core stamps deferred;
     /// compensators run in registration order (C-0042).
     pub fn register_process_manager(
         &mut self,
@@ -541,22 +634,21 @@ impl FfiRouter {
             });
         }
 
-        let mut dispatch =
-            ProcessManagerDispatch::new(desc.name.clone(), desc.pm_domain.clone(), rebuilder);
+        let mut dispatch = ProcessManagerDispatch::new(
+            desc.name.clone(),
+            desc.pm_domain.clone(),
+            desc.target_domains.clone(),
+            rebuilder,
+        );
 
         for event in &desc.events {
             let id = event.callback_id;
             dispatch = dispatch.on_event(
                 &event.input_domain,
                 &event.fq_type,
-                move |any, _state, dests| {
-                    let destination_sequences = dests
-                        .domains()
-                        .into_iter()
-                        .filter_map(|d| dests.sequence_for(&d).map(|s| (d, s)))
-                        .collect();
+                move |any, _state, _dests, trigger_cover| {
                     let aux = abi_pb::PmEventAux {
-                        destination_sequences,
+                        trigger_cover: trigger_cover.cloned(),
                     }
                     .encode_to_vec();
                     let (ret, bytes) = invoke(cb, id, &any.type_url, &any.value, &aux);
@@ -581,7 +673,7 @@ impl FfiRouter {
         for rejection in &desc.rejections {
             for &id in &rejection.callback_ids {
                 dispatch = dispatch.on_rejected(
-                    &rejection.fq_command_type,
+                    &rejection.compensates,
                     move |notification, rejection, _state| {
                         let aux = abi_pb::RejectionAux {
                             notification: notification.encode_to_vec(),
@@ -602,9 +694,9 @@ impl FfiRouter {
                                             .to_string(),
                                     )
                                 })?;
-                                Ok((resp.process_events, resp.notification))
+                                Ok(resp)
                             }
-                            STATUS_OK_EMPTY => Ok((Vec::new(), None)),
+                            STATUS_OK_EMPTY => Ok(pb::ProcessManagerHandleResponse::default()),
                             _ => Err(host_error(ret, bytes)),
                         }
                     },
@@ -612,6 +704,7 @@ impl FfiRouter {
             }
         }
 
+        dispatch.validate()?;
         self.process_managers.push((desc.name, dispatch));
         Ok(())
     }

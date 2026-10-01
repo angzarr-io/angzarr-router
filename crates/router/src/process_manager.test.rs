@@ -31,12 +31,10 @@ const FQ_RESERVE: &str = "test.ReserveStock";
 fn request(
     trigger: Option<pb::EventBook>,
     process_state: Option<pb::EventBook>,
-    dest: &[(&str, u32)],
 ) -> pb::ProcessManagerHandleRequest {
     pb::ProcessManagerHandleRequest {
         trigger,
         process_state,
-        destination_sequences: dest.iter().map(|(d, s)| (d.to_string(), *s)).collect(),
     }
 }
 
@@ -104,9 +102,10 @@ fn pm_emitting_one() -> ProcessManagerDispatch<TestState> {
     ProcessManagerDispatch::new(
         "fulfillment-pm",
         "fulfillment",
+        ["inventory"],
         cover_applier(fresh_rebuilder()),
     )
-    .on_event(IN_DOMAIN, FQ_SHIPPED, |_e, _s, _d| {
+    .on_event(IN_DOMAIN, FQ_SHIPPED, |_e, _s, _d, _cover| {
         Ok(pb::ProcessManagerHandleResponse {
             commands: vec![command_to("inventory")],
             ..Default::default()
@@ -114,10 +113,15 @@ fn pm_emitting_one() -> ProcessManagerDispatch<TestState> {
     })
 }
 
-fn cmd_page_seq(page: &pb::CommandPage) -> Option<u32> {
-    match page.header.as_ref().and_then(|h| h.sequence_type.as_ref()) {
-        Some(pb::page_header::SequenceType::Sequence(s)) => Some(*s),
-        _ => None,
+/// A compensator response of process events plus an optional escalation.
+fn pm_resp(
+    process_events: Vec<pb::EventBook>,
+    notification: Option<pb::Notification>,
+) -> pb::ProcessManagerHandleResponse {
+    pb::ProcessManagerHandleResponse {
+        process_events,
+        notification,
+        ..Default::default()
     }
 }
 
@@ -142,7 +146,6 @@ fn newest_declared_event_runs_handler() {
         .dispatch(&request(
             Some(trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED)])),
             None,
-            &[],
         ))
         .expect("dispatch");
     assert_eq!(resp.commands.len(), 1);
@@ -158,7 +161,6 @@ fn only_the_newest_page_fires() {
         .dispatch(&request(
             Some(trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED), ev(FQ_OTHER)])),
             None,
-            &[],
         ))
         .expect("dispatch");
     assert!(resp.commands.is_empty(), "history must not re-trigger");
@@ -172,7 +174,6 @@ fn newest_page_fires_even_after_undeclared_history() {
         .dispatch(&request(
             Some(trigger(IN_DOMAIN, vec![ev(FQ_OTHER), ev(FQ_SHIPPED)])),
             None,
-            &[],
         ))
         .expect("dispatch");
     assert_eq!(resp.commands.len(), 1, "newest page triggers");
@@ -185,7 +186,6 @@ fn trigger_outside_sources_is_empty() {
         .dispatch(&request(
             Some(trigger("unrelated", vec![ev(FQ_SHIPPED)])),
             None,
-            &[],
         ))
         .expect("dispatch");
     assert!(
@@ -198,11 +198,7 @@ fn trigger_outside_sources_is_empty() {
 fn undeclared_event_type_is_empty() {
     let d = pm_emitting_one();
     let resp = d
-        .dispatch(&request(
-            Some(trigger(IN_DOMAIN, vec![ev(FQ_OTHER)])),
-            None,
-            &[],
-        ))
+        .dispatch(&request(Some(trigger(IN_DOMAIN, vec![ev(FQ_OTHER)])), None))
         .expect("dispatch");
     assert!(resp.commands.is_empty(), "undeclared type → empty");
 }
@@ -216,49 +212,89 @@ fn handler_sees_rebuilt_state() {
     let d = ProcessManagerDispatch::new(
         "fulfillment-pm",
         "fulfillment",
+        ["inventory"],
         cover_applier(fresh_rebuilder()),
     )
-    .on_event(IN_DOMAIN, FQ_SHIPPED, |_e, state: &mut TestState, _d| {
-        let n = state.applied.len();
-        Ok(pb::ProcessManagerHandleResponse {
-            commands: (0..n).map(|_| command_to("inventory")).collect(),
-            ..Default::default()
-        })
-    });
+    .on_event(
+        IN_DOMAIN,
+        FQ_SHIPPED,
+        |_e, state: &mut TestState, _d, _cover| {
+            let n = state.applied.len();
+            Ok(pb::ProcessManagerHandleResponse {
+                commands: (0..n).map(|_| command_to("inventory")).collect(),
+                ..Default::default()
+            })
+        },
+    );
     let state_book = book_of_covers(&["a", "b", "c"]);
     let resp = d
         .dispatch(&request(
             Some(trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED)])),
             Some(state_book),
-            &[],
         ))
         .expect("dispatch");
     assert_eq!(resp.commands.len(), 3, "three prior state events rebuilt");
 }
 
 #[test]
-fn handler_stamps_from_destinations() {
+fn emitted_commands_are_deferred_from_the_trigger() {
     let d = ProcessManagerDispatch::new(
         "fulfillment-pm",
         "fulfillment",
+        ["inventory", "billing"],
         cover_applier(fresh_rebuilder()),
     )
-    .on_event(IN_DOMAIN, FQ_SHIPPED, |_e, _s, dests| {
-        let mut cmd = command_to("inventory");
-        dests.stamp_command(&mut cmd, "inventory")?;
+    .on_event(IN_DOMAIN, FQ_SHIPPED, |_e, _s, dests, _cover| {
+        assert_eq!(
+            dests.domains(),
+            ["inventory".to_string(), "billing".to_string()]
+        );
+        let mut explicit = command_to("inventory");
+        explicit.pages[0].header = Some(pb::PageHeader {
+            sequence_type: Some(pb::page_header::SequenceType::Sequence(9)),
+            ..Default::default()
+        });
         Ok(pb::ProcessManagerHandleResponse {
-            commands: vec![cmd],
+            commands: vec![explicit, command_to("billing")],
             ..Default::default()
         })
     });
+    let mut newest = ev(FQ_SHIPPED);
+    newest.header = Some(pb::PageHeader {
+        sequence_type: Some(pb::page_header::SequenceType::Sequence(2)),
+        ..Default::default()
+    });
+    let mut trig = trigger(IN_DOMAIN, vec![ev(FQ_OTHER), newest]);
+    trig.cover.as_mut().unwrap().root = Some(pb::Uuid { value: vec![5] });
     let resp = d
-        .dispatch(&request(
-            Some(trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED)])),
-            None,
-            &[("inventory", 9)],
-        ))
+        .dispatch(&request(Some(trig.clone()), None))
         .expect("dispatch");
-    assert_eq!(cmd_page_seq(&resp.commands[0].pages[0]), Some(9));
+    for (index, cmd) in resp.commands.iter().enumerate() {
+        let Some(pb::page_header::SequenceType::AngzarrDeferred(dfr)) = cmd.pages[0]
+            .header
+            .as_ref()
+            .and_then(|h| h.sequence_type.clone())
+        else {
+            panic!("command {index} is not deferred (C-0181)");
+        };
+        assert_eq!(dfr.source, trig.cover, "the trigger is the source");
+        assert_eq!(dfr.source_seq, 2, "the newest trigger page's sequence");
+        assert_eq!(dfr.command_index, index as u32);
+    }
+}
+
+#[test]
+fn accessors_report_the_declared_targets() {
+    let d: ProcessManagerDispatch<TestState> = ProcessManagerDispatch::new(
+        "pm",
+        "pm-domain",
+        ["inventory", "billing"],
+        fresh_rebuilder(),
+    );
+    assert_eq!(
+        d.target_domains(),
+        ["inventory".to_string(), "billing".to_string()]
+    );
 }
 
 #[test]
@@ -266,9 +302,10 @@ fn handler_can_emit_process_events_and_facts() {
     let d = ProcessManagerDispatch::new(
         "fulfillment-pm",
         "fulfillment",
+        ["inventory"],
         cover_applier(fresh_rebuilder()),
     )
-    .on_event(IN_DOMAIN, FQ_SHIPPED, |_e, _s, _d| {
+    .on_event(IN_DOMAIN, FQ_SHIPPED, |_e, _s, _d, _cover| {
         Ok(pb::ProcessManagerHandleResponse {
             process_events: vec![tagged_book("pe")],
             facts: vec![tagged_book("fact")],
@@ -279,7 +316,6 @@ fn handler_can_emit_process_events_and_facts() {
         .dispatch(&request(
             Some(trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED)])),
             None,
-            &[],
         ))
         .expect("dispatch");
     assert_eq!(book_domains(&resp.process_events), vec!["pe".to_string()]);
@@ -293,19 +329,19 @@ fn notification_routes_to_ordered_compensators() {
     let d = ProcessManagerDispatch::new(
         "fulfillment-pm",
         "fulfillment",
+        ["inventory"],
         cover_applier(fresh_rebuilder()),
     )
     .on_rejected(FQ_RESERVE, |_n, _r, _s| {
-        Ok((vec![tagged_book("comp-1")], None))
+        Ok(pm_resp(vec![tagged_book("comp-1")], None))
     })
     .on_rejected(FQ_RESERVE, |_n, _r, _s| {
-        Ok((vec![tagged_book("comp-2")], None))
+        Ok(pm_resp(vec![tagged_book("comp-2")], None))
     });
     let resp = d
         .dispatch(&request(
             Some(trigger(IN_DOMAIN, vec![notification_page_for(FQ_RESERVE)])),
             None,
-            &[],
         ))
         .expect("dispatch");
     assert_eq!(
@@ -319,19 +355,19 @@ fn first_escalation_wins() {
     let d = ProcessManagerDispatch::new(
         "fulfillment-pm",
         "fulfillment",
+        ["inventory"],
         cover_applier(fresh_rebuilder()),
     )
     .on_rejected(FQ_RESERVE, |_n, _r, _s| {
-        Ok((vec![], Some(escalation("esc-1"))))
+        Ok(pm_resp(vec![], Some(escalation("esc-1"))))
     })
     .on_rejected(FQ_RESERVE, |_n, _r, _s| {
-        Ok((vec![], Some(escalation("esc-2"))))
+        Ok(pm_resp(vec![], Some(escalation("esc-2"))))
     });
     let resp = d
         .dispatch(&request(
             Some(trigger(IN_DOMAIN, vec![notification_page_for(FQ_RESERVE)])),
             None,
-            &[],
         ))
         .expect("dispatch");
     assert_eq!(
@@ -348,7 +384,6 @@ fn undeclared_rejection_yields_empty_response() {
         .dispatch(&request(
             Some(trigger(IN_DOMAIN, vec![notification_page_for(FQ_RESERVE)])),
             None,
-            &[],
         ))
         .expect("dispatch");
     assert!(resp.process_events.is_empty());
@@ -361,7 +396,7 @@ fn undeclared_rejection_yields_empty_response() {
 fn nil_trigger_is_missing_pm_trigger() {
     let d = pm_emitting_one();
     let err = d
-        .dispatch(&request(None, None, &[]))
+        .dispatch(&request(None, None))
         .expect_err("nil trigger must fail");
     assert_eq!(err.code, codes::MISSING_PM_TRIGGER);
 }
@@ -370,7 +405,7 @@ fn nil_trigger_is_missing_pm_trigger() {
 fn empty_trigger_is_empty_pm_trigger() {
     let d = pm_emitting_one();
     let err = d
-        .dispatch(&request(Some(trigger(IN_DOMAIN, vec![])), None, &[]))
+        .dispatch(&request(Some(trigger(IN_DOMAIN, vec![])), None))
         .expect_err("empty trigger must fail");
     assert_eq!(err.code, codes::EMPTY_PM_TRIGGER);
 }
@@ -382,7 +417,6 @@ fn trigger_last_page_without_payload_is_coded() {
         .dispatch(&request(
             Some(trigger(IN_DOMAIN, vec![pb::EventPage::default()])),
             None,
-            &[],
         ))
         .expect_err("payload-less trigger must fail");
     assert_eq!(err.code, codes::MISSING_PM_EVENT_PAYLOAD);
@@ -397,11 +431,12 @@ fn corrupt_notification_payload_is_coded() {
     let d = ProcessManagerDispatch::new(
         "fulfillment-pm",
         "fulfillment",
+        ["inventory"],
         cover_applier(fresh_rebuilder()),
     )
-    .on_rejected(FQ_RESERVE, |_n, _r, _s| Ok((vec![], None)));
+    .on_rejected(FQ_RESERVE, |_n, _r, _s| Ok(pm_resp(vec![], None)));
     let err = d
-        .dispatch(&request(Some(trigger(IN_DOMAIN, vec![bad])), None, &[]))
+        .dispatch(&request(Some(trigger(IN_DOMAIN, vec![bad])), None))
         .expect_err("corrupt notification must fail");
     assert_eq!(err.code, codes::NOTIFICATION_DECODE_FAILED);
 }
@@ -418,7 +453,6 @@ fn corrupt_process_state_is_data_loss() {
         .dispatch(&request(
             Some(trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED)])),
             Some(state),
-            &[],
         ))
         .expect_err("corrupt state must fail");
     assert_eq!(err.code, codes::PERSISTED_EVENT_CORRUPT);
@@ -429,16 +463,16 @@ fn handler_error_propagates_as_unhandled() {
     let d = ProcessManagerDispatch::new(
         "fulfillment-pm",
         "fulfillment",
+        ["inventory"],
         cover_applier(fresh_rebuilder()),
     )
-    .on_event(IN_DOMAIN, FQ_SHIPPED, |_e, _s, _d| {
+    .on_event(IN_DOMAIN, FQ_SHIPPED, |_e, _s, _d, _cover| {
         Err(HandlerError::Other("boom".to_string()))
     });
     let err = d
         .dispatch(&request(
             Some(trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED)])),
             None,
-            &[],
         ))
         .expect_err("handler error must fail dispatch");
     assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
@@ -449,11 +483,11 @@ fn handler_error_propagates_as_unhandled() {
 #[test]
 fn accessors_report_name_domain_and_sources() {
     let rebuilder: Rebuilder<TestState> = fresh_rebuilder();
-    let d = ProcessManagerDispatch::new("fulfillment-pm", "fulfillment", rebuilder)
-        .on_event(IN_DOMAIN, FQ_SHIPPED, |_e, _s, _d| {
+    let d = ProcessManagerDispatch::new("fulfillment-pm", "fulfillment", ["inventory"], rebuilder)
+        .on_event(IN_DOMAIN, FQ_SHIPPED, |_e, _s, _d, _cover| {
             Ok(pb::ProcessManagerHandleResponse::default())
         })
-        .on_event("billing", "test.Invoiced", |_e, _s, _d| {
+        .on_event("billing", "test.Invoiced", |_e, _s, _d, _cover| {
             Ok(pb::ProcessManagerHandleResponse::default())
         });
     assert_eq!(d.name(), "fulfillment-pm");
@@ -473,10 +507,10 @@ use crate::process_manager::{merge_response, select_process_managers, ProcessMan
 
 /// A PM named `name` owning `pm_domain`, consuming FQ_SHIPPED from `source`.
 fn routed_pm(name: &str, pm_domain: &str, source: &str) -> ProcessManagerDispatch<TestState> {
-    ProcessManagerDispatch::new(name, pm_domain, fresh_rebuilder()).on_event(
+    ProcessManagerDispatch::new(name, pm_domain, ["inventory"], fresh_rebuilder()).on_event(
         source,
         FQ_SHIPPED,
-        |_e, _s, _d| Ok(pb::ProcessManagerHandleResponse::default()),
+        |_e, _s, _d, _cover| Ok(pb::ProcessManagerHandleResponse::default()),
     )
 }
 
@@ -549,7 +583,7 @@ fn event_trigger_without_state_identity_selects_every_subscriber_in_order() {
     let a = routed_pm("a", "a-pm", IN_DOMAIN);
     let other = routed_pm("x", "x-pm", "billing");
     let b = routed_pm("b", "b-pm", IN_DOMAIN);
-    let req = request(Some(trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED)])), None, &[]);
+    let req = request(Some(trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED)])), None);
     assert_eq!(select(&[&a, &other, &b], &req), vec![0, 2]);
 }
 
@@ -560,7 +594,6 @@ fn event_trigger_with_uncovered_state_selects_subscribers() {
     let req = request(
         Some(trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED)])),
         Some(pb::EventBook::default()),
-        &[],
     );
     assert_eq!(select(&[&a, &b], &req), vec![0, 1]);
 }
@@ -572,7 +605,6 @@ fn process_state_cover_addresses_its_own_process_manager_only() {
     let req = request(
         Some(trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED)])),
         Some(state_in("b-pm")),
-        &[],
     );
     assert_eq!(select(&[&a, &b], &req), vec![1]);
 }
@@ -584,7 +616,6 @@ fn process_state_cover_matching_no_process_manager_falls_back_to_subscribers() {
     let req = request(
         Some(trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED)])),
         Some(state_in("unknown-pm")),
-        &[],
     );
     assert_eq!(select(&[&a, &b], &req), vec![0]);
 }
@@ -597,7 +628,6 @@ fn rejection_routes_to_the_issuing_component_by_name() {
     let req = request(
         Some(trigger("a-pm", vec![issued_notification_page("b", "")])),
         None,
-        &[],
     );
     assert_eq!(select(&[&a, &b], &req), vec![1]);
 }
@@ -612,7 +642,6 @@ fn rejection_routes_to_the_issuing_domain_when_the_component_is_unknown() {
             vec![issued_notification_page("gone", "b-pm")],
         )),
         None,
-        &[],
     );
     assert_eq!(select(&[&a, &b], &req), vec![1]);
 }
@@ -624,7 +653,6 @@ fn rejection_without_provenance_routes_by_the_trigger_cover_domain() {
     let req = request(
         Some(trigger("a-pm", vec![notification_page_for(FQ_RESERVE)])),
         None,
-        &[],
     );
     assert_eq!(select(&[&a, &b], &req), vec![0]);
 }
@@ -636,7 +664,6 @@ fn unaddressed_rejection_never_fans_out_across_subscribers() {
     let req = request(
         Some(trigger(IN_DOMAIN, vec![notification_page_for(FQ_RESERVE)])),
         None,
-        &[],
     );
     assert!(select(&[&a, &b], &req).is_empty());
 }
@@ -647,7 +674,6 @@ fn unaddressed_rejection_reaches_a_sole_process_manager() {
     let req = request(
         Some(trigger(IN_DOMAIN, vec![notification_page_for(FQ_RESERVE)])),
         None,
-        &[],
     );
     assert_eq!(select(&[&a], &req), vec![0]);
 }
@@ -660,11 +686,11 @@ fn undecodable_rejection_reaches_only_a_sole_process_manager() {
         type_url: type_url("io.angzarr.v1.Notification"),
         value: vec![0xff, 0xff, 0xff],
     });
-    let req = request(Some(trigger("a-pm", vec![garbage.clone()])), None, &[]);
+    let req = request(Some(trigger("a-pm", vec![garbage.clone()])), None);
     // The trigger cover still addresses a; the PM's own dispatch reports the
     // decode failure.
     assert_eq!(select(&[&a, &b], &req), vec![0]);
-    let req = request(Some(trigger(IN_DOMAIN, vec![garbage])), None, &[]);
+    let req = request(Some(trigger(IN_DOMAIN, vec![garbage])), None);
     assert!(select(&[&a, &b], &req).is_empty());
     assert_eq!(select(&[&a], &req), vec![0]);
 }
@@ -672,8 +698,8 @@ fn undecodable_rejection_reaches_only_a_sole_process_manager() {
 #[test]
 fn missing_or_empty_trigger_selects_nothing_to_route() {
     let a = routed_pm("a", "a-pm", IN_DOMAIN);
-    assert!(select(&[&a], &request(None, None, &[])).is_empty());
-    assert!(select(&[&a], &request(Some(trigger(IN_DOMAIN, vec![])), None, &[])).is_empty());
+    assert!(select(&[&a], &request(None, None)).is_empty());
+    assert!(select(&[&a], &request(Some(trigger(IN_DOMAIN, vec![])), None)).is_empty());
 }
 
 #[test]
@@ -723,4 +749,180 @@ fn merge_concatenates_in_order_and_the_first_escalation_wins() {
         .collect();
     assert_eq!(cmd_domains, vec!["c1", "c2"]);
     assert_eq!(acc.notification, Some(escalation("first")));
+}
+
+// --- compensation keys + Compensate payloads -------------------------------
+
+/// A rejection Notification page for `fq` sent to `target_domain`.
+fn rejection_sent_to(target_domain: &str, fq: &str) -> pb::EventPage {
+    let mut page = notification_page_for(fq);
+    let Some(pb::event_page::Payload::Event(any)) = page.payload.as_mut() else {
+        unreachable!()
+    };
+    let mut notification: pb::Notification = prost::Message::decode(any.value.as_slice()).unwrap();
+    let payload = notification.payload.as_mut().unwrap();
+    let mut rejection: pb::RejectionNotification =
+        prost::Message::decode(payload.value.as_slice()).unwrap();
+    rejection
+        .rejected_command
+        .as_mut()
+        .unwrap()
+        .cover
+        .as_mut()
+        .unwrap()
+        .domain = target_domain.to_string();
+    payload.value = prost::Message::encode_to_vec(&rejection);
+    any.value = prost::Message::encode_to_vec(&notification);
+    page
+}
+
+fn compensate_page(command_type: &str) -> pb::EventPage {
+    let notification = pb::Notification {
+        payload: Some(Any {
+            type_url: type_url("io.angzarr.v1.Compensate"),
+            value: prost::Message::encode_to_vec(&pb::Compensate {
+                command_type: command_type.to_string(),
+                ..Default::default()
+            }),
+        }),
+        ..Default::default()
+    };
+    event_page(Any {
+        type_url: type_url("io.angzarr.v1.Notification"),
+        value: prost::Message::encode_to_vec(&notification),
+    })
+}
+
+fn labelled_compensator(
+    pm: ProcessManagerDispatch<TestState>,
+    key: &str,
+    label: &'static str,
+) -> ProcessManagerDispatch<TestState> {
+    pm.on_rejected(key, move |_n, _r, _s| {
+        Ok(pm_resp(vec![tagged_book(label)], None))
+    })
+}
+
+#[test]
+fn domain_qualified_compensator_matches_only_its_domain() {
+    let pm = ProcessManagerDispatch::new("pm", "pm", ["inventory", "warehouse"], fresh_rebuilder());
+    let pm = labelled_compensator(pm, &format!("inventory:{FQ_RESERVE}"), "from-inventory");
+    let pm = labelled_compensator(pm, &format!("warehouse:{FQ_RESERVE}"), "from-warehouse");
+    let resp = pm
+        .dispatch(&request(
+            Some(trigger(
+                "pm",
+                vec![rejection_sent_to("warehouse", FQ_RESERVE)],
+            )),
+            None,
+        ))
+        .expect("dispatch");
+    assert_eq!(book_domains(&resp.process_events), vec!["from-warehouse"]);
+    let resp = pm
+        .dispatch(&request(
+            Some(trigger(
+                "pm",
+                vec![rejection_sent_to("billing", FQ_RESERVE)],
+            )),
+            None,
+        ))
+        .expect("dispatch");
+    assert!(resp.process_events.is_empty(), "no entry for billing");
+}
+
+#[test]
+fn unqualified_compensator_matches_any_domain() {
+    let pm = ProcessManagerDispatch::new("pm", "pm", ["inventory"], fresh_rebuilder());
+    let pm = labelled_compensator(pm, FQ_RESERVE, "any");
+    let resp = pm
+        .dispatch(&request(
+            Some(trigger(
+                "pm",
+                vec![rejection_sent_to("warehouse", FQ_RESERVE)],
+            )),
+            None,
+        ))
+        .expect("dispatch");
+    assert_eq!(book_domains(&resp.process_events), vec!["any"]);
+}
+
+#[test]
+fn validate_refuses_a_type_listed_both_ways() {
+    let pm = ProcessManagerDispatch::new("pm", "pm", ["inventory"], fresh_rebuilder());
+    let pm = labelled_compensator(pm, FQ_RESERVE, "a");
+    assert!(pm.validate().is_ok());
+    let pm = labelled_compensator(pm, &format!("inventory:{FQ_RESERVE}"), "b");
+    assert_eq!(
+        pm.validate().unwrap_err().code,
+        codes::AMBIGUOUS_COMPENSATION
+    );
+}
+
+#[test]
+fn a_compensate_is_never_dropped_by_a_process_manager() {
+    let pm = ProcessManagerDispatch::new("pm", "pm", ["inventory"], fresh_rebuilder());
+    let pm = labelled_compensator(pm, FQ_RESERVE, "a");
+    let err = pm
+        .dispatch(&request(
+            Some(trigger("pm", vec![compensate_page(FQ_RESERVE)])),
+            None,
+        ))
+        .expect_err("undo is aggregate-only");
+    assert_eq!(err.code, codes::NO_UNDO_HANDLER);
+    assert_eq!(err.grpc, crate::error::GrpcCode::Unimplemented);
+}
+
+// A PM compensator may emit commands too (e.g. releasing a hold); they are
+// deferred from the notification page like any PM command.
+#[test]
+fn compensator_commands_are_kept_and_deferred() {
+    let pm = ProcessManagerDispatch::new("pm", "pm", ["inventory"], fresh_rebuilder()).on_rejected(
+        FQ_RESERVE,
+        |_n, _r, _s| {
+            Ok(pb::ProcessManagerHandleResponse {
+                commands: vec![command_to("inventory")],
+                process_events: vec![tagged_book("released")],
+                ..Default::default()
+            })
+        },
+    );
+    let mut page = notification_page_for(FQ_RESERVE);
+    page.header = Some(pb::PageHeader {
+        sequence_type: Some(pb::page_header::SequenceType::Sequence(6)),
+        ..Default::default()
+    });
+    let resp = pm
+        .dispatch(&request(Some(trigger("pm", vec![page])), None))
+        .expect("dispatch");
+    assert_eq!(book_domains(&resp.process_events), vec!["released"]);
+    assert_eq!(resp.commands.len(), 1);
+    let Some(pb::page_header::SequenceType::AngzarrDeferred(d)) = resp.commands[0].pages[0]
+        .header
+        .as_ref()
+        .and_then(|h| h.sequence_type.clone())
+    else {
+        panic!("compensator command is not deferred");
+    };
+    assert_eq!(d.source_seq, 6);
+    assert_eq!(d.source.map(|c| c.domain), Some("pm".to_string()));
+}
+
+// The handler reads the trigger's cover (e.g. to address the trigger's root).
+#[test]
+fn handler_sees_the_trigger_cover() {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let captured = seen.clone();
+    let pm = ProcessManagerDispatch::new("pm", "pm", ["inventory"], fresh_rebuilder()).on_event(
+        IN_DOMAIN,
+        FQ_SHIPPED,
+        move |_e, _s, _d, cover| {
+            *captured.lock().unwrap() = cover.cloned();
+            Ok(pb::ProcessManagerHandleResponse::default())
+        },
+    );
+    let mut trig = trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED)]);
+    trig.cover.as_mut().unwrap().root = Some(pb::Uuid { value: vec![3] });
+    pm.dispatch(&request(Some(trig.clone()), None))
+        .expect("dispatch");
+    assert_eq!(*seen.lock().unwrap(), trig.cover);
 }

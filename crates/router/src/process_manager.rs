@@ -8,9 +8,15 @@
 //! the NEWEST page fires, so history never re-triggers. Handlers are keyed by
 //! (input domain, fully-qualified event type). A trigger from a domain outside
 //! the PM's sources, or an undeclared event type, yields an empty response
-//! (spec C-0022), not an error. A Notification trigger routes to the FQ-keyed
-//! compensators (ordered, C-0042); their process events merge and the FIRST
-//! escalation Notification wins (response field 4).
+//! (spec C-0022), not an error. Emitted commands are deferred: the router
+//! stamps their `angzarr_deferred` provenance from the trigger (source cover,
+//! source_seq, command_index), never an explicit sequence (C-0181). A
+//! Notification trigger carrying a RejectionNotification routes to the
+//! compensators keyed by the rejected command's type, optionally qualified by
+//! the domain it was sent to (ordered, C-0042); their process events merge and
+//! the FIRST escalation Notification wins (response field 4). A Compensate
+//! payload has no handler on a process manager (undo is aggregate-only) and is
+//! answered NO_UNDO_HANDLER (UNIMPLEMENTED), never dropped.
 
 use std::collections::HashMap;
 
@@ -21,26 +27,32 @@ use crate::destinations::Destinations;
 use crate::error::{codes, extras, map_handler_error, messages, CodedError, HandlerError};
 use crate::pb;
 use crate::rebuild::Rebuilder;
+use crate::NotificationPayload;
 
 /// Handles the newest trigger event against rebuilt PM state, returning the
 /// full response (process events, commands, facts, optional escalation).
 /// Generated thunks unmarshal to the typed event and call the typed business
 /// method.
 pub type EventFn<S> = Box<
-    dyn Fn(&Any, &mut S, &Destinations) -> Result<pb::ProcessManagerHandleResponse, HandlerError>
+    dyn Fn(
+            &Any,
+            &mut S,
+            &Destinations,
+            Option<&pb::Cover>,
+        ) -> Result<pb::ProcessManagerHandleResponse, HandlerError>
         + Send
         + Sync,
 >;
 
 /// Compensates a rejected PM-issued command against rebuilt state, returning
-/// process events and an optional escalation Notification (rides field 4 of
-/// the response).
+/// a full response: process events, commands (deferred like any PM command),
+/// facts, and an optional escalation Notification (field 4).
 pub type RejectionFn<S> = Box<
     dyn Fn(
             &pb::Notification,
             &pb::RejectionNotification,
             &mut S,
-        ) -> Result<(Vec<pb::EventBook>, Option<pb::Notification>), HandlerError>
+        ) -> Result<pb::ProcessManagerHandleResponse, HandlerError>
         + Send
         + Sync,
 >;
@@ -49,6 +61,7 @@ pub type RejectionFn<S> = Box<
 pub struct ProcessManagerDispatch<S> {
     name: String,
     pm_domain: String,
+    targets: Vec<String>,
     rebuilder: Rebuilder<S>,
     /// input domain → fully-qualified event type → thunk.
     handlers: HashMap<String, HashMap<String, EventFn<S>>>,
@@ -56,16 +69,19 @@ pub struct ProcessManagerDispatch<S> {
 }
 
 impl<S> ProcessManagerDispatch<S> {
-    /// An empty PM table over a Rebuilder for the PM's own event-sourced
+    /// An empty PM table owning `pm_domain`, issuing commands to
+    /// `target_domains`, over a Rebuilder for the PM's own event-sourced
     /// state.
     pub fn new(
         name: impl Into<String>,
         pm_domain: impl Into<String>,
+        target_domains: impl IntoIterator<Item = impl Into<String>>,
         rebuilder: Rebuilder<S>,
     ) -> Self {
         ProcessManagerDispatch {
             name: name.into(),
             pm_domain: pm_domain.into(),
+            targets: target_domains.into_iter().map(Into::into).collect(),
             rebuilder,
             handlers: HashMap::new(),
             rejections: HashMap::new(),
@@ -81,6 +97,7 @@ impl<S> ProcessManagerDispatch<S> {
                 &Any,
                 &mut S,
                 &Destinations,
+                Option<&pb::Cover>,
             ) -> Result<pb::ProcessManagerHandleResponse, HandlerError>
             + Send
             + Sync
@@ -93,26 +110,34 @@ impl<S> ProcessManagerDispatch<S> {
         self
     }
 
-    /// Registers a compensation thunk keyed by the fully-qualified rejected
-    /// command type. Repeated registration for one command appends, preserving
-    /// order (C-0042).
+    /// Registers a compensation thunk under a `compensates` entry: the
+    /// rejected command's fully-qualified type (`"fq.Type"`, any target
+    /// domain) or `"domain:fq.Type"` (only rejections of commands sent to that
+    /// domain). Repeated registration for one entry appends, preserving order
+    /// (C-0042).
     pub fn on_rejected(
         mut self,
-        fq_command_type: &str,
+        compensates: &str,
         thunk: impl Fn(
                 &pb::Notification,
                 &pb::RejectionNotification,
                 &mut S,
-            ) -> Result<(Vec<pb::EventBook>, Option<pb::Notification>), HandlerError>
+            ) -> Result<pb::ProcessManagerHandleResponse, HandlerError>
             + Send
             + Sync
             + 'static,
     ) -> Self {
         self.rejections
-            .entry(fq_command_type.to_string())
+            .entry(compensates.to_string())
             .or_default()
             .push(Box::new(thunk));
         self
+    }
+
+    /// Refuses a table whose `compensates` entries list one command type both
+    /// unqualified and domain-qualified (AMBIGUOUS_COMPENSATION).
+    pub fn validate(&self) -> Result<(), CodedError> {
+        crate::validate_compensation_keys(self.rejections.keys().map(String::as_str))
     }
 
     /// The component name.
@@ -123,6 +148,11 @@ impl<S> ProcessManagerDispatch<S> {
     /// The PM's own domain.
     pub fn pm_domain(&self) -> &str {
         &self.pm_domain
+    }
+
+    /// The domains this PM issues commands to.
+    pub fn target_domains(&self) -> &[String] {
+        &self.targets
     }
 
     /// The input domains this PM listens to.
@@ -170,7 +200,13 @@ impl<S> ProcessManagerDispatch<S> {
 
         // Exact type-URL match only — suffix matching misroutes user types.
         if crate::is_notification_type_url(&event_any.type_url) {
-            return self.dispatch_rejection(event_any, req.process_state.as_ref());
+            let mut resp = self.dispatch_rejection(event_any, req.process_state.as_ref())?;
+            crate::stamp_deferred(
+                &mut resp.commands,
+                trigger.cover.as_ref(),
+                crate::page_sequence(last),
+            );
+            return Ok(resp);
         }
 
         let trigger_domain = trigger
@@ -186,54 +222,52 @@ impl<S> ProcessManagerDispatch<S> {
         };
 
         let (mut state, _info) = self.rebuilder.rebuild(req.process_state.as_ref())?;
-        let dests = Destinations::new(req.destination_sequences.clone());
-        thunk(event_any, &mut state, &dests).map_err(map_handler_error)
+        let dests = Destinations::new(self.targets.iter().cloned());
+        let mut resp = thunk(event_any, &mut state, &dests, trigger.cover.as_ref())
+            .map_err(map_handler_error)?;
+        crate::stamp_deferred(
+            &mut resp.commands,
+            trigger.cover.as_ref(),
+            crate::page_sequence(last),
+        );
+        Ok(resp)
     }
 
-    /// Routes a Notification trigger to the FQ-keyed compensators (ordered,
-    /// C-0042); process events merge and the first escalation wins. An
-    /// undeclared rejection is the framework's to handle (DelegateToFramework)
-    /// and yields an empty response.
+    /// Routes a Notification trigger: a RejectionNotification goes to the
+    /// compensators matching the rejected command (ordered, C-0042; their
+    /// responses merge and the first escalation wins; their commands are
+    /// stamped deferred from the notification page), and an undeclared
+    /// rejection is the framework's to handle (DelegateToFramework) with an
+    /// empty response; a Compensate is NO_UNDO_HANDLER.
     fn dispatch_rejection(
         &self,
         event_any: &Any,
         process_state: Option<&pb::EventBook>,
     ) -> Result<pb::ProcessManagerHandleResponse, CodedError> {
-        let notification = pb::Notification::decode(event_any.value.as_slice()).map_err(|_| {
-            CodedError::invalid_argument(
-                codes::NOTIFICATION_DECODE_FAILED,
-                messages::NOTIFICATION_DECODE_FAILED,
-                [(extras::TYPE_URL.to_string(), event_any.type_url.clone())],
-            )
-        })?;
-
-        let rejection = match notification.payload.as_ref() {
-            Some(payload) => {
-                pb::RejectionNotification::decode(payload.value.as_slice()).map_err(|_| {
-                    CodedError::invalid_argument(
-                        codes::REJECTION_NOTIFICATION_DECODE_FAILED,
-                        messages::REJECTION_NOTIFICATION_DECODE_FAILED,
-                        [],
-                    )
-                })?
+        let (notification, payload) = crate::decode_notification(event_any)?;
+        let rejection = match payload {
+            NotificationPayload::Rejection(rejection) => rejection,
+            NotificationPayload::Compensate(compensate) => {
+                return Err(CodedError::invalid_argument(
+                    codes::NO_UNDO_HANDLER,
+                    messages::NO_UNDO_HANDLER,
+                    [(extras::COMMAND_TYPE.to_string(), compensate.command_type)],
+                ));
             }
-            None => pb::RejectionNotification::default(),
         };
 
-        let (_domain, fq_command) = crate::extract_rejection_key(&rejection);
-        let Some(thunks) = self.rejections.get(&fq_command) else {
+        let (target_domain, fq_command) = crate::extract_rejection_key(&rejection);
+        let Some(thunks) =
+            crate::compensation_lookup(&self.rejections, &target_domain, &fq_command)
+        else {
             return Ok(pb::ProcessManagerHandleResponse::default()); // DelegateToFramework
         };
 
         let (mut state, _info) = self.rebuilder.rebuild(process_state)?;
         let mut out = pb::ProcessManagerHandleResponse::default();
         for thunk in thunks {
-            let (process_events, escalation) =
-                thunk(&notification, &rejection, &mut state).map_err(map_handler_error)?;
-            out.process_events.extend(process_events);
-            if out.notification.is_none() {
-                out.notification = escalation;
-            }
+            let resp = thunk(&notification, &rejection, &mut state).map_err(map_handler_error)?;
+            merge_response(&mut out, resp);
         }
         Ok(out)
     }

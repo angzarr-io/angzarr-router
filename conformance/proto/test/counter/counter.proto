@@ -93,15 +93,15 @@ message CounterState {
 
 // --- saga ---
 
-// OrderSaga translates each Increased source event into one Reserve command for
-// "inventory" and compensates a rejected Reserve by injecting one fact event. A
-// stateless saga has no state message, so it is declared on this marker.
+// OrderSaga translates each Increased source event into one deferred Reserve
+// command for "inventory". Sagas receive no rejections (only aggregates and
+// process managers declare compensates). A stateless saga has no state
+// message, so it is declared on this marker.
 message OrderSaga {
   option (io.angzarr.v1.component) = {
     kind: COMPONENT_KIND_SAGA
     input_domain: "order"
     output_domain: "inventory"
-    compensates: "test.counter.Reserve"
   };
 }
 
@@ -121,8 +121,8 @@ message CounterProjectorState {
 // --- process manager ---
 
 // OrderProcessManager folds Increased into its own state (applies) AND reacts to
-// the newest Increased trigger from "counter" by emitting a Reserve command for
-// "inventory" plus one fact per prior state event, compensating a rejected
+// the newest Increased trigger from "counter" by emitting a deferred Reserve
+// command for "inventory" plus one fact per prior state event, compensating a rejected
 // Reserve with a process event and an escalation.
 message OrderProcessManagerState {
   option (io.angzarr.v1.component) = {

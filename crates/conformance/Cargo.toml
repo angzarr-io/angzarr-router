@@ -34,3 +34,7 @@ harness = false
 [[test]]
 name = "process_manager"
 harness = false
+
+[[test]]
+name = "compensation"
+harness = false

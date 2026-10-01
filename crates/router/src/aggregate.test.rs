@@ -45,7 +45,7 @@ fn absent_events_fresh_state_no_prior_history() {
     let (d, contexts) = test_agg_dispatch();
     let resp = d.dispatch(&command_for(cover_any(""))).expect("dispatch");
     assert!(events_of(&resp).is_some(), "expected events result");
-    let cctx = contexts.lock().unwrap()[0];
+    let cctx = contexts.lock().unwrap()[0].clone();
     assert!(
         !cctx.had_prior_events,
         "had_prior_events for absent events (the Exists() bug)"
@@ -62,7 +62,7 @@ fn prior_events_reach_state_and_context() {
     cmd.events = Some(prior);
 
     d.dispatch(&cmd).expect("dispatch");
-    let cctx = contexts.lock().unwrap()[0];
+    let cctx = contexts.lock().unwrap()[0].clone();
     assert!(cctx.had_prior_events, "had_prior_events with 2 prior pages");
     assert_ne!(
         cctx.next_sequence, 0,
@@ -257,6 +257,19 @@ fn events_in(domain: &str, pages: usize) -> Option<pb::business_response::Result
     }))
 }
 
+/// The merged events book's cover domain and page count.
+fn events_shape(resp: &pb::BusinessResponse) -> Option<(String, usize)> {
+    events_of(resp).map(|b| {
+        (
+            b.cover
+                .as_ref()
+                .map(|c| c.domain.clone())
+                .unwrap_or_default(),
+            b.pages.len(),
+        )
+    })
+}
+
 fn escalate_to(domain: &str) -> Option<pb::business_response::Result> {
     Some(pb::business_response::Result::Notification(
         pb::Notification {
@@ -327,7 +340,7 @@ fn fan_out_events_merge_under_the_first_book_cover() {
     let resp = d
         .dispatch(&command_for(notification_command_for(FQ_RESERVE)))
         .expect("dispatch");
-    assert_eq!(resp.result, events_in("payment", 3));
+    assert_eq!(events_shape(&resp), Some(("payment".to_string(), 3)));
 }
 
 #[test]
@@ -336,7 +349,7 @@ fn fan_out_events_after_an_empty_compensator_still_merge() {
     let resp = d
         .dispatch(&command_for(notification_command_for(FQ_RESERVE)))
         .expect("dispatch");
-    assert_eq!(resp.result, events_in("payment", 2));
+    assert_eq!(events_shape(&resp), Some(("payment".to_string(), 2)));
 }
 
 #[test]
@@ -392,7 +405,7 @@ fn rejection_receives_command_context() {
         }),
     };
     d.dispatch(&cmd).expect("dispatch");
-    let cctx = *saw.lock().unwrap();
+    let cctx = saw.lock().unwrap().clone();
     assert_eq!(
         cctx.next_sequence, 7,
         "compensation stamping needs next_sequence"
@@ -535,5 +548,199 @@ fn stamps_ext_and_sequences_fill_only() {
     assert!(
         events.cover.as_ref().and_then(|c| c.ext.as_ref()).is_none(),
         "ext invented from nothing"
+    );
+}
+
+// --- compensation stamping, qualified keys, undo (Compensate) --------------
+
+fn page_seqs(resp: &pb::BusinessResponse) -> Vec<Option<u32>> {
+    events_of(resp)
+        .map(|b| {
+            b.pages
+                .iter()
+                .map(
+                    |p| match p.header.as_ref().and_then(|h| h.sequence_type.as_ref()) {
+                        Some(pb::page_header::SequenceType::Sequence(s)) => Some(*s),
+                        _ => None,
+                    },
+                )
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn with_history(command: Any, next_sequence: u32) -> pb::ContextualCommand {
+    let mut cmd = command_for(command);
+    cmd.events = Some(pb::EventBook {
+        next_sequence,
+        pages: vec![pb::EventPage::default()],
+        ..Default::default()
+    });
+    cmd
+}
+
+// Compensation events append after prior history (C-0083): header-less
+// pages take consecutive sequences from next_sequence.
+#[test]
+fn compensation_events_are_stamped_after_prior_history() {
+    let d = AggregateDispatch::new("agg-test", "payment", fresh_rebuilder())
+        .on_rejected(FQ_RESERVE, |_, _, _: &mut TestState, _| {
+            reject_with(events_in("payment", 2))
+        });
+    let resp = d
+        .dispatch(&with_history(notification_command_for(FQ_RESERVE), 7))
+        .expect("dispatch");
+    assert_eq!(page_seqs(&resp), vec![Some(7), Some(8)]);
+}
+
+/// A rejection Notification for FQ_RESERVE sent to `target_domain`.
+fn rejection_sent_to(target_domain: &str) -> Any {
+    let mut any = notification_command_for(FQ_RESERVE);
+    let mut notification: pb::Notification = prost::Message::decode(any.value.as_slice()).unwrap();
+    let payload = notification.payload.as_mut().unwrap();
+    let mut rejection: pb::RejectionNotification =
+        prost::Message::decode(payload.value.as_slice()).unwrap();
+    rejection
+        .rejected_command
+        .as_mut()
+        .unwrap()
+        .cover
+        .as_mut()
+        .unwrap()
+        .domain = target_domain.to_string();
+    payload.value = prost::Message::encode_to_vec(&rejection);
+    any.value = prost::Message::encode_to_vec(&notification);
+    any
+}
+
+fn labelled(
+    label: &'static str,
+) -> impl Fn(
+    &pb::Notification,
+    &pb::RejectionNotification,
+    &mut TestState,
+    CommandContext,
+) -> Result<pb::BusinessResponse, crate::error::HandlerError>
+       + Send
+       + Sync
+       + 'static {
+    move |_, _, _, _| reject_with(events_in(label, 1))
+}
+
+// C-0481: an unqualified entry matches the command type sent to any domain.
+#[test]
+fn unqualified_compensates_matches_any_target_domain() {
+    let d = AggregateDispatch::new("agg-test", "payment", fresh_rebuilder())
+        .on_rejected(FQ_RESERVE, labelled("FundsReleased"));
+    let resp = d
+        .dispatch(&command_for(rejection_sent_to("warehouse")))
+        .expect("dispatch");
+    assert_eq!(events_shape(&resp), Some(("FundsReleased".to_string(), 1)));
+}
+
+// C-0482: a domain-qualified entry matches only rejections from its domain.
+#[test]
+fn qualified_compensates_matches_only_its_domain() {
+    let d = AggregateDispatch::new("agg-test", "payment", fresh_rebuilder())
+        .on_rejected(
+            &format!("inventory:{FQ_RESERVE}"),
+            labelled("FundsReleased"),
+        )
+        .on_rejected(
+            &format!("warehouse:{FQ_RESERVE}"),
+            labelled("WorkflowFailed"),
+        );
+    let resp = d
+        .dispatch(&command_for(rejection_sent_to("warehouse")))
+        .expect("dispatch");
+    assert_eq!(events_shape(&resp), Some(("WorkflowFailed".to_string(), 1)));
+    let resp = d
+        .dispatch(&command_for(rejection_sent_to("billing")))
+        .expect("dispatch");
+    assert_eq!(resp.result, None, "no entry matches billing");
+}
+
+#[test]
+fn validate_refuses_a_type_listed_both_unqualified_and_qualified() {
+    let d = AggregateDispatch::new("agg-test", "payment", fresh_rebuilder())
+        .on_rejected(FQ_RESERVE, labelled("a"));
+    assert!(d.validate().is_ok());
+    let d = d.on_rejected(&format!("inventory:{FQ_RESERVE}"), labelled("b"));
+    assert_eq!(
+        d.validate().unwrap_err().code,
+        codes::AMBIGUOUS_COMPENSATION
+    );
+}
+
+const FQ_ADJUST: &str = "inventory.AdjustStock";
+const FQ_COUNT: &str = "inventory.CountStock";
+
+fn compensate_command(command_type: &str) -> Any {
+    let notification = pb::Notification {
+        payload: Some(Any {
+            type_url: format!("{TYPE_URL_PREFIX}io.angzarr.v1.Compensate"),
+            value: prost::Message::encode_to_vec(&pb::Compensate {
+                command_type: command_type.to_string(),
+                sequences: vec![4],
+                reason: "aborted".to_string(),
+            }),
+        }),
+        ..Default::default()
+    };
+    Any {
+        type_url: format!("{TYPE_URL_PREFIX}io.angzarr.v1.Notification"),
+        value: prost::Message::encode_to_vec(&notification),
+    }
+}
+
+// C-0478: a Compensate routes to the undo handler for its command type, with
+// rebuilt state and the Compensate, and its events append after history.
+#[test]
+fn compensate_routes_to_the_undo_handler_for_its_command_type() {
+    let ran = Arc::new(Mutex::new(Vec::new()));
+    let (adjust, reserve) = (ran.clone(), ran.clone());
+    let d = AggregateDispatch::new("agg-test", "inventory", cover_applier(fresh_rebuilder()))
+        .on_undo(FQ_RESERVE, move |_, _, _: &mut TestState, _| {
+            reserve.lock().unwrap().push("reserve".to_string());
+            reject_with(events_in("inventory", 1))
+        })
+        .on_undo(
+            FQ_ADJUST,
+            move |_, compensate, state: &mut TestState, cctx| {
+                adjust.lock().unwrap().push(format!(
+                    "adjust {:?} {} {}",
+                    compensate.sequences,
+                    state.applied.len(),
+                    cctx.next_sequence
+                ));
+                reject_with(events_in("inventory", 1))
+            },
+        );
+    let mut cmd = with_history(compensate_command(FQ_ADJUST), 5);
+    cmd.events = Some(pb::EventBook {
+        next_sequence: 5,
+        ..book_of_covers(&["prior"])
+    });
+    let resp = d.dispatch(&cmd).expect("dispatch");
+    assert_eq!(*ran.lock().unwrap(), vec!["adjust [4] 1 5".to_string()]);
+    assert_eq!(page_seqs(&resp), vec![Some(5)]);
+}
+
+// C-0479: a Compensate with no undo handler is UNIMPLEMENTED, never dropped.
+#[test]
+fn compensate_without_an_undo_handler_is_unimplemented() {
+    let d = AggregateDispatch::new("agg-test", "inventory", fresh_rebuilder())
+        .on_undo(FQ_ADJUST, |_, _, _: &mut TestState, _| reject_with(None))
+        .on_rejected(FQ_COUNT, labelled("not-an-undo"));
+    let err = d
+        .dispatch(&command_for(compensate_command(FQ_COUNT)))
+        .expect_err("no undo handler");
+    assert_eq!(err.code, codes::NO_UNDO_HANDLER);
+    assert_eq!(err.grpc, crate::error::GrpcCode::Unimplemented);
+    assert_eq!(
+        err.extras
+            .get(crate::error::extras::COMMAND_TYPE)
+            .map(String::as_str),
+        Some(FQ_COUNT)
     );
 }

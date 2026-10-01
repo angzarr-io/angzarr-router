@@ -46,6 +46,17 @@ async fn prior_increases(w: &mut CounterWorld, n: u32) {
     w.prior = conf::prior_history(n);
 }
 
+#[given(
+    regex = r#"^a counter that has already recorded (\d+) increases under the "([^"]*)" type-URL prefix$"#
+)]
+async fn prior_increases_prefixed(w: &mut CounterWorld, n: u32, prefix: String) {
+    let carrier = pb::ContextualCommand {
+        command: None,
+        events: conf::prior_history(n),
+    };
+    w.prior = conf::with_type_url_prefix(carrier, &prefix).events;
+}
+
 #[given("a counter whose history holds a corrupt event")]
 async fn corrupt_history(w: &mut CounterWorld) {
     w.prior = conf::corrupt_prior_history();
@@ -59,6 +70,16 @@ async fn snapshot_history(w: &mut CounterWorld) {
 #[when(regex = r"^the operator increases the counter by (\d+)$")]
 async fn increase_by(w: &mut CounterWorld, n: u32) {
     w.dispatch(conf::increase_command(n));
+}
+
+#[when(
+    regex = r#"^the operator increases the counter by (\d+) under the "([^"]*)" type-URL prefix$"#
+)]
+async fn increase_by_prefixed(w: &mut CounterWorld, n: u32, prefix: String) {
+    w.dispatch(conf::with_type_url_prefix(
+        conf::increase_command(n),
+        &prefix,
+    ));
 }
 
 #[when(regex = r"^the operator increases the counter by (\d+) on behalf of a parent$")]

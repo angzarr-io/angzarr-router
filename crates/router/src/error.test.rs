@@ -85,3 +85,13 @@ fn rejection_details_travel_as_extras() {
     );
     assert_eq!(err.extras.get("input").map(String::as_str), Some("0"));
 }
+
+#[test]
+fn no_undo_handler_is_unimplemented() {
+    let err = CodedError::invalid_argument(codes::NO_UNDO_HANDLER, messages::NO_UNDO_HANDLER, []);
+    assert_eq!(
+        err.grpc,
+        GrpcCode::Unimplemented,
+        "the coordinator dead-letters an undeliverable Compensate on UNIMPLEMENTED"
+    );
+}

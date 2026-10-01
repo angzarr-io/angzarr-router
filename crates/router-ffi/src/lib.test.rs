@@ -63,6 +63,10 @@ const CB_OK_ZERO: u64 = 17;
 const CB_OK_EMPTY: u64 = 18;
 /// Fails with -13 and no status payload.
 const CB_FAILS: u64 = 19;
+const CB_UNDO_RESERVE: u64 = 20;
+const CB_FACT_ANNOTATE: u64 = 21;
+const CB_PACK_STATE: u64 = 22;
+const CB_PM_COMP_COMMANDS: u64 = 23;
 
 const FQ_ORDER_CREATED: &str = "test.order.OrderCreated";
 const FQ_RESERVE_STOCK: &str = "test.order.ReserveStock";
@@ -73,6 +77,8 @@ const FQ_ORDER_SHIPPED: &str = "test.order.OrderShipped";
 #[derive(Default, Clone)]
 struct Session {
     counter: u32,
+    observed_covers: Vec<Option<pb::Cover>>,
+    observed_pages: Vec<(Option<pb::Cover>, u32)>,
     observed_cctx: Vec<(u32, bool)>,
     markers: Vec<&'static str>,
 }
@@ -174,7 +180,8 @@ unsafe extern "C" fn host_cb(
             let cctx = abi_pb::CommandContextAux::decode(aux).expect("cctx aux");
             with_session(key, |s| {
                 s.observed_cctx
-                    .push((cctx.next_sequence, cctx.had_prior_events))
+                    .push((cctx.next_sequence, cctx.had_prior_events));
+                s.observed_covers.push(cctx.cover.clone());
             });
             let cmd = IncreaseBy::decode(payload).expect("IncreaseBy");
             if cmd.n == 0 {
@@ -192,7 +199,11 @@ unsafe extern "C" fn host_cb(
             if Increased::decode(payload).is_err() {
                 return -3;
             }
-            with_session(key, |s| s.counter += 1);
+            let paux = abi_pb::ProjectorEventAux::decode(aux).expect("projector aux");
+            with_session(key, |s| {
+                s.counter += 1;
+                s.observed_pages.push((paux.cover, paux.sequence));
+            });
             STATUS_OK_EMPTY
         }
         CB_PROJ_FOLD_REJECTS => {
@@ -218,8 +229,8 @@ unsafe extern "C" fn host_cb(
         CB_SAGA_EVENT => {
             // Host translates the source event into one stamped command,
             // stamping from the coordinator-supplied destination sequences.
-            let saux = abi_pb::SagaEventAux::decode(aux).expect("saga event aux");
-            let mut cmd = pb::CommandBook {
+            abi_pb::SagaEventAux::decode(aux).expect("saga event aux");
+            let cmd = pb::CommandBook {
                 cover: Some(pb::Cover {
                     domain: "inventory".to_string(),
                     ..Default::default()
@@ -232,14 +243,6 @@ unsafe extern "C" fn host_cb(
                     ..Default::default()
                 }],
             };
-            if let Some(&seq) = saux.destination_sequences.get("inventory") {
-                for page in &mut cmd.pages {
-                    page.header = Some(pb::PageHeader {
-                        sequence_type: Some(pb::page_header::SequenceType::Sequence(seq)),
-                        ..Default::default()
-                    });
-                }
-            }
             let resp = pb::SagaResponse {
                 commands: vec![cmd],
                 events: Vec::new(),
@@ -265,7 +268,7 @@ unsafe extern "C" fn host_cb(
             // Stateful PM: the host reacts to the newest trigger event and
             // emits one stamped command, returning the full PM response.
             let paux = abi_pb::PmEventAux::decode(aux).expect("pm event aux");
-            let mut cmd = pb::CommandBook {
+            let cmd = pb::CommandBook {
                 cover: Some(pb::Cover {
                     domain: "inventory".to_string(),
                     ..Default::default()
@@ -278,14 +281,10 @@ unsafe extern "C" fn host_cb(
                     ..Default::default()
                 }],
             };
-            if let Some(&seq) = paux.destination_sequences.get("inventory") {
-                for page in &mut cmd.pages {
-                    page.header = Some(pb::PageHeader {
-                        sequence_type: Some(pb::page_header::SequenceType::Sequence(seq)),
-                        ..Default::default()
-                    });
-                }
-            }
+            // The trigger cover crosses in the aux; echo its root into the
+            // command's cover so tests can observe it.
+            let mut cmd = cmd;
+            cmd.cover.as_mut().unwrap().root = paux.trigger_cover.and_then(|c| c.root);
             let resp = pb::ProcessManagerHandleResponse {
                 commands: vec![cmd],
                 ..Default::default()
@@ -338,6 +337,57 @@ unsafe extern "C" fn host_cb(
                         ..Default::default()
                     }),
                     ..Default::default()
+                }],
+                ..Default::default()
+            };
+            host_fill(out, &resp.encode_to_vec());
+            STATUS_OK
+        }
+        CB_UNDO_RESERVE => {
+            let uaux = abi_pb::UndoAux::decode(aux).expect("undo aux");
+            let compensate =
+                pb::Compensate::decode(uaux.compensate.as_slice()).expect("compensate");
+            pb::Notification::decode(uaux.notification.as_slice()).expect("notification");
+            let resp = pb::BusinessResponse {
+                result: Some(pb::business_response::Result::Events(pb::EventBook {
+                    pages: compensate
+                        .sequences
+                        .iter()
+                        .map(|_| pb::EventPage::default())
+                        .collect(),
+                    ..Default::default()
+                })),
+            };
+            host_fill(out, &resp.encode_to_vec());
+            STATUS_OK
+        }
+        CB_FACT_ANNOTATE => {
+            // Annotates a fact with the folded counter (the state the fact sees).
+            let counter = with_session(key, |s| s.counter);
+            let annotated = Any {
+                type_url: "type.googleapis.com/test.counter.CounterState".to_string(),
+                value: CounterState { value: counter }.encode_to_vec(),
+            };
+            host_fill(out, &annotated.encode_to_vec());
+            STATUS_OK
+        }
+        CB_PACK_STATE => {
+            let counter = with_session(key, |s| s.counter);
+            let packed = Any {
+                type_url: "type.googleapis.com/test.counter.CounterState".to_string(),
+                value: CounterState { value: counter }.encode_to_vec(),
+            };
+            host_fill(out, &packed.encode_to_vec());
+            STATUS_OK
+        }
+        CB_PM_COMP_COMMANDS => {
+            let resp = pb::ProcessManagerHandleResponse {
+                commands: vec![pb::CommandBook {
+                    cover: Some(pb::Cover {
+                        domain: "inventory".to_string(),
+                        ..Default::default()
+                    }),
+                    pages: vec![pb::CommandPage::default()],
                 }],
                 ..Default::default()
             };
@@ -399,10 +449,11 @@ fn descriptor_bytes() -> Vec<u8> {
             callback_id: CB_APPLIER,
         }],
         rejections: vec![abi_pb::RejectionEntry {
-            fq_command_type: FQ_RESERVE.to_string(),
+            compensates: FQ_RESERVE.to_string(),
             callback_ids: vec![CB_COMP_A, CB_COMP_B],
         }],
         snapshot_callback_id: Some(CB_SNAPSHOT),
+        ..Default::default()
     }
     .encode_to_vec()
 }
@@ -508,8 +559,8 @@ fn increased_history(n: u32, next_sequence: u32) -> pb::EventBook {
 }
 
 #[test]
-fn abi_version_is_one() {
-    assert_eq!(angzarr_abi_version(), 1);
+fn abi_version_is_two() {
+    assert_eq!(angzarr_abi_version(), 2);
 }
 
 #[test]
@@ -996,10 +1047,6 @@ fn saga_descriptor_bytes() -> Vec<u8> {
             fq_type: FQ_ORDER_CREATED.to_string(),
             callback_id: CB_SAGA_EVENT,
         }],
-        rejections: vec![abi_pb::RejectionEntry {
-            fq_command_type: FQ_RESERVE_STOCK.to_string(),
-            callback_ids: vec![CB_SAGA_COMP],
-        }],
     }
     .encode_to_vec()
 }
@@ -1040,12 +1087,8 @@ impl Router {
 }
 
 /// A SagaHandleRequest over a source book in `domain` carrying the given
-/// event pages, plus a destination-sequence map.
-fn saga_request(
-    domain: &str,
-    pages: Vec<pb::EventPage>,
-    dest: &[(&str, u32)],
-) -> pb::SagaHandleRequest {
+/// event pages.
+fn saga_request(domain: &str, pages: Vec<pb::EventPage>) -> pb::SagaHandleRequest {
     pb::SagaHandleRequest {
         source: Some(pb::EventBook {
             cover: Some(pb::Cover {
@@ -1055,7 +1098,6 @@ fn saga_request(
             pages,
             ..Default::default()
         }),
-        destination_sequences: dest.iter().map(|(d, s)| (d.to_string(), *s)).collect(),
         ..Default::default()
     }
 }
@@ -1071,52 +1113,32 @@ fn event_page_of(fq: &str) -> pb::EventPage {
 }
 
 #[test]
-fn saga_emits_stamped_command_through_the_abi() {
+fn saga_emits_deferred_command_through_the_abi() {
     // The whole saga path across raw pointers: register a saga, dispatch a
-    // source book, and confirm the host emitted one command stamped with the
-    // coordinator-supplied destination sequence.
+    // source book, and confirm the host's command came back deferred from the
+    // triggering page.
     let router = Router::with_saga();
-    let session = next_session();
-    let req = saga_request(
-        "order",
-        vec![event_page_of(FQ_ORDER_CREATED)],
-        &[("inventory", 7)],
-    );
-    let (ret, bytes) = router.dispatch_saga(session, &req);
+    let mut page = event_page_of(FQ_ORDER_CREATED);
+    page.header = Some(pb::PageHeader {
+        sequence_type: Some(pb::page_header::SequenceType::Sequence(7)),
+        ..Default::default()
+    });
+    let req = saga_request("order", vec![page]);
+    let (ret, bytes) = router.dispatch_saga(next_session(), &req);
     assert_eq!(ret, 0);
     let resp = pb::SagaResponse::decode(bytes.as_slice()).expect("SagaResponse");
     assert_eq!(resp.commands.len(), 1, "one command emitted");
     let cmd = &resp.commands[0];
     assert_eq!(cmd.cover.as_ref().unwrap().domain, "inventory");
-    let seq = match cmd.pages[0]
+    let Some(pb::page_header::SequenceType::AngzarrDeferred(d)) = cmd.pages[0]
         .header
         .as_ref()
-        .and_then(|h| h.sequence_type.as_ref())
-    {
-        Some(pb::page_header::SequenceType::Sequence(s)) => *s,
-        _ => panic!("command page not stamped"),
+        .and_then(|h| h.sequence_type.clone())
+    else {
+        panic!("command page is not deferred");
     };
-    assert_eq!(seq, 7, "host stamped the destination sequence over the ABI");
-}
-
-#[test]
-fn saga_compensator_runs_through_the_abi() {
-    // A Notification source page routes to the registered compensator, whose
-    // injected fact event crosses back as a SagaResponse.
-    let router = Router::with_saga();
-    let session = next_session();
-    let notification_page = pb::EventPage {
-        payload: Some(pb::event_page::Payload::Event(notification_command(
-            FQ_RESERVE_STOCK,
-        ))),
-        ..Default::default()
-    };
-    let req = saga_request("order", vec![notification_page], &[]);
-    let (ret, bytes) = router.dispatch_saga(session, &req);
-    assert_eq!(ret, 0);
-    let resp = pb::SagaResponse::decode(bytes.as_slice()).expect("SagaResponse");
-    assert!(resp.commands.is_empty());
-    assert_eq!(resp.events.len(), 1, "compensator injected one fact event");
+    assert_eq!(d.source_seq, 7);
+    assert_eq!(d.source.map(|c| c.domain), Some("order".to_string()));
 }
 
 #[test]
@@ -1162,9 +1184,10 @@ fn pm_descriptor_bytes() -> Vec<u8> {
             callback_id: CB_PM_EVENT,
         }],
         rejections: vec![abi_pb::RejectionEntry {
-            fq_command_type: FQ_RESERVE_STOCK.to_string(),
+            compensates: FQ_RESERVE_STOCK.to_string(),
             callback_ids: vec![CB_PM_COMP],
         }],
+        target_domains: vec!["inventory".to_string()],
     }
     .encode_to_vec()
 }
@@ -1211,11 +1234,7 @@ impl Router {
 }
 
 /// A PM request over a trigger book in `domain` carrying the given pages.
-fn pm_request(
-    domain: &str,
-    pages: Vec<pb::EventPage>,
-    dest: &[(&str, u32)],
-) -> pb::ProcessManagerHandleRequest {
+fn pm_request(domain: &str, pages: Vec<pb::EventPage>) -> pb::ProcessManagerHandleRequest {
     pb::ProcessManagerHandleRequest {
         trigger: Some(pb::EventBook {
             cover: Some(pb::Cover {
@@ -1226,35 +1245,40 @@ fn pm_request(
             ..Default::default()
         }),
         process_state: None,
-        destination_sequences: dest.iter().map(|(d, s)| (d.to_string(), *s)).collect(),
     }
 }
 
 #[test]
-fn pm_emits_stamped_command_through_the_abi() {
-    // The whole PM path across raw pointers: register a PM, dispatch a trigger
-    // whose newest page is the declared event, and confirm the host emitted
-    // one command stamped with the destination sequence.
+fn pm_emits_deferred_command_through_the_abi() {
+    // The whole PM path across raw pointers: the host sees the trigger cover
+    // in its aux (it echoes the root into its command), and the command comes
+    // back deferred from the newest trigger page.
     let router = Router::with_process_manager();
-    let session = next_session();
-    let req = pm_request(
-        "orders",
-        vec![event_page_of(FQ_ORDER_SHIPPED)],
-        &[("inventory", 4)],
-    );
-    let (ret, bytes) = router.dispatch_process_manager(session, &req);
+    let mut page = event_page_of(FQ_ORDER_SHIPPED);
+    page.header = Some(pb::PageHeader {
+        sequence_type: Some(pb::page_header::SequenceType::Sequence(4)),
+        ..Default::default()
+    });
+    let mut req = pm_request("orders", vec![page]);
+    req.trigger.as_mut().unwrap().cover.as_mut().unwrap().root = Some(pb::Uuid { value: vec![8] });
+    let (ret, bytes) = router.dispatch_process_manager(next_session(), &req);
     assert_eq!(ret, 0);
     let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
     assert_eq!(resp.commands.len(), 1);
-    let seq = match resp.commands[0].pages[0]
+    let cmd = &resp.commands[0];
+    assert_eq!(
+        cmd.cover.as_ref().unwrap().root,
+        Some(pb::Uuid { value: vec![8] }),
+        "the trigger cover crossed to the host"
+    );
+    let Some(pb::page_header::SequenceType::AngzarrDeferred(d)) = cmd.pages[0]
         .header
         .as_ref()
-        .and_then(|h| h.sequence_type.as_ref())
-    {
-        Some(pb::page_header::SequenceType::Sequence(s)) => *s,
-        _ => panic!("command not stamped"),
+        .and_then(|h| h.sequence_type.clone())
+    else {
+        panic!("command page is not deferred");
     };
-    assert_eq!(seq, 4, "host stamped the destination sequence over the ABI");
+    assert_eq!(d.source_seq, 4);
 }
 
 #[test]
@@ -1269,7 +1293,7 @@ fn pm_compensator_runs_through_the_abi() {
         ))),
         ..Default::default()
     };
-    let req = pm_request("orders", vec![notification_page], &[]);
+    let req = pm_request("orders", vec![notification_page]);
     let (ret, bytes) = router.dispatch_process_manager(session, &req);
     assert_eq!(ret, 0);
     let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
@@ -1302,6 +1326,7 @@ fn two_process_managers_share_a_source_domain_route_by_type() {
             callback_id: CB_PM_EVENT,
         }],
         rejections: Vec::new(),
+        target_domains: vec!["inventory".to_string()],
     }
     .encode_to_vec();
     assert_eq!(
@@ -1314,11 +1339,7 @@ fn two_process_managers_share_a_source_domain_route_by_type() {
     );
     let router = Router(r);
     let session = next_session();
-    let req = pm_request(
-        "orders",
-        vec![event_page_of(FQ_ORDER_SHIPPED)],
-        &[("inventory", 4)],
-    );
+    let req = pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)]);
     let (ret, bytes) = router.dispatch_process_manager(session, &req);
     assert_eq!(ret, 0, "multi-PM routing should not report NO_HANDLER");
     let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
@@ -1371,9 +1392,10 @@ fn pm2_descriptor_bytes() -> Vec<u8> {
             callback_id: CB_PM2_EVENT,
         }],
         rejections: vec![abi_pb::RejectionEntry {
-            fq_command_type: FQ_RESERVE_STOCK.to_string(),
+            compensates: FQ_RESERVE_STOCK.to_string(),
             callback_ids: vec![CB_PM2_COMP],
         }],
+        target_domains: vec!["inventory".to_string()],
     }
     .encode_to_vec()
 }
@@ -1417,7 +1439,7 @@ fn pm_rejection_addressed_to_its_own_domain_reaches_its_compensator() {
     // The coordinator delivers a PM-issued command's rejection to the PM's own
     // domain, which is not one of its input domains.
     let router = Router::with_process_manager();
-    let req = pm_request("order-pm", vec![notification_page(FQ_RESERVE_STOCK)], &[]);
+    let req = pm_request("order-pm", vec![notification_page(FQ_RESERVE_STOCK)]);
     let (ret, bytes) = router.dispatch_process_manager(next_session(), &req);
     assert_eq!(ret, 0);
     let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
@@ -1428,7 +1450,7 @@ fn pm_rejection_addressed_to_its_own_domain_reaches_its_compensator() {
 #[test]
 fn co_resident_rejection_reaches_only_the_addressed_pm() {
     let router = Router::with_two_process_managers();
-    let req = pm_request("other-pm", vec![notification_page(FQ_RESERVE_STOCK)], &[]);
+    let req = pm_request("other-pm", vec![notification_page(FQ_RESERVE_STOCK)]);
     let (ret, bytes) = router.dispatch_process_manager(next_session(), &req);
     assert_eq!(ret, 0);
     let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
@@ -1452,7 +1474,7 @@ fn co_resident_rejection_reaches_only_the_addressed_pm() {
 #[test]
 fn co_resident_rejection_on_a_shared_input_domain_runs_no_compensator() {
     let router = Router::with_two_process_managers();
-    let req = pm_request("orders", vec![notification_page(FQ_RESERVE_STOCK)], &[]);
+    let req = pm_request("orders", vec![notification_page(FQ_RESERVE_STOCK)]);
     let (ret, bytes) = router.dispatch_process_manager(next_session(), &req);
     assert_eq!(ret, 0);
     let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
@@ -1462,7 +1484,7 @@ fn co_resident_rejection_on_a_shared_input_domain_runs_no_compensator() {
 #[test]
 fn process_state_cover_routes_the_trigger_to_its_own_pm() {
     let router = Router::with_two_process_managers();
-    let mut req = pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)], &[]);
+    let mut req = pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)]);
     req.process_state = Some(pb::EventBook {
         cover: Some(pb::Cover {
             domain: "other-pm".to_string(),
@@ -1479,7 +1501,7 @@ fn process_state_cover_routes_the_trigger_to_its_own_pm() {
 #[test]
 fn uncovered_process_state_fans_the_trigger_out_in_registration_order() {
     let router = Router::with_two_process_managers();
-    let req = pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)], &[]);
+    let req = pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)]);
     let (ret, bytes) = router.dispatch_process_manager(next_session(), &req);
     assert_eq!(ret, 0);
     let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
@@ -1646,10 +1668,9 @@ fn projector_fold_returning_status_ok_is_success() {
     assert_eq!(ret, 0);
 }
 
-fn saga_with(event: u64, comp: u64) -> Router {
+fn saga_with(event: u64) -> Router {
     let mut desc = abi_pb::SagaDescriptor::decode(saga_descriptor_bytes().as_slice()).unwrap();
     desc.events[0].callback_id = event;
-    desc.rejections[0].callback_ids = vec![comp];
     let bytes = desc.encode_to_vec();
     let r = angzarr_router_new();
     assert_eq!(
@@ -1661,8 +1682,8 @@ fn saga_with(event: u64, comp: u64) -> Router {
 
 #[test]
 fn saga_handler_emitting_nothing_is_an_empty_response() {
-    let router = saga_with(CB_OK_EMPTY, CB_OK_EMPTY);
-    let req = saga_request("order", vec![event_page_of(FQ_ORDER_CREATED)], &[]);
+    let router = saga_with(CB_OK_EMPTY);
+    let req = saga_request("order", vec![event_page_of(FQ_ORDER_CREATED)]);
     let (ret, bytes) = router.dispatch_saga(next_session(), &req);
     assert_eq!(ret, 0);
     assert_eq!(
@@ -1672,9 +1693,9 @@ fn saga_handler_emitting_nothing_is_an_empty_response() {
 }
 
 #[test]
-fn saga_compensator_emitting_nothing_is_an_empty_response() {
-    let router = saga_with(CB_OK_EMPTY, CB_OK_EMPTY);
-    let req = saga_request("order", vec![notification_page(FQ_RESERVE_STOCK)], &[]);
+fn saga_ignores_a_notification_page() {
+    let router = saga_with(CB_OK_EMPTY);
+    let req = saga_request("order", vec![notification_page(FQ_RESERVE_STOCK)]);
     let (ret, bytes) = router.dispatch_saga(next_session(), &req);
     assert_eq!(ret, 0);
     assert_eq!(
@@ -1705,7 +1726,7 @@ fn pm_with(applier: u64, snapshot: u64, event: u64, comp: u64) -> Router {
 }
 
 fn pm_over_state(state: pb::EventBook) -> pb::ProcessManagerHandleRequest {
-    let mut req = pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)], &[]);
+    let mut req = pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)]);
     req.process_state = Some(state);
     req
 }
@@ -1748,7 +1769,7 @@ fn failing_pm_snapshot_loader_is_data_loss() {
 #[test]
 fn pm_compensator_emitting_nothing_is_an_empty_response() {
     let router = pm_with(CB_OK_EMPTY, CB_OK_EMPTY, CB_OK_EMPTY, CB_OK_EMPTY);
-    let req = pm_request("order-pm", vec![notification_page(FQ_RESERVE_STOCK)], &[]);
+    let req = pm_request("order-pm", vec![notification_page(FQ_RESERVE_STOCK)]);
     let (ret, bytes) = router.dispatch_process_manager(next_session(), &req);
     assert_eq!(ret, 0);
     assert_eq!(
@@ -1818,4 +1839,322 @@ fn a_sole_aggregate_claims_any_domain() {
     let (ret, bytes) = router.dispatch(next_session(), &increase_in("nobody"));
     assert_eq!(ret, 0);
     assert_eq!(emitted_pages(&bytes), 1);
+}
+
+// --- ABI v2 surface: undo, facts, replay, context aux
+
+impl Router {
+    fn call(
+        &self,
+        f: unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, usize, *mut AngzarrBuf) -> i32,
+        session: usize,
+        bytes: &[u8],
+    ) -> (i32, Vec<u8>) {
+        let mut out = AngzarrBuf {
+            data: std::ptr::null_mut(),
+            len: 0,
+        };
+        let ret = unsafe {
+            f(
+                self.0,
+                session as *mut c_void,
+                bytes.as_ptr(),
+                bytes.len(),
+                &mut out,
+            )
+        };
+        let response = if out.data.is_null() {
+            Vec::new()
+        } else {
+            let copied = unsafe { std::slice::from_raw_parts(out.data, out.len) }.to_vec();
+            unsafe { angzarr_buf_release(out.data, out.len) };
+            copied
+        };
+        (ret, response)
+    }
+}
+
+/// The counter aggregate plus an undo for Reserve, a fact handler for
+/// Increased, and the state packer.
+fn full_counter() -> Router {
+    let mut desc = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
+    desc.undoes = vec![abi_pb::CallbackEntry {
+        fq_type: FQ_RESERVE.to_string(),
+        callback_id: CB_UNDO_RESERVE,
+    }];
+    desc.facts = vec![abi_pb::CallbackEntry {
+        fq_type: FQ_INCREASED.to_string(),
+        callback_id: CB_FACT_ANNOTATE,
+    }];
+    desc.state_callback_id = Some(CB_PACK_STATE);
+    let r = angzarr_router_new();
+    assert_eq!(register_aggregate_desc(r, desc), 0);
+    Router(r)
+}
+
+fn compensate_command(command_type: &str, sequences: Vec<u32>) -> pb::ContextualCommand {
+    let notification = pb::Notification {
+        payload: Some(Any {
+            type_url: "type.googleapis.com/io.angzarr.v1.Compensate".to_string(),
+            value: pb::Compensate {
+                command_type: command_type.to_string(),
+                sequences,
+                reason: "aborted".to_string(),
+            }
+            .encode_to_vec(),
+        }),
+        ..Default::default()
+    };
+    let mut req = command_req(FQ_RESERVE, Vec::new(), Some(increased_history(1, 3)));
+    req.command.as_mut().unwrap().pages[0].payload =
+        Some(pb::command_page::Payload::Command(Any {
+            type_url: "type.googleapis.com/io.angzarr.v1.Notification".to_string(),
+            value: notification.encode_to_vec(),
+        }));
+    req
+}
+
+#[test]
+fn compensate_runs_the_undo_handler_through_the_abi() {
+    let router = full_counter();
+    let (ret, bytes) = router.dispatch(next_session(), &compensate_command(FQ_RESERVE, vec![1, 2]));
+    assert_eq!(ret, 0);
+    let book = match decode_response(&bytes).result {
+        Some(pb::business_response::Result::Events(book)) => book,
+        other => panic!("expected events, got {other:?}"),
+    };
+    let seqs: Vec<_> = book
+        .pages
+        .iter()
+        .map(
+            |p| match p.header.as_ref().and_then(|h| h.sequence_type.as_ref()) {
+                Some(pb::page_header::SequenceType::Sequence(s)) => *s,
+                _ => panic!("undo events are stamped"),
+            },
+        )
+        .collect();
+    assert_eq!(
+        seqs,
+        vec![3, 4],
+        "one event per undone sequence, after history"
+    );
+}
+
+#[test]
+fn compensate_with_no_undo_handler_is_unimplemented_through_the_abi() {
+    let router = full_counter();
+    let (ret, bytes) = router.dispatch(
+        next_session(),
+        &compensate_command("test.counter.CountStock", vec![]),
+    );
+    assert_eq!(ret, -12);
+    assert_eq!(
+        decode_status(&bytes).1,
+        angzarr_router::error::codes::NO_UNDO_HANDLER
+    );
+}
+
+#[test]
+fn command_handler_sees_its_cover_through_the_abi() {
+    let router = Router::with_counter();
+    let session = next_session();
+    let mut req = command_req(FQ_INCREASE_BY, IncreaseBy { n: 1 }.encode_to_vec(), None);
+    req.command.as_mut().unwrap().cover.as_mut().unwrap().root = Some(pb::Uuid { value: vec![4] });
+    let (ret, _) = router.dispatch(session, &req);
+    assert_eq!(ret, 0);
+    assert_eq!(
+        session_snapshot(session).observed_covers,
+        vec![req.command.unwrap().cover]
+    );
+}
+
+#[test]
+fn projector_fold_sees_its_page_place_through_the_abi() {
+    let router = Router::with_projector();
+    let session = next_session();
+    let mut book = book_in_domain("counter", 2);
+    book.cover.as_mut().unwrap().root = Some(pb::Uuid { value: vec![6] });
+    book.pages[1].header = Some(pb::PageHeader {
+        sequence_type: Some(pb::page_header::SequenceType::Sequence(9)),
+        ..Default::default()
+    });
+    let (ret, _) = router.dispatch_projector(session, &book);
+    assert_eq!(ret, 0);
+    assert_eq!(
+        session_snapshot(session).observed_pages,
+        vec![(book.cover.clone(), 0), (book.cover.clone(), 9)]
+    );
+}
+
+#[test]
+fn facts_are_annotated_against_folded_state_through_the_abi() {
+    let router = full_counter();
+    let mut facts = book_in_domain("counter", 2);
+    facts.pages[0].header = Some(pb::PageHeader {
+        sequence_type: Some(pb::page_header::SequenceType::ExternalDeferred(
+            pb::ExternalDeferredSequence {
+                external_id: "ext-1".to_string(),
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    });
+    let req = pb::FactRequest {
+        facts: Some(facts.clone()),
+        prior_events: Some(increased_history(3, 3)),
+    };
+    let (ret, bytes) = router.call(
+        angzarr_router_dispatch_fact,
+        next_session(),
+        &req.encode_to_vec(),
+    );
+    assert_eq!(ret, 0);
+    let out = pb::EventBook::decode(bytes.as_slice()).expect("EventBook");
+    assert_eq!(out.cover, facts.cover, "the facts' cover is kept");
+    assert_eq!(
+        out.pages[0].header, facts.pages[0].header,
+        "headers are kept"
+    );
+    let counters: Vec<u32> = out
+        .pages
+        .iter()
+        .map(|p| match p.payload.as_ref() {
+            Some(pb::event_page::Payload::Event(any)) => {
+                CounterState::decode(any.value.as_slice()).unwrap().value
+            }
+            _ => panic!("fact page lost its event"),
+        })
+        .collect();
+    // The annotation replaces the Increased fact, so it does not fold again:
+    // both facts see the 3 prior events.
+    assert_eq!(counters, vec![3, 3]);
+}
+
+#[test]
+fn facts_route_by_their_cover_domain_through_the_abi() {
+    let r = angzarr_router_new();
+    assert_eq!(
+        register_aggregate_desc(
+            r,
+            abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap()
+        ),
+        0
+    );
+    let mut other = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
+    other.domain = "other".to_string();
+    other.facts = vec![abi_pb::CallbackEntry {
+        fq_type: FQ_INCREASED.to_string(),
+        callback_id: CB_FACT_ANNOTATE,
+    }];
+    assert_eq!(register_aggregate_desc(r, other), 0);
+    let router = Router(r);
+    let annotated = |domain: &str| {
+        let req = pb::FactRequest {
+            facts: Some(book_in_domain(domain, 1)),
+            prior_events: None,
+        };
+        let (ret, bytes) = router.call(
+            angzarr_router_dispatch_fact,
+            next_session(),
+            &req.encode_to_vec(),
+        );
+        assert_eq!(ret, 0);
+        let out = pb::EventBook::decode(bytes.as_slice()).unwrap();
+        match out.pages[0].payload.as_ref() {
+            Some(pb::event_page::Payload::Event(any)) => any.type_url.ends_with("CounterState"),
+            _ => false,
+        }
+    };
+    assert!(
+        !annotated("counter"),
+        "counter has no fact handler: the fact is unchanged"
+    );
+    assert!(annotated("other"), "other's fact handler ran");
+}
+
+#[test]
+fn replay_returns_the_packed_state_through_the_abi() {
+    let router = full_counter();
+    let call = abi_pb::ReplayCall {
+        domain: "counter".to_string(),
+        request: Some(pb::ReplayRequest {
+            base_snapshot: Some(pb::Snapshot {
+                sequence: 1,
+                state: Some(Any {
+                    type_url: "type.googleapis.com/test.counter.CounterState".to_string(),
+                    value: CounterState { value: 10 }.encode_to_vec(),
+                }),
+                ..Default::default()
+            }),
+            events: increased_book(2).pages,
+        }),
+    };
+    let (ret, bytes) = router.call(
+        angzarr_router_dispatch_replay,
+        next_session(),
+        &call.encode_to_vec(),
+    );
+    assert_eq!(ret, 0);
+    let resp = pb::ReplayResponse::decode(bytes.as_slice()).expect("ReplayResponse");
+    let state = CounterState::decode(resp.state.unwrap().value.as_slice()).unwrap();
+    assert_eq!(state.value, 12, "snapshot 10 + two unsequenced events");
+}
+
+#[test]
+fn replay_without_a_state_packer_is_unimplemented_through_the_abi() {
+    let router = Router::with_counter();
+    let call = abi_pb::ReplayCall {
+        domain: "counter".to_string(),
+        request: Some(pb::ReplayRequest::default()),
+    };
+    let (ret, bytes) = router.call(
+        angzarr_router_dispatch_replay,
+        next_session(),
+        &call.encode_to_vec(),
+    );
+    assert_eq!(ret, -12);
+    assert_eq!(
+        decode_status(&bytes).1,
+        angzarr_router::error::codes::NO_HANDLER_REGISTERED
+    );
+}
+
+#[test]
+fn pm_compensator_commands_cross_back_deferred() {
+    let router = pm_with(CB_OK_EMPTY, CB_OK_EMPTY, CB_OK_EMPTY, CB_PM_COMP_COMMANDS);
+    let req = pm_request("order-pm", vec![notification_page(FQ_RESERVE_STOCK)]);
+    let (ret, bytes) = router.dispatch_process_manager(next_session(), &req);
+    assert_eq!(ret, 0);
+    let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).unwrap();
+    assert_eq!(resp.commands.len(), 1);
+    assert!(matches!(
+        resp.commands[0].pages[0]
+            .header
+            .as_ref()
+            .and_then(|h| h.sequence_type.as_ref()),
+        Some(pb::page_header::SequenceType::AngzarrDeferred(_))
+    ));
+}
+
+#[test]
+fn ambiguous_compensates_entries_are_refused_at_registration() {
+    let mut desc = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
+    desc.rejections.push(abi_pb::RejectionEntry {
+        compensates: format!("inventory:{FQ_RESERVE}"),
+        callback_ids: vec![CB_COMP_A],
+    });
+    let r = angzarr_router_new();
+    assert_eq!(register_aggregate_desc(r, desc), -3);
+    let mut pm =
+        abi_pb::ProcessManagerDescriptor::decode(pm_descriptor_bytes().as_slice()).unwrap();
+    pm.rejections.push(abi_pb::RejectionEntry {
+        compensates: format!("inventory:{FQ_RESERVE_STOCK}"),
+        callback_ids: vec![CB_PM_COMP],
+    });
+    let bytes = pm.encode_to_vec();
+    assert_eq!(
+        unsafe { angzarr_router_register_process_manager(r, bytes.as_ptr(), bytes.len(), host_cb) },
+        -3
+    );
+    unsafe { angzarr_router_free(r) };
 }

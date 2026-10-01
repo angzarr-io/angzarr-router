@@ -7,7 +7,7 @@ use angzarr_router::error::{CodedError, GrpcCode, ERROR_INFO_DOMAIN};
 
 use crate::proto::google::rpc::{ErrorInfo, Status};
 
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 /// Callback success with a payload in `out`.
 pub const STATUS_OK: i32 = 0;

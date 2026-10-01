@@ -72,16 +72,19 @@ async fn an_order_pm(_w: &mut ProcessManagerWorld) {
     // Each dispatch builds a fresh PM; nothing to seed.
 }
 
-#[when(
-    regex = r#"^an Increased trigger in domain "([^"]*)" is dispatched with destination inventory sequence (\d+)$"#
-)]
-async fn increased_with_destination(w: &mut ProcessManagerWorld, domain: String, seq: u32) {
+#[when(regex = r#"^an Increased trigger in domain "([^"]*)" at sequence (\d+) is dispatched$"#)]
+async fn increased_at(w: &mut ProcessManagerWorld, domain: String, seq: u32) {
     w.dispatch(conf::pm_trigger_request(
         &domain,
         &["test.counter.Increased"],
         None,
-        &[("inventory", seq)],
+        Some(seq),
     ));
+}
+
+#[when("a Compensate for Reserve is dispatched to the order process-manager")]
+async fn compensate_for_reserve(w: &mut ProcessManagerWorld) {
+    w.dispatch(conf::pm_compensate_request("Reserve"));
 }
 
 #[when(regex = r#"^an Increased trigger in domain "([^"]*)" is dispatched$"#)]
@@ -90,7 +93,7 @@ async fn increased_in_domain(w: &mut ProcessManagerWorld, domain: String) {
         &domain,
         &["test.counter.Increased"],
         None,
-        &[],
+        None,
     ));
 }
 
@@ -101,7 +104,7 @@ async fn newest_undeclared(w: &mut ProcessManagerWorld) {
         "counter",
         &["test.counter.Increased", "test.counter.Unwatched"],
         None,
-        &[],
+        None,
     ));
 }
 
@@ -111,7 +114,7 @@ async fn increased_over_state(w: &mut ProcessManagerWorld, n: u32) {
         "counter",
         &["test.counter.Increased"],
         Some(conf::pm_state_of(n)),
-        &[],
+        None,
     ));
 }
 
@@ -140,18 +143,26 @@ async fn emits_one_command(w: &mut ProcessManagerWorld, target: String) {
     );
 }
 
-#[then(regex = r"^the command carries destination sequence (\d+)$")]
-async fn command_carries_sequence(w: &mut ProcessManagerWorld, seq: u32) {
+#[then(regex = r"^the command is deferred from source sequence (\d+) at command index (\d+)$")]
+async fn command_is_deferred(w: &mut ProcessManagerWorld, seq: u32, index: u32) {
     let cmd = &w.response().commands[0];
-    let got = match cmd.pages[0]
-        .header
-        .as_ref()
-        .and_then(|h| h.sequence_type.as_ref())
-    {
-        Some(pb::page_header::SequenceType::Sequence(s)) => *s,
-        _ => panic!("command page carries no explicit sequence"),
-    };
-    assert_eq!(got, seq);
+    for page in &cmd.pages {
+        let Some(pb::page_header::SequenceType::AngzarrDeferred(d)) =
+            page.header.as_ref().and_then(|h| h.sequence_type.as_ref())
+        else {
+            panic!("command page is not deferred");
+        };
+        assert_eq!(d.source_seq, seq, "source_seq is the trigger's");
+        assert_eq!(
+            d.command_index, index,
+            "command_index is the emission position"
+        );
+        assert_eq!(
+            d.source.as_ref().map(|c| c.domain.as_str()),
+            Some("counter"),
+            "the source cover is the trigger book's"
+        );
+    }
 }
 
 #[then("the process-manager emits no commands")]
@@ -206,7 +217,7 @@ async fn increased_over_owned_state(w: &mut ProcessManagerWorld, owner: String, 
         "counter",
         &["test.counter.Increased"],
         Some(conf::pm_state_in(&owner, n)),
-        &[],
+        None,
     ));
 }
 
