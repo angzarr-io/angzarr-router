@@ -1,5 +1,9 @@
-//! angzarr-router-ffi — the C ABI over the core. Nothing else: no
-//! semantics in this layer.
+//! angzarr-router-ffi — the C ABI over the core. Dispatch semantics live in
+//! the core; this layer owns the marshaling plus the registry's component
+//! claims: routing a command to its aggregate by domain (a sole aggregate
+//! claims everything), one projector per router, sagas by source domain, and
+//! co-resident PMs through the core's selection. Those rules are
+//! mutation-tested with the core.
 //!
 //! # Status codes
 //! Every entry point and host callback returns `i32`:
@@ -24,7 +28,12 @@
 //! Callbacks are invoked synchronously on the dispatching thread — one
 //! callback at a time per dispatch; dispatches on different host_ctx
 //! values may run concurrently. `host_ctx` is opaque to Rust: it is where
-//! the binding parks the per-dispatch state object (state never crosses).
+//! the binding parks the per-dispatch session (state never crosses). One
+//! dispatch may run several components under the same `host_ctx`
+//! (co-resident sagas or process managers), so the host keys any lazily
+//! created state by component (each component's callback ids), never by
+//! session alone. Registration takes the router exclusively: it must not run
+//! concurrently with any other call on the same router.
 //! Every entry point wraps `catch_unwind`; a Rust panic surfaces as a
 //! coded UNHANDLED_HANDLER_ERROR failure — never an abort, never an
 //! unwind across the boundary.

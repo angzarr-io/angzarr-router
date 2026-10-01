@@ -174,7 +174,7 @@ build: (_container "build")
 # Run the unit test bank
 test: (_container "test")
 
-# Mutation-test the core modules
+# Mutation-test the core modules and the FFI registry
 mutation-test: (_container "mutation-test")
 
 # Format

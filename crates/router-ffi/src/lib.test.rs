@@ -57,6 +57,12 @@ const CB_PM_COMP: u64 = 13;
 const CB_PM2_EVENT: u64 = 14;
 const CB_PM2_COMP: u64 = 15;
 const CB_PROJ_FOLD_REJECTS: u64 = 16;
+/// Succeeds with STATUS_OK and no output (an applier/fold that returns 0).
+const CB_OK_ZERO: u64 = 17;
+/// Succeeds with STATUS_OK_EMPTY and no output (a handler emitting nothing).
+const CB_OK_EMPTY: u64 = 18;
+/// Fails with -13 and no status payload.
+const CB_FAILS: u64 = 19;
 
 const FQ_ORDER_CREATED: &str = "test.order.OrderCreated";
 const FQ_RESERVE_STOCK: &str = "test.order.ReserveStock";
@@ -338,6 +344,9 @@ unsafe extern "C" fn host_cb(
             host_fill(out, &resp.encode_to_vec());
             STATUS_OK
         }
+        CB_OK_ZERO => STATUS_OK,
+        CB_OK_EMPTY => STATUS_OK_EMPTY,
+        CB_FAILS => -13,
         CB_FAIL_HARD => -13, // plain failure, no status payload
         CB_RETURN_NOTHING => STATUS_OK_EMPTY,
         CB_COMP_A | CB_COMP_B => {
@@ -1542,4 +1551,271 @@ fn projector_fold_failure_keeps_the_host_status() {
     assert_eq!(ret, -9, "the host's gRPC code survives");
     let (_, reason) = decode_status(&bytes);
     assert_eq!(reason, "PROJECTION_STALE");
+}
+
+// --- host return-code boundaries across every callback kind
+
+fn register_aggregate_desc(r: *mut c_void, desc: abi_pb::AggregateDescriptor) -> i32 {
+    let bytes = desc.encode_to_vec();
+    unsafe { angzarr_router_register_aggregate(r, bytes.as_ptr(), bytes.len(), host_cb) }
+}
+
+/// The counter aggregate with its applier and snapshot loader replaced.
+fn counter_with(applier: u64, snapshot: u64) -> Router {
+    let mut desc = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
+    desc.appliers[0].callback_id = applier;
+    desc.snapshot_callback_id = Some(snapshot);
+    let r = angzarr_router_new();
+    assert_eq!(register_aggregate_desc(r, desc), 0);
+    Router(r)
+}
+
+fn snapshot_history_book() -> pb::EventBook {
+    let mut book = increased_history(1, 2);
+    book.snapshot = Some(pb::Snapshot {
+        sequence: 0,
+        state: Some(Any {
+            type_url: "type.googleapis.com/test.counter.CounterState".to_string(),
+            value: CounterState { value: 1 }.encode_to_vec(),
+        }),
+        ..Default::default()
+    });
+    book
+}
+
+fn increase_one(events: Option<pb::EventBook>) -> pb::ContextualCommand {
+    command_req(FQ_INCREASE_BY, IncreaseBy { n: 1 }.encode_to_vec(), events)
+}
+
+#[test]
+fn applier_returning_status_ok_is_success() {
+    let router = counter_with(CB_OK_ZERO, CB_OK_ZERO);
+    let (ret, _) = router.dispatch(next_session(), &increase_one(Some(increased_history(2, 2))));
+    assert_eq!(ret, 0);
+}
+
+#[test]
+fn snapshot_loader_returning_status_ok_is_success() {
+    let router = counter_with(CB_OK_ZERO, CB_OK_ZERO);
+    let (ret, _) = router.dispatch(next_session(), &increase_one(Some(snapshot_history_book())));
+    assert_eq!(ret, 0);
+}
+
+#[test]
+fn failing_snapshot_loader_is_data_loss() {
+    let router = counter_with(CB_OK_ZERO, CB_FAILS);
+    let (ret, bytes) =
+        router.dispatch(next_session(), &increase_one(Some(snapshot_history_book())));
+    assert_eq!(ret, -15);
+    let (_, reason) = decode_status(&bytes);
+    assert_eq!(
+        reason,
+        angzarr_router::error::codes::PERSISTED_EVENT_CORRUPT
+    );
+}
+
+#[test]
+fn compensator_emitting_nothing_is_an_empty_response() {
+    let mut desc = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
+    desc.rejections[0].callback_ids = vec![CB_OK_EMPTY];
+    let r = angzarr_router_new();
+    assert_eq!(register_aggregate_desc(r, desc), 0);
+    let router = Router(r);
+    let mut req = command_req(FQ_RESERVE, Vec::new(), None);
+    req.command.as_mut().unwrap().pages[0].payload = Some(pb::command_page::Payload::Command(
+        notification_command(FQ_RESERVE),
+    ));
+    let (ret, bytes) = router.dispatch(next_session(), &req);
+    assert_eq!(ret, 0);
+    assert_eq!(decode_response(&bytes).result, None);
+}
+
+#[test]
+fn projector_fold_returning_status_ok_is_success() {
+    let mut desc =
+        abi_pb::ProjectorDescriptor::decode(projector_descriptor_bytes().as_slice()).unwrap();
+    desc.events[0].callback_id = CB_OK_ZERO;
+    let bytes = desc.encode_to_vec();
+    let r = angzarr_router_new();
+    assert_eq!(
+        unsafe { angzarr_router_register_projector(r, bytes.as_ptr(), bytes.len(), host_cb) },
+        0
+    );
+    let router = Router(r);
+    let (ret, _) = router.dispatch_projector(next_session(), &book_in_domain("counter", 2));
+    assert_eq!(ret, 0);
+}
+
+fn saga_with(event: u64, comp: u64) -> Router {
+    let mut desc = abi_pb::SagaDescriptor::decode(saga_descriptor_bytes().as_slice()).unwrap();
+    desc.events[0].callback_id = event;
+    desc.rejections[0].callback_ids = vec![comp];
+    let bytes = desc.encode_to_vec();
+    let r = angzarr_router_new();
+    assert_eq!(
+        unsafe { angzarr_router_register_saga(r, bytes.as_ptr(), bytes.len(), host_cb) },
+        0
+    );
+    Router(r)
+}
+
+#[test]
+fn saga_handler_emitting_nothing_is_an_empty_response() {
+    let router = saga_with(CB_OK_EMPTY, CB_OK_EMPTY);
+    let req = saga_request("order", vec![event_page_of(FQ_ORDER_CREATED)], &[]);
+    let (ret, bytes) = router.dispatch_saga(next_session(), &req);
+    assert_eq!(ret, 0);
+    assert_eq!(
+        pb::SagaResponse::decode(bytes.as_slice()).unwrap(),
+        pb::SagaResponse::default()
+    );
+}
+
+#[test]
+fn saga_compensator_emitting_nothing_is_an_empty_response() {
+    let router = saga_with(CB_OK_EMPTY, CB_OK_EMPTY);
+    let req = saga_request("order", vec![notification_page(FQ_RESERVE_STOCK)], &[]);
+    let (ret, bytes) = router.dispatch_saga(next_session(), &req);
+    assert_eq!(ret, 0);
+    assert_eq!(
+        pb::SagaResponse::decode(bytes.as_slice()).unwrap(),
+        pb::SagaResponse::default()
+    );
+}
+
+/// The order PM with an applier and snapshot loader for Increased, and its
+/// event handler / compensator replaced.
+fn pm_with(applier: u64, snapshot: u64, event: u64, comp: u64) -> Router {
+    let mut desc =
+        abi_pb::ProcessManagerDescriptor::decode(pm_descriptor_bytes().as_slice()).unwrap();
+    desc.appliers = vec![abi_pb::CallbackEntry {
+        fq_type: FQ_INCREASED.to_string(),
+        callback_id: applier,
+    }];
+    desc.snapshot_callback_id = Some(snapshot);
+    desc.events[0].callback_id = event;
+    desc.rejections[0].callback_ids = vec![comp];
+    let bytes = desc.encode_to_vec();
+    let r = angzarr_router_new();
+    assert_eq!(
+        unsafe { angzarr_router_register_process_manager(r, bytes.as_ptr(), bytes.len(), host_cb) },
+        0
+    );
+    Router(r)
+}
+
+fn pm_over_state(state: pb::EventBook) -> pb::ProcessManagerHandleRequest {
+    let mut req = pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)], &[]);
+    req.process_state = Some(state);
+    req
+}
+
+#[test]
+fn pm_applier_and_loader_succeed_on_either_ok_status() {
+    for ok in [CB_OK_ZERO, CB_OK_EMPTY] {
+        let router = pm_with(ok, ok, CB_OK_EMPTY, CB_OK_EMPTY);
+        let (ret, bytes) = router
+            .dispatch_process_manager(next_session(), &pm_over_state(snapshot_history_book()));
+        assert_eq!(ret, 0, "callback status {ok} is success");
+        assert_eq!(
+            pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).unwrap(),
+            pb::ProcessManagerHandleResponse::default(),
+            "a handler emitting nothing is an empty response"
+        );
+    }
+}
+
+#[test]
+fn failing_pm_applier_is_data_loss() {
+    let router = pm_with(CB_FAILS, CB_OK_EMPTY, CB_OK_EMPTY, CB_OK_EMPTY);
+    let (ret, bytes) =
+        router.dispatch_process_manager(next_session(), &pm_over_state(increased_book(1)));
+    assert_eq!(ret, -15);
+    assert_eq!(
+        decode_status(&bytes).1,
+        angzarr_router::error::codes::PERSISTED_EVENT_CORRUPT
+    );
+}
+
+#[test]
+fn failing_pm_snapshot_loader_is_data_loss() {
+    let router = pm_with(CB_OK_EMPTY, CB_FAILS, CB_OK_EMPTY, CB_OK_EMPTY);
+    let (ret, _) =
+        router.dispatch_process_manager(next_session(), &pm_over_state(snapshot_history_book()));
+    assert_eq!(ret, -15);
+}
+
+#[test]
+fn pm_compensator_emitting_nothing_is_an_empty_response() {
+    let router = pm_with(CB_OK_EMPTY, CB_OK_EMPTY, CB_OK_EMPTY, CB_OK_EMPTY);
+    let req = pm_request("order-pm", vec![notification_page(FQ_RESERVE_STOCK)], &[]);
+    let (ret, bytes) = router.dispatch_process_manager(next_session(), &req);
+    assert_eq!(ret, 0);
+    assert_eq!(
+        pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).unwrap(),
+        pb::ProcessManagerHandleResponse::default()
+    );
+}
+
+// --- aggregate routing by command domain
+
+/// Two aggregates: "counter" (IncreaseBy emits events) and "other", whose
+/// IncreaseBy handler emits nothing.
+fn two_aggregates() -> Router {
+    let r = angzarr_router_new();
+    assert_eq!(
+        register_aggregate_desc(
+            r,
+            abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap()
+        ),
+        0
+    );
+    let mut other = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
+    other.domain = "other".to_string();
+    other.commands[0].callback_id = CB_OK_EMPTY;
+    assert_eq!(register_aggregate_desc(r, other), 0);
+    Router(r)
+}
+
+fn increase_in(domain: &str) -> pb::ContextualCommand {
+    let mut req = increase_one(None);
+    req.command.as_mut().unwrap().cover.as_mut().unwrap().domain = domain.to_string();
+    req
+}
+
+fn emitted_pages(bytes: &[u8]) -> usize {
+    match decode_response(bytes).result {
+        Some(pb::business_response::Result::Events(book)) => book.pages.len(),
+        other => panic!("expected events, got {other:?}"),
+    }
+}
+
+#[test]
+fn commands_route_to_the_aggregate_owning_their_domain() {
+    let router = two_aggregates();
+    let (ret, bytes) = router.dispatch(next_session(), &increase_in("counter"));
+    assert_eq!(ret, 0);
+    assert_eq!(emitted_pages(&bytes), 1, "the counter aggregate handled it");
+    let (ret, bytes) = router.dispatch(next_session(), &increase_in("other"));
+    assert_eq!(ret, 0);
+    assert_eq!(emitted_pages(&bytes), 0, "the other aggregate handled it");
+}
+
+#[test]
+fn unclaimed_domain_with_several_aggregates_is_no_handler() {
+    let router = two_aggregates();
+    let (ret, bytes) = router.dispatch(next_session(), &increase_in("nobody"));
+    assert_eq!(ret, -12, "NO_HANDLER_REGISTERED is UNIMPLEMENTED");
+    assert_eq!(
+        decode_status(&bytes).1,
+        angzarr_router::error::codes::NO_HANDLER_REGISTERED
+    );
+}
+
+#[test]
+fn a_sole_aggregate_claims_any_domain() {
+    let router = Router::with_counter();
+    let (ret, bytes) = router.dispatch(next_session(), &increase_in("nobody"));
+    assert_eq!(ret, 0);
+    assert_eq!(emitted_pages(&bytes), 1);
 }

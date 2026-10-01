@@ -672,3 +672,7 @@ impl FfiRouter {
         Ok(merged.encode_to_vec())
     }
 }
+
+#[cfg(test)]
+#[path = "registry.test.rs"]
+mod registry_tests;
