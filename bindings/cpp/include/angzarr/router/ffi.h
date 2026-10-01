@@ -44,6 +44,9 @@ int32_t angzarr_router_dispatch_process_manager(void* r, void* host_ctx, const u
 
 }  // extern "C"
 
+// The router-ffi ABI version this binding is written against.
+inline constexpr uint32_t kAbiVersion = 1;
+
 inline constexpr int32_t kStatusOk = 0;
 inline constexpr int32_t kStatusOkEmpty = 1;
 

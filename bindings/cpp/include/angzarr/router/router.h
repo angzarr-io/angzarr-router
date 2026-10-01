@@ -18,6 +18,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 
 #include "angzarr/router/coded_error.h"
@@ -43,12 +44,26 @@ extern "C" inline int32_t AngzarrTrampoline(void* host_ctx, uint64_t callback_id
                                             const uint8_t* aux, size_t aux_len,
                                             ffi::AngzarrBuf* out);
 
+// Refuses a router-ffi library whose ABI version differs from the one this
+// binding is written against, naming both versions.
+inline void CheckAbiVersion(uint32_t actual) {
+  if (actual != ffi::kAbiVersion) {
+    throw std::runtime_error("router-ffi ABI version mismatch: expected " +
+                             std::to_string(ffi::kAbiVersion) + ", got " + std::to_string(actual));
+  }
+}
+
 class Router {
  public:
-  Router() : ptr_(ffi::angzarr_router_new()) {}
+  // Checks the linked router-ffi's ABI version before creating the native
+  // router; a drifted library throws std::runtime_error.
+  Router() : ptr_(NewNative()) {}
   ~Router() { ffi::angzarr_router_free(ptr_); }
   Router(const Router&) = delete;
   Router& operator=(const Router&) = delete;
+
+  // The ABI version the linked router-ffi library reports.
+  static uint32_t AbiVersion() { return ffi::angzarr_abi_version(); }
 
   Invoker* InvokerFor(uint64_t id) {
     std::lock_guard<std::mutex> lock(mu_);
@@ -174,6 +189,11 @@ class Router {
     std::string response;
     int32_t status;
   };
+
+  static void* NewNative() {
+    CheckAbiVersion(AbiVersion());
+    return ffi::angzarr_router_new();
+  }
 
   ComponentKey NextComponentKey() { return ++next_component_; }
 
