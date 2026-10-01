@@ -94,7 +94,7 @@ public sealed class Router : IDisposable
             if (d.Rebuilder.Snapshot != null)
             {
                 desc.SnapshotCallbackId = Assign(
-                    ApplierInvoker(component, factory, d.Rebuilder.Snapshot)
+                    SnapshotInvoker(component, factory, d.Rebuilder.Snapshot)
                 );
             }
             foreach (var (key, thunk) in d.Commands)
@@ -188,7 +188,7 @@ public sealed class Router : IDisposable
             if (d.Rebuilder.Snapshot != null)
             {
                 desc.SnapshotCallbackId = Assign(
-                    ApplierInvoker(component, factory, d.Rebuilder.Snapshot)
+                    SnapshotInvoker(component, factory, d.Rebuilder.Snapshot)
                 );
             }
             foreach (var (sourceDomain, byType) in d.Handlers)
@@ -214,6 +214,7 @@ public sealed class Router : IDisposable
                 }
                 desc.Rejections.Add(entry);
             }
+            desc.StateCallbackId = Assign(StateInvoker(component, factory));
             Check(Ffi.RegisterProcessManager(Handle(), desc.ToByteArray()));
         }
     }
@@ -257,8 +258,9 @@ public sealed class Router : IDisposable
         Parse(DispatchVia(request, Ffi.DispatchFact), EventBook.Parser, "EventBook");
 
     /// <summary>Replays a ReplayRequest (base snapshot, then events) through
-    /// the aggregate registered for <paramref name="domain"/> (empty selects a
-    /// sole registered aggregate) and returns its state packed as an Any.</summary>
+    /// the aggregate registered for <paramref name="domain"/>, else the process
+    /// manager whose own domain it is (empty selects a sole registered
+    /// aggregate), and returns its state packed as an Any.</summary>
     public ReplayResponse DispatchReplay(string domain, ReplayRequest request) =>
         Parse(
             DispatchVia(
@@ -313,7 +315,29 @@ public sealed class Router : IDisposable
             ? new CommandContext(0, false)
             : new CommandContext(cax.NextSequence, cax.HadPriorEvents, cax.Cover);
 
+    private static PageContext PageOf(byte[] aux)
+    {
+        var pax = Abi.ProjectorEventAux.Parser.ParseFrom(aux);
+        return new PageContext(pax.Cover, pax.Sequence);
+    }
+
     private static Invoker ApplierInvoker<TState>(
+        ComponentKey component,
+        Func<TState> factory,
+        ApplierPageThunk<TState> thunk
+    )
+        where TState : class, IMessage =>
+        (session, typeUrl, payload, aux) =>
+        {
+            thunk(
+                (TState)session.EnsureState(component, factory),
+                AnyOf(typeUrl, payload),
+                PageOf(aux)
+            );
+            return new InvokerResult(null, Ffi.StatusOk);
+        };
+
+    private static Invoker SnapshotInvoker<TState>(
         ComponentKey component,
         Func<TState> factory,
         ApplierThunk<TState> thunk
@@ -419,11 +443,10 @@ public sealed class Router : IDisposable
         where TState : class, IMessage =>
         (session, typeUrl, payload, aux) =>
         {
-            var pax = Abi.ProjectorEventAux.Parser.ParseFrom(aux);
             thunk(
                 (TState)session.EnsureState(component, factory),
                 AnyOf(typeUrl, payload),
-                new PageContext(pax.Cover, pax.Sequence)
+                PageOf(aux)
             );
             return new InvokerResult(null, Ffi.StatusOk);
         };

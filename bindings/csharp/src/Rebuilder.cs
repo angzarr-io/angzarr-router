@@ -13,7 +13,7 @@ public sealed class Rebuilder<TState>
     where TState : class, IMessage
 {
     internal readonly Func<TState> Factory;
-    internal readonly Dictionary<string, ApplierThunk<TState>> Appliers = new();
+    internal readonly Dictionary<string, ApplierPageThunk<TState>> Appliers = new();
     internal ApplierThunk<TState>? Snapshot;
 
     /// <summary>Starts a rebuilder from a zero-state factory (e.g.
@@ -21,7 +21,12 @@ public sealed class Rebuilder<TState>
     public Rebuilder(Func<TState> factory) => Factory = factory;
 
     /// <summary>Registers an applier for one fully-qualified event type.</summary>
-    public Rebuilder<TState> Apply(string fullName, ApplierThunk<TState> thunk)
+    public Rebuilder<TState> Apply(string fullName, ApplierThunk<TState> thunk) =>
+        ApplyWithContext(fullName, (state, ev, _) => thunk(state, ev));
+
+    /// <summary>Registers an applier for one fully-qualified event type; the
+    /// applier also reads where each event sits (<see cref="PageContext"/>).</summary>
+    public Rebuilder<TState> ApplyWithContext(string fullName, ApplierPageThunk<TState> thunk)
     {
         Appliers[fullName] = thunk;
         return this;

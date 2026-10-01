@@ -552,6 +552,18 @@ public static class Builders
         return new FactRequest { Facts = book, PriorEvents = history };
     }
 
+    /// <summary>A ReplayRequest of <paramref name="events"/> Increased events
+    /// at sequences 0..., with no snapshot.</summary>
+    public static ReplayRequest EventsReplayOf(int events)
+    {
+        var req = new ReplayRequest();
+        for (var i = 0; i < events; i++)
+        {
+            req.Events.Add(IncreasedPageAt(i));
+        }
+        return req;
+    }
+
     /// <summary>A ReplayRequest: a snapshot of count at sequence 1, then
     /// `events` Increased events at sequences 2...</summary>
     public static ReplayRequest ReplayOf(int count, int events)

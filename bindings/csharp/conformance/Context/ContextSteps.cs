@@ -20,6 +20,7 @@ public sealed class ContextSteps
     private Router _router = null!;
     private readonly List<Cover?> _covers = new();
     private readonly List<(ByteString Root, uint Sequence)> _pages = new();
+    private readonly List<uint> _applied = new();
     private EventBook? _facts;
     private TC.CounterState? _replayed;
     private ProcessManagerHandleResponse? _pm;
@@ -30,6 +31,7 @@ public sealed class ContextSteps
         _router = new Router();
         _covers.Clear();
         _pages.Clear();
+        _applied.Clear();
         _facts = null;
         _replayed = null;
         _pm = null;
@@ -39,7 +41,8 @@ public sealed class ContextSteps
     public void After() => _router?.Dispose();
 
     /// <summary>The ledger aggregate (domain "ledger") over CounterState:
-    /// Increased folds count += 1; a snapshot loads CounterState; IncreaseBy
+    /// Increased folds count += 1 and records the page sequence it applied; a
+    /// snapshot loads CounterState; IncreaseBy
     /// records the handled cover and emits nothing; an Increased fact is
     /// annotated as a CounterState carrying the folded count.</summary>
     [Given("a ledger aggregate")]
@@ -49,7 +52,14 @@ public sealed class ContextSteps
                 "Ledger",
                 "ledger",
                 new Rebuilder<TC.CounterState>(() => new TC.CounterState())
-                    .Apply("test.counter.Increased", (state, ev) => state.Count += 1)
+                    .ApplyWithContext(
+                        "test.counter.Increased",
+                        (state, ev, page) =>
+                        {
+                            state.Count += 1;
+                            _applied.Add(page.Sequence);
+                        }
+                    )
                     .WithSnapshot(
                         (state, snapshot) =>
                             state.Count = TC.CounterState.Parser.ParseFrom(snapshot.Value).Count
@@ -70,7 +80,8 @@ public sealed class ContextSteps
         );
 
     /// <summary>The reserving process-manager (domain "reserving-pm", target
-    /// "inventory") over CounterState: an Increased trigger from "counter"
+    /// "inventory") over CounterState (Increased folds count += 1): an
+    /// Increased trigger from "counter"
     /// records the trigger cover and emits nothing; a rejected Reserve is
     /// compensated with a Release command to "inventory".</summary>
     [Given("a reserving process-manager")]
@@ -80,7 +91,10 @@ public sealed class ContextSteps
                 "Reserving",
                 "reserving-pm",
                 new[] { "inventory" },
-                new Rebuilder<TC.CounterState>(() => new TC.CounterState())
+                new Rebuilder<TC.CounterState>(() => new TC.CounterState()).Apply(
+                    "test.counter.Increased",
+                    (state, ev) => state.Count += 1
+                )
             )
                 .OnEvent(
                     "counter",
@@ -128,6 +142,18 @@ public sealed class ContextSteps
     public void Replay(int count, int events)
     {
         var resp = _router.DispatchReplay("ledger", Builders.ReplayOf(count, events));
+        Assert.That(
+            TypeNames.FromUrl(resp.State.TypeUrl),
+            Is.EqualTo(TC.CounterState.Descriptor.FullName),
+            "replayed state type"
+        );
+        _replayed = TC.CounterState.Parser.ParseFrom(resp.State.Value);
+    }
+
+    [When("the reserving process-manager replays {int} Increased events")]
+    public void PmReplay(int events)
+    {
+        var resp = _router.DispatchReplay("reserving-pm", Builders.EventsReplayOf(events));
         Assert.That(
             TypeNames.FromUrl(resp.State.TypeUrl),
             Is.EqualTo(TC.CounterState.Descriptor.FullName),
@@ -188,6 +214,14 @@ public sealed class ContextSteps
 
     [Then("the replayed state has a count of {int}")]
     public void Replayed(int count) => Assert.That((int)_replayed!.Count, Is.EqualTo(count));
+
+    [Then("the ledger applied Increased events at sequences {int} and {int}")]
+    public void AppliedAt(int first, int second) =>
+        Assert.That(
+            _applied,
+            Is.EqualTo(new[] { (uint)first, (uint)second }),
+            "applied page sequences"
+        );
 
     private byte[] SingleRoot()
     {

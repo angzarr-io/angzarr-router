@@ -14,6 +14,11 @@ namespace Angzarr.Router;
 public delegate void ApplierThunk<TState>(TState state, Any @event)
     where TState : class, IMessage;
 
+/// <summary>Folds one event into rebuilding state, knowing where it sits (its
+/// book's cover and the page's sequence).</summary>
+public delegate void ApplierPageThunk<TState>(TState state, Any @event, PageContext page)
+    where TState : class, IMessage;
+
 /// <summary>Handles a command; returns the EventBook to persist, or null for
 /// nothing emitted.</summary>
 public delegate EventBook? CommandThunk<TState>(Any command, TState state, CommandContext cctx)
