@@ -5,26 +5,31 @@ import com.google.protobuf.ByteString;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.Message;
 import io.angzarr.BusinessResponse;
+import io.angzarr.Compensate;
 import io.angzarr.ContextualCommand;
 import io.angzarr.EventBook;
+import io.angzarr.FactRequest;
 import io.angzarr.Notification;
 import io.angzarr.ProcessManagerHandleRequest;
 import io.angzarr.ProcessManagerHandleResponse;
 import io.angzarr.Projection;
 import io.angzarr.RejectionNotification;
+import io.angzarr.ReplayRequest;
+import io.angzarr.ReplayResponse;
 import io.angzarr.SagaHandleRequest;
 import io.angzarr.SagaResponse;
 import io.angzarr.router.Thunks.ApplierThunk;
 import io.angzarr.router.Thunks.CommandThunk;
-import io.angzarr.router.Thunks.PmEventThunk;
-import io.angzarr.router.Thunks.PmRejectionThunk;
-import io.angzarr.router.Thunks.ProjectorEventThunk;
+import io.angzarr.router.Thunks.FactThunk;
+import io.angzarr.router.Thunks.PmCompensatorThunk;
+import io.angzarr.router.Thunks.PmEventCoverThunk;
+import io.angzarr.router.Thunks.ProjectorEventContextThunk;
 import io.angzarr.router.Thunks.ProjectorFinishThunk;
 import io.angzarr.router.Thunks.ProjectorUnknownThunk;
 import io.angzarr.router.Thunks.RejectionThunk;
 import io.angzarr.router.Thunks.SagaEmission;
 import io.angzarr.router.Thunks.SagaEventThunk;
-import io.angzarr.router.Thunks.SagaRejectionThunk;
+import io.angzarr.router.Thunks.UndoThunk;
 import io.angzarr.router.ffi.v1.Abi;
 import java.lang.foreign.MemorySegment;
 import java.util.List;
@@ -122,13 +127,21 @@ public final class Router implements AutoCloseable {
       desc.addCommands(callbackEntry(e.getKey(), id));
     }
     for (Map.Entry<String, List<RejectionThunk>> e : d.rejections.entrySet()) {
-      Abi.RejectionEntry.Builder entry =
-          Abi.RejectionEntry.newBuilder().setFqCommandType(e.getKey());
+      Abi.RejectionEntry.Builder entry = Abi.RejectionEntry.newBuilder().setCompensates(e.getKey());
       for (RejectionThunk thunk : e.getValue()) {
         entry.addCallbackIds(assign(rejectionInvoker(component, factory, thunk)));
       }
       desc.addRejections(entry);
     }
+    for (Map.Entry<String, UndoThunk> e : d.undoes.entrySet()) {
+      long id = assign(undoInvoker(component, factory, e.getValue()));
+      desc.addUndoes(callbackEntry(e.getKey(), id));
+    }
+    for (Map.Entry<String, FactThunk> e : d.facts.entrySet()) {
+      long id = assign(factInvoker(component, factory, e.getValue()));
+      desc.addFacts(callbackEntry(e.getKey(), id));
+    }
+    desc.setStateCallbackId(assign(stateInvoker(component, factory)));
     byte[] descriptor = desc.build().toByteArray();
     check(withRouter(p -> Ffi.registerAggregate(p, descriptor)));
   }
@@ -139,7 +152,7 @@ public final class Router implements AutoCloseable {
     Abi.ProjectorDescriptor.Builder desc =
         Abi.ProjectorDescriptor.newBuilder().setName(d.name).addAllDomains(d.domains);
 
-    for (Map.Entry<String, ProjectorEventThunk> e : d.events.entrySet()) {
+    for (Map.Entry<String, ProjectorEventContextThunk> e : d.events.entrySet()) {
       long id = assign(projectorEventInvoker(component, factory, e.getValue()));
       desc.addEvents(callbackEntry(e.getKey(), id));
     }
@@ -154,6 +167,7 @@ public final class Router implements AutoCloseable {
   }
 
   public synchronized void registerSaga(SagaDispatch d) {
+    Destinations dests = new Destinations(d.targets);
     Abi.SagaDescriptor.Builder desc =
         Abi.SagaDescriptor.newBuilder()
             .setName(d.name)
@@ -161,16 +175,8 @@ public final class Router implements AutoCloseable {
             .addAllTargetDomains(d.targets);
 
     for (Map.Entry<String, SagaEventThunk> e : d.events.entrySet()) {
-      long id = assign(sagaEventInvoker(e.getValue()));
+      long id = assign(sagaEventInvoker(dests, e.getValue()));
       desc.addEvents(callbackEntry(e.getKey(), id));
-    }
-    for (Map.Entry<String, List<SagaRejectionThunk>> e : d.rejections.entrySet()) {
-      Abi.RejectionEntry.Builder entry =
-          Abi.RejectionEntry.newBuilder().setFqCommandType(e.getKey());
-      for (SagaRejectionThunk thunk : e.getValue()) {
-        entry.addCallbackIds(assign(sagaRejectionInvoker(thunk)));
-      }
-      desc.addRejections(entry);
     }
     byte[] descriptor = desc.build().toByteArray();
     check(withRouter(p -> Ffi.registerSaga(p, descriptor)));
@@ -180,7 +186,11 @@ public final class Router implements AutoCloseable {
     Supplier<Message.Builder> factory = d.rebuilder.factory;
     long component = nextComponent.incrementAndGet();
     Abi.ProcessManagerDescriptor.Builder desc =
-        Abi.ProcessManagerDescriptor.newBuilder().setName(d.name).setPmDomain(d.pmDomain);
+        Abi.ProcessManagerDescriptor.newBuilder()
+            .setName(d.name)
+            .setPmDomain(d.pmDomain)
+            .addAllTargetDomains(d.targets);
+    Destinations dests = new Destinations(d.targets);
 
     for (Map.Entry<String, ApplierThunk> e : d.rebuilder.appliers.entrySet()) {
       long id = assign(applierInvoker(component, factory, e.getValue()));
@@ -189,9 +199,9 @@ public final class Router implements AutoCloseable {
     if (d.rebuilder.snapshot != null) {
       desc.setSnapshotCallbackId(assign(applierInvoker(component, factory, d.rebuilder.snapshot)));
     }
-    for (Map.Entry<String, Map<String, PmEventThunk>> byDomain : d.handlers.entrySet()) {
-      for (Map.Entry<String, PmEventThunk> e : byDomain.getValue().entrySet()) {
-        long id = assign(pmEventInvoker(component, factory, e.getValue()));
+    for (Map.Entry<String, Map<String, PmEventCoverThunk>> byDomain : d.handlers.entrySet()) {
+      for (Map.Entry<String, PmEventCoverThunk> e : byDomain.getValue().entrySet()) {
+        long id = assign(pmEventInvoker(component, factory, dests, e.getValue()));
         desc.addEvents(
             Abi.PmEventEntry.newBuilder()
                 .setInputDomain(byDomain.getKey())
@@ -199,10 +209,9 @@ public final class Router implements AutoCloseable {
                 .setCallbackId(id));
       }
     }
-    for (Map.Entry<String, List<PmRejectionThunk>> e : d.rejections.entrySet()) {
-      Abi.RejectionEntry.Builder entry =
-          Abi.RejectionEntry.newBuilder().setFqCommandType(e.getKey());
-      for (PmRejectionThunk thunk : e.getValue()) {
+    for (Map.Entry<String, List<PmCompensatorThunk>> e : d.rejections.entrySet()) {
+      Abi.RejectionEntry.Builder entry = Abi.RejectionEntry.newBuilder().setCompensates(e.getKey());
+      for (PmCompensatorThunk thunk : e.getValue()) {
         entry.addCallbackIds(assign(pmRejectionInvoker(component, factory, thunk)));
       }
       desc.addRejections(entry);
@@ -243,6 +252,29 @@ public final class Router implements AutoCloseable {
     return parse(d, ProcessManagerHandleResponse::parseFrom, "ProcessManagerHandleResponse");
   }
 
+  /**
+   * Runs facts through the fact handling of the aggregate claiming the facts' cover domain (a sole
+   * aggregate claims everything); returns the facts to record.
+   */
+  public EventBook dispatchFact(FactRequest request) {
+    Ffi.Dispatched d = dispatch(request, Ffi::dispatchFact);
+    return parse(d, EventBook::parseFrom, "EventBook");
+  }
+
+  /**
+   * Replays a snapshot and events through the appliers of the aggregate registered for domain (an
+   * empty domain selects a sole registered aggregate); returns its packed state.
+   */
+  public ReplayResponse dispatchReplay(String domain, ReplayRequest request) {
+    Abi.ReplayCall call =
+        Abi.ReplayCall.newBuilder()
+            .setDomain(domain == null ? "" : domain)
+            .setRequest(request)
+            .build();
+    Ffi.Dispatched d = dispatch(call, Ffi::dispatchReplay);
+    return parse(d, ReplayResponse::parseFrom, "ReplayResponse");
+  }
+
   @FunctionalInterface
   private interface DispatchCall {
     Ffi.Dispatched call(MemorySegment router, long sessionId, byte[] request);
@@ -280,6 +312,11 @@ public final class Router implements AutoCloseable {
     return Any.newBuilder().setTypeUrl(typeUrl).setValue(ByteString.copyFrom(payload)).build();
   }
 
+  private static CommandContext commandContext(Abi.CommandContextAux cax) {
+    return new CommandContext(
+        Integer.toUnsignedLong(cax.getNextSequence()), cax.getHadPriorEvents(), cax.getCover());
+  }
+
   private static Invoker applierInvoker(
       long component, Supplier<Message.Builder> factory, ApplierThunk thunk) {
     return (session, typeUrl, payload, aux) -> {
@@ -291,10 +328,7 @@ public final class Router implements AutoCloseable {
   private static Invoker commandInvoker(
       long component, Supplier<Message.Builder> factory, CommandThunk thunk) {
     return (session, typeUrl, payload, aux) -> {
-      Abi.CommandContextAux cax = Abi.CommandContextAux.parseFrom(aux);
-      CommandContext cctx =
-          new CommandContext(
-              Integer.toUnsignedLong(cax.getNextSequence()), cax.getHadPriorEvents());
+      CommandContext cctx = commandContext(Abi.CommandContextAux.parseFrom(aux));
       EventBook book =
           thunk.handle(anyOf(typeUrl, payload), session.ensureState(component, factory), cctx);
       if (book == null) {
@@ -310,12 +344,7 @@ public final class Router implements AutoCloseable {
       Abi.RejectionAux rax = Abi.RejectionAux.parseFrom(aux);
       Notification n = Notification.parseFrom(rax.getNotification());
       RejectionNotification rej = RejectionNotification.parseFrom(rax.getRejection());
-      CommandContext cctx =
-          rax.hasCctx()
-              ? new CommandContext(
-                  Integer.toUnsignedLong(rax.getCctx().getNextSequence()),
-                  rax.getCctx().getHadPriorEvents())
-              : new CommandContext(0, false);
+      CommandContext cctx = commandContext(rax.getCctx());
       BusinessResponse resp =
           thunk.compensate(n, rej, session.ensureState(component, factory), cctx);
       if (resp == null) {
@@ -325,10 +354,50 @@ public final class Router implements AutoCloseable {
     };
   }
 
-  private static Invoker projectorEventInvoker(
-      long component, Supplier<Message.Builder> factory, ProjectorEventThunk thunk) {
+  private static Invoker undoInvoker(
+      long component, Supplier<Message.Builder> factory, UndoThunk thunk) {
     return (session, typeUrl, payload, aux) -> {
-      thunk.fold(session.ensureState(component, factory), anyOf(typeUrl, payload));
+      Abi.UndoAux uax = Abi.UndoAux.parseFrom(aux);
+      Notification n = Notification.parseFrom(uax.getNotification());
+      Compensate compensate = Compensate.parseFrom(uax.getCompensate());
+      BusinessResponse resp =
+          thunk.undo(
+              n,
+              compensate,
+              session.ensureState(component, factory),
+              commandContext(uax.getCctx()));
+      if (resp == null) {
+        return new Invoker.Result(null, Ffi.STATUS_OK_EMPTY);
+      }
+      return new Invoker.Result(resp.toByteArray(), Ffi.STATUS_OK);
+    };
+  }
+
+  private static Invoker factInvoker(
+      long component, Supplier<Message.Builder> factory, FactThunk thunk) {
+    return (session, typeUrl, payload, aux) -> {
+      Any recorded = thunk.handle(anyOf(typeUrl, payload), session.ensureState(component, factory));
+      if (recorded == null) {
+        return new Invoker.Result(null, Ffi.STATUS_OK_EMPTY);
+      }
+      return new Invoker.Result(recorded.toByteArray(), Ffi.STATUS_OK);
+    };
+  }
+
+  /** Packs the component's current state (google.protobuf.Any, bare "/" prefix) for Replay. */
+  private static Invoker stateInvoker(long component, Supplier<Message.Builder> factory) {
+    return (session, typeUrl, payload, aux) -> {
+      Any state = Pack.pack(session.ensureState(component, factory).build());
+      return new Invoker.Result(state.toByteArray(), Ffi.STATUS_OK);
+    };
+  }
+
+  private static Invoker projectorEventInvoker(
+      long component, Supplier<Message.Builder> factory, ProjectorEventContextThunk thunk) {
+    return (session, typeUrl, payload, aux) -> {
+      Abi.ProjectorEventAux pax = Abi.ProjectorEventAux.parseFrom(aux);
+      PageContext ctx = new PageContext(pax.getCover(), Integer.toUnsignedLong(pax.getSequence()));
+      thunk.fold(session.ensureState(component, factory), anyOf(typeUrl, payload), ctx);
       return new Invoker.Result(null, Ffi.STATUS_OK);
     };
   }
@@ -349,10 +418,9 @@ public final class Router implements AutoCloseable {
     };
   }
 
-  private static Invoker sagaEventInvoker(SagaEventThunk thunk) {
+  private static Invoker sagaEventInvoker(Destinations dests, SagaEventThunk thunk) {
     return (session, typeUrl, payload, aux) -> {
       Abi.SagaEventAux sax = Abi.SagaEventAux.parseFrom(aux);
-      Destinations dests = new Destinations(sax.getDestinationSequencesMap());
       SagaEmission emission = thunk.translate(anyOf(typeUrl, payload), dests, sax.getSourceCover());
       SagaResponse resp =
           SagaResponse.newBuilder()
@@ -363,40 +431,38 @@ public final class Router implements AutoCloseable {
     };
   }
 
-  private static Invoker sagaRejectionInvoker(SagaRejectionThunk thunk) {
-    return (session, typeUrl, payload, aux) -> {
-      Abi.RejectionAux rax = Abi.RejectionAux.parseFrom(aux);
-      Notification n = Notification.parseFrom(rax.getNotification());
-      RejectionNotification rej = RejectionNotification.parseFrom(rax.getRejection());
-      SagaResponse resp = SagaResponse.newBuilder().addAllEvents(thunk.compensate(n, rej)).build();
-      return new Invoker.Result(resp.toByteArray(), Ffi.STATUS_OK);
-    };
-  }
-
   private static Invoker pmEventInvoker(
-      long component, Supplier<Message.Builder> factory, PmEventThunk thunk) {
+      long component,
+      Supplier<Message.Builder> factory,
+      Destinations dests,
+      PmEventCoverThunk thunk) {
     return (session, typeUrl, payload, aux) -> {
       Abi.PmEventAux pax = Abi.PmEventAux.parseFrom(aux);
-      Destinations dests = new Destinations(pax.getDestinationSequencesMap());
       ProcessManagerHandleResponse resp =
-          thunk.handle(anyOf(typeUrl, payload), session.ensureState(component, factory), dests);
+          thunk.handle(
+              anyOf(typeUrl, payload),
+              session.ensureState(component, factory),
+              dests,
+              pax.getTriggerCover());
+      if (resp == null) {
+        return new Invoker.Result(null, Ffi.STATUS_OK_EMPTY);
+      }
       return new Invoker.Result(resp.toByteArray(), Ffi.STATUS_OK);
     };
   }
 
   private static Invoker pmRejectionInvoker(
-      long component, Supplier<Message.Builder> factory, PmRejectionThunk thunk) {
+      long component, Supplier<Message.Builder> factory, PmCompensatorThunk thunk) {
     return (session, typeUrl, payload, aux) -> {
       Abi.RejectionAux rax = Abi.RejectionAux.parseFrom(aux);
       Notification n = Notification.parseFrom(rax.getNotification());
       RejectionNotification rej = RejectionNotification.parseFrom(rax.getRejection());
-      Thunks.PmRejection r = thunk.compensate(n, rej, session.ensureState(component, factory));
-      ProcessManagerHandleResponse.Builder resp =
-          ProcessManagerHandleResponse.newBuilder().addAllProcessEvents(r.processEvents());
-      if (r.escalation() != null) {
-        resp.setNotification(r.escalation());
+      ProcessManagerHandleResponse resp =
+          thunk.compensate(n, rej, session.ensureState(component, factory));
+      if (resp == null) {
+        return new Invoker.Result(null, Ffi.STATUS_OK_EMPTY);
       }
-      return new Invoker.Result(resp.build().toByteArray(), Ffi.STATUS_OK);
+      return new Invoker.Result(resp.toByteArray(), Ffi.STATUS_OK);
     };
   }
 }

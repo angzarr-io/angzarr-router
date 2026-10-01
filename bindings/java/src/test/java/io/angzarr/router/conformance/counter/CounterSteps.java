@@ -75,6 +75,11 @@ public class CounterSteps {
     prior = Builders.priorIncreases(n);
   }
 
+  @Given("a counter that has already recorded {int} increases under the {string} type-URL prefix")
+  public void recordedIncreasesUnderPrefix(int n, String prefix) {
+    prior = Builders.withTypeUrlPrefix(Builders.priorIncreases(n), prefix);
+  }
+
   @Given("a counter whose history holds a corrupt event")
   public void historyHoldsCorrupt() {
     prior = Builders.corruptHistory();
@@ -90,6 +95,11 @@ public class CounterSteps {
   @When("the operator increases the counter by {int}")
   public void increaseBy(int n) {
     dispatch(Builders.increaseCommand(n));
+  }
+
+  @When("the operator increases the counter by {int} under the {string} type-URL prefix")
+  public void increaseByUnderPrefix(int n, String prefix) {
+    dispatch(Builders.withTypeUrlPrefix(Builders.increaseCommand(n), prefix));
   }
 
   @When("the operator increases the counter by {int} on behalf of a parent")

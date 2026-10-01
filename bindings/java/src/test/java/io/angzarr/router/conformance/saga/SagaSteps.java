@@ -3,7 +3,10 @@ package io.angzarr.router.conformance.saga;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.angzarr.AngzarrDeferredSequence;
+import io.angzarr.CommandPage;
 import io.angzarr.SagaHandleRequest;
 import io.angzarr.SagaResponse;
 import io.angzarr.router.CodedError;
@@ -14,7 +17,6 @@ import io.cucumber.java.Before;
 import io.cucumber.java.en.Given;
 import io.cucumber.java.en.Then;
 import io.cucumber.java.en.When;
-import java.util.Map;
 import test.counter.OrderSagaAngzarr;
 
 /** Step definitions for saga.feature — the OrderSaga translation-side dispatch. */
@@ -55,9 +57,9 @@ public class SagaSteps {
     // is part of the declaration the generated wiring already carries.
   }
 
-  @When("an Increased event is dispatched with destination inventory sequence {int}")
-  public void increasedWithDestination(int seq) {
-    dispatch(Builders.sagaEventSource("test.counter.Increased", Map.of("inventory", seq)));
+  @When("an Increased event at sequence {int} is dispatched")
+  public void increasedAt(int seq) {
+    dispatch(Builders.sagaEventSource("test.counter.Increased", seq));
   }
 
   @When("a Reserve event is dispatched")
@@ -80,11 +82,6 @@ public class SagaSteps {
     dispatch(Builders.sagaRejectionSource("test.counter.Reserve"));
   }
 
-  @When("a rejection of Unwatched is dispatched")
-  public void rejectionUnwatched() {
-    dispatch(Builders.sagaRejectionSource("test.counter.Unwatched"));
-  }
-
   @Then("the saga emits one command to {string}")
   public void emitsOneCommand(String target) {
     assertNull(err, "dispatch failed");
@@ -92,9 +89,16 @@ public class SagaSteps {
     assertEquals(target, resp.getCommandsList().get(0).getCover().getDomain(), "command target");
   }
 
-  @Then("the command carries destination sequence {int}")
-  public void commandCarriesSequence(int seq) {
-    assertEquals(seq, resp.getCommandsList().get(0).getPages(0).getHeader().getSequence());
+  @Then("the command is deferred from source sequence {int} at command index {int}")
+  public void commandIsDeferred(int seq, int index) {
+    assertNull(err, "dispatch failed");
+    for (CommandPage page : resp.getCommands(0).getPagesList()) {
+      assertTrue(page.getHeader().hasAngzarrDeferred(), "command page is not deferred");
+      AngzarrDeferredSequence d = page.getHeader().getAngzarrDeferred();
+      assertEquals(seq, d.getSourceSeq(), "source_seq is the triggering event's");
+      assertEquals(index, d.getCommandIndex(), "command_index is the emission position");
+      assertEquals("order", d.getSource().getDomain(), "the source cover is the triggering book's");
+    }
   }
 
   @Then("the saga emits no commands")
@@ -107,12 +111,6 @@ public class SagaSteps {
   public void dispatchFailsWith(String code) {
     assertNotNull(err, "expected coded error " + code);
     assertEquals(code, err.code);
-  }
-
-  @Then("the saga injects one fact event")
-  public void injectsOneEvent() {
-    assertNull(err, "dispatch failed");
-    assertEquals(1, resp.getEventsList().size(), "injected events");
   }
 
   @Then("the saga injects no events")

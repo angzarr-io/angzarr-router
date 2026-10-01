@@ -13,19 +13,19 @@ class AbiVersionTest {
   @Test
   void theLoadedLibraryReportsTheExpectedVersion() {
     assertEquals(Ffi.EXPECTED_ABI_VERSION, Router.abiVersion());
-    assertEquals(1, Ffi.EXPECTED_ABI_VERSION);
+    assertEquals(2, Ffi.EXPECTED_ABI_VERSION);
   }
 
   @Test
   void aMismatchedVersionIsRefusedNamingBothVersions() {
     IllegalStateException e =
-        assertThrows(IllegalStateException.class, () -> Ffi.checkAbiVersion(2));
-    assertTrue(e.getMessage().contains("expected 1"), e.getMessage());
-    assertTrue(e.getMessage().contains("got 2"), e.getMessage());
+        assertThrows(IllegalStateException.class, () -> Ffi.checkAbiVersion(1));
+    assertTrue(e.getMessage().contains("expected 2"), e.getMessage());
+    assertTrue(e.getMessage().contains("got 1"), e.getMessage());
   }
 
   @Test
   void theExpectedVersionIsAccepted() {
-    assertDoesNotThrow(() -> Ffi.checkAbiVersion(1));
+    assertDoesNotThrow(() -> Ffi.checkAbiVersion(2));
   }
 }

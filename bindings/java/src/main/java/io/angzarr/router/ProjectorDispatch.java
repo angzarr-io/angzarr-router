@@ -1,6 +1,7 @@
 package io.angzarr.router;
 
 import com.google.protobuf.Message;
+import io.angzarr.router.Thunks.ProjectorEventContextThunk;
 import io.angzarr.router.Thunks.ProjectorEventThunk;
 import io.angzarr.router.Thunks.ProjectorFinishThunk;
 import io.angzarr.router.Thunks.ProjectorUnknownThunk;
@@ -17,7 +18,7 @@ public final class ProjectorDispatch {
   final String name;
   final Supplier<Message.Builder> factory;
   List<String> domains = List.of();
-  final Map<String, ProjectorEventThunk> events = new LinkedHashMap<>();
+  final Map<String, ProjectorEventContextThunk> events = new LinkedHashMap<>();
   ProjectorFinishThunk finish;
   ProjectorUnknownThunk unknown;
 
@@ -34,6 +35,14 @@ public final class ProjectorDispatch {
 
   /** Registers the fold thunk for a fully-qualified event type. */
   public ProjectorDispatch onEvent(String fullName, ProjectorEventThunk thunk) {
+    return onEvent(fullName, (projection, event, ctx) -> thunk.fold(projection, event));
+  }
+
+  /**
+   * Registers the fold thunk for a fully-qualified event type that also reads where the event sits
+   * (its book's cover and the page's sequence).
+   */
+  public ProjectorDispatch onEvent(String fullName, ProjectorEventContextThunk thunk) {
     events.put(fullName, thunk);
     return this;
   }

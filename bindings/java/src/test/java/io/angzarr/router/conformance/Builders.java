@@ -7,22 +7,26 @@ import com.google.protobuf.Message;
 import com.google.protobuf.TextFormat;
 import com.google.protobuf.TypeRegistry;
 import io.angzarr.AngzarrDeferredSequence;
+import io.angzarr.BusinessResponse;
 import io.angzarr.CommandBook;
 import io.angzarr.CommandPage;
+import io.angzarr.Compensate;
 import io.angzarr.ContextualCommand;
 import io.angzarr.Cover;
 import io.angzarr.EventBook;
 import io.angzarr.EventPage;
+import io.angzarr.FactRequest;
 import io.angzarr.Notification;
 import io.angzarr.PageHeader;
 import io.angzarr.ProcessManagerHandleRequest;
 import io.angzarr.RejectionNotification;
+import io.angzarr.ReplayRequest;
 import io.angzarr.SagaHandleRequest;
 import io.angzarr.Snapshot;
 import io.angzarr.router.Pack;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Map;
+import java.util.List;
 import test.counter.Counter;
 
 /**
@@ -188,6 +192,45 @@ public final class Builders {
         .build();
   }
 
+  /**
+   * Rewrites every Any type URL in the command and its prior history to prefix + the
+   * fully-qualified name.
+   */
+  public static ContextualCommand withTypeUrlPrefix(ContextualCommand cmd, String prefix) {
+    ContextualCommand.Builder b = cmd.toBuilder();
+    if (b.hasCommand()) {
+      for (CommandPage.Builder page : b.getCommandBuilder().getPagesBuilderList()) {
+        if (page.hasCommand()) {
+          page.setCommand(reprefix(page.getCommand(), prefix));
+        }
+      }
+    }
+    if (b.hasEvents()) {
+      b.setEvents(withTypeUrlPrefix(b.getEvents(), prefix));
+    }
+    return b.build();
+  }
+
+  /** Rewrites every event Any type URL in the book to prefix + the fully-qualified name. */
+  public static EventBook withTypeUrlPrefix(EventBook book, String prefix) {
+    EventBook.Builder b = book.toBuilder();
+    for (EventPage.Builder page : b.getPagesBuilderList()) {
+      if (page.hasEvent()) {
+        page.setEvent(reprefix(page.getEvent(), prefix));
+      }
+    }
+    return b.build();
+  }
+
+  private static Any reprefix(Any any, String prefix) {
+    return any.toBuilder().setTypeUrl(prefix + fqOf(any.getTypeUrl())).build();
+  }
+
+  /** The fully-qualified type name of a type URL: everything after the last "/". */
+  public static String fqOf(String typeUrl) {
+    return typeUrl.substring(typeUrl.lastIndexOf('/') + 1);
+  }
+
   /** Parses the Increased event skeleton and stamps a sequence. */
   public static EventPage increasedPageAt(int seq) {
     EventPage.Builder page = load("event_increased.txtpb", EventPage.newBuilder());
@@ -215,26 +258,24 @@ public final class Builders {
   // --- saga dispatch requests (no skeleton — built by field) --------------
 
   /**
-   * A SagaHandleRequest whose source carries one event of fq in the "order" domain, plus the
-   * coordinator's destination-sequence map.
+   * A SagaHandleRequest whose source carries one event of fq in the "order" domain, at sequence seq
+   * when given (null: no header).
    */
-  public static SagaHandleRequest sagaEventSource(String fq, Map<String, Integer> dest) {
-    SagaHandleRequest.Builder b =
-        SagaHandleRequest.newBuilder()
-            .setSource(
-                EventBook.newBuilder()
-                    .setCover(Cover.newBuilder().setDomain("order"))
-                    .addPages(
-                        EventPage.newBuilder().setEvent(Any.newBuilder().setTypeUrl(typeUrl(fq)))));
-    if (dest != null) {
-      b.putAllDestinationSequences(dest);
+  public static SagaHandleRequest sagaEventSource(String fq, Integer seq) {
+    EventPage.Builder page =
+        EventPage.newBuilder().setEvent(Any.newBuilder().setTypeUrl(typeUrl(fq)));
+    if (seq != null) {
+      page.setHeader(PageHeader.newBuilder().setSequence(seq));
     }
-    return b.build();
+    return SagaHandleRequest.newBuilder()
+        .setSource(
+            EventBook.newBuilder().setCover(Cover.newBuilder().setDomain("order")).addPages(page))
+        .build();
   }
 
   /**
-   * A SagaHandleRequest whose source is a rejection Notification for fqCommand — routes to the
-   * compensation path.
+   * A SagaHandleRequest whose source is a rejection Notification for fqCommand — a saga skips it
+   * (sagas receive no rejections).
    */
   public static SagaHandleRequest sagaRejectionSource(String fqCommand) {
     RejectionNotification rejection =
@@ -286,26 +327,71 @@ public final class Builders {
   // --- process-manager triggers (no skeleton — built by field) ------------
 
   /**
-   * A request whose trigger carries the given event pages in domain, plus the PM's prior state and
-   * a destination map. Trigger event pages are built by field (the fq list includes types with no
-   * skeleton, e.g. Unwatched).
+   * A request whose trigger carries the given event pages in domain, the newest at sequence
+   * newestSeq when given (null: no header), plus the PM's prior state. Trigger event pages are
+   * built by field (the fq list includes types with no skeleton, e.g. Unwatched).
    */
   public static ProcessManagerHandleRequest pmTrigger(
-      String domain, java.util.List<String> fqs, EventBook state, Map<String, Integer> dest) {
+      String domain, List<String> fqs, EventBook state, Integer newestSeq) {
     EventBook.Builder trigger =
         EventBook.newBuilder().setCover(Cover.newBuilder().setDomain(domain));
     for (String fq : fqs) {
       trigger.addPages(EventPage.newBuilder().setEvent(Any.newBuilder().setTypeUrl(typeUrl(fq))));
+    }
+    if (newestSeq != null && trigger.getPagesCount() > 0) {
+      trigger
+          .getPagesBuilder(trigger.getPagesCount() - 1)
+          .setHeader(PageHeader.newBuilder().setSequence(newestSeq));
     }
     ProcessManagerHandleRequest.Builder b =
         ProcessManagerHandleRequest.newBuilder().setTrigger(trigger);
     if (state != null) {
       b.setProcessState(state);
     }
-    if (dest != null) {
-      b.putAllDestinationSequences(dest);
-    }
     return b.build();
+  }
+
+  /**
+   * A PM request whose trigger (in the order PM's own domain) is a Compensate for an executed
+   * test.counter.&lt;command&gt;.
+   */
+  public static ProcessManagerHandleRequest pmCompensate(String command) {
+    Notification notification =
+        Notification.newBuilder().setPayload(compensatePayload(command)).build();
+    return ProcessManagerHandleRequest.newBuilder()
+        .setTrigger(
+            EventBook.newBuilder()
+                .setCover(Cover.newBuilder().setDomain("order-pm"))
+                .addPages(EventPage.newBuilder().setEvent(Pack.pack(notification))))
+        .build();
+  }
+
+  /** The Compensate payload for an executed test.counter.&lt;command&gt;. */
+  public static Any compensatePayload(String command) {
+    return Pack.pack(
+        Compensate.newBuilder()
+            .setCommandType("test.counter." + command)
+            .addSequences(0)
+            .setReason("aborted")
+            .build());
+  }
+
+  /** The root bytes for a label: UUID v5 in the OID namespace. */
+  public static byte[] rootOf(String label) {
+    return Uuid5.oid(label);
+  }
+
+  /** A cover in domain with the root for label. */
+  public static Cover coverOf(String domain, String label) {
+    return Cover.newBuilder()
+        .setDomain(domain)
+        .setRoot(io.angzarr.UUID.newBuilder().setValue(ByteString.copyFrom(rootOf(label))))
+        .build();
+  }
+
+  /** A page header carrying an explicit sequence. */
+  public static PageHeader sequenceHeader(int seq) {
+    return PageHeader.newBuilder().setSequence(seq).build();
   }
 
   /** A prior-state book of n Increased events (drives the rebuild). */
@@ -366,6 +452,166 @@ public final class Builders {
                 .setCover(Cover.newBuilder().setDomain(triggerDomain))
                 .addPages(EventPage.newBuilder().setEvent(Pack.pack(notification))))
         .build();
+  }
+
+  // --- compensation routing (compensation.feature) ------------------------
+
+  /**
+   * A Notification command (bare "/" type URL) wrapping payload, addressed to domain, over prior
+   * history whose next sequence is nextSequence when given (null: no prior history).
+   */
+  public static ContextualCommand notificationCommand(
+      String domain, Any payload, Integer nextSequence) {
+    Notification notification = Notification.newBuilder().setPayload(payload).build();
+    ContextualCommand.Builder cc =
+        ContextualCommand.newBuilder()
+            .setCommand(
+                CommandBook.newBuilder()
+                    .setCover(Cover.newBuilder().setDomain(domain))
+                    .addPages(CommandPage.newBuilder().setCommand(Pack.pack(notification))));
+    if (nextSequence != null) {
+      cc.setEvents(
+          EventBook.newBuilder()
+              .setNextSequence(nextSequence)
+              .addPages(
+                  EventPage.newBuilder()
+                      .setHeader(sequenceHeader(Math.max(0, nextSequence - 1)))
+                      .setEvent(Any.newBuilder().setTypeUrl(typeUrl("test.counter.Unrelated")))));
+    }
+    return cc.build();
+  }
+
+  /**
+   * The rejection of a test.counter.&lt;command&gt; sent to targetDomain, delivered to the payment
+   * aggregate over prior history ending before nextSequence when given.
+   */
+  public static ContextualCommand rejectionSentTo(
+      String command, String targetDomain, Integer nextSequence) {
+    RejectionNotification rejection =
+        RejectionNotification.newBuilder()
+            .setRejectedCommand(
+                CommandBook.newBuilder()
+                    .setCover(Cover.newBuilder().setDomain(targetDomain))
+                    .addPages(
+                        CommandPage.newBuilder()
+                            .setCommand(
+                                Any.newBuilder().setTypeUrl(typeUrl("test.counter." + command)))))
+            .build();
+    return notificationCommand("payment", Pack.pack(rejection), nextSequence);
+  }
+
+  /**
+   * A Compensate for an executed test.counter.&lt;command&gt;, delivered to the inventory
+   * aggregate.
+   */
+  public static ContextualCommand compensateFor(String command) {
+    return notificationCommand("inventory", compensatePayload(command), null);
+  }
+
+  /** A business response carrying one header-less event page of test.counter.&lt;name&gt;. */
+  public static BusinessResponse oneEvent(String name) {
+    return BusinessResponse.newBuilder()
+        .setEvents(
+            EventBook.newBuilder()
+                .addPages(
+                    EventPage.newBuilder()
+                        .setEvent(Any.newBuilder().setTypeUrl(typeUrl("test.counter." + name)))))
+        .build();
+  }
+
+  // --- facts, replay and handler context (context.feature) ----------------
+
+  /** An Increased page (empty payload) at sequence seq. */
+  public static EventPage increasedAt(int seq) {
+    return EventPage.newBuilder()
+        .setHeader(sequenceHeader(seq))
+        .setEvent(Pack.pack(Counter.Increased.getDefaultInstance()))
+        .build();
+  }
+
+  /**
+   * A FactRequest of facts pages of test.counter.&lt;fact&gt; in "ledger" over prior Increased
+   * events.
+   */
+  public static FactRequest factRequest(String fact, int facts, int prior) {
+    EventBook.Builder book =
+        EventBook.newBuilder().setCover(Cover.newBuilder().setDomain("ledger"));
+    for (int i = 0; i < facts; i++) {
+      book.addPages(
+          EventPage.newBuilder()
+              .setEvent(Any.newBuilder().setTypeUrl(typeUrl("test.counter." + fact))));
+    }
+    EventBook.Builder history = EventBook.newBuilder().setNextSequence(prior);
+    for (int i = 0; i < prior; i++) {
+      history.addPages(increasedAt(i));
+    }
+    return FactRequest.newBuilder().setFacts(book).setPriorEvents(history).build();
+  }
+
+  /** A ReplayRequest: a snapshot of count at sequence 1, then events Increased at sequences 2... */
+  public static ReplayRequest replayRequest(int count, int events) {
+    ReplayRequest.Builder req =
+        ReplayRequest.newBuilder()
+            .setBaseSnapshot(
+                Snapshot.newBuilder()
+                    .setSequence(1)
+                    .setState(
+                        Pack.pack(Counter.CounterState.newBuilder().setCount(count).build())));
+    for (int i = 0; i < events; i++) {
+      req.addEvents(increasedAt(2 + i));
+    }
+    return req.build();
+  }
+
+  /** An IncreaseBy command for the ledger root label. */
+  public static ContextualCommand ledgerCommand(String label) {
+    return ContextualCommand.newBuilder()
+        .setCommand(
+            CommandBook.newBuilder()
+                .setCover(coverOf("ledger", label))
+                .addPages(
+                    CommandPage.newBuilder()
+                        .setCommand(Pack.pack(Counter.IncreaseBy.newBuilder().setN(1).build()))))
+        .build();
+  }
+
+  /** An Increased trigger from "counter" root label at sequence seq. */
+  public static ProcessManagerHandleRequest reservingTrigger(String label, int seq) {
+    return ProcessManagerHandleRequest.newBuilder()
+        .setTrigger(
+            EventBook.newBuilder().setCover(coverOf("counter", label)).addPages(increasedAt(seq)))
+        .build();
+  }
+
+  /**
+   * The rejection of a Reserve sent to targetDomain, delivered to the reserving process-manager's
+   * own domain at sequence seq.
+   */
+  public static ProcessManagerHandleRequest reservingRejection(String targetDomain, int seq) {
+    RejectionNotification rejection =
+        RejectionNotification.newBuilder()
+            .setRejectedCommand(
+                reserveCommand().toBuilder().setCover(Cover.newBuilder().setDomain(targetDomain)))
+            .build();
+    Notification notification = Notification.newBuilder().setPayload(Pack.pack(rejection)).build();
+    return ProcessManagerHandleRequest.newBuilder()
+        .setTrigger(
+            EventBook.newBuilder()
+                .setCover(Cover.newBuilder().setDomain("reserving-pm"))
+                .addPages(
+                    EventPage.newBuilder()
+                        .setHeader(sequenceHeader(seq))
+                        .setEvent(Pack.pack(notification))))
+        .build();
+  }
+
+  /** A book of Increased events of "counter" root label at sequences. */
+  public static EventBook trackedBook(String label, int... sequences) {
+    EventBook.Builder book = EventBook.newBuilder().setCover(coverOf("counter", label));
+    for (int seq : sequences) {
+      book.addPages(increasedAt(seq));
+    }
+    return book.build();
   }
 
   public static ProcessManagerHandleRequest pmNoTrigger() {

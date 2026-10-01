@@ -17,7 +17,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * The raw C-ABI layer over the router-ffi cdylib, via Panama/FFM. Holds the downcall handles for
- * the 11 exported functions, the {@code AngzarrBuf} layout, and the single upcall trampoline the
+ * the 15 exported functions, the {@code AngzarrBuf} layout, and the single upcall trampoline the
  * core calls for every host callback.
  *
  * <p>Memory ownership is symmetric, copy-at-the-boundary: a callback fills the router-allocated
@@ -90,6 +90,10 @@ final class Ffi {
       down("angzarr_router_dispatch_saga", DISPATCH_DESC);
   private static final MethodHandle DISPATCH_PROCESS_MANAGER =
       down("angzarr_router_dispatch_process_manager", DISPATCH_DESC);
+  private static final MethodHandle DISPATCH_FACT =
+      down("angzarr_router_dispatch_fact", DISPATCH_DESC);
+  private static final MethodHandle DISPATCH_REPLAY =
+      down("angzarr_router_dispatch_replay", DISPATCH_DESC);
 
   // The single host-callback gateway, shared across every registration. It is
   // stateless: it reaches the session via host_ctx and the registry via the
@@ -102,7 +106,7 @@ final class Ffi {
   private static final AtomicLong NEXT_SESSION = new AtomicLong(1);
 
   /** The router-ffi ABI version this binding is built against. */
-  static final int EXPECTED_ABI_VERSION = 1;
+  static final int EXPECTED_ABI_VERSION = 2;
 
   static {
     checkAbiVersion(abiVersion());
@@ -285,6 +289,14 @@ final class Ffi {
 
   static Dispatched dispatchProcessManager(MemorySegment router, long sessionId, byte[] request) {
     return dispatch(DISPATCH_PROCESS_MANAGER, router, sessionId, request);
+  }
+
+  static Dispatched dispatchFact(MemorySegment router, long sessionId, byte[] request) {
+    return dispatch(DISPATCH_FACT, router, sessionId, request);
+  }
+
+  static Dispatched dispatchReplay(MemorySegment router, long sessionId, byte[] request) {
+    return dispatch(DISPATCH_REPLAY, router, sessionId, request);
   }
 
   private static Dispatched dispatch(

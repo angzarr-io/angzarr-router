@@ -15,9 +15,9 @@ import test.counter.Counter;
 import test.counter.OrderProcessManagerAngzarr;
 
 /**
- * The conformance OrderProcessManager fixture: the newest trigger reacts with a stamped Reserve
- * command plus one fact per rebuilt prior-state event; a rejection injects one process event and
- * escalates.
+ * The conformance OrderProcessManager fixture: the newest trigger reacts with a Reserve command
+ * (stamped deferred by the router) plus one fact per rebuilt prior-state event; a rejection injects
+ * one process event and escalates.
  */
 final class PMFixture implements OrderProcessManagerAngzarr.OrderProcessManagerHandler {
 
@@ -25,9 +25,6 @@ final class PMFixture implements OrderProcessManagerAngzarr.OrderProcessManagerH
   public ProcessManagerHandleResponse increased(
       Counter.Increased event, Counter.OrderProcessManagerState.Builder state, Destinations dests) {
     CommandBook cmd = Builders.reserveCommand();
-    if (dests.has("inventory")) {
-      cmd = dests.stampCommand(cmd, "inventory");
-    }
     List<EventBook> facts = new ArrayList<>();
     for (int i = 0; i < state.getCount(); i++) {
       facts.add(Builders.oneFact());
