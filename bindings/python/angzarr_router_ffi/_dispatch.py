@@ -14,12 +14,14 @@ from __future__ import annotations
 
 import enum
 import threading
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from google.protobuf import any_pb2
-from google.protobuf.message import DecodeError
+from google.protobuf.message import DecodeError, Message
 from google.rpc import error_details_pb2, status_pb2
 
 from ._abi import ffi, lib
@@ -120,21 +122,92 @@ def pack(msg) -> any_pb2.Any:
 
 @dataclass
 class CommandContext:
-    """The historical-state evidence a handler sees. Host state never
-    crosses the FFI, so the core reconstructs this from the prior-events book
-    and hands it back."""
+    """The historical-state evidence a handler sees, and the cover it is
+    handling. Host state never crosses the FFI, so the core reconstructs this
+    from the prior-events book and hands it back. ``cover`` is the command's
+    (or notification delivery's) cover: the aggregate's own domain and root,
+    None when the command carried none."""
 
     next_sequence: int = 0
     had_prior_events: bool = False
+    cover: types_pb2.Cover | None = None
+
+
+@dataclass(frozen=True)
+class PageContext:
+    """Where the event or command a handler is handling sits: the cover of
+    its book (None when the book carries none) and the page's explicit
+    sequence (0 when the page carries none, and for commands, sagas and
+    process-manager triggers, whose callbacks carry no page sequence)."""
+
+    cover: types_pb2.Cover | None = None
+    sequence: int = 0
+
+
+_CURRENT_PAGE: ContextVar[PageContext | None] = ContextVar(
+    "angzarr_router_ffi_current_page", default=None
+)
+
+
+@contextmanager
+def _handling(ctx: PageContext) -> Iterator[None]:
+    """Make ``ctx`` the current page context while the block runs."""
+    token = _CURRENT_PAGE.set(ctx)
+    try:
+        yield
+    finally:
+        _CURRENT_PAGE.reset(token)
+
+
+def _cover_of(msg, name: str) -> types_pb2.Cover | None:
+    """``msg``'s cover field ``name``, or None when it is unset."""
+    return getattr(msg, name) if msg.HasField(name) else None
+
+
+def current_page() -> PageContext:
+    """The page context of the handler running on this thread. A dispatch
+    sets it for every callback it makes: an aggregate command, compensation
+    or undo handler sees its command's cover, a fact handler the facts'
+    cover, a saga handler the source cover, a process-manager handler the
+    trigger cover, a projector fold its book's cover and page sequence.
+    Raises RuntimeError outside a dispatch."""
+    ctx = _CURRENT_PAGE.get()
+    if ctx is None:
+        raise RuntimeError("no angzarr dispatch is being handled on this thread")
+    return ctx
+
+
+def current_cover() -> types_pb2.Cover:
+    """The cover of the book the running handler is handling (see
+    :func:`current_page`). Raises RuntimeError outside a dispatch or when that
+    book carries no cover."""
+    cover = current_page().cover
+    if cover is None:
+        raise RuntimeError("the book being handled carries no cover")
+    return cover
+
+
+def _command_context(cax) -> CommandContext:
+    """The CommandContext a CommandContextAux stands for."""
+    return CommandContext(
+        next_sequence=cax.next_sequence,
+        had_prior_events=cax.had_prior_events,
+        cover=_cover_of(cax, "cover"),
+    )
 
 
 # Thunk shapes (host-supplied business logic):
 #   applier:   (state, payload: Any) -> None            (folds; raises on corrupt)
 #   command:   (cmd: Any, state, cctx) -> EventBook|None (raises CodedError to reject)
 #   rejection: (notification, rejection, state, cctx) -> BusinessResponse|None
+#   undo:      (notification, compensate, state, cctx) -> BusinessResponse|None
+#   fact:      (fact: Any, state) -> Message|Any|None    (the fact to record;
+#                                                         None = unchanged)
 ApplierThunk = Callable[[object, any_pb2.Any], None]
 CommandThunk = Callable[[any_pb2.Any, object, CommandContext], object | None]
 RejectionThunk = Callable[[object, object, object, CommandContext], object | None]
+UndoThunk = Callable[[object, object, object, CommandContext], object | None]
+FactThunk = Callable[[any_pb2.Any, object], object | None]
 
 
 @dataclass
@@ -160,13 +233,18 @@ class Rebuilder:
 @dataclass
 class AggregateDispatch:
     """One aggregate component's registration: name, domain, rebuilder,
-    command handlers, and ordered rejection compensators."""
+    command handlers, ordered rejection compensators, undo handlers and fact
+    handlers. An aggregate whose state (the rebuilder factory's product) is a
+    protobuf message also supports Replay: the router packs its rebuilt
+    state."""
 
     name: str
     domain: str
     rebuilder: Rebuilder
     commands: dict[str, CommandThunk] = field(default_factory=dict)
     rejections: dict[str, list[RejectionThunk]] = field(default_factory=dict)
+    undoes: dict[str, UndoThunk] = field(default_factory=dict)
+    facts: dict[str, FactThunk] = field(default_factory=dict)
 
     def on_command(self, full_name: str, thunk: CommandThunk) -> AggregateDispatch:
         """Register a handler for one fully-qualified command type."""
@@ -181,12 +259,32 @@ class AggregateDispatch:
         self.rejections.setdefault(compensates, []).append(thunk)
         return self
 
+    def on_undo(self, fq_command: str, thunk: UndoThunk) -> AggregateDispatch:
+        """Register the undo handler for a Compensate whose ``command_type``
+        is ``fq_command`` (the fully-qualified type of the executed command to
+        undo). The handler receives (notification, compensate, state, cctx)
+        and returns a BusinessResponse, or None to record nothing. A
+        Compensate with no undo handler fails NO_UNDO_HANDLER
+        (UNIMPLEMENTED)."""
+        self.undoes[fq_command] = thunk
+        return self
+
+    def on_fact(self, fq_fact: str, thunk: FactThunk) -> AggregateDispatch:
+        """Register the fact handler for a fully-qualified fact (event) type.
+        The handler receives (fact Any, rebuilt state) and returns the fact to
+        record: a message (packed with the framework type-URL prefix), an
+        Any, or None to record the fact unchanged. A fact cannot be refused."""
+        self.facts[fq_fact] = thunk
+        return self
+
 
 # Projector thunk shapes:
 #   event:   (state, event: Any) -> None             (folds; raises on corrupt)
+#   context event: (state, event: Any, ctx: PageContext) -> None
 #   finish:  (state, events: EventBook) -> Projection (packs the folded state)
 #   unknown: (type_url: str) -> None                  (observes an unhandled type)
 ProjectorEventThunk = Callable[[object, any_pb2.Any], None]
+ProjectorContextThunk = Callable[[object, any_pb2.Any, PageContext], None]
 ProjectorFinishThunk = Callable[[object, object], object]
 ProjectorUnknownThunk = Callable[[str], None]
 
@@ -214,6 +312,19 @@ class ProjectorDispatch:
     def on_event(self, full_name: str, thunk: ProjectorEventThunk) -> ProjectorDispatch:
         """Register the fold thunk for a fully-qualified event type name."""
         self.events[full_name] = thunk
+        return self
+
+    def on_event_with_context(
+        self, full_name: str, thunk: ProjectorContextThunk
+    ) -> ProjectorDispatch:
+        """Register a fold thunk for a fully-qualified event type that also
+        receives the event's :class:`PageContext` (its book's cover and the
+        page's sequence)."""
+
+        def fold(state, event):
+            thunk(state, event, current_page())
+
+        self.events[full_name] = fold
         return self
 
     def on_unknown(self, thunk: ProjectorUnknownThunk) -> ProjectorDispatch:
@@ -277,6 +388,8 @@ class SagaDispatch:
 
 # Process-manager thunk shapes (a PM is stateful — it sees rebuilt state):
 #   event:     (event: Any, state, dests) -> ProcessManagerHandleResponse
+#   cover event: (event: Any, state, dests, trigger_cover: Cover | None) ->
+#                ProcessManagerHandleResponse
 #   rejection: (notification, rejection, state) ->
 #                ProcessManagerHandleResponse            (process events, commands,
 #                                                         facts, escalation)
@@ -285,6 +398,7 @@ class SagaDispatch:
 # dests are the PM's declared targets. The router stamps every command the
 # PM returns (from an event handler or a compensator) deferred.
 PMEventThunk = Callable[[any_pb2.Any, object, Destinations], object]
+PMCoverEventThunk = Callable[[any_pb2.Any, object, Destinations, object], object]
 PMRejectionThunk = Callable[[object, object, object], object]
 
 
@@ -308,6 +422,19 @@ class ProcessManagerDispatch:
     ) -> ProcessManagerDispatch:
         """Register the thunk for (input domain, fully-qualified event type)."""
         self.handlers.setdefault(input_domain, {})[full_name] = thunk
+        return self
+
+    def on_event_with_cover(
+        self, input_domain: str, full_name: str, thunk: PMCoverEventThunk
+    ) -> ProcessManagerDispatch:
+        """Register a thunk for (input domain, fully-qualified event type)
+        that also receives the trigger book's cover (None when it carries
+        none)."""
+
+        def handle(event, state, dests):
+            return thunk(event, state, dests, current_page().cover)
+
+        self.handlers.setdefault(input_domain, {})[full_name] = handle
         return self
 
     def on_rejected(self, compensates: str, thunk: PMRejectionThunk) -> ProcessManagerDispatch:
@@ -419,11 +546,10 @@ def _command_invoker(key: int, factory, thunk: CommandThunk) -> Invoker:
     def inv(session, type_url, payload, aux):
         cax = abi_pb2.CommandContextAux()
         cax.ParseFromString(aux)
-        cctx = CommandContext(
-            next_sequence=cax.next_sequence, had_prior_events=cax.had_prior_events
-        )
+        cctx = _command_context(cax)
         state = session.ensure_state(key, factory)
-        book = thunk(any_pb2.Any(type_url=type_url, value=payload), state, cctx)
+        with _handling(PageContext(cover=cctx.cover)):
+            book = thunk(any_pb2.Any(type_url=type_url, value=payload), state, cctx)
         if book is None:
             return None, _STATUS_OK_EMPTY
         return book.SerializeToString(), _STATUS_OK
@@ -439,11 +565,10 @@ def _rejection_invoker(key: int, factory, thunk: RejectionThunk) -> Invoker:
         notification.ParseFromString(rax.notification)
         rejection = types_pb2.RejectionNotification()
         rejection.ParseFromString(rax.rejection)
-        cctx = CommandContext(
-            next_sequence=rax.cctx.next_sequence, had_prior_events=rax.cctx.had_prior_events
-        )
+        cctx = _command_context(rax.cctx)
         state = session.ensure_state(key, factory)
-        resp = thunk(notification, rejection, state, cctx)
+        with _handling(PageContext(cover=cctx.cover)):
+            resp = thunk(notification, rejection, state, cctx)
         if resp is None:
             return None, _STATUS_OK_EMPTY
         return resp.SerializeToString(), _STATUS_OK
@@ -451,10 +576,55 @@ def _rejection_invoker(key: int, factory, thunk: RejectionThunk) -> Invoker:
     return inv
 
 
-def _projector_event_invoker(key: int, factory, thunk: ProjectorEventThunk) -> Invoker:
+def _undo_invoker(key: int, factory, thunk: UndoThunk) -> Invoker:
+    def inv(session, _type_url, _payload, aux):
+        uax = abi_pb2.UndoAux()
+        uax.ParseFromString(aux)
+        notification = types_pb2.Notification()
+        notification.ParseFromString(uax.notification)
+        compensate = types_pb2.Compensate()
+        compensate.ParseFromString(uax.compensate)
+        cctx = _command_context(uax.cctx)
+        state = session.ensure_state(key, factory)
+        with _handling(PageContext(cover=cctx.cover)):
+            resp = thunk(notification, compensate, state, cctx)
+        if resp is None:
+            return None, _STATUS_OK_EMPTY
+        return resp.SerializeToString(), _STATUS_OK
+
+    return inv
+
+
+def _fact_invoker(key: int, factory, thunk: FactThunk) -> Invoker:
+    # The facts' cover is the dispatch-level page context Router.dispatch_fact
+    # sets; the fact callback carries no aux.
     def inv(session, type_url, payload, _aux):
         state = session.ensure_state(key, factory)
-        thunk(state, any_pb2.Any(type_url=type_url, value=payload))
+        recorded = thunk(any_pb2.Any(type_url=type_url, value=payload), state)
+        if recorded is None:
+            return None, _STATUS_OK_EMPTY
+        if not isinstance(recorded, any_pb2.Any):
+            recorded = pack(recorded)
+        return recorded.SerializeToString(), _STATUS_OK
+
+    return inv
+
+
+def _state_invoker(key: int, factory) -> Invoker:
+    # Packs the component's rebuilt state for Replay.
+    def inv(session, _type_url, _payload, _aux):
+        return pack(session.ensure_state(key, factory)).SerializeToString(), _STATUS_OK
+
+    return inv
+
+
+def _projector_event_invoker(key: int, factory, thunk: ProjectorEventThunk) -> Invoker:
+    def inv(session, type_url, payload, aux):
+        pax = abi_pb2.ProjectorEventAux()
+        pax.ParseFromString(aux)
+        state = session.ensure_state(key, factory)
+        with _handling(PageContext(cover=_cover_of(pax, "cover"), sequence=pax.sequence)):
+            thunk(state, any_pb2.Any(type_url=type_url, value=payload))
         return None, _STATUS_OK
 
     return inv
@@ -490,9 +660,12 @@ def _saga_event_invoker(targets: list[str], thunk: SagaEventThunk) -> Invoker:
     def inv(_session, type_url, payload, aux):
         sax = abi_pb2.SagaEventAux()
         sax.ParseFromString(aux)
-        commands, events = thunk(
-            any_pb2.Any(type_url=type_url, value=payload), Destinations(targets), sax.source_cover
-        )
+        with _handling(PageContext(cover=_cover_of(sax, "source_cover"))):
+            commands, events = thunk(
+                any_pb2.Any(type_url=type_url, value=payload),
+                Destinations(targets),
+                sax.source_cover,
+            )
         resp = saga_pb2.SagaResponse(commands=commands, events=events)
         return resp.SerializeToString(), _STATUS_OK
 
@@ -502,10 +675,17 @@ def _saga_event_invoker(targets: list[str], thunk: SagaEventThunk) -> Invoker:
 def _pm_event_invoker(key: int, factory, targets: list[str], thunk: PMEventThunk) -> Invoker:
     # The PM is stateful: the appliers fold process_state into the session's
     # state first, then this handler reads it. The host returns a full
-    # ProcessManagerHandleResponse.
-    def inv(session, type_url, payload, _aux):
+    # ProcessManagerHandleResponse; the trigger cover is its page context.
+    def inv(session, type_url, payload, aux):
+        pax = abi_pb2.PmEventAux()
+        pax.ParseFromString(aux)
         state = session.ensure_state(key, factory)
-        resp = thunk(any_pb2.Any(type_url=type_url, value=payload), state, Destinations(targets))
+        with _handling(PageContext(cover=_cover_of(pax, "trigger_cover"))):
+            resp = thunk(
+                any_pb2.Any(type_url=type_url, value=payload), state, Destinations(targets)
+            )
+        if resp is None:
+            return None, _STATUS_OK_EMPTY
         return resp.SerializeToString(), _STATUS_OK
 
     return inv
@@ -659,6 +839,21 @@ class Router:
         self._next_component += 1
         return self._next_component
 
+    def _call(self, fn, request: bytes, page: PageContext) -> tuple[int, bytes]:
+        """Run one dispatch entry point over ``request`` bytes with a fresh
+        session and ``page`` as the dispatch-level page context (callbacks
+        whose aux carries a cover narrow it). Returns the dispatch's return
+        code and its consumed out bytes."""
+        # The session is reached from callbacks via this handle; the core holds
+        # it only for the duration of this synchronous call. `handle` must stay
+        # referenced until dispatch returns.
+        session = _Session(self)
+        handle = ffi.new_handle(session)
+        out = ffi.new("angzarr_buf*")
+        with _handling(page):
+            ret = fn(self._ptr, handle, _as_u8(request), len(request), out)
+        return ret, _consume_out(out)
+
     def _assign(self, inv: Invoker) -> int:
         self._next_id += 1
         self._registry[self._next_id] = inv
@@ -688,6 +883,14 @@ class Router:
                 for thunk in thunks:
                     entry.callback_ids.append(self._assign(_rejection_invoker(key, factory, thunk)))
                 desc.rejections.append(entry)
+            for fq, thunk in dispatch.undoes.items():
+                cid = self._assign(_undo_invoker(key, factory, thunk))
+                desc.undoes.append(abi_pb2.CallbackEntry(fq_type=fq, callback_id=cid))
+            for fq, thunk in dispatch.facts.items():
+                cid = self._assign(_fact_invoker(key, factory, thunk))
+                desc.facts.append(abi_pb2.CallbackEntry(fq_type=fq, callback_id=cid))
+            if isinstance(factory(), Message):
+                desc.state_callback_id = self._assign(_state_invoker(key, factory))
 
             desc_bytes = desc.SerializeToString()
             ret = lib.angzarr_router_register_aggregate(
@@ -700,17 +903,49 @@ class Router:
         """Run one ContextualCommand through the core and return the
         BusinessResponse, or raise a CodedError decoded from the core's
         failure."""
-        req = contextual_command.SerializeToString()
-        # The session is reached from callbacks via this handle; the core holds
-        # it only for the duration of this synchronous call. `handle` must stay
-        # referenced until dispatch returns.
-        session = _Session(self)
-        handle = ffi.new_handle(session)
-        out = ffi.new("angzarr_buf*")
-        ret = lib.angzarr_router_dispatch(self._ptr, handle, _as_u8(req), len(req), out)
-        resp_bytes = _consume_out(out)
+        ret, resp_bytes = self._call(
+            lib.angzarr_router_dispatch,
+            contextual_command.SerializeToString(),
+            PageContext(cover=_cover_of(contextual_command.command, "cover")),
+        )
         if ret == 0:
             resp = command_handler_pb2.BusinessResponse()
+            if resp_bytes:
+                resp.ParseFromString(resp_bytes)
+            return resp
+        raise _decode_status(resp_bytes, ret)
+
+    def dispatch_fact(self, fact_request) -> object:
+        """Run one FactRequest through the aggregate claiming the facts' cover
+        domain: rebuild its state from the prior events, run each fact through
+        its fact handler, and return the EventBook of facts to record. Raises a
+        CodedError decoded from the core's failure."""
+        ret, resp_bytes = self._call(
+            lib.angzarr_router_dispatch_fact,
+            fact_request.SerializeToString(),
+            PageContext(cover=_cover_of(fact_request.facts, "cover")),
+        )
+        if ret == 0:
+            book = types_pb2.EventBook()
+            if resp_bytes:
+                book.ParseFromString(resp_bytes)
+            return book
+        raise _decode_status(resp_bytes, ret)
+
+    def dispatch_replay(self, domain: str, replay_request) -> object:
+        """Replay a ReplayRequest (a base snapshot, then events) through the
+        aggregate registered for ``domain`` (empty selects a sole registered
+        aggregate) and return the ReplayResponse carrying its rebuilt state,
+        packed. An aggregate whose state is not a protobuf message does not
+        support Replay (NO_HANDLER_REGISTERED). Raises a CodedError decoded
+        from the core's failure."""
+        call = abi_pb2.ReplayCall(domain=domain)
+        call.request.CopyFrom(replay_request)
+        ret, resp_bytes = self._call(
+            lib.angzarr_router_dispatch_replay, call.SerializeToString(), PageContext()
+        )
+        if ret == 0:
+            resp = command_handler_pb2.ReplayResponse()
             if resp_bytes:
                 resp.ParseFromString(resp_bytes)
             return resp
@@ -747,12 +982,11 @@ class Router:
     def dispatch_projector(self, event_book) -> object:
         """Fold one EventBook through the registered projector and return the
         Projection, or raise a CodedError decoded from the core's failure."""
-        req = event_book.SerializeToString()
-        session = _Session(self)
-        handle = ffi.new_handle(session)
-        out = ffi.new("angzarr_buf*")
-        ret = lib.angzarr_router_dispatch_projector(self._ptr, handle, _as_u8(req), len(req), out)
-        resp_bytes = _consume_out(out)
+        ret, resp_bytes = self._call(
+            lib.angzarr_router_dispatch_projector,
+            event_book.SerializeToString(),
+            PageContext(cover=_cover_of(event_book, "cover")),
+        )
         if ret == 0:
             proj = types_pb2.Projection()
             if resp_bytes:
@@ -782,12 +1016,11 @@ class Router:
     def dispatch_saga(self, saga_request) -> object:
         """Run one SagaHandleRequest through the registered saga and return the
         SagaResponse, or raise a CodedError decoded from the core's failure."""
-        req = saga_request.SerializeToString()
-        session = _Session(self)
-        handle = ffi.new_handle(session)
-        out = ffi.new("angzarr_buf*")
-        ret = lib.angzarr_router_dispatch_saga(self._ptr, handle, _as_u8(req), len(req), out)
-        resp_bytes = _consume_out(out)
+        ret, resp_bytes = self._call(
+            lib.angzarr_router_dispatch_saga,
+            saga_request.SerializeToString(),
+            PageContext(cover=_cover_of(saga_request.source, "cover")),
+        )
         if ret == 0:
             resp = saga_pb2.SagaResponse()
             if resp_bytes:
@@ -839,14 +1072,11 @@ class Router:
         """Run one ProcessManagerHandleRequest through the registered PM and
         return the ProcessManagerHandleResponse, or raise a CodedError decoded
         from the core's failure."""
-        req = pm_request.SerializeToString()
-        session = _Session(self)
-        handle = ffi.new_handle(session)
-        out = ffi.new("angzarr_buf*")
-        ret = lib.angzarr_router_dispatch_process_manager(
-            self._ptr, handle, _as_u8(req), len(req), out
+        ret, resp_bytes = self._call(
+            lib.angzarr_router_dispatch_process_manager,
+            pm_request.SerializeToString(),
+            PageContext(cover=_cover_of(pm_request.trigger, "cover")),
         )
-        resp_bytes = _consume_out(out)
         if ret == 0:
             resp = process_manager_pb2.ProcessManagerHandleResponse()
             if resp_bytes:
