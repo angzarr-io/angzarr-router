@@ -1,10 +1,11 @@
 //! angzarr-router — the shared client router core.
 //!
-//! The engine semantics table in client-go's docs/architecture.md is this
-//! crate's contract: dispatch/rebuild mechanics implemented exactly once,
-//! consumed natively by client-rust and through the C-ABI FFI crate by
-//! every other language binding. Framework rules live here — do not
-//! duplicate them into generated output, bindings, or component adapters.
+//! Dispatch/rebuild mechanics implemented once, exposed through the C-ABI
+//! FFI crate (crates/router-ffi) to the language bindings that
+//! angzarr-cli's generated code targets. The engine semantics table in
+//! docs/architecture.md is this crate's contract. Framework rules live
+//! here — do not duplicate them into generated output, bindings, or
+//! component adapters.
 
 pub mod aggregate;
 pub mod destinations;

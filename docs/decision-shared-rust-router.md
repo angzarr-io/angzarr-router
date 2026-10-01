@@ -1,6 +1,27 @@
 # Decision record: one shared Rust client router, FFI-bound to every client language
 
-**Status**: Accepted, pending implementation. Decided 2026-06-12.
+**Status**: Accepted, partially implemented. Decided 2026-06-12.
+
+**As implemented in this repo** (where it differs from the text below):
+
+- The core lives in its own repo (angzarr-router), not in client-rust;
+  bindings live under `bindings/<language>` here.
+- No client library has adopted it yet: client-go still runs its own
+  engine (the "Go engine is dropped" step has not happened), as do
+  client-python and client-rust. angzarr-cli's generated code targets the
+  router bindings.
+- §4.1 is superseded by a per-kind ABI: `angzarr_router_new()` takes no
+  config, components register through `angzarr_router_register_{aggregate,
+  projector,saga,process_manager}` with kind-specific descriptors, and
+  dispatch goes through one `dispatch*` entry point per kind (13 exported
+  functions in all; `crates/router-ffi/src/lib.rs`). There is no
+  serve/shutdown, transport config, upcaster kind, or composition
+  validation in the router; hosts keep their own gRPC serving.
+- §4.4: there is no reentrancy assertion; a Rust panic's message travels in
+  `google.rpc.Status.message` (not ErrorInfo metadata). Registration must
+  not run concurrently with other calls on the same router.
+- §4.5: there is no `angzarr_has_capability`; every binding checks
+  `angzarr_abi_version` before first use.
 
 **Decision in one paragraph**: The client router — the engine that
 dispatches commands/events to business handlers, rebuilds state, fans
@@ -293,7 +314,7 @@ can degrade gracefully.
 
 ## 5. What lives where, after
 
-### Rust core (workspace in the client-rust repo)
+### Rust core (the angzarr-router repo)
 
 - `angzarr-router` (crate, Rust-native API): the entire semantics
   table from [architecture.md](architecture.md) — Rebuilder with the

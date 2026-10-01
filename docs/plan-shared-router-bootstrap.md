@@ -75,12 +75,15 @@ only after this slice's review freezes the ABI.
   (ours). **No old client linked** (§3). **Two findings** surfaced (recorded
   in §4.1): the generated-import `io`-package collision, and the
   no-committed-generated-code policy.
-- Unit 6 (angzarr-cli emitters): next. The bindings live **in this repo**
-  from the start — the home decision (§8), not a later migration; no old
-  client library is linked (§3). The **ABI-freeze review comes after unit
-  6**, not before the bindings — the whole point of doing two FFI languages
-  in the bootstrap is that units 4–6 exercise the ABI and surface findings
-  while it is still cheap to change (§6).
+- **Unit 6 — angzarr-cli emitters**: done. `angzarr codegen <language>`
+  emits the typed seam + registration wiring for all six bindings, and
+  every binding's conformance fixtures implement the generated handler
+  interfaces.
+- **Beyond the slice**: Java (FFM), C# (P/Invoke), TypeScript (koffi) and
+  C++ (static link) bindings run the same conformance features; the core
+  covers aggregates, sagas, process managers (including co-resident PMs)
+  and projectors. The ABI-freeze review (§6) has not been recorded, and no
+  client-* library has adopted the router yet.
 
 Framework protos are consumed under the **io.angzarr** packages
 (`io.angzarr.v1`); the router's own ABI protos are
