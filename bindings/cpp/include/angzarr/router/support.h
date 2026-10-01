@@ -1,12 +1,14 @@
 #pragma once
 
 // The host-side value types the dispatch surfaces and Router use: the command
-// context, destination stamping, Any packing, the saga/PM emission results, the
-// per-dispatch Session (host_ctx), the type-erased Invoker, and the Rebuilder.
+// context, declared output destinations, Any packing, the saga/PM emission
+// results, the per-dispatch Session (host_ctx), the type-erased Invoker, and the
+// Rebuilder.
 
 #include <google/protobuf/any.pb.h>
 #include <google/protobuf/message.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -31,32 +33,23 @@ struct CommandContext {
   bool had_prior_events = false;
 };
 
-// The coordinator-supplied next-sequences for command stamping. Sagas and PMs
-// are translators — they stamp emitted commands, they do not rebuild state.
+// The declared output domains of one saga or process manager (its command
+// targets), in declaration order. Emitted commands are deferred: the router
+// stamps their angzarr_deferred provenance, so handlers never stamp sequences.
 class Destinations {
  public:
-  explicit Destinations(std::map<std::string, uint32_t> sequences)
-      : sequences_(std::move(sequences)) {}
+  explicit Destinations(std::vector<std::string> domains) : domains_(std::move(domains)) {}
 
-  bool Has(const std::string& domain) const { return sequences_.count(domain) > 0; }
-
-  // Returns a copy of cmd with every page stamped with the next sequence for
-  // domain; a domain with no supplied sequence is MISSING_DESTINATION_SEQUENCE.
-  io::angzarr::v1::CommandBook StampCommand(io::angzarr::v1::CommandBook cmd,
-                                            const std::string& domain) const {
-    auto it = sequences_.find(domain);
-    if (it == sequences_.end()) {
-      throw CodedError("MISSING_DESTINATION_SEQUENCE", "no sequence for destination domain",
-                       GrpcCode::kInvalidArgument, {{"domain", domain}});
-    }
-    for (auto& page : *cmd.mutable_pages()) {
-      page.mutable_header()->set_sequence(it->second);
-    }
-    return cmd;
+  // True when domain is a declared output domain.
+  bool Has(const std::string& domain) const {
+    return std::find(domains_.begin(), domains_.end(), domain) != domains_.end();
   }
 
+  // The declared output domains, in declaration order.
+  const std::vector<std::string>& Domains() const { return domains_; }
+
  private:
-  std::map<std::string, uint32_t> sequences_;
+  std::vector<std::string> domains_;
 };
 
 // Wraps a message in a google.protobuf.Any using the framework's bare-"/"

@@ -38,8 +38,12 @@ class AggregateDispatch {
     commands.emplace_back(std::move(full_name), std::move(fn));
     return *this;
   }
-  AggregateDispatch& OnRejected(std::string fq_command, RejectionFn fn) {
-    rejections[fq_command].push_back(std::move(fn));
+  // compensates is the declared entry: the rejected command's fully-qualified
+  // type ("fq.Type", sent to any domain) or "domain:fq.Type" (only when it was
+  // sent to that domain). Several compensators for one entry run in
+  // registration order.
+  AggregateDispatch& OnRejected(std::string compensates, RejectionFn fn) {
+    rejections[compensates].push_back(std::move(fn));
     return *this;
   }
 
@@ -50,14 +54,15 @@ class AggregateDispatch {
   std::map<std::string, std::vector<RejectionFn>> rejections;
 };
 
+// A stateless translator: declared source events emit commands (deferred; the
+// router stamps their provenance) and/or fact events. Sagas receive no
+// rejections. The Destinations a handler sees are the declared targets.
 class SagaDispatch {
  public:
   // sourceCover is the source book's cover, so the saga can route emitted
   // commands by the trigger's identity (root, ext).
   using EventFn = std::function<SagaEmission(const google::protobuf::Any&, const Destinations&,
                                              const io::angzarr::v1::Cover&)>;
-  using RejectionFn = std::function<std::vector<io::angzarr::v1::EventBook>(
-      const io::angzarr::v1::Notification&, const io::angzarr::v1::RejectionNotification&)>;
 
   SagaDispatch(std::string name, std::string input_domain, std::vector<std::string> targets)
       : name(std::move(name)), input_domain(std::move(input_domain)), targets(std::move(targets)) {}
@@ -66,16 +71,11 @@ class SagaDispatch {
     events.emplace_back(std::move(full_name), std::move(fn));
     return *this;
   }
-  SagaDispatch& OnRejected(std::string fq_command, RejectionFn fn) {
-    rejections[fq_command].push_back(std::move(fn));
-    return *this;
-  }
 
   std::string name;
   std::string input_domain;
   std::vector<std::string> targets;
   std::vector<std::pair<std::string, EventFn>> events;
-  std::map<std::string, std::vector<RejectionFn>> rejections;
 };
 
 // Observes the type URL of a delivered event that has no projector fold.
@@ -132,18 +132,28 @@ class ProcessManagerDispatch {
 
   ProcessManagerDispatch(std::string name, std::string pm_domain, Rebuilder<TState> rebuilder)
       : name(std::move(name)), pm_domain(std::move(pm_domain)), rebuilder(std::move(rebuilder)) {}
+  // targets are the PM's declared output domains (its command targets): the
+  // Destinations its handlers see.
+  ProcessManagerDispatch(std::string name, std::string pm_domain, std::vector<std::string> targets,
+                         Rebuilder<TState> rebuilder)
+      : name(std::move(name)),
+        pm_domain(std::move(pm_domain)),
+        targets(std::move(targets)),
+        rebuilder(std::move(rebuilder)) {}
 
   ProcessManagerDispatch& OnEvent(std::string source_domain, std::string full_name, EventFn fn) {
     handlers.push_back({std::move(source_domain), std::move(full_name), std::move(fn)});
     return *this;
   }
-  ProcessManagerDispatch& OnRejected(std::string fq_command, RejectionFn fn) {
-    rejections[fq_command].push_back(std::move(fn));
+  // compensates is "fq.Type" or "domain:fq.Type", as for aggregates.
+  ProcessManagerDispatch& OnRejected(std::string compensates, RejectionFn fn) {
+    rejections[compensates].push_back(std::move(fn));
     return *this;
   }
 
   std::string name;
   std::string pm_domain;
+  std::vector<std::string> targets;
   Rebuilder<TState> rebuilder;
   std::vector<Handler> handlers;
   std::map<std::string, std::vector<RejectionFn>> rejections;

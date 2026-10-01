@@ -94,7 +94,7 @@ class Router {
     }
     for (auto& [fq, fns] : d.rejections) {
       auto* entry = desc.add_rejections();
-      entry->set_fq_command_type(fq);
+      entry->set_compensates(fq);
       for (auto& fn : fns) entry->add_callback_ids(Assign(RejectionInvoker<TState>(key, fn)));
     }
     Register(ffi::angzarr_router_register_aggregate, desc);
@@ -128,12 +128,7 @@ class Router {
     for (auto& [fq, fn] : d.events) {
       auto* e = desc.add_events();
       e->set_fq_type(fq);
-      e->set_callback_id(Assign(SagaEventInvoker(fn)));
-    }
-    for (auto& [fq, fns] : d.rejections) {
-      auto* entry = desc.add_rejections();
-      entry->set_fq_command_type(fq);
-      for (auto& fn : fns) entry->add_callback_ids(Assign(SagaRejectionInvoker(fn)));
+      e->set_callback_id(Assign(SagaEventInvoker(d.targets, fn)));
     }
     Register(ffi::angzarr_router_register_saga, desc);
   }
@@ -144,6 +139,7 @@ class Router {
     abi::ProcessManagerDescriptor desc;
     desc.set_name(d.name);
     desc.set_pm_domain(d.pm_domain);
+    for (auto& t : d.targets) desc.add_target_domains(t);
     for (auto& [fq, fn] : d.rebuilder.appliers) {
       auto* e = desc.add_appliers();
       e->set_fq_type(fq);
@@ -156,11 +152,11 @@ class Router {
       auto* e = desc.add_events();
       e->set_input_domain(h.source_domain);
       e->set_fq_type(h.full_name);
-      e->set_callback_id(Assign(PmEventInvoker<TState>(key, h.fn)));
+      e->set_callback_id(Assign(PmEventInvoker<TState>(key, d.targets, h.fn)));
     }
     for (auto& [fq, fns] : d.rejections) {
       auto* entry = desc.add_rejections();
-      entry->set_fq_command_type(fq);
+      entry->set_compensates(fq);
       for (auto& fn : fns) entry->add_callback_ids(Assign(PmRejectionInvoker<TState>(key, fn)));
     }
     Register(ffi::angzarr_router_register_process_manager, desc);
@@ -317,14 +313,12 @@ class Router {
     };
   }
 
-  static Invoker SagaEventInvoker(SagaDispatch::EventFn fn) {
+  static Invoker SagaEventInvoker(std::vector<std::string> targets, SagaDispatch::EventFn fn) {
     return
-        [fn](Session&, const std::string& tu, const std::string& payload, const std::string& aux) {
+        [dests = Destinations(std::move(targets)), fn](
+            Session&, const std::string& tu, const std::string& payload, const std::string& aux) {
           abi::SagaEventAux sax;
           sax.ParseFromString(aux);
-          std::map<std::string, uint32_t> seqs;
-          for (const auto& kv : sax.destination_sequences()) seqs[kv.first] = kv.second;
-          Destinations dests(std::move(seqs));
           auto emission = fn(AnyOf(tu, payload), dests, sax.source_cover());
           pb::SagaResponse resp;
           for (auto& c : emission.commands) *resp.add_commands() = c;
@@ -333,30 +327,11 @@ class Router {
         };
   }
 
-  static Invoker SagaRejectionInvoker(SagaDispatch::RejectionFn fn) {
-    return [fn](Session&, const std::string&, const std::string&, const std::string& aux) {
-      abi::RejectionAux rax;
-      rax.ParseFromString(aux);
-      pb::Notification n;
-      n.ParseFromString(rax.notification());
-      pb::RejectionNotification rej;
-      rej.ParseFromString(rax.rejection());
-      pb::SagaResponse resp;
-      for (auto& e : fn(n, rej)) *resp.add_events() = e;
-      return InvokerResult{resp.SerializeAsString(), ffi::kStatusOk, true};
-    };
-  }
-
   template <class TState>
-  static Invoker PmEventInvoker(ComponentKey key,
+  static Invoker PmEventInvoker(ComponentKey key, std::vector<std::string> targets,
                                 typename ProcessManagerDispatch<TState>::EventFn fn) {
-    return [key, fn](Session& s, const std::string& tu, const std::string& payload,
-                     const std::string& aux) {
-      abi::PmEventAux pax;
-      pax.ParseFromString(aux);
-      std::map<std::string, uint32_t> seqs;
-      for (const auto& kv : pax.destination_sequences()) seqs[kv.first] = kv.second;
-      Destinations dests(std::move(seqs));
+    return [key, dests = Destinations(std::move(targets)), fn](
+               Session& s, const std::string& tu, const std::string& payload, const std::string&) {
       auto resp = fn(AnyOf(tu, payload), s.EnsureState<TState>(key), dests);
       return InvokerResult{resp.SerializeAsString(), ffi::kStatusOk, true};
     };

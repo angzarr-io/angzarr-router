@@ -8,6 +8,7 @@
 
 #include <google/protobuf/any.pb.h>
 
+#include <catch2/catch.hpp>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -27,6 +28,12 @@ namespace pb = io::angzarr::v1;
 namespace tc = test::counter;
 
 inline std::string TypeUrl(const std::string& fq) { return "/" + fq; }
+
+// The fully-qualified name of a type URL: everything after its last "/".
+inline std::string FqFromUrl(const std::string& url) {
+  const auto i = url.rfind('/');
+  return i == std::string::npos ? url : url.substr(i + 1);
+}
 
 inline void SetAny(google::protobuf::Any* any, const std::string& fq, const std::string& value) {
   any->set_type_url(TypeUrl(fq));
@@ -168,13 +175,15 @@ inline pb::EventPage IncreasedEventPage() {
 
 // --- saga requests --------------------------------------------------------
 
+// A saga source in "order" carrying one fq event, at sequence seq when given.
 inline pb::SagaHandleRequest SagaEventSource(const std::string& fq,
-                                             const std::map<std::string, uint32_t>& dest) {
+                                             std::optional<uint32_t> seq = std::nullopt) {
   pb::SagaHandleRequest req;
   auto* source = req.mutable_source();
   source->mutable_cover()->set_domain("order");
-  SetAnyEmpty(source->add_pages()->mutable_event(), fq);
-  for (const auto& [k, v] : dest) (*req.mutable_destination_sequences())[k] = v;
+  auto* page = source->add_pages();
+  SetAnyEmpty(page->mutable_event(), fq);
+  if (seq) page->mutable_header()->set_sequence(*seq);
   return req;
 }
 
@@ -210,16 +219,19 @@ inline pb::EventBook DeliveryNoCover() {
 
 // --- process-manager triggers ---------------------------------------------
 
-inline pb::ProcessManagerHandleRequest PmTrigger(const std::string& domain,
-                                                 const std::vector<std::string>& fqs,
-                                                 const std::optional<pb::EventBook>& state,
-                                                 const std::map<std::string, uint32_t>& dest) {
+// A PM trigger in domain carrying the fq event pages, the newest at sequence
+// newest_seq when given, over the PM's prior process state when given.
+inline pb::ProcessManagerHandleRequest PmTrigger(
+    const std::string& domain, const std::vector<std::string>& fqs,
+    const std::optional<pb::EventBook>& state, std::optional<uint32_t> newest_seq = std::nullopt) {
   pb::ProcessManagerHandleRequest req;
   auto* trigger = req.mutable_trigger();
   trigger->mutable_cover()->set_domain(domain);
   for (const auto& fq : fqs) SetAnyEmpty(trigger->add_pages()->mutable_event(), fq);
+  if (newest_seq && trigger->pages_size() > 0) {
+    trigger->mutable_pages(trigger->pages_size() - 1)->mutable_header()->set_sequence(*newest_seq);
+  }
   if (state) *req.mutable_process_state() = *state;
-  for (const auto& [k, v] : dest) (*req.mutable_destination_sequences())[k] = v;
   return req;
 }
 
@@ -264,6 +276,61 @@ inline pb::ProcessManagerHandleRequest PmEmptyTrigger() {
   pb::ProcessManagerHandleRequest req;
   req.mutable_trigger();
   return req;
+}
+
+// The Compensate payload for an executed test.counter.<command>.
+inline google::protobuf::Any CompensatePayload(const std::string& command) {
+  pb::Compensate compensate;
+  compensate.set_command_type("test.counter." + command);
+  compensate.add_sequences(0);
+  compensate.set_reason("aborted");
+  return angzarr::router::Pack::Wrap(compensate);
+}
+
+// A PM request whose trigger (in the order PM's own domain) is a Compensate for
+// an executed test.counter.<command>.
+inline pb::ProcessManagerHandleRequest PmCompensateRequest(const std::string& command) {
+  pb::Notification n;
+  *n.mutable_payload() = CompensatePayload(command);
+  pb::ProcessManagerHandleRequest req;
+  auto* trigger = req.mutable_trigger();
+  trigger->mutable_cover()->set_domain("order-pm");
+  *trigger->add_pages()->mutable_event() = angzarr::router::Pack::Wrap(n);
+  return req;
+}
+
+// Rewrites every Any type URL in the command and its prior history to prefix +
+// the fully-qualified name.
+inline pb::ContextualCommand WithTypeUrlPrefix(pb::ContextualCommand cc,
+                                               const std::string& prefix) {
+  auto rewrite = [&prefix](google::protobuf::Any* any) {
+    any->set_type_url(prefix + FqFromUrl(any->type_url()));
+  };
+  if (cc.has_command()) {
+    for (auto& page : *cc.mutable_command()->mutable_pages()) {
+      if (page.has_command()) rewrite(page.mutable_command());
+    }
+  }
+  if (cc.has_events()) {
+    for (auto& page : *cc.mutable_events()->mutable_pages()) {
+      if (page.has_event()) rewrite(page.mutable_event());
+    }
+  }
+  return cc;
+}
+
+// Asserts every page of cmd is deferred from source_domain at the step's
+// (source sequence, command index) captures, and carries no explicit sequence.
+inline void RequireDeferred(const pb::CommandBook& cmd, const std::string& source_domain,
+                            const std::vector<std::string>& args) {
+  REQUIRE(cmd.pages_size() > 0);
+  for (const auto& page : cmd.pages()) {
+    REQUIRE(page.header().sequence_type_case() == pb::PageHeader::kAngzarrDeferred);
+    const auto& d = page.header().angzarr_deferred();
+    REQUIRE(static_cast<int>(d.source_seq()) == std::stoi(args.at(0)));
+    REQUIRE(static_cast<int>(d.command_index()) == std::stoi(args.at(1)));
+    REQUIRE(d.source().domain() == source_domain);
+  }
 }
 
 }  // namespace angzarr::conformance

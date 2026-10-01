@@ -14,17 +14,16 @@ using angzarr::router::Destinations;
 using angzarr::router::PmRejection;
 
 // The conformance OrderProcessManager fixture: the newest trigger reacts with a
-// stamped Reserve command plus one fact per rebuilt prior-state event; a
-// rejection injects one process event and escalates.
+// Reserve command (deferred: the router stamps its provenance) plus one fact
+// per rebuilt prior-state event; a rejection injects one process event and
+// escalates.
 class PmFixture : public tc::OrderProcessManagerHandler {
  public:
   pb::ProcessManagerHandleResponse Increased(const tc::Increased&,
                                              tc::OrderProcessManagerState& state,
-                                             const Destinations& dests) override {
-    auto cmd = ReserveCommand();
-    if (dests.Has("inventory")) cmd = dests.StampCommand(cmd, "inventory");
+                                             const Destinations&) override {
     pb::ProcessManagerHandleResponse resp;
-    *resp.add_commands() = cmd;
+    *resp.add_commands() = ReserveCommand();
     for (uint32_t i = 0; i < state.count(); ++i) *resp.add_facts() = OneFact();
     return resp;
   }
@@ -104,30 +103,27 @@ void Register(StepRegistry& r, PmWorld& w) {
     tc::RegisterOrderProcessManager(w.router, w.fixture);
     tc::RegisterAuditProcessManager(w.router, w.audit);
   });
-  r.On(
-      "an Increased trigger in domain {string} is dispatched with destination inventory sequence "
-      "{int}",
-      [&w](const StepArgs& a) {
-        w.Dispatch(PmTrigger(a[0], {"test.counter.Increased"}, std::nullopt,
-                             {{"inventory", static_cast<uint32_t>(std::stoi(a[1]))}}));
-      });
+  r.On("an Increased trigger in domain {string} at sequence {int} is dispatched",
+       [&w](const StepArgs& a) {
+         w.Dispatch(PmTrigger(a[0], {"test.counter.Increased"}, std::nullopt,
+                              static_cast<uint32_t>(std::stoi(a[1]))));
+       });
   r.On("an Increased trigger in domain {string} is dispatched", [&w](const StepArgs& a) {
-    w.Dispatch(PmTrigger(a[0], {"test.counter.Increased"}, std::nullopt, {}));
+    w.Dispatch(PmTrigger(a[0], {"test.counter.Increased"}, std::nullopt));
   });
   r.On("a trigger whose newest page is an undeclared event is dispatched", [&w](const StepArgs&) {
-    w.Dispatch(PmTrigger("counter", {"test.counter.Increased", "test.counter.Unwatched"},
-                         std::nullopt, {}));
+    w.Dispatch(
+        PmTrigger("counter", {"test.counter.Increased", "test.counter.Unwatched"}, std::nullopt));
   });
   r.On("an Increased trigger is dispatched over a prior state of {int} events",
        [&w](const StepArgs& a) {
-         w.Dispatch(
-             PmTrigger("counter", {"test.counter.Increased"}, PmStateOf(std::stoi(a[0])), {}));
+         w.Dispatch(PmTrigger("counter", {"test.counter.Increased"}, PmStateOf(std::stoi(a[0]))));
        });
   r.On("an Increased trigger is dispatched over a prior {string} state of {int} events",
        [&w](const StepArgs& a) {
          auto state = PmStateOf(std::stoi(a[1]));
          state.mutable_cover()->set_domain(a[0]);
-         w.Dispatch(PmTrigger("counter", {"test.counter.Increased"}, state, {}));
+         w.Dispatch(PmTrigger("counter", {"test.counter.Increased"}, state));
        });
   r.On("a request with no trigger is dispatched",
        [&w](const StepArgs&) { w.Dispatch(PmNoTrigger()); });
@@ -139,6 +135,8 @@ void Register(StepRegistry& r, PmWorld& w) {
     w.Dispatch(angzarr::conformance::PmRejection("test.counter.Reserve"));
   });
 
+  r.On("a Compensate for Reserve is dispatched to the order process-manager",
+       [&w](const StepArgs&) { w.Dispatch(PmCompensateRequest("Reserve")); });
   r.On("a rejection of Reserve issued by {string} is dispatched",
        [&w](const StepArgs& a) { w.Dispatch(PmIssuedRejection("test.counter.Reserve", a[0])); });
 
@@ -147,9 +145,8 @@ void Register(StepRegistry& r, PmWorld& w) {
     REQUIRE(w.resp->commands_size() == 1);
     REQUIRE(w.resp->commands(0).cover().domain() == a[0]);
   });
-  r.On("the command carries destination sequence {int}", [&w](const StepArgs& a) {
-    REQUIRE(static_cast<int>(w.resp->commands(0).pages(0).header().sequence()) == std::stoi(a[0]));
-  });
+  r.On("the command is deferred from source sequence {int} at command index {int}",
+       [&w](const StepArgs& a) { RequireDeferred(w.resp->commands(0), "counter", a); });
   r.On("the process-manager emits no commands", [&w](const StepArgs&) {
     REQUIRE_FALSE(w.err.has_value());
     REQUIRE(w.resp->commands_size() == 0);

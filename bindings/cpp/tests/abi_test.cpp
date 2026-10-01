@@ -18,11 +18,12 @@ TEST_CASE("an ABI version mismatch is refused naming expected and actual", "[abi
     FAIL("a mismatching ABI version was accepted");
   } catch (const std::runtime_error& e) {
     const std::string msg = e.what();
-    REQUIRE(msg.find("expected 1") != std::string::npos);
-    REQUIRE(msg.find("got 2") != std::string::npos);
+    REQUIRE(msg.find("expected 2") != std::string::npos);
+    REQUIRE(msg.find("got 3") != std::string::npos);
   }
 }
 
 TEST_CASE("the linked router-ffi reports the binding's ABI version", "[abi]") {
+  REQUIRE(ffi::kAbiVersion == 2);
   REQUIRE(Router::AbiVersion() == ffi::kAbiVersion);
 }
