@@ -45,6 +45,7 @@ public class ContextSteps {
   private Router router;
   private final List<Cover> covers = new ArrayList<>();
   private final List<Seen> pages = new ArrayList<>();
+  private final List<Long> applied = new ArrayList<>();
   private EventBook facts;
   private Counter.CounterState replayed;
   private ProcessManagerHandleResponse pmResp;
@@ -55,6 +56,7 @@ public class ContextSteps {
     router = new Router();
     covers.clear();
     pages.clear();
+    applied.clear();
     facts = null;
     replayed = null;
     pmResp = null;
@@ -74,11 +76,12 @@ public class ContextSteps {
   public void ledger() {
     Rebuilder rebuilder =
         new Rebuilder(Counter.CounterState::newBuilder)
-            .apply(
+            .applyWithContext(
                 INCREASED,
-                (state, event) -> {
+                (state, event, ctx) -> {
                   Counter.CounterState.Builder s = (Counter.CounterState.Builder) state;
                   s.setCount(s.getCount() + 1);
+                  applied.add(ctx.sequence());
                 })
             .withSnapshot(
                 (state, snapshot) ->
@@ -107,7 +110,13 @@ public class ContextSteps {
                 "Reserving",
                 "reserving-pm",
                 List.of("inventory"),
-                new Rebuilder(Counter.CounterState::newBuilder))
+                new Rebuilder(Counter.CounterState::newBuilder)
+                    .apply(
+                        INCREASED,
+                        (state, event) -> {
+                          Counter.CounterState.Builder s = (Counter.CounterState.Builder) state;
+                          s.setCount(s.getCount() + 1);
+                        }))
             .onEvent(
                 "counter",
                 INCREASED,
@@ -151,6 +160,14 @@ public class ContextSteps {
   @When("the ledger replays a snapshot of {int} then {int} Increased events")
   public void replay(int count, int events) throws Exception {
     Any state = router.dispatchReplay("ledger", Builders.replayRequest(count, events)).getState();
+    assertEquals("test.counter.CounterState", Builders.fqOf(state.getTypeUrl()), "state type");
+    replayed = Counter.CounterState.parseFrom(state.getValue());
+  }
+
+  @When("the reserving process-manager replays {int} Increased events")
+  public void pmReplay(int events) throws Exception {
+    Any state =
+        router.dispatchReplay("reserving-pm", Builders.eventsReplayRequest(events)).getState();
     assertEquals("test.counter.CounterState", Builders.fqOf(state.getTypeUrl()), "state type");
     replayed = Counter.CounterState.parseFrom(state.getValue());
   }
@@ -215,6 +232,11 @@ public class ContextSteps {
   public void replayedCount(int count) {
     assertNotNull(replayed, "replayed");
     assertEquals(count, replayed.getCount(), "replayed count");
+  }
+
+  @Then("the ledger applied Increased events at sequences {int} and {int}")
+  public void appliedAt(int first, int second) {
+    assertEquals(List.of((long) first, (long) second), applied, "applied sequences");
   }
 
   private ByteString singleRoot() {

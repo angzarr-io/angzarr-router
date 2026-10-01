@@ -28,6 +28,12 @@ public final class Thunks {
   }
 
   @FunctionalInterface
+  public interface ApplierContextThunk {
+    /** ctx is where the event sits: its book's cover and the page's sequence. */
+    void apply(Message.Builder state, Any event, PageContext ctx) throws Exception;
+  }
+
+  @FunctionalInterface
   public interface CommandThunk {
     /** Returns the EventBook to persist, or null for nothing emitted. */
     EventBook handle(Any command, Message.Builder state, CommandContext cctx) throws Exception;

@@ -563,6 +563,15 @@ public final class Builders {
     return req.build();
   }
 
+  /** A ReplayRequest of events Increased events at sequences 0..., with no snapshot. */
+  public static ReplayRequest eventsReplayRequest(int events) {
+    ReplayRequest.Builder req = ReplayRequest.newBuilder();
+    for (int i = 0; i < events; i++) {
+      req.addEvents(increasedAt(i));
+    }
+    return req.build();
+  }
+
   /** An IncreaseBy command for the ledger root label. */
   public static ContextualCommand ledgerCommand(String label) {
     return ContextualCommand.newBuilder()

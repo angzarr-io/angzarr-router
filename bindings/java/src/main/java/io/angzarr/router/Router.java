@@ -18,6 +18,7 @@ import io.angzarr.ReplayRequest;
 import io.angzarr.ReplayResponse;
 import io.angzarr.SagaHandleRequest;
 import io.angzarr.SagaResponse;
+import io.angzarr.router.Thunks.ApplierContextThunk;
 import io.angzarr.router.Thunks.ApplierThunk;
 import io.angzarr.router.Thunks.CommandThunk;
 import io.angzarr.router.Thunks.FactThunk;
@@ -115,12 +116,12 @@ public final class Router implements AutoCloseable {
     Abi.AggregateDescriptor.Builder desc =
         Abi.AggregateDescriptor.newBuilder().setName(d.name).setDomain(d.domain);
 
-    for (Map.Entry<String, ApplierThunk> e : d.rebuilder.appliers.entrySet()) {
+    for (Map.Entry<String, ApplierContextThunk> e : d.rebuilder.appliers.entrySet()) {
       long id = assign(applierInvoker(component, factory, e.getValue()));
       desc.addAppliers(callbackEntry(e.getKey(), id));
     }
     if (d.rebuilder.snapshot != null) {
-      desc.setSnapshotCallbackId(assign(applierInvoker(component, factory, d.rebuilder.snapshot)));
+      desc.setSnapshotCallbackId(assign(snapshotInvoker(component, factory, d.rebuilder.snapshot)));
     }
     for (Map.Entry<String, CommandThunk> e : d.commands.entrySet()) {
       long id = assign(commandInvoker(component, factory, e.getValue()));
@@ -192,12 +193,12 @@ public final class Router implements AutoCloseable {
             .addAllTargetDomains(d.targets);
     Destinations dests = new Destinations(d.targets);
 
-    for (Map.Entry<String, ApplierThunk> e : d.rebuilder.appliers.entrySet()) {
+    for (Map.Entry<String, ApplierContextThunk> e : d.rebuilder.appliers.entrySet()) {
       long id = assign(applierInvoker(component, factory, e.getValue()));
       desc.addAppliers(callbackEntry(e.getKey(), id));
     }
     if (d.rebuilder.snapshot != null) {
-      desc.setSnapshotCallbackId(assign(applierInvoker(component, factory, d.rebuilder.snapshot)));
+      desc.setSnapshotCallbackId(assign(snapshotInvoker(component, factory, d.rebuilder.snapshot)));
     }
     for (Map.Entry<String, Map<String, PmEventCoverThunk>> byDomain : d.handlers.entrySet()) {
       for (Map.Entry<String, PmEventCoverThunk> e : byDomain.getValue().entrySet()) {
@@ -216,6 +217,7 @@ public final class Router implements AutoCloseable {
       }
       desc.addRejections(entry);
     }
+    desc.setStateCallbackId(assign(stateInvoker(component, factory)));
     byte[] descriptor = desc.build().toByteArray();
     check(withRouter(p -> Ffi.registerProcessManager(p, descriptor)));
   }
@@ -262,8 +264,9 @@ public final class Router implements AutoCloseable {
   }
 
   /**
-   * Replays a snapshot and events through the appliers of the aggregate registered for domain (an
-   * empty domain selects a sole registered aggregate); returns its packed state.
+   * Replays a snapshot and events through the appliers of the aggregate registered for domain, else
+   * the process manager whose own domain it is (an empty domain selects a sole registered
+   * aggregate); returns its packed state.
    */
   public ReplayResponse dispatchReplay(String domain, ReplayRequest request) {
     Abi.ReplayCall call =
@@ -317,7 +320,21 @@ public final class Router implements AutoCloseable {
         Integer.toUnsignedLong(cax.getNextSequence()), cax.getHadPriorEvents(), cax.getCover());
   }
 
+  private static PageContext pageContext(byte[] aux) throws InvalidProtocolBufferException {
+    Abi.ProjectorEventAux pax = Abi.ProjectorEventAux.parseFrom(aux);
+    return new PageContext(pax.getCover(), Integer.toUnsignedLong(pax.getSequence()));
+  }
+
   private static Invoker applierInvoker(
+      long component, Supplier<Message.Builder> factory, ApplierContextThunk thunk) {
+    return (session, typeUrl, payload, aux) -> {
+      thunk.apply(
+          session.ensureState(component, factory), anyOf(typeUrl, payload), pageContext(aux));
+      return new Invoker.Result(null, Ffi.STATUS_OK);
+    };
+  }
+
+  private static Invoker snapshotInvoker(
       long component, Supplier<Message.Builder> factory, ApplierThunk thunk) {
     return (session, typeUrl, payload, aux) -> {
       thunk.apply(session.ensureState(component, factory), anyOf(typeUrl, payload));
@@ -395,9 +412,8 @@ public final class Router implements AutoCloseable {
   private static Invoker projectorEventInvoker(
       long component, Supplier<Message.Builder> factory, ProjectorEventContextThunk thunk) {
     return (session, typeUrl, payload, aux) -> {
-      Abi.ProjectorEventAux pax = Abi.ProjectorEventAux.parseFrom(aux);
-      PageContext ctx = new PageContext(pax.getCover(), Integer.toUnsignedLong(pax.getSequence()));
-      thunk.fold(session.ensureState(component, factory), anyOf(typeUrl, payload), ctx);
+      thunk.fold(
+          session.ensureState(component, factory), anyOf(typeUrl, payload), pageContext(aux));
       return new Invoker.Result(null, Ffi.STATUS_OK);
     };
   }
