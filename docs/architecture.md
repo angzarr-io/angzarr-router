@@ -18,7 +18,12 @@ router.
 - **Not consumers (yet).** The `angzarr-client-*` libraries still carry
   their own engines (client-go `engine*.go`, client-python
   `angzarr_client/router/`, client-rust's own router). No client-*
-  library links this crate or its FFI. Until those engines retire, the
+  library links this crate or its FFI yet. client-rust is planned to move
+  onto `crates/router`'s Rust-native API (no FFI) and delete its engine;
+  the Rust-native API (`Rebuilder`, `AggregateDispatch`, `SagaDispatch`,
+  `ProcessManagerDispatch` with `select_process_managers`/`merge_response`,
+  `ProjectorDispatch`, `Destinations`, `CodedError`) is therefore a public
+  contract, documented on each item. Until the client engines retire, the
   engine semantics exist in this repo AND in each client library; the
   shared contract between them is the semantics table below and the
   angzarr-project feature suite, not shared code.
