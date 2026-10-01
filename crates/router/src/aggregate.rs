@@ -4,7 +4,8 @@
 //! command must report NO_HANDLER_REGISTERED, not whatever the rebuild
 //! would surface); rejection routing keys on FULLY-QUALIFIED command type
 //! names; multiple compensators all run, in registration order, merging
-//! their compensation events into one response.
+//! their compensation events into one response unless one escalates (the
+//! first escalation wins).
 
 use std::collections::HashMap;
 
@@ -94,7 +95,9 @@ impl<S> AggregateDispatch<S> {
     /// Registers a compensation thunk keyed by the FULLY-QUALIFIED
     /// rejected-command type name. Multiple registrations for the same
     /// command all run, in registration order; their compensation events
-    /// merge into one response.
+    /// merge into one response, and the first escalation (Revocation or
+    /// Notification) wins over events. Compensation books are returned as
+    /// the compensators built them (CommandContext supplies next_sequence).
     pub fn on_rejected(
         mut self,
         fq_command_type: &str,
@@ -241,22 +244,36 @@ impl<S> AggregateDispatch<S> {
             next_sequence: crate::next_sequence(events),
             had_prior_events: info.had_prior_events,
         };
-        if let [thunk] = thunks.as_slice() {
-            return thunk(&notification, &rejection, &mut state, cctx).map_err(map_handler_error);
-        }
-        // Fan-out: run every compensator in registration order, merging
-        // their compensation events into one response.
-        let mut merged = pb::EventBook::default();
+        let mut merged: Option<pb::business_response::Result> = None;
         for thunk in thunks {
             let resp =
                 thunk(&notification, &rejection, &mut state, cctx).map_err(map_handler_error)?;
-            if let Some(pb::business_response::Result::Events(out)) = resp.result {
-                merged.pages.extend(out.pages);
-            }
+            merged = merge_compensation(merged, resp.result);
         }
-        Ok(pb::BusinessResponse {
-            result: Some(pb::business_response::Result::Events(merged)),
-        })
+        Ok(pb::BusinessResponse { result: merged })
+    }
+}
+
+/// Folds one compensator's result into the fan-out result. Compensators run in
+/// registration order (C-0042); their compensation events concatenate under the
+/// first events book's cover, and the first escalation (a Revocation or a
+/// Notification) wins over events and over later escalations. A compensator
+/// returning nothing contributes nothing. One compensator's result is
+/// therefore returned unchanged.
+fn merge_compensation(
+    acc: Option<pb::business_response::Result>,
+    next: Option<pb::business_response::Result>,
+) -> Option<pb::business_response::Result> {
+    use pb::business_response::Result as R;
+    match (acc, next) {
+        (None, next) => next,
+        (acc, None) => acc,
+        (Some(R::Events(mut book)), Some(R::Events(more))) => {
+            book.pages.extend(more.pages);
+            Some(R::Events(book))
+        }
+        (Some(R::Events(_)), escalation) => escalation,
+        (escalation, _) => escalation,
     }
 }
 

@@ -240,6 +240,127 @@ fn multiple_compensators_all_run_in_order() {
     );
 }
 
+fn reject_with(
+    result: Option<pb::business_response::Result>,
+) -> Result<pb::BusinessResponse, crate::error::HandlerError> {
+    Ok(pb::BusinessResponse { result })
+}
+
+fn events_in(domain: &str, pages: usize) -> Option<pb::business_response::Result> {
+    Some(pb::business_response::Result::Events(pb::EventBook {
+        cover: Some(pb::Cover {
+            domain: domain.to_string(),
+            ..Default::default()
+        }),
+        pages: vec![pb::EventPage::default(); pages],
+        ..Default::default()
+    }))
+}
+
+fn escalate_to(domain: &str) -> Option<pb::business_response::Result> {
+    Some(pb::business_response::Result::Notification(
+        pb::Notification {
+            cover: Some(pb::Cover {
+                domain: domain.to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    ))
+}
+
+fn revoke(reason: &str) -> Option<pb::business_response::Result> {
+    Some(pb::business_response::Result::Revocation(
+        pb::RevocationResponse {
+            reason: reason.to_string(),
+            ..Default::default()
+        },
+    ))
+}
+
+/// Two compensators for FQ_RESERVE returning `first` then `second`, recording
+/// their run order.
+fn two_compensators(
+    first: Option<pb::business_response::Result>,
+    second: Option<pb::business_response::Result>,
+) -> (AggregateDispatch<TestState>, Arc<Mutex<Vec<&'static str>>>) {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let (o1, o2) = (order.clone(), order.clone());
+    let d = AggregateDispatch::new("agg-test", "payment", fresh_rebuilder())
+        .on_rejected(FQ_RESERVE, move |_, _, _: &mut TestState, _| {
+            o1.lock().unwrap().push("first");
+            reject_with(first.clone())
+        })
+        .on_rejected(FQ_RESERVE, move |_, _, _: &mut TestState, _| {
+            o2.lock().unwrap().push("second");
+            reject_with(second.clone())
+        });
+    (d, order)
+}
+
+// With several compensators an escalation is never dropped: every compensator
+// still runs, and the first escalation (Notification or Revocation) is the
+// response — the same rule a single compensator's verbatim response follows.
+#[test]
+fn fan_out_escalation_after_events_wins() {
+    let (d, order) = two_compensators(events_in("payment", 1), escalate_to("upstream"));
+    let resp = d
+        .dispatch(&command_for(notification_command_for(FQ_RESERVE)))
+        .expect("dispatch");
+    assert_eq!(*order.lock().unwrap(), vec!["first", "second"]);
+    assert_eq!(resp.result, escalate_to("upstream"));
+}
+
+#[test]
+fn fan_out_first_escalation_wins_over_a_later_one() {
+    let (d, order) = two_compensators(revoke("undo"), escalate_to("upstream"));
+    let resp = d
+        .dispatch(&command_for(notification_command_for(FQ_RESERVE)))
+        .expect("dispatch");
+    assert_eq!(*order.lock().unwrap(), vec!["first", "second"]);
+    assert_eq!(resp.result, revoke("undo"));
+}
+
+#[test]
+fn fan_out_events_merge_under_the_first_book_cover() {
+    let (d, _) = two_compensators(events_in("payment", 1), events_in("other", 2));
+    let resp = d
+        .dispatch(&command_for(notification_command_for(FQ_RESERVE)))
+        .expect("dispatch");
+    assert_eq!(resp.result, events_in("payment", 3));
+}
+
+#[test]
+fn fan_out_events_after_an_empty_compensator_still_merge() {
+    let (d, _) = two_compensators(None, events_in("payment", 2));
+    let resp = d
+        .dispatch(&command_for(notification_command_for(FQ_RESERVE)))
+        .expect("dispatch");
+    assert_eq!(resp.result, events_in("payment", 2));
+}
+
+#[test]
+fn fan_out_of_empty_compensators_is_an_empty_response() {
+    let (d, order) = two_compensators(None, None);
+    let resp = d
+        .dispatch(&command_for(notification_command_for(FQ_RESERVE)))
+        .expect("dispatch");
+    assert_eq!(*order.lock().unwrap(), vec!["first", "second"]);
+    assert_eq!(resp.result, None);
+}
+
+#[test]
+fn single_compensator_escalation_is_returned() {
+    let d = AggregateDispatch::new("agg-test", "payment", fresh_rebuilder())
+        .on_rejected(FQ_RESERVE, |_, _, _: &mut TestState, _| {
+            reject_with(escalate_to("upstream"))
+        });
+    let resp = d
+        .dispatch(&command_for(notification_command_for(FQ_RESERVE)))
+        .expect("dispatch");
+    assert_eq!(resp.result, escalate_to("upstream"));
+}
+
 // Compensation events append after prior history — the rejection thunk
 // needs the aggregate's next_sequence to stamp them.
 #[test]
