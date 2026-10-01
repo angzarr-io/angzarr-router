@@ -24,6 +24,7 @@ public sealed class ContextSteps
     private EventBook? _facts;
     private TC.CounterState? _replayed;
     private ProcessManagerHandleResponse? _pm;
+    private BusinessResponse? _command;
     private CodedError? _factErr;
 
     [BeforeScenario]
@@ -36,6 +37,7 @@ public sealed class ContextSteps
         _facts = null;
         _replayed = null;
         _pm = null;
+        _command = null;
         _factErr = null;
     }
 
@@ -45,7 +47,8 @@ public sealed class ContextSteps
     /// <summary>The ledger aggregate (domain "ledger") over CounterState:
     /// Increased folds count += 1 and records the page sequence it applied; a
     /// snapshot loads CounterState; IncreaseBy
-    /// records the handled cover and emits nothing; the only declared fact,
+    /// records the handled cover and emits one Increased whose cover carries
+    /// the ledger's own linkage; the only declared fact,
     /// Increased, is recorded as received and flagged by a CounterState
     /// carrying the count it brings the ledger to.</summary>
     [Given("a ledger aggregate")]
@@ -73,7 +76,11 @@ public sealed class ContextSteps
                     (cmd, state, cctx) =>
                     {
                         _covers.Add(cctx.Cover);
-                        return null;
+                        return new EventBook
+                        {
+                            Cover = new Cover { Ext = Builders.LedgerLinkage() },
+                            Pages = { new EventPage { Event = Pack.Wrap(new TC.Increased()) } },
+                        };
                     }
                 )
                 .OnFact(
@@ -183,7 +190,12 @@ public sealed class ContextSteps
     }
 
     [When("an IncreaseBy command for ledger root {string} is dispatched")]
-    public void LedgerCommand(string label) => _router.Dispatch(Builders.LedgerCommand(label));
+    public void LedgerCommand(string label) =>
+        _command = _router.Dispatch(Builders.LedgerCommand(label));
+
+    [When("an IncreaseBy command for ledger root {string} on behalf of a parent is dispatched")]
+    public void LedgerCommandWithParent(string label) =>
+        _command = _router.Dispatch(Builders.LedgerCommandWithLinkage(label));
 
     [When(
         "an Increased trigger of counter root {string} at sequence {int} is dispatched to the reserving process-manager"
@@ -256,6 +268,23 @@ public sealed class ContextSteps
         var root = _covers[0]?.Root;
         Assert.That(root, Is.Not.Null, "the handler saw a cover with a root");
         return root!.Value.ToByteArray();
+    }
+
+    [Then("the recorded event carries the ledger's own linkage")]
+    public void LedgerOwnLinkage()
+    {
+        Assert.That(_command, Is.Not.Null, "a command was dispatched");
+        Assert.That(
+            _command!.ResultCase,
+            Is.EqualTo(BusinessResponse.ResultOneofCase.Events),
+            "expected events"
+        );
+        Assert.That(_command.Events.Pages.Count, Is.EqualTo(1), "recorded events");
+        Assert.That(
+            _command.Events.Cover?.Ext,
+            Is.EqualTo(Builders.LedgerLinkage()),
+            "the handler-set linkage is kept over the command's"
+        );
     }
 
     [Then("the ledger handler saw root {string}")]

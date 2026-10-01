@@ -123,6 +123,9 @@ public sealed class PmSteps
     public void CommandIsDeferred(int seq, int index) =>
         Steps.AssertDeferred(Succeeded().Commands[0], "counter", seq, index);
 
+    [Then("the command leaves its source component to the coordinator")]
+    public void NoSourceComponent() => Steps.AssertNoSourceComponent(Succeeded().Commands[0]);
+
     [Then("the process-manager emits no commands")]
     public void EmitsNoCommands()
     {

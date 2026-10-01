@@ -164,6 +164,18 @@ public sealed class CounterSteps
         );
     }
 
+    [Then("the recorded events carry no parent linkage")]
+    public void EventsCarryNoParentLinkage()
+    {
+        Assert.That(_err, Is.Null, "dispatch unexpectedly failed");
+        Assert.That(_resp!.Events.Pages, Is.Not.Empty, "events were recorded");
+        Assert.That(
+            _resp.Events.Cover?.Ext,
+            Is.Null,
+            "no command linkage, no handler linkage: none on the events"
+        );
+    }
+
     [Then("the compensations run first then second")]
     public void CompensationsFirstThenSecond()
     {
