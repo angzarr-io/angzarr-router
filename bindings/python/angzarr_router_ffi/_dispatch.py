@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import enum
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -173,10 +173,12 @@ class AggregateDispatch:
         self.commands[full_name] = thunk
         return self
 
-    def on_rejected(self, fq_command: str, thunk: RejectionThunk) -> AggregateDispatch:
-        """Append a compensator for one fully-qualified command type; repeated
+    def on_rejected(self, compensates: str, thunk: RejectionThunk) -> AggregateDispatch:
+        """Append a compensator under a ``compensates`` entry: the rejected
+        command's fully-qualified type (``"fq.Type"``, sent to any domain) or
+        ``"domain:fq.Type"`` (only when it was sent to that domain). Repeated
         calls register an ordered fan-out."""
-        self.rejections.setdefault(fq_command, []).append(thunk)
+        self.rejections.setdefault(compensates, []).append(thunk)
         return self
 
 
@@ -227,94 +229,77 @@ class ProjectorDispatch:
 
 
 class Destinations:
-    """Coordinator-supplied next-sequences for command stamping. Sagas and
-    process managers are translators — they stamp emitted commands, they do
-    not rebuild destination state to make decisions."""
+    """The declared output domains of one saga or process manager (its command
+    targets), in declaration order. Emitted commands carry no destination
+    sequence: the router stamps their ``angzarr_deferred`` provenance from the
+    triggering page, so a handler returns its commands as built."""
 
-    __slots__ = ("_sequences",)
+    __slots__ = ("_domains",)
 
-    def __init__(self, sequences: dict[str, int] | None = None):
-        self._sequences = dict(sequences) if sequences else {}
-
-    def sequence_for(self, domain: str) -> int | None:
-        """The next sequence for a domain, or None when none was supplied."""
-        return self._sequences.get(domain)
+    def __init__(self, domains: Iterable[str] | None = None):
+        self._domains = list(domains) if domains else []
 
     def has(self, domain: str) -> bool:
-        """Whether a sequence exists for the domain."""
-        return domain in self._sequences
+        """Whether ``domain`` is a declared output domain."""
+        return domain in self._domains
 
     def domains(self) -> list[str]:
-        """Every domain carrying a sequence (unordered)."""
-        return list(self._sequences.keys())
-
-    def stamp_command(self, command_book, domain: str) -> None:
-        """Stamp every page of ``command_book`` with the next sequence for
-        ``domain``. A domain with no supplied sequence raises the coded
-        MISSING_DESTINATION_SEQUENCE (check output_domains config)."""
-        seq = self._sequences.get(domain)
-        if seq is None:
-            raise CodedError(
-                code="MISSING_DESTINATION_SEQUENCE",
-                message="no sequence for destination domain",
-                grpc=GrpcCode.INVALID_ARGUMENT,
-                extras={"domain": domain},
-            )
-        for page in command_book.pages:
-            page.header.sequence = seq
+        """The declared output domains, in declaration order."""
+        return list(self._domains)
 
 
-# Saga thunk shapes (a saga is stateless — no state argument):
-#   event:     (event: Any, dests: Destinations, source_cover: Cover) -> (commands, events)
-#   rejection: (notification, rejection) -> events
-# source_cover is the source book's cover passed through whole (Rust owns the
-# deserialization) so the saga can route emitted commands by the trigger's identity.
+# Saga thunk shape (a saga is stateless — no state argument):
+#   event: (event: Any, dests: Destinations, source_cover: Cover) -> (commands, events)
+# dests are the saga's declared targets; source_cover is the source book's
+# cover passed through whole so the saga can route emitted commands by the
+# trigger's identity. The router stamps the commands deferred. Sagas receive
+# no rejections.
 SagaEventThunk = Callable[[any_pb2.Any, Destinations, object], tuple[list, list]]
-SagaRejectionThunk = Callable[[object, object], list]
 
 
 @dataclass
 class SagaDispatch:
     """One saga component's registration: name, the input domain it consumes,
-    the domains it issues commands to, event handlers, and ordered rejection
-    compensators. A saga is stateless — no rebuilder, no state. Shaped like the
-    core/Go API so the unit-6 emitter targets it with minimal changes."""
+    the domains it issues commands to (its declared output domains), and event
+    handlers. A saga is stateless — no rebuilder, no state — and receives no
+    rejections. Shaped like the core/Go API."""
 
     name: str
     input_domain: str
     targets: list[str] = field(default_factory=list)
     events: dict[str, SagaEventThunk] = field(default_factory=dict)
-    rejections: dict[str, list[SagaRejectionThunk]] = field(default_factory=dict)
 
     def on_event(self, full_name: str, thunk: SagaEventThunk) -> SagaDispatch:
         """Register the translation thunk for a fully-qualified event type."""
         self.events[full_name] = thunk
         return self
 
-    def on_rejected(self, fq_command: str, thunk: SagaRejectionThunk) -> SagaDispatch:
-        """Append a compensator for one fully-qualified command type; repeated
-        calls register an ordered fan-out (C-0042)."""
-        self.rejections.setdefault(fq_command, []).append(thunk)
-        return self
-
 
 # Process-manager thunk shapes (a PM is stateful — it sees rebuilt state):
 #   event:     (event: Any, state, dests) -> ProcessManagerHandleResponse
-#   rejection: (notification, rejection, state) -> (process_events, escalation|None)
+#   rejection: (notification, rejection, state) ->
+#                ProcessManagerHandleResponse            (process events, commands,
+#                                                         facts, escalation)
+#              | (process_events, escalation | None)
+#              | None                                    (nothing)
+# dests are the PM's declared targets. The router stamps every command the
+# PM returns (from an event handler or a compensator) deferred.
 PMEventThunk = Callable[[any_pb2.Any, object, Destinations], object]
-PMRejectionThunk = Callable[[object, object, object], tuple[list, object | None]]
+PMRejectionThunk = Callable[[object, object, object], object]
 
 
 @dataclass
 class ProcessManagerDispatch:
     """One process-manager component's registration: name, its own domain, the
-    rebuilder for its event-sourced state, event handlers keyed by (input
-    domain, FQ event type), and ordered rejection compensators. Shaped like the
-    core/Go API so the unit-6 emitter targets it with minimal changes."""
+    rebuilder for its event-sourced state, its declared output domains
+    (``targets``, its command targets), event handlers keyed by (input domain,
+    FQ event type), and ordered rejection compensators keyed by ``compensates``
+    entry. Shaped like the core/Go API."""
 
     name: str
     pm_domain: str
     rebuilder: Rebuilder
+    targets: list[str] = field(default_factory=list)
     handlers: dict[str, dict[str, PMEventThunk]] = field(default_factory=dict)
     rejections: dict[str, list[PMRejectionThunk]] = field(default_factory=dict)
 
@@ -325,10 +310,14 @@ class ProcessManagerDispatch:
         self.handlers.setdefault(input_domain, {})[full_name] = thunk
         return self
 
-    def on_rejected(self, fq_command: str, thunk: PMRejectionThunk) -> ProcessManagerDispatch:
-        """Append a compensator for one fully-qualified command type; repeated
-        calls register an ordered fan-out (C-0042)."""
-        self.rejections.setdefault(fq_command, []).append(thunk)
+    def on_rejected(self, compensates: str, thunk: PMRejectionThunk) -> ProcessManagerDispatch:
+        """Append a compensator under a ``compensates`` entry: the rejected
+        command's fully-qualified type (``"fq.Type"``, sent to any domain) or
+        ``"domain:fq.Type"`` (only when it was sent to that domain). Repeated
+        calls register an ordered fan-out (C-0042). The compensator may return
+        a full ProcessManagerHandleResponse (its commands are kept and stamped
+        deferred) or the ``(process_events, escalation)`` pair."""
+        self.rejections.setdefault(compensates, []).append(thunk)
         return self
 
 
@@ -495,15 +484,14 @@ def _projector_unknown_invoker(thunk: ProjectorUnknownThunk) -> Invoker:
     return inv
 
 
-def _saga_event_invoker(thunk: SagaEventThunk) -> Invoker:
+def _saga_event_invoker(targets: list[str], thunk: SagaEventThunk) -> Invoker:
     # Saga is stateless — the session's host state is untouched. The event
-    # thunk rebuilds Destinations from the aux and returns a SagaResponse.
+    # thunk sees the saga's declared targets and returns a SagaResponse.
     def inv(_session, type_url, payload, aux):
         sax = abi_pb2.SagaEventAux()
         sax.ParseFromString(aux)
-        dests = Destinations(dict(sax.destination_sequences))
         commands, events = thunk(
-            any_pb2.Any(type_url=type_url, value=payload), dests, sax.source_cover
+            any_pb2.Any(type_url=type_url, value=payload), Destinations(targets), sax.source_cover
         )
         resp = saga_pb2.SagaResponse(commands=commands, events=events)
         return resp.SerializeToString(), _STATUS_OK
@@ -511,34 +499,29 @@ def _saga_event_invoker(thunk: SagaEventThunk) -> Invoker:
     return inv
 
 
-def _saga_rejection_invoker(thunk: SagaRejectionThunk) -> Invoker:
-    def inv(_session, _type_url, _payload, aux):
-        rax = abi_pb2.RejectionAux()
-        rax.ParseFromString(aux)
-        notification = types_pb2.Notification()
-        notification.ParseFromString(rax.notification)
-        rejection = types_pb2.RejectionNotification()
-        rejection.ParseFromString(rax.rejection)
-        events = thunk(notification, rejection)
-        resp = saga_pb2.SagaResponse(events=events)
-        return resp.SerializeToString(), _STATUS_OK
-
-    return inv
-
-
-def _pm_event_invoker(key: int, factory, thunk: PMEventThunk) -> Invoker:
+def _pm_event_invoker(key: int, factory, targets: list[str], thunk: PMEventThunk) -> Invoker:
     # The PM is stateful: the appliers fold process_state into the session's
     # state first, then this handler reads it. The host returns a full
     # ProcessManagerHandleResponse.
-    def inv(session, type_url, payload, aux):
-        pax = abi_pb2.PmEventAux()
-        pax.ParseFromString(aux)
-        dests = Destinations(dict(pax.destination_sequences))
+    def inv(session, type_url, payload, _aux):
         state = session.ensure_state(key, factory)
-        resp = thunk(any_pb2.Any(type_url=type_url, value=payload), state, dests)
+        resp = thunk(any_pb2.Any(type_url=type_url, value=payload), state, Destinations(targets))
         return resp.SerializeToString(), _STATUS_OK
 
     return inv
+
+
+def _pm_compensation_response(result) -> object | None:
+    """The ProcessManagerHandleResponse a PM compensator's result stands for:
+    a full response as returned, the ``(process_events, escalation)`` pair
+    folded into one, or None for nothing."""
+    if result is None or isinstance(result, process_manager_pb2.ProcessManagerHandleResponse):
+        return result
+    process_events, escalation = result
+    resp = process_manager_pb2.ProcessManagerHandleResponse(process_events=process_events)
+    if escalation is not None:
+        resp.notification.CopyFrom(escalation)
+    return resp
 
 
 def _pm_rejection_invoker(key: int, factory, thunk: PMRejectionThunk) -> Invoker:
@@ -550,10 +533,9 @@ def _pm_rejection_invoker(key: int, factory, thunk: PMRejectionThunk) -> Invoker
         rejection = types_pb2.RejectionNotification()
         rejection.ParseFromString(rax.rejection)
         state = session.ensure_state(key, factory)
-        process_events, escalation = thunk(notification, rejection, state)
-        resp = process_manager_pb2.ProcessManagerHandleResponse(process_events=process_events)
-        if escalation is not None:
-            resp.notification.CopyFrom(escalation)
+        resp = _pm_compensation_response(thunk(notification, rejection, state))
+        if resp is None:
+            return None, _STATUS_OK_EMPTY
         return resp.SerializeToString(), _STATUS_OK
 
     return inv
@@ -701,8 +683,8 @@ class Router:
             for fq, thunk in dispatch.commands.items():
                 cid = self._assign(_command_invoker(key, factory, thunk))
                 desc.commands.append(abi_pb2.CallbackEntry(fq_type=fq, callback_id=cid))
-            for fq, thunks in dispatch.rejections.items():
-                entry = abi_pb2.RejectionEntry(fq_command_type=fq)
+            for compensates, thunks in dispatch.rejections.items():
+                entry = abi_pb2.RejectionEntry(compensates=compensates)
                 for thunk in thunks:
                     entry.callback_ids.append(self._assign(_rejection_invoker(key, factory, thunk)))
                 desc.rejections.append(entry)
@@ -779,20 +761,16 @@ class Router:
         raise _decode_status(resp_bytes, ret)
 
     def register_saga(self, dispatch: SagaDispatch) -> None:
-        """Register one saga component: assign callback ids to every
-        event/rejection thunk, serialize the SagaDescriptor, and hand it to the
-        core with the shared trampoline."""
+        """Register one saga component: assign callback ids to every event
+        thunk, serialize the SagaDescriptor, and hand it to the core with the
+        shared trampoline."""
         with self._lock:
+            targets = list(dispatch.targets)
             desc = abi_pb2.SagaDescriptor(name=dispatch.name, input_domain=dispatch.input_domain)
-            desc.target_domains.extend(dispatch.targets)
+            desc.target_domains.extend(targets)
             for fq, thunk in dispatch.events.items():
-                cid = self._assign(_saga_event_invoker(thunk))
+                cid = self._assign(_saga_event_invoker(targets, thunk))
                 desc.events.append(abi_pb2.CallbackEntry(fq_type=fq, callback_id=cid))
-            for fq, thunks in dispatch.rejections.items():
-                entry = abi_pb2.RejectionEntry(fq_command_type=fq)
-                for thunk in thunks:
-                    entry.callback_ids.append(self._assign(_saga_rejection_invoker(thunk)))
-                desc.rejections.append(entry)
 
             desc_bytes = desc.SerializeToString()
             ret = lib.angzarr_router_register_saga(
@@ -825,9 +803,11 @@ class Router:
         with self._lock:
             factory = dispatch.rebuilder.factory
             key = self._component_key()
+            targets = list(dispatch.targets)
             desc = abi_pb2.ProcessManagerDescriptor(
                 name=dispatch.name, pm_domain=dispatch.pm_domain
             )
+            desc.target_domains.extend(targets)
             for fq, thunk in dispatch.rebuilder.appliers.items():
                 cid = self._assign(_applier_invoker(key, factory, thunk))
                 desc.appliers.append(abi_pb2.CallbackEntry(fq_type=fq, callback_id=cid))
@@ -837,12 +817,12 @@ class Router:
                 )
             for input_domain, by_type in dispatch.handlers.items():
                 for fq, thunk in by_type.items():
-                    cid = self._assign(_pm_event_invoker(key, factory, thunk))
+                    cid = self._assign(_pm_event_invoker(key, factory, targets, thunk))
                     desc.events.append(
                         abi_pb2.PmEventEntry(input_domain=input_domain, fq_type=fq, callback_id=cid)
                     )
-            for fq, thunks in dispatch.rejections.items():
-                entry = abi_pb2.RejectionEntry(fq_command_type=fq)
+            for compensates, thunks in dispatch.rejections.items():
+                entry = abi_pb2.RejectionEntry(compensates=compensates)
                 for thunk in thunks:
                     cid = self._assign(_pm_rejection_invoker(key, factory, thunk))
                     entry.callback_ids.append(cid)

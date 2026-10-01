@@ -10,6 +10,7 @@ import pytest
 from pytest_bdd import given, parsers, scenarios, then, when
 
 from ... import CodedError, Router
+from ...gen.io.angzarr.v1 import types_pb2
 from ...gen.test.counter import counter_aggregate_angzarr
 from .. import builders
 from ..fixture import CounterAggregate, Observation
@@ -70,6 +71,17 @@ def _recorded_increases(world, n):
     world.prior = builders.prior_increases(int(n))
 
 
+@given(
+    parsers.re(
+        r'a counter that has already recorded (?P<n>\d+) increases? under the "(?P<prefix>[^"]*)" type-URL prefix'
+    )
+)
+def _recorded_increases_prefixed(world, n, prefix):
+    carrier = types_pb2.ContextualCommand()
+    carrier.events.CopyFrom(builders.prior_increases(int(n)))
+    world.prior = builders.with_type_url_prefix(carrier, prefix).events
+
+
 @given("a counter whose history holds a corrupt event")
 def _corrupt_history(world):
     world.prior = builders.corrupt_history()
@@ -91,6 +103,15 @@ def _increase_by(world, n):
 @when(parsers.parse("the operator increases the counter by {n:d} on behalf of a parent"))
 def _increase_on_behalf(world, n):
     world.dispatch(builders.increase_command_with_linkage(n))
+
+
+@when(
+    parsers.re(
+        r'the operator increases the counter by (?P<n>\d+) under the "(?P<prefix>[^"]*)" type-URL prefix'
+    )
+)
+def _increase_by_prefixed(world, n, prefix):
+    world.dispatch(builders.with_type_url_prefix(builders.increase_command(int(n)), prefix))
 
 
 @when("the operator triggers a hard failure")

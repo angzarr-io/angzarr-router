@@ -7,9 +7,9 @@ from .. import AbiVersionError, abi_version
 from .._abi import EXPECTED_ABI_VERSION, check_abi_version
 
 
-def test_abi_version_is_one():
-    assert abi_version() == 1
-    assert EXPECTED_ABI_VERSION == 1
+def test_abi_version_is_two():
+    assert abi_version() == 2
+    assert EXPECTED_ABI_VERSION == 2
 
 
 def test_matching_abi_version_is_accepted():

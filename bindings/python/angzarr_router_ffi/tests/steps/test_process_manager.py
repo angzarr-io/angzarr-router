@@ -12,7 +12,7 @@ from pytest_bdd import given, parsers, scenarios, then, when
 from ... import CodedError, Router
 from ...gen.io.angzarr.v1 import process_manager_pb2, types_pb2
 from ...gen.test.counter import audit_process_manager_angzarr, order_process_manager_angzarr
-from ..builders import FQ_INCREASED, FQ_RESERVE, type_url
+from ..builders import FQ_INCREASED, FQ_RESERVE, assert_deferred, type_url
 from ..fixture import AUDIT_MARK, AuditProcessManager, OrderProcessManager
 
 scenarios("process_manager.feature")
@@ -52,15 +52,32 @@ def world():
     w.close()
 
 
-def _trigger(domain: str, fqs: list[str], state=None, dest: dict[str, int] | None = None):
+def _trigger(domain: str, fqs: list[str], state=None, newest_seq: int | None = None):
+    """A trigger of ``fqs`` pages in ``domain``, the newest at explicit
+    sequence ``newest_seq`` when given, over the PM's prior ``state``."""
     req = process_manager_pb2.ProcessManagerHandleRequest()
     req.trigger.cover.domain = domain
     for fq in fqs:
         req.trigger.pages.add().event.type_url = type_url(fq)
+    if newest_seq is not None:
+        req.trigger.pages[-1].header.sequence = newest_seq
     if state is not None:
         req.process_state.CopyFrom(state)
-    for d, seq in (dest or {}).items():
-        req.destination_sequences[d] = seq
+    return req
+
+
+def _compensate(fq_command: str):
+    """A trigger in the order PM's own domain whose page is a Notification
+    carrying a Compensate for an executed ``fq_command``."""
+    compensate = types_pb2.Compensate(command_type=fq_command, sequences=[0], reason="aborted")
+    notification = types_pb2.Notification()
+    notification.payload.type_url = type_url("io.angzarr.v1.Compensate")
+    notification.payload.value = compensate.SerializeToString()
+    req = process_manager_pb2.ProcessManagerHandleRequest()
+    req.trigger.cover.domain = "order-pm"
+    page = req.trigger.pages.add()
+    page.event.type_url = type_url("io.angzarr.v1.Notification")
+    page.event.value = notification.SerializeToString()
     return req
 
 
@@ -116,11 +133,16 @@ def _co_resident_pms(world):
 
 @when(
     parsers.re(
-        r'an Increased trigger in domain "(?P<domain>[^"]*)" is dispatched with destination inventory sequence (?P<seq>\d+)'
+        r'an Increased trigger in domain "(?P<domain>[^"]*)" at sequence (?P<seq>\d+) is dispatched'
     )
 )
-def _increased_with_destination(world, domain, seq):
-    world.dispatch(_trigger(domain, [FQ_INCREASED], dest={"inventory": int(seq)}))
+def _increased_at(world, domain, seq):
+    world.dispatch(_trigger(domain, [FQ_INCREASED], newest_seq=int(seq)))
+
+
+@when("a Compensate for Reserve is dispatched to the order process-manager")
+def _compensate_for_reserve(world):
+    world.dispatch(_compensate(FQ_RESERVE))
 
 
 @when(parsers.re(r'an Increased trigger in domain "(?P<domain>[^"]*)" is dispatched$'))
@@ -176,10 +198,14 @@ def _emits_one_command(world, target):
     assert world.resp.commands[0].cover.domain == target
 
 
-@then(parsers.re(r"the command carries destination sequence (?P<seq>\d+)"))
-def _command_carries_sequence(world, seq):
+@then(
+    parsers.re(
+        r"the command is deferred from source sequence (?P<seq>\d+) at command index (?P<index>\d+)"
+    )
+)
+def _command_is_deferred(world, seq, index):
     assert world.err is None, f"dispatch failed: {world.err}"
-    assert world.resp.commands[0].pages[0].header.sequence == int(seq)
+    assert_deferred(world.resp.commands[0], "counter", int(seq), int(index))
 
 
 @then("the process-manager emits no commands")

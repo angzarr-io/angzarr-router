@@ -54,6 +54,12 @@ ffi.cdef(
     int32_t  angzarr_router_dispatch_process_manager(void* r, void* host_ctx,
                  const uint8_t* request, size_t request_len,
                  angzarr_buf* out);
+    int32_t  angzarr_router_dispatch_fact(void* r, void* host_ctx,
+                 const uint8_t* request, size_t request_len,
+                 angzarr_buf* out);
+    int32_t  angzarr_router_dispatch_replay(void* r, void* host_ctx,
+                 const uint8_t* request, size_t request_len,
+                 angzarr_buf* out);
     """
 )
 
@@ -84,7 +90,7 @@ def _library_path() -> str:
 
 # The router-ffi ABI version this binding is written against
 # (crates/router-ffi/src/abi.rs ABI_VERSION).
-EXPECTED_ABI_VERSION = 1
+EXPECTED_ABI_VERSION = 2
 
 
 class AbiVersionError(ImportError):

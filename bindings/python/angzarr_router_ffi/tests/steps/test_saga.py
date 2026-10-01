@@ -11,7 +11,7 @@ from pytest_bdd import given, parsers, scenarios, then, when
 from ... import CodedError, Router
 from ...gen.io.angzarr.v1 import saga_pb2, types_pb2
 from ...gen.test.counter import order_saga_angzarr
-from ..builders import FQ_INCREASED, FQ_RESERVE, type_url
+from ..builders import FQ_INCREASED, FQ_RESERVE, assert_deferred, type_url
 from ..fixture import OrderSaga
 
 scenarios("saga.feature")
@@ -46,20 +46,21 @@ def world():
     w.close()
 
 
-def _event_source(fq: str, dest: dict[str, int] | None):
-    """A SagaHandleRequest carrying one event of fq in the "order" domain plus
-    the destination-sequence map."""
+def _event_source(fq: str, seq: int | None = None):
+    """A SagaHandleRequest carrying one event of fq in the "order" domain, at
+    explicit sequence ``seq`` when given."""
     req = saga_pb2.SagaHandleRequest()
     req.source.cover.domain = "order"
-    req.source.pages.add().event.type_url = type_url(fq)
-    for domain, seq in (dest or {}).items():
-        req.destination_sequences[domain] = seq
+    page = req.source.pages.add()
+    page.event.type_url = type_url(fq)
+    if seq is not None:
+        page.header.sequence = seq
     return req
 
 
 def _rejection_source(fq_command: str):
     """A SagaHandleRequest whose source is a rejection Notification for
-    fq_command — routes to the compensation path."""
+    fq_command (sagas receive no rejections, so it emits nothing)."""
     rejection = types_pb2.RejectionNotification()
     rejection.rejected_command.cover.domain = "inventory"
     rejection.rejected_command.pages.add().command.type_url = type_url(fq_command)
@@ -82,16 +83,14 @@ def _an_order_saga(world, target):
     pass
 
 
-@when(
-    parsers.re(r"an Increased event is dispatched with destination inventory sequence (?P<seq>\d+)")
-)
-def _increased_with_destination(world, seq):
-    world.dispatch(_event_source(FQ_INCREASED, {"inventory": int(seq)}))
+@when(parsers.re(r"an Increased event at sequence (?P<seq>\d+) is dispatched"))
+def _increased_at(world, seq):
+    world.dispatch(_event_source(FQ_INCREASED, int(seq)))
 
 
 @when("a Reserve event is dispatched")
 def _reserve_event(world):
-    world.dispatch(_event_source(FQ_RESERVE, None))
+    world.dispatch(_event_source(FQ_RESERVE))
 
 
 @when("a source with no pages is dispatched")
@@ -111,11 +110,6 @@ def _rejection_reserve(world):
     world.dispatch(_rejection_source(FQ_RESERVE))
 
 
-@when("a rejection of Unwatched is dispatched")
-def _rejection_unwatched(world):
-    world.dispatch(_rejection_source("test.counter.Unwatched"))
-
-
 @then(parsers.re(r'the saga emits one command to "(?P<target>[^"]*)"'))
 def _emits_one_command(world, target):
     assert world.err is None, f"dispatch failed: {world.err}"
@@ -123,22 +117,20 @@ def _emits_one_command(world, target):
     assert world.resp.commands[0].cover.domain == target
 
 
-@then(parsers.re(r"the command carries destination sequence (?P<seq>\d+)"))
-def _command_carries_sequence(world, seq):
+@then(
+    parsers.re(
+        r"the command is deferred from source sequence (?P<seq>\d+) at command index (?P<index>\d+)"
+    )
+)
+def _command_is_deferred(world, seq, index):
     assert world.err is None, f"dispatch failed: {world.err}"
-    assert world.resp.commands[0].pages[0].header.sequence == int(seq)
+    assert_deferred(world.resp.commands[0], "order", int(seq), int(index))
 
 
 @then("the saga emits no commands")
 def _emits_no_commands(world):
     assert world.err is None, f"dispatch failed: {world.err}"
     assert len(world.resp.commands) == 0
-
-
-@then("the saga injects one fact event")
-def _injects_one_event(world):
-    assert world.err is None, f"dispatch failed: {world.err}"
-    assert len(world.resp.events) == 1
 
 
 @then("the saga injects no events")

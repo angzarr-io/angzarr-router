@@ -68,13 +68,7 @@ class OrderSaga:
     """Implements order_saga_angzarr.OrderSagaHandler."""
 
     def increased(self, event, dests, source_cover):
-        cmd = _reserve_command()
-        if dests.has("inventory"):
-            dests.stamp_command(cmd, "inventory")
-        return [cmd], []
-
-    def on_reserve_rejected(self, notification, rejection):
-        return [_one_fact()]
+        return [_reserve_command()], []
 
 
 # --- CounterProjector ---
@@ -102,11 +96,8 @@ class OrderProcessManager:
     """Implements order_process_manager_angzarr.OrderProcessManagerHandler."""
 
     def increased(self, event, state, dests):
-        cmd = _reserve_command()
-        if dests.has("inventory"):
-            dests.stamp_command(cmd, "inventory")
         resp = process_manager_pb2.ProcessManagerHandleResponse()
-        resp.commands.append(cmd)
+        resp.commands.append(_reserve_command())
         for _ in range(state.count):
             resp.facts.add().pages.add()
         return resp
