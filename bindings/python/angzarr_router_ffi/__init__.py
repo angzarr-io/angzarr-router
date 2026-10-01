@@ -11,11 +11,13 @@ Public surface (engine-shaped, so the unit-6 generator targets it):
         SagaDispatch, ProcessManagerDispatch, Destinations,
         CommandContext, PageContext, current_cover, current_page,
         CodedError, reject, GrpcCode, abi_version, AbiVersionError,
+        WILDCARD_DOMAIN,
     )
 """
 
 from ._abi import AbiVersionError
 from ._dispatch import (
+    WILDCARD_DOMAIN,
     AggregateDispatch,
     CodedError,
     CommandContext,
@@ -36,6 +38,7 @@ from ._dispatch import (
 )
 
 __all__ = [
+    "WILDCARD_DOMAIN",
     "AbiVersionError",
     "AggregateDispatch",
     "CodedError",

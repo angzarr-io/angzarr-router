@@ -244,6 +244,13 @@ def _only_audit_compensates(world):
     assert not world.resp.HasField("notification")
 
 
+@then(parsers.re(r'the process event is addressed to "(?P<domain>[^"]*)"'))
+def _process_event_addressed_to(world, domain):
+    assert world.err is None, f"dispatch failed: {world.err}"
+    assert len(world.resp.process_events) == 1
+    assert world.resp.process_events[0].cover.domain == domain
+
+
 @then("the process-manager emits one process event")
 def _emits_one_process_event(world):
     assert world.err is None, f"dispatch failed: {world.err}"

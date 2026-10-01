@@ -400,6 +400,42 @@ def test_saga_handler_reaches_the_source_cover_through_the_accessor():
     assert seen == [(root, root)]
 
 
+def test_saga_handlers_read_the_source_cover_and_sequence_by_argument_and_accessor():
+    seen = []
+
+    def translate_rich(event, dests, source: PageContext):
+        seen.append(("rich", source.cover.root.value, source.sequence))
+        return [], []
+
+    def translate_plain(event, dests, source_cover):
+        page = current_page()
+        seen.append(("plain", page.cover.root.value, page.sequence))
+        return [], []
+
+    saga = (
+        SagaDispatch("order-saga", "order")
+        .on_event_with_context(builders.FQ_INCREASED, translate_rich)
+        .on_event("test.counter.Reserve", translate_plain)
+    )
+    rich = saga_pb2.SagaHandleRequest()
+    rich.source.cover.CopyFrom(builders.cover_of("order", "order-1"))
+    rich.source.pages.append(_increased_page(7))
+    plain = saga_pb2.SagaHandleRequest()
+    plain.source.cover.CopyFrom(builders.cover_of("order", "order-2"))
+    reserve = plain.source.pages.add()
+    reserve.header.sequence = 9
+    reserve.event.CopyFrom(pack(counter_pb2.Reserve()))
+    with Router() as router:
+        router.register_saga(saga)
+        router.dispatch_saga(rich)
+        router.dispatch_saga(plain)
+
+    assert seen == [
+        ("rich", builders.root_of("order-1"), 7),
+        ("plain", builders.root_of("order-2"), 9),
+    ]
+
+
 # --- projector page context ---
 
 

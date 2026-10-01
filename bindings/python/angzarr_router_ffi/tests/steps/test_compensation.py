@@ -119,6 +119,15 @@ def _payment_unqualified(world, event):
 
 @given(
     parsers.re(
+        r"a second payment aggregate compensating Reserve from any domain with (?P<event>\w+)"
+    )
+)
+def _second_payment(world, event):
+    world.build(_payment_aggregate([(FQ_RESERVE, event)]))
+
+
+@given(
+    parsers.re(
         r'a payment aggregate compensating Reserve from "(?P<first_domain>[^"]*)" with '
         r'(?P<first_event>\w+) and from "(?P<second_domain>[^"]*)" with (?P<second_event>\w+)'
     )
@@ -172,6 +181,23 @@ def _emits_one(world, event):
     pages = world.pages()
     assert len(pages) == 1, f"emitted {len(pages)} events, want exactly one"
     assert fq_from_url(pages[0].event.type_url) == "test.counter." + event
+
+
+@then(
+    parsers.re(
+        r"the aggregates emit (?P<first>\w+) at sequence (?P<first_seq>\d+) "
+        r"then (?P<second>\w+) at sequence (?P<second_seq>\d+)"
+    )
+)
+def _emit_in_order(world, first, first_seq, second, second_seq):
+    got = []
+    for page in world.pages():
+        assert page.header.WhichOneof("sequence_type") == "sequence"
+        got.append((fq_from_url(page.event.type_url), page.header.sequence))
+    assert got == [
+        ("test.counter." + first, int(first_seq)),
+        ("test.counter." + second, int(second_seq)),
+    ]
 
 
 @then("the aggregate emits nothing")

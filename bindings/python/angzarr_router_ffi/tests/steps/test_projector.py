@@ -8,7 +8,7 @@ from __future__ import annotations
 import pytest
 from pytest_bdd import given, parsers, scenarios, then, when
 
-from ... import CodedError, Router
+from ... import WILDCARD_DOMAIN, CodedError, Router
 from ...gen.io.angzarr.v1 import types_pb2
 from ...gen.test.counter import counter_projector_angzarr
 from ..builders import FQ_INCREASED, type_url
@@ -59,6 +59,14 @@ def _delivery(domain: str, n: int):
 def _a_counter_projection(world):
     # Each scenario's fresh projector is registered in _World.__init__.
     pass
+
+
+@given("a counter projection over every domain")
+def _a_counter_projection_over_every_domain(world):
+    world.router.close()
+    world.router = Router()
+    projector = counter_projector_angzarr.new_counter_projector_dispatch(CounterProjector())
+    world.router.register_projector(projector.for_domains(WILDCARD_DOMAIN))
 
 
 @when(parsers.re(r'(?P<n>\d+) events are delivered in domain "(?P<domain>[^"]*)"'))

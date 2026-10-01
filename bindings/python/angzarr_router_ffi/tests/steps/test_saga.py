@@ -18,12 +18,22 @@ scenarios("saga.feature")
 
 
 class _World:
-    """One scenario's state: a router with the saga fixture registered, and
-    the dispatch outcome."""
+    """One scenario's state: a router with the saga fixture registered (its
+    Increased handler recording the source sequence it is given), and the
+    dispatch outcome."""
 
     def __init__(self):
         self.router = Router()
-        order_saga_angzarr.register_order_saga(self.router, OrderSaga())
+        self.seen: list[int] = []
+        saga = order_saga_angzarr.new_order_saga_dispatch(OrderSaga())
+        generated = saga.events[FQ_INCREASED]
+
+        def increased(event, dests, source):
+            self.seen.append(source.sequence)
+            return generated(event, dests, source.cover)
+
+        saga.on_event_with_context(FQ_INCREASED, increased)
+        self.router.register_saga(saga)
         self.resp = None
         self.err: CodedError | None = None
 
@@ -125,6 +135,12 @@ def _emits_one_command(world, target):
 def _command_is_deferred(world, seq, index):
     assert world.err is None, f"dispatch failed: {world.err}"
     assert_deferred(world.resp.commands[0], "order", int(seq), int(index))
+
+
+@then(parsers.re(r"the saga handler saw source sequence (?P<seq>\d+)"))
+def _handler_saw_sequence(world, seq):
+    assert world.err is None, f"dispatch failed: {world.err}"
+    assert world.seen == [int(seq)]
 
 
 @then("the saga emits no commands")

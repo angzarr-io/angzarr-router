@@ -137,10 +137,11 @@ class CommandContext:
 class PageContext:
     """Where the event or command a handler is handling sits: the cover of
     its book (None when the book carries none) and the page's explicit
-    sequence (0 when the page carries none, and for commands, sagas and
+    sequence (0 when the page carries none, and for commands and
     process-manager triggers, whose callbacks carry no page sequence).
     Projector folds and aggregate / process-manager appliers see the
-    folded event's own book cover and page sequence."""
+    folded event's own book cover and page sequence; a saga handler sees the
+    source book's cover and the triggering event's sequence."""
 
     cover: types_pb2.Cover | None = None
     sequence: int = 0
@@ -170,7 +171,8 @@ def current_page() -> PageContext:
     """The page context of the handler running on this thread. A dispatch
     sets it for every callback it makes: an aggregate command, compensation
     or undo handler sees its command's cover, a fact handler the facts'
-    cover, a saga handler the source cover, a process-manager handler the
+    cover, a saga handler the source cover and the triggering event's
+    sequence, a process-manager handler the
     trigger cover, a projector fold or an aggregate / process-manager applier
     its event's book cover and page sequence.
     Raises RuntimeError outside a dispatch."""
@@ -294,6 +296,10 @@ class AggregateDispatch:
         return self
 
 
+# A projector domain that consumes every domain.
+WILDCARD_DOMAIN = "*"
+
+
 # Projector thunk shapes:
 #   event:   (state, event: Any) -> None             (folds; raises on corrupt)
 #   context event: (state, event: Any, ctx: PageContext) -> None
@@ -321,7 +327,8 @@ class ProjectorDispatch:
 
     def for_domains(self, *domains: str) -> ProjectorDispatch:
         """Restrict folding to books whose cover carries one of these domains.
-        Unset (the default) consumes every domain."""
+        Unset (the default) or :data:`WILDCARD_DOMAIN` consumes every
+        domain."""
         self.domains = list(domains)
         return self
 
@@ -375,13 +382,16 @@ class Destinations:
         return list(self._domains)
 
 
-# Saga thunk shape (a saga is stateless — no state argument):
+# Saga thunk shapes (a saga is stateless — no state argument):
 #   event: (event: Any, dests: Destinations, source_cover: Cover) -> (commands, events)
+#   context event: (event: Any, dests: Destinations, source: PageContext) ->
+#                  (commands, events)
 # dests are the saga's declared targets; source_cover is the source book's
 # cover passed through whole so the saga can route emitted commands by the
-# trigger's identity. The router stamps the commands deferred. Sagas receive
-# no rejections.
+# trigger's identity; source adds the triggering event's sequence. The router
+# stamps the commands deferred. Sagas receive no rejections.
 SagaEventThunk = Callable[[any_pb2.Any, Destinations, object], tuple[list, list]]
+SagaContextThunk = Callable[[any_pb2.Any, Destinations, PageContext], tuple[list, list]]
 
 
 @dataclass
@@ -399,6 +409,18 @@ class SagaDispatch:
     def on_event(self, full_name: str, thunk: SagaEventThunk) -> SagaDispatch:
         """Register the translation thunk for a fully-qualified event type."""
         self.events[full_name] = thunk
+        return self
+
+    def on_event_with_context(self, full_name: str, thunk: SagaContextThunk) -> SagaDispatch:
+        """Register a translation thunk for a fully-qualified event type that
+        receives the triggering event's :class:`PageContext` (the source
+        book's cover and the event's sequence) in place of the source
+        cover."""
+
+        def translate(event, dests, _source_cover):
+            return thunk(event, dests, current_page())
+
+        self.events[full_name] = translate
         return self
 
 
@@ -690,7 +712,8 @@ def _saga_event_invoker(targets: list[str], thunk: SagaEventThunk) -> Invoker:
     def inv(_session, type_url, payload, aux):
         sax = abi_pb2.SagaEventAux()
         sax.ParseFromString(aux)
-        with _handling(PageContext(cover=_cover_of(sax, "source_cover"))):
+        source = PageContext(cover=_cover_of(sax, "source_cover"), sequence=sax.source_seq)
+        with _handling(source):
             commands, events = thunk(
                 any_pb2.Any(type_url=type_url, value=payload),
                 Destinations(targets),
