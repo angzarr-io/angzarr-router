@@ -37,20 +37,21 @@ final class Ffi {
   private static final Linker LINKER = Linker.nativeLinker();
   private static final SymbolLookup LIB = loadLibrary();
 
-  // AngzarrBuf { *mut u8 data; usize len } — data at 0, len at 8 (64-bit).
-  private static final MemoryLayout ANGZARR_BUF =
-      MemoryLayout.structLayout(
-          ValueLayout.ADDRESS.withName("data"), ValueLayout.JAVA_LONG.withName("len"));
-  private static final long BUF_LEN_OFFSET = 8;
+  // The platform's C size_t (Rust usize): every length crossing the ABI.
+  static final ValueLayout SIZE_T = (ValueLayout) LINKER.canonicalLayouts().get("size_t");
+
+  // AngzarrBuf { *mut u8 data; usize len }.
+  static final MemoryLayout ANGZARR_BUF =
+      MemoryLayout.structLayout(ValueLayout.ADDRESS.withName("data"), SIZE_T.withName("len"));
+  static final long BUF_LEN_OFFSET =
+      ANGZARR_BUF.byteOffset(MemoryLayout.PathElement.groupElement("len"));
 
   private static final MethodHandle ABI_VERSION =
       down("angzarr_abi_version", FunctionDescriptor.of(ValueLayout.JAVA_INT));
   private static final MethodHandle BUF_ALLOC =
-      down("angzarr_buf_alloc", FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.JAVA_LONG));
+      down("angzarr_buf_alloc", FunctionDescriptor.of(ValueLayout.ADDRESS, SIZE_T));
   private static final MethodHandle BUF_RELEASE =
-      down(
-          "angzarr_buf_release",
-          FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.JAVA_LONG));
+      down("angzarr_buf_release", FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, SIZE_T));
   private static final MethodHandle ROUTER_NEW =
       down("angzarr_router_new", FunctionDescriptor.of(ValueLayout.ADDRESS));
   private static final MethodHandle ROUTER_FREE =
@@ -62,7 +63,7 @@ final class Ffi {
           ValueLayout.JAVA_INT,
           ValueLayout.ADDRESS,
           ValueLayout.ADDRESS,
-          ValueLayout.JAVA_LONG,
+          SIZE_T,
           ValueLayout.ADDRESS);
   private static final MethodHandle REGISTER_AGGREGATE =
       down("angzarr_router_register_aggregate", REGISTER_DESC);
@@ -80,7 +81,7 @@ final class Ffi {
           ValueLayout.ADDRESS,
           ValueLayout.ADDRESS,
           ValueLayout.ADDRESS,
-          ValueLayout.JAVA_LONG,
+          SIZE_T,
           ValueLayout.ADDRESS);
   private static final MethodHandle DISPATCH = down("angzarr_router_dispatch", DISPATCH_DESC);
   private static final MethodHandle DISPATCH_PROJECTOR =
@@ -143,7 +144,36 @@ final class Ffi {
   private static MethodHandle down(String name, FunctionDescriptor desc) {
     MemorySegment sym =
         LIB.find(name).orElseThrow(() -> new IllegalStateException("missing FFI symbol: " + name));
-    return LINKER.downcallHandle(sym, desc);
+    MethodHandle handle = LINKER.downcallHandle(sym, desc);
+    return MethodHandles.explicitCastArguments(handle, widened(desc));
+  }
+
+  /**
+   * The descriptor's Java type with every size_t carried as {@code long}, so call sites pass
+   * lengths as {@code long} whatever the platform's size_t width.
+   */
+  private static MethodType widened(FunctionDescriptor desc) {
+    MethodType type = desc.toMethodType();
+    for (int i = 0; i < desc.argumentLayouts().size(); i++) {
+      if (desc.argumentLayouts().get(i).equals(SIZE_T)) {
+        type = type.changeParameterType(i, long.class);
+      }
+    }
+    return type;
+  }
+
+  private static long getSize(MemorySegment seg, long offset) {
+    return SIZE_T.byteSize() == Long.BYTES
+        ? seg.get(ValueLayout.JAVA_LONG, offset)
+        : Integer.toUnsignedLong(seg.get(ValueLayout.JAVA_INT, offset));
+  }
+
+  private static void setSize(MemorySegment seg, long offset, long value) {
+    if (SIZE_T.byteSize() == Long.BYTES) {
+      seg.set(ValueLayout.JAVA_LONG, offset, value);
+    } else {
+      seg.set(ValueLayout.JAVA_INT, offset, Math.toIntExact(value));
+    }
   }
 
   private static MemorySegment upcallStub() {
@@ -167,16 +197,17 @@ final class Ffi {
       FunctionDescriptor desc =
           FunctionDescriptor.of(
               ValueLayout.JAVA_INT,
+              ValueLayout.ADDRESS, // host_ctx
+              ValueLayout.JAVA_LONG, // callback_id (u64)
               ValueLayout.ADDRESS,
-              ValueLayout.JAVA_LONG,
+              SIZE_T,
               ValueLayout.ADDRESS,
-              ValueLayout.JAVA_LONG,
+              SIZE_T,
               ValueLayout.ADDRESS,
-              ValueLayout.JAVA_LONG,
-              ValueLayout.ADDRESS,
-              ValueLayout.JAVA_LONG,
+              SIZE_T,
               ValueLayout.ADDRESS);
-      return LINKER.upcallStub(handle, desc, Arena.global());
+      MethodHandle adapted = MethodHandles.explicitCastArguments(handle, desc.toMethodType());
+      return LINKER.upcallStub(adapted, desc, Arena.global());
     } catch (NoSuchMethodException | IllegalAccessException e) {
       throw new ExceptionInInitializerError(e);
     }
@@ -344,7 +375,7 @@ final class Ffi {
     MemorySegment buf = out.reinterpret(ANGZARR_BUF.byteSize());
     if (bytes == null || bytes.length == 0) {
       buf.set(ValueLayout.ADDRESS, 0, MemorySegment.NULL);
-      buf.set(ValueLayout.JAVA_LONG, BUF_LEN_OFFSET, 0L);
+      setSize(buf, BUF_LEN_OFFSET, 0L);
       return;
     }
     MemorySegment data;
@@ -356,7 +387,7 @@ final class Ffi {
     MemorySegment.copy(
         bytes, 0, data.reinterpret(bytes.length), ValueLayout.JAVA_BYTE, 0, bytes.length);
     buf.set(ValueLayout.ADDRESS, 0, data);
-    buf.set(ValueLayout.JAVA_LONG, BUF_LEN_OFFSET, (long) bytes.length);
+    setSize(buf, BUF_LEN_OFFSET, bytes.length);
   }
 
   /**
@@ -365,7 +396,7 @@ final class Ffi {
    */
   private static byte[] consumeOut(MemorySegment out) {
     MemorySegment data = out.get(ValueLayout.ADDRESS, 0);
-    long len = out.get(ValueLayout.JAVA_LONG, BUF_LEN_OFFSET);
+    long len = getSize(out, BUF_LEN_OFFSET);
     if (data.address() == 0 || len == 0) {
       return new byte[0];
     }
