@@ -390,23 +390,25 @@ def _decode_status(data: bytes | None, ret: int) -> CodedError:
 
 
 class _Session:
-    """One dispatch's host-side state object, reached from callbacks via the
-    host_ctx handle. State never crosses to Rust; it lives here and is
-    created lazily by the first callback (all callbacks in one dispatch belong
-    to the same aggregate, so the factory is consistent)."""
+    """One dispatch's host-side state, reached from callbacks via the host_ctx
+    handle. State never crosses to Rust; it lives here, created lazily per
+    component. One dispatch may run several components (co-resident process
+    managers subscribed to the same trigger), so each component's state is
+    keyed by the component key assigned at registration and is never shared
+    with another component."""
 
-    __slots__ = ("_has_state", "_state", "router")
+    __slots__ = ("_states", "router")
 
     def __init__(self, router: Router):
         self.router = router
-        self._state: object = None
-        self._has_state = False
+        self._states: dict[int, object] = {}
 
-    def ensure_state(self, factory: Callable[[], object]) -> object:
-        if not self._has_state:
-            self._state = factory()
-            self._has_state = True
-        return self._state
+    def ensure_state(self, key: int, factory: Callable[[], object]) -> object:
+        """The state for component ``key``, created by ``factory`` on first
+        use within this dispatch."""
+        if key not in self._states:
+            self._states[key] = factory()
+        return self._states[key]
 
 
 # An invoker bridges a callback_id to a registered typed thunk: it receives
@@ -415,23 +417,23 @@ class _Session:
 Invoker = Callable[[_Session, str, bytes, bytes], tuple[bytes | None, int]]
 
 
-def _applier_invoker(factory, thunk: ApplierThunk) -> Invoker:
+def _applier_invoker(key: int, factory, thunk: ApplierThunk) -> Invoker:
     def inv(session, type_url, payload, _aux):
-        state = session.ensure_state(factory)
+        state = session.ensure_state(key, factory)
         thunk(state, any_pb2.Any(type_url=type_url, value=payload))
         return None, _STATUS_OK
 
     return inv
 
 
-def _command_invoker(factory, thunk: CommandThunk) -> Invoker:
+def _command_invoker(key: int, factory, thunk: CommandThunk) -> Invoker:
     def inv(session, type_url, payload, aux):
         cax = abi_pb2.CommandContextAux()
         cax.ParseFromString(aux)
         cctx = CommandContext(
             next_sequence=cax.next_sequence, had_prior_events=cax.had_prior_events
         )
-        state = session.ensure_state(factory)
+        state = session.ensure_state(key, factory)
         book = thunk(any_pb2.Any(type_url=type_url, value=payload), state, cctx)
         if book is None:
             return None, _STATUS_OK_EMPTY
@@ -440,7 +442,7 @@ def _command_invoker(factory, thunk: CommandThunk) -> Invoker:
     return inv
 
 
-def _rejection_invoker(factory, thunk: RejectionThunk) -> Invoker:
+def _rejection_invoker(key: int, factory, thunk: RejectionThunk) -> Invoker:
     def inv(session, _type_url, _payload, aux):
         rax = abi_pb2.RejectionAux()
         rax.ParseFromString(aux)
@@ -451,7 +453,7 @@ def _rejection_invoker(factory, thunk: RejectionThunk) -> Invoker:
         cctx = CommandContext(
             next_sequence=rax.cctx.next_sequence, had_prior_events=rax.cctx.had_prior_events
         )
-        state = session.ensure_state(factory)
+        state = session.ensure_state(key, factory)
         resp = thunk(notification, rejection, state, cctx)
         if resp is None:
             return None, _STATUS_OK_EMPTY
@@ -460,23 +462,23 @@ def _rejection_invoker(factory, thunk: RejectionThunk) -> Invoker:
     return inv
 
 
-def _projector_event_invoker(factory, thunk: ProjectorEventThunk) -> Invoker:
+def _projector_event_invoker(key: int, factory, thunk: ProjectorEventThunk) -> Invoker:
     def inv(session, type_url, payload, _aux):
-        state = session.ensure_state(factory)
+        state = session.ensure_state(key, factory)
         thunk(state, any_pb2.Any(type_url=type_url, value=payload))
         return None, _STATUS_OK
 
     return inv
 
 
-def _projector_finish_invoker(factory, thunk: ProjectorFinishThunk) -> Invoker:
+def _projector_finish_invoker(key: int, factory, thunk: ProjectorFinishThunk) -> Invoker:
     def inv(session, _type_url, payload, _aux):
         # The core hands the EventBook over as the callback payload so the
         # finisher can carry its cover onto the Projection.
         book = types_pb2.EventBook()
         if payload:
             book.ParseFromString(payload)
-        state = session.ensure_state(factory)
+        state = session.ensure_state(key, factory)
         projection = thunk(state, book)
         if projection is None:
             return None, _STATUS_OK_EMPTY
@@ -524,7 +526,7 @@ def _saga_rejection_invoker(thunk: SagaRejectionThunk) -> Invoker:
     return inv
 
 
-def _pm_event_invoker(factory, thunk: PMEventThunk) -> Invoker:
+def _pm_event_invoker(key: int, factory, thunk: PMEventThunk) -> Invoker:
     # The PM is stateful: the appliers fold process_state into the session's
     # state first, then this handler reads it. The host returns a full
     # ProcessManagerHandleResponse.
@@ -532,14 +534,14 @@ def _pm_event_invoker(factory, thunk: PMEventThunk) -> Invoker:
         pax = abi_pb2.PmEventAux()
         pax.ParseFromString(aux)
         dests = Destinations(dict(pax.destination_sequences))
-        state = session.ensure_state(factory)
+        state = session.ensure_state(key, factory)
         resp = thunk(any_pb2.Any(type_url=type_url, value=payload), state, dests)
         return resp.SerializeToString(), _STATUS_OK
 
     return inv
 
 
-def _pm_rejection_invoker(factory, thunk: PMRejectionThunk) -> Invoker:
+def _pm_rejection_invoker(key: int, factory, thunk: PMRejectionThunk) -> Invoker:
     def inv(session, _type_url, _payload, aux):
         rax = abi_pb2.RejectionAux()
         rax.ParseFromString(aux)
@@ -547,7 +549,7 @@ def _pm_rejection_invoker(factory, thunk: PMRejectionThunk) -> Invoker:
         notification.ParseFromString(rax.notification)
         rejection = types_pb2.RejectionNotification()
         rejection.ParseFromString(rax.rejection)
-        state = session.ensure_state(factory)
+        state = session.ensure_state(key, factory)
         process_events, escalation = thunk(notification, rejection, state)
         resp = process_manager_pb2.ProcessManagerHandleResponse(process_events=process_events)
         if escalation is not None:
@@ -650,6 +652,7 @@ class Router:
         self._ptr = lib.angzarr_router_new()
         self._registry: dict[int, Invoker] = {}
         self._next_id = 0
+        self._next_component = 0
         self._lock = threading.Lock()
 
     def close(self) -> None:
@@ -664,6 +667,11 @@ class Router:
     def __exit__(self, *_exc) -> None:
         self.close()
 
+    def _component_key(self) -> int:
+        """A fresh key identifying one registered component's host state."""
+        self._next_component += 1
+        return self._next_component
+
     def _assign(self, inv: Invoker) -> int:
         self._next_id += 1
         self._registry[self._next_id] = inv
@@ -675,22 +683,23 @@ class Router:
         the shared trampoline."""
         with self._lock:
             factory = dispatch.rebuilder.factory
+            key = self._component_key()
             desc = abi_pb2.AggregateDescriptor(name=dispatch.name, domain=dispatch.domain)
 
             for fq, thunk in dispatch.rebuilder.appliers.items():
-                cid = self._assign(_applier_invoker(factory, thunk))
+                cid = self._assign(_applier_invoker(key, factory, thunk))
                 desc.appliers.append(abi_pb2.CallbackEntry(fq_type=fq, callback_id=cid))
             if dispatch.rebuilder.snapshot is not None:
                 desc.snapshot_callback_id = self._assign(
-                    _applier_invoker(factory, dispatch.rebuilder.snapshot)
+                    _applier_invoker(key, factory, dispatch.rebuilder.snapshot)
                 )
             for fq, thunk in dispatch.commands.items():
-                cid = self._assign(_command_invoker(factory, thunk))
+                cid = self._assign(_command_invoker(key, factory, thunk))
                 desc.commands.append(abi_pb2.CallbackEntry(fq_type=fq, callback_id=cid))
             for fq, thunks in dispatch.rejections.items():
                 entry = abi_pb2.RejectionEntry(fq_command_type=fq)
                 for thunk in thunks:
-                    entry.callback_ids.append(self._assign(_rejection_invoker(factory, thunk)))
+                    entry.callback_ids.append(self._assign(_rejection_invoker(key, factory, thunk)))
                 desc.rejections.append(entry)
 
             desc_bytes = desc.SerializeToString()
@@ -726,10 +735,11 @@ class Router:
         it to the core with the shared trampoline."""
         with self._lock:
             factory = dispatch.factory
+            key = self._component_key()
             desc = abi_pb2.ProjectorDescriptor(name=dispatch.name)
             desc.domains.extend(dispatch.domains)
             for fq, thunk in dispatch.events.items():
-                cid = self._assign(_projector_event_invoker(factory, thunk))
+                cid = self._assign(_projector_event_invoker(key, factory, thunk))
                 desc.events.append(abi_pb2.CallbackEntry(fq_type=fq, callback_id=cid))
             if dispatch.unknown is not None:
                 desc.unknown_callback_id = self._assign(
@@ -737,7 +747,7 @@ class Router:
                 )
             if dispatch.finisher is not None:
                 desc.finish_callback_id = self._assign(
-                    _projector_finish_invoker(factory, dispatch.finisher)
+                    _projector_finish_invoker(key, factory, dispatch.finisher)
                 )
 
             desc_bytes = desc.SerializeToString()
@@ -809,26 +819,28 @@ class Router:
         trampoline."""
         with self._lock:
             factory = dispatch.rebuilder.factory
+            key = self._component_key()
             desc = abi_pb2.ProcessManagerDescriptor(
                 name=dispatch.name, pm_domain=dispatch.pm_domain
             )
             for fq, thunk in dispatch.rebuilder.appliers.items():
-                cid = self._assign(_applier_invoker(factory, thunk))
+                cid = self._assign(_applier_invoker(key, factory, thunk))
                 desc.appliers.append(abi_pb2.CallbackEntry(fq_type=fq, callback_id=cid))
             if dispatch.rebuilder.snapshot is not None:
                 desc.snapshot_callback_id = self._assign(
-                    _applier_invoker(factory, dispatch.rebuilder.snapshot)
+                    _applier_invoker(key, factory, dispatch.rebuilder.snapshot)
                 )
             for input_domain, by_type in dispatch.handlers.items():
                 for fq, thunk in by_type.items():
-                    cid = self._assign(_pm_event_invoker(factory, thunk))
+                    cid = self._assign(_pm_event_invoker(key, factory, thunk))
                     desc.events.append(
                         abi_pb2.PmEventEntry(input_domain=input_domain, fq_type=fq, callback_id=cid)
                     )
             for fq, thunks in dispatch.rejections.items():
                 entry = abi_pb2.RejectionEntry(fq_command_type=fq)
                 for thunk in thunks:
-                    entry.callback_ids.append(self._assign(_pm_rejection_invoker(factory, thunk)))
+                    cid = self._assign(_pm_rejection_invoker(key, factory, thunk))
+                    entry.callback_ids.append(cid)
                 desc.rejections.append(entry)
 
             desc_bytes = desc.SerializeToString()
