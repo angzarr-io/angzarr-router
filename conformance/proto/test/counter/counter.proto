@@ -84,7 +84,7 @@ message Reserve {}
 message CounterState {
   option (io.angzarr.v1.component) = {
     kind: COMPONENT_KIND_AGGREGATE
-    input_domain: "counter"
+    domain: "counter"
     name: "CounterAggregate"
     compensates: "test.counter.Reserve"
   };
@@ -127,7 +127,8 @@ message CounterProjectorState {
 message OrderProcessManagerState {
   option (io.angzarr.v1.component) = {
     kind: COMPONENT_KIND_PROCESS_MANAGER
-    output_domain: "order-pm"
+    domain: "order-pm"
+    output_domain: "inventory"
     name: "OrderProcessManager"
     compensates: "test.counter.Reserve"
   };
@@ -144,7 +145,7 @@ message OrderProcessManagerState {
 message AuditProcessManagerState {
   option (io.angzarr.v1.component) = {
     kind: COMPONENT_KIND_PROCESS_MANAGER
-    output_domain: "audit-pm"
+    domain: "audit-pm"
     name: "AuditProcessManager"
     compensates: "test.counter.Reserve"
   };
