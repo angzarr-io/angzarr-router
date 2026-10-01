@@ -117,6 +117,10 @@ message ProcessManagerDescriptor {
   repeated PmEventEntry events = 5;
   repeated RejectionEntry rejections = 6;
   repeated string target_domains = 7;
+  // Packs the session's current PM state into a serialized
+  // google.protobuf.Any (for Replay); absent when the PM does not support
+  // Replay.
+  optional uint64 state_callback_id = 8;
 }
 
 // One ((input domain, fully-qualified event type) → host callback) row for a
@@ -136,16 +140,18 @@ message PmEventAux {
   io.angzarr.v1.Cover trigger_cover = 2;
 }
 
-// aux payload for projector fold callbacks: where the folded event sits (its
-// book's cover and the page's explicit sequence, 0 when absent).
+// aux payload for projector fold callbacks AND for aggregate / process-manager
+// applier callbacks: where the folded event sits (its book's cover and the
+// page's explicit sequence, 0 when absent).
 message ProjectorEventAux {
   io.angzarr.v1.Cover cover = 1;
   uint32 sequence = 2;
 }
 
-// Request bytes of angzarr_router_dispatch_replay: the aggregate domain the
-// replay is for (a ReplayRequest carries none; empty selects a sole
-// registered aggregate) and the request itself.
+// Request bytes of angzarr_router_dispatch_replay: the domain the replay is
+// for — an aggregate's domain, or a process manager's own (pm) domain when no
+// aggregate claims it; empty selects a sole registered aggregate — and the
+// request itself.
 message ReplayCall {
   string domain = 1;
   io.angzarr.v1.ReplayRequest request = 2;

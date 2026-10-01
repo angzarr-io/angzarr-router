@@ -134,6 +134,18 @@ impl<S> ProcessManagerDispatch<S> {
         self
     }
 
+    /// The PM's state after folding the base snapshot (when present) and
+    /// then the events, in order — the process-manager counterpart of the
+    /// aggregate's `Replay`.
+    pub fn replay(&self, req: &pb::ReplayRequest) -> Result<S, CodedError> {
+        let book = pb::EventBook {
+            snapshot: req.base_snapshot.clone(),
+            pages: req.events.clone(),
+            ..Default::default()
+        };
+        Ok(self.rebuilder.rebuild(Some(&book))?.0)
+    }
+
     /// Refuses a table whose `compensates` entries list one command type both
     /// unqualified and domain-qualified (AMBIGUOUS_COMPENSATION).
     pub fn validate(&self) -> Result<(), CodedError> {

@@ -138,6 +138,16 @@ pub fn stamp_deferred(
     }
 }
 
+/// Where a folded event sits: its book's cover (domain, root) and the page's
+/// explicit sequence (0 when the page carries none). Projector folds and
+/// state appliers receive it, e.g. for idempotent per-page handling or to
+/// record which sequence produced a fact.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PageContext<'a> {
+    pub cover: Option<&'a pb::Cover>,
+    pub sequence: u32,
+}
+
 /// Fully-qualified names of the two Notification payloads.
 pub const REJECTION_NOTIFICATION_FULL_NAME: &str = "io.angzarr.v1.RejectionNotification";
 pub const COMPENSATE_FULL_NAME: &str = "io.angzarr.v1.Compensate";

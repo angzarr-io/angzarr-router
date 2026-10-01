@@ -395,7 +395,8 @@ impl<S> AggregateDispatch<S> {
                     recorded.payload = Some(pb::event_page::Payload::Event(annotated));
                 }
             }
-            self.rebuilder.apply_page(&mut state, &recorded)?;
+            self.rebuilder
+                .apply_page(&mut state, &recorded, facts.cover.as_ref())?;
             out.pages.push(recorded);
         }
         Ok(out)

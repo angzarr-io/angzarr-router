@@ -1045,6 +1045,9 @@ pub fn cover_of(domain: &str, label: &str) -> pb::Cover {
 /// Covers a handler observed.
 pub type CoverSink = Arc<Mutex<Vec<Option<pb::Cover>>>>;
 
+/// Page sequences an applier observed.
+pub type SequenceSink = Arc<Mutex<Vec<u32>>>;
+
 fn increased_page(seq: Option<u32>) -> pb::EventPage {
     pb::EventPage {
         header: seq.map(sequence_header),
@@ -1054,15 +1057,19 @@ fn increased_page(seq: Option<u32>) -> pb::EventPage {
 }
 
 /// The ledger aggregate (domain "ledger") over CounterState: Increased folds
-/// count += 1; a snapshot loads CounterState; IncreaseBy records the handled
+/// count += 1 and records the page sequence it applied; a snapshot loads CounterState; IncreaseBy records the handled
 /// cover and emits nothing; an Increased fact is annotated as a CounterState
 /// carrying the folded count.
-pub fn ledger_aggregate(seen: CoverSink) -> AggregateDispatch<CounterState> {
+pub fn ledger_aggregate(seen: CoverSink, applied: SequenceSink) -> AggregateDispatch<CounterState> {
     let rebuilder = Rebuilder::new(CounterState::default)
-        .apply("test.counter.Increased", |state: &mut CounterState, _| {
-            state.count += 1;
-            Ok(())
-        })
+        .apply_with_context(
+            "test.counter.Increased",
+            move |state: &mut CounterState, _, ctx| {
+                state.count += 1;
+                applied.lock().unwrap().push(ctx.sequence);
+                Ok(())
+            },
+        )
         .with_snapshot(|state: &mut CounterState, any| {
             *state = CounterState::decode(any.value.as_slice())?;
             Ok(())
@@ -1123,6 +1130,14 @@ pub fn replay_request(count: u32, events: u32) -> pb::ReplayRequest {
     }
 }
 
+/// A ReplayRequest of `events` Increased events at sequences 0...
+pub fn events_replay_request(events: u32) -> pb::ReplayRequest {
+    pb::ReplayRequest {
+        base_snapshot: None,
+        events: (0..events).map(|i| increased_page(Some(i))).collect(),
+    }
+}
+
 /// An IncreaseBy command for the ledger root `label`.
 pub fn ledger_command(label: &str) -> pb::ContextualCommand {
     pb::ContextualCommand {
@@ -1141,7 +1156,8 @@ pub fn ledger_command(label: &str) -> pb::ContextualCommand {
 }
 
 /// The reserving process-manager (domain "reserving-pm", target
-/// "inventory") over CounterState: an Increased trigger from "counter"
+/// "inventory") over CounterState (Increased folds count += 1): an Increased
+/// trigger from "counter"
 /// records the trigger cover and emits nothing; a rejected Reserve is
 /// compensated with a Release command to "inventory".
 pub fn reserving_pm(seen: CoverSink) -> ProcessManagerDispatch<CounterState> {
@@ -1149,7 +1165,13 @@ pub fn reserving_pm(seen: CoverSink) -> ProcessManagerDispatch<CounterState> {
         "Reserving",
         "reserving-pm",
         ["inventory"],
-        Rebuilder::new(CounterState::default),
+        Rebuilder::new(CounterState::default).apply(
+            "test.counter.Increased",
+            |state: &mut CounterState, _| {
+                state.count += 1;
+                Ok(())
+            },
+        ),
     )
     .on_event(
         "counter",

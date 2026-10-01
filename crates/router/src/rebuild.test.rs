@@ -345,3 +345,47 @@ fn unsequenced_page_is_never_covered() {
     let (state, _) = r.rebuild(Some(&book)).expect("rebuild");
     assert_eq!(state.applied, vec!["snapshot", "unsequenced"]);
 }
+
+// Appliers registered with context see the book's cover and each page's
+// explicit sequence (0 when absent).
+#[test]
+fn context_appliers_see_the_book_cover_and_page_sequence() {
+    let r = fresh_rebuilder().apply_with_context(&cover_full_name(), |s, _any, ctx| {
+        s.applied.push(format!(
+            "{}@{}",
+            ctx.cover.map_or("", |c| c.domain.as_str()),
+            ctx.sequence
+        ));
+        Ok(())
+    });
+    let mut book = pb::EventBook {
+        cover: Some(pb::Cover {
+            domain: "ledger".to_string(),
+            ..Default::default()
+        }),
+        pages: vec![
+            sequenced_event_page(4, cover_any("a")),
+            event_page(cover_any("b")),
+        ],
+        ..Default::default()
+    };
+    let (state, _) = r.rebuild(Some(&book)).expect("rebuild");
+    assert_eq!(state.applied, vec!["ledger@4", "ledger@0"]);
+
+    book.cover = None;
+    let mut state = TestState::default();
+    assert!(r
+        .apply_page(
+            &mut state,
+            &book.pages[0],
+            Some(&pb::Cover {
+                domain: "facts".to_string(),
+                ..Default::default()
+            })
+        )
+        .expect("apply"));
+    assert_eq!(state.applied, vec!["facts@4"]);
+    assert!(!r
+        .apply_page(&mut state, &pb::EventPage::default(), None)
+        .expect("no event"));
+}

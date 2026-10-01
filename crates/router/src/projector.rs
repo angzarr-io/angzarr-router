@@ -15,14 +15,7 @@ use prost_types::Any;
 use crate::error::{codes, map_handler_error, messages, CodedError, HandlerError};
 use crate::pb;
 
-/// Where a folded event sits: its book's cover (domain, root) and the page's
-/// explicit sequence (0 when the page carries none), for idempotent
-/// per-page handling.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PageContext<'a> {
-    pub cover: Option<&'a pb::Cover>,
-    pub sequence: u32,
-}
+pub use crate::PageContext;
 
 /// Folds one delivered event page into the rebuilding projection. Generated
 /// thunks unmarshal to the typed event and call the typed business method.

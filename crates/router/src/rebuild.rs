@@ -7,11 +7,23 @@ use prost_types::Any;
 
 use crate::error::CodedError;
 use crate::pb;
+use crate::PageContext;
 
-/// Folds one event payload into state. Generated/binding thunks unmarshal
-/// to the typed event and call the pure typed applier; decode errors
-/// surface here so the engine can classify them.
-pub type ApplierFn<S> =
+/// Folds one event payload into state, seeing where the event sits.
+/// Generated/binding thunks unmarshal to the typed event and call the pure
+/// typed applier; decode errors surface here so the engine can classify them.
+pub type ApplierFn<S> = Box<
+    dyn for<'a> Fn(
+            &mut S,
+            &Any,
+            &PageContext<'a>,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+        + Send
+        + Sync,
+>;
+
+/// Loads snapshot state into fresh state.
+pub type SnapshotFn<S> =
     Box<dyn Fn(&mut S, &Any) -> Result<(), Box<dyn std::error::Error + Send + Sync>> + Send + Sync>;
 
 /// What the rebuild consumed.
@@ -33,7 +45,7 @@ pub struct RebuildInfo {
 /// applier are skipped: not every event folds into state.
 pub struct Rebuilder<S> {
     factory: Box<dyn Fn() -> S + Send + Sync>,
-    snapshot: Option<ApplierFn<S>>,
+    snapshot: Option<SnapshotFn<S>>,
     appliers: HashMap<String, ApplierFn<S>>,
 }
 
@@ -52,6 +64,27 @@ impl<S> Rebuilder<S> {
         mut self,
         full_name: &str,
         thunk: impl Fn(&mut S, &Any) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.appliers.insert(
+            full_name.to_string(),
+            Box::new(move |state, any, _ctx| thunk(state, any)),
+        );
+        self
+    }
+
+    /// Registers an applier that also sees the page's context (the book's
+    /// cover and the page's explicit sequence).
+    pub fn apply_with_context(
+        mut self,
+        full_name: &str,
+        thunk: impl for<'a> Fn(
+                &mut S,
+                &Any,
+                &PageContext<'a>,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
             + Send
             + Sync
             + 'static,
@@ -114,7 +147,11 @@ impl<S> Rebuilder<S> {
             else {
                 continue;
             };
-            if thunk(&mut state, event).is_err() {
+            let ctx = PageContext {
+                cover: book.cover.as_ref(),
+                sequence: crate::page_sequence(page),
+            };
+            if thunk(&mut state, event, &ctx).is_err() {
                 return Err(CodedError::persisted_corrupt(&event.type_url));
             }
             info.applied_count += 1;
@@ -124,10 +161,15 @@ impl<S> Rebuilder<S> {
 }
 
 impl<S> Rebuilder<S> {
-    /// Folds one page into `state` through its applier, returning whether an
-    /// applier ran. A page with no event or an unapplied type is skipped; a
+    /// Folds one page of a book with `cover` into `state` through its applier,
+    /// returning whether an applier ran. A page with no event or an unapplied type is skipped; a
     /// corrupt payload is PERSISTED_EVENT_CORRUPT.
-    pub fn apply_page(&self, state: &mut S, page: &pb::EventPage) -> Result<bool, CodedError> {
+    pub fn apply_page(
+        &self,
+        state: &mut S,
+        page: &pb::EventPage,
+        cover: Option<&pb::Cover>,
+    ) -> Result<bool, CodedError> {
         let Some(event) = crate::page_event(page) else {
             return Ok(false);
         };
@@ -137,7 +179,11 @@ impl<S> Rebuilder<S> {
         else {
             return Ok(false);
         };
-        thunk(state, event).map_err(|_| CodedError::persisted_corrupt(&event.type_url))?;
+        let ctx = PageContext {
+            cover,
+            sequence: crate::page_sequence(page),
+        };
+        thunk(state, event, &ctx).map_err(|_| CodedError::persisted_corrupt(&event.type_url))?;
         Ok(true)
     }
 }

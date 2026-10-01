@@ -101,7 +101,8 @@ pub struct FfiRouter {
     aggregates: Vec<RegisteredAggregate>,
     projectors: Vec<(String, ProjectorDispatch<()>)>,
     sagas: Vec<(String, SagaDispatch)>,
-    process_managers: Vec<(String, ProcessManagerDispatch<()>)>,
+    /// (name, table, state-packing callback id, host gateway).
+    process_managers: Vec<(String, ProcessManagerDispatch<()>, Option<u64>, AngzarrCb)>,
 }
 
 impl FfiRouter {
@@ -144,8 +145,13 @@ impl FfiRouter {
         let mut rebuilder: Rebuilder<()> = Rebuilder::new(|| ());
         for applier in &desc.appliers {
             let id = applier.callback_id;
-            rebuilder = rebuilder.apply(&applier.fq_type, move |_, any| {
-                let (ret, _) = invoke(cb, id, &any.type_url, &any.value, &[]);
+            rebuilder = rebuilder.apply_with_context(&applier.fq_type, move |_, any, ctx| {
+                let aux = abi_pb::ProjectorEventAux {
+                    cover: ctx.cover.cloned(),
+                    sequence: ctx.sequence,
+                }
+                .encode_to_vec();
+                let (ret, _) = invoke(cb, id, &any.type_url, &any.value, &aux);
                 if ret < 0 {
                     return Err("host applier failed".into());
                 }
@@ -408,10 +414,11 @@ impl FfiRouter {
         Ok(dispatch.handle_fact(&req)?.encode_to_vec())
     }
 
-    /// Decodes ReplayCall bytes, routes to the aggregate claiming its domain,
-    /// rebuilds the host state through the appliers, and has the host pack it
-    /// (the state callback). Returns ReplayResponse bytes; an aggregate with no
-    /// state callback does not support Replay (NO_HANDLER_REGISTERED).
+    /// Decodes ReplayCall bytes, routes to the aggregate claiming its domain
+    /// (else the process manager owning it), rebuilds the host state through
+    /// the appliers, and has the host pack it (the state callback). Returns
+    /// ReplayResponse bytes; a component with no state callback does not
+    /// support Replay (NO_HANDLER_REGISTERED).
     pub fn dispatch_replay(
         &self,
         host_ctx: *mut c_void,
@@ -424,11 +431,32 @@ impl FfiRouter {
                 [],
             )
         })?;
-        let aggregate = self.aggregate_for(&call.domain)?;
-        let Some(id) = aggregate.state_callback else {
+        let request = call.request.unwrap_or_default();
+        let (state_callback, cb) = match self.aggregate_for(&call.domain) {
+            Ok(aggregate) => {
+                let _guard = HostCtxGuard::set(host_ctx);
+                aggregate.dispatch.replay(&request)?;
+                drop(_guard);
+                (aggregate.state_callback, aggregate.cb)
+            }
+            Err(no_aggregate) => {
+                let Some((_, pm, state_callback, cb)) = self
+                    .process_managers
+                    .iter()
+                    .find(|(_, pm, ..)| pm.pm_domain() == call.domain)
+                else {
+                    return Err(no_aggregate);
+                };
+                let _guard = HostCtxGuard::set(host_ctx);
+                pm.replay(&request)?;
+                drop(_guard);
+                (*state_callback, *cb)
+            }
+        };
+        let Some(id) = state_callback else {
             return Err(CodedError::invalid_argument(
                 codes::NO_HANDLER_REGISTERED,
-                "the aggregate does not support Replay",
+                "the component does not support Replay",
                 [(
                     angzarr_router::error::extras::DOMAIN.to_string(),
                     call.domain.clone(),
@@ -436,10 +464,7 @@ impl FfiRouter {
             ));
         };
         let _guard = HostCtxGuard::set(host_ctx);
-        aggregate
-            .dispatch
-            .replay(&call.request.unwrap_or_default())?;
-        let (ret, bytes) = invoke(aggregate.cb, id, "", &[], &[]);
+        let (ret, bytes) = invoke(cb, id, "", &[], &[]);
         if ret < 0 {
             return Err(status_to_coded(bytes.as_deref(), ret));
         }
@@ -616,8 +641,13 @@ impl FfiRouter {
         let mut rebuilder: Rebuilder<()> = Rebuilder::new(|| ());
         for applier in &desc.appliers {
             let id = applier.callback_id;
-            rebuilder = rebuilder.apply(&applier.fq_type, move |_, any| {
-                let (ret, _) = invoke(cb, id, &any.type_url, &any.value, &[]);
+            rebuilder = rebuilder.apply_with_context(&applier.fq_type, move |_, any, ctx| {
+                let aux = abi_pb::ProjectorEventAux {
+                    cover: ctx.cover.cloned(),
+                    sequence: ctx.sequence,
+                }
+                .encode_to_vec();
+                let (ret, _) = invoke(cb, id, &any.type_url, &any.value, &aux);
                 if ret < 0 {
                     return Err("host applier failed".into());
                 }
@@ -705,7 +735,8 @@ impl FfiRouter {
         }
 
         dispatch.validate()?;
-        self.process_managers.push((desc.name, dispatch));
+        self.process_managers
+            .push((desc.name, dispatch, desc.state_callback_id, cb));
         Ok(())
     }
 
@@ -753,7 +784,7 @@ impl FfiRouter {
         let routes: Vec<&dyn ProcessManagerRoute> = self
             .process_managers
             .iter()
-            .map(|(_, pm)| pm as &dyn ProcessManagerRoute)
+            .map(|(_, pm, ..)| pm as &dyn ProcessManagerRoute)
             .collect();
         let selected = select_process_managers(&routes, &req);
         let _guard = HostCtxGuard::set(host_ctx);

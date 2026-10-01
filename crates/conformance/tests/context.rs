@@ -11,6 +11,7 @@ use prost::Message;
 #[derive(Debug, Default, World)]
 struct ContextWorld {
     covers: conf::CoverSink,
+    applied: conf::SequenceSink,
     pages: conf::PageSink,
     facts: Option<Result<pb::EventBook, CodedError>>,
     replayed: Option<conf::CounterState>,
@@ -28,19 +29,19 @@ async fn tracking(_w: &mut ContextWorld) {}
 
 #[when(regex = r"^(\d+) Increased facts are handled over (\d+) prior Increased events$")]
 async fn increased_facts(w: &mut ContextWorld, facts: u32, prior: u32) {
-    let ledger = conf::ledger_aggregate(w.covers.clone());
+    let ledger = conf::ledger_aggregate(w.covers.clone(), w.applied.clone());
     w.facts = Some(ledger.handle_fact(&conf::fact_request("Increased", facts, prior)));
 }
 
 #[when("a Reserve fact is handled over no prior events")]
 async fn reserve_fact(w: &mut ContextWorld) {
-    let ledger = conf::ledger_aggregate(w.covers.clone());
+    let ledger = conf::ledger_aggregate(w.covers.clone(), w.applied.clone());
     w.facts = Some(ledger.handle_fact(&conf::fact_request("Reserve", 1, 0)));
 }
 
 #[when(regex = r"^the ledger replays a snapshot of (\d+) then (\d+) Increased events$")]
 async fn replay(w: &mut ContextWorld, count: u32, events: u32) {
-    let ledger = conf::ledger_aggregate(w.covers.clone());
+    let ledger = conf::ledger_aggregate(w.covers.clone(), w.applied.clone());
     w.replayed = Some(
         ledger
             .replay(&conf::replay_request(count, events))
@@ -48,9 +49,23 @@ async fn replay(w: &mut ContextWorld, count: u32, events: u32) {
     );
 }
 
+#[when(regex = r"^the reserving process-manager replays (\d+) Increased events$")]
+async fn pm_replay(w: &mut ContextWorld, events: u32) {
+    let pm = conf::reserving_pm(w.covers.clone());
+    w.replayed = Some(
+        pm.replay(&conf::events_replay_request(events))
+            .expect("replay"),
+    );
+}
+
+#[then(regex = r"^the ledger applied Increased events at sequences (\d+) and (\d+)$")]
+async fn applied_at(w: &mut ContextWorld, first: u32, second: u32) {
+    assert_eq!(*w.applied.lock().unwrap(), vec![first, second]);
+}
+
 #[when(regex = r#"^an IncreaseBy command for ledger root "([^"]*)" is dispatched$"#)]
 async fn ledger_command(w: &mut ContextWorld, label: String) {
-    let ledger = conf::ledger_aggregate(w.covers.clone());
+    let ledger = conf::ledger_aggregate(w.covers.clone(), w.applied.clone());
     ledger
         .dispatch(&conf::ledger_command(&label))
         .expect("dispatch");

@@ -926,3 +926,27 @@ fn handler_sees_the_trigger_cover() {
         .expect("dispatch");
     assert_eq!(*seen.lock().unwrap(), trig.cover);
 }
+
+#[test]
+fn replay_folds_the_snapshot_then_the_events() {
+    let pm = ProcessManagerDispatch::new(
+        "pm",
+        "pm",
+        ["inventory"],
+        cover_applier(fresh_rebuilder().with_snapshot(|s, _| {
+            s.applied.push("snapshot".to_string());
+            Ok(())
+        })),
+    );
+    let state = pm
+        .replay(&pb::ReplayRequest {
+            base_snapshot: Some(pb::Snapshot {
+                sequence: 1,
+                state: Some(crate::test_support::cover_any("snap")),
+                ..Default::default()
+            }),
+            events: book_of_covers(&["a", "b"]).pages,
+        })
+        .expect("replay");
+    assert_eq!(state.applied, vec!["snapshot", "a", "b"]);
+}

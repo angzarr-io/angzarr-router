@@ -79,6 +79,7 @@ struct Session {
     counter: u32,
     observed_covers: Vec<Option<pb::Cover>>,
     observed_pages: Vec<(Option<pb::Cover>, u32)>,
+    applied_pages: Vec<(Option<pb::Cover>, u32)>,
     observed_cctx: Vec<(u32, bool)>,
     markers: Vec<&'static str>,
 }
@@ -166,7 +167,11 @@ unsafe extern "C" fn host_cb(
             if Increased::decode(payload).is_err() {
                 return -3;
             }
-            with_session(key, |s| s.counter += 1);
+            let paux = abi_pb::ProjectorEventAux::decode(aux).expect("applier page aux");
+            with_session(key, |s| {
+                s.counter += 1;
+                s.applied_pages.push((paux.cover, paux.sequence));
+            });
             STATUS_OK_EMPTY
         }
         CB_SNAPSHOT => {
@@ -1188,6 +1193,7 @@ fn pm_descriptor_bytes() -> Vec<u8> {
             callback_ids: vec![CB_PM_COMP],
         }],
         target_domains: vec!["inventory".to_string()],
+        state_callback_id: None,
     }
     .encode_to_vec()
 }
@@ -1327,6 +1333,7 @@ fn two_process_managers_share_a_source_domain_route_by_type() {
         }],
         rejections: Vec::new(),
         target_domains: vec!["inventory".to_string()],
+        state_callback_id: None,
     }
     .encode_to_vec();
     assert_eq!(
@@ -1396,6 +1403,7 @@ fn pm2_descriptor_bytes() -> Vec<u8> {
             callback_ids: vec![CB_PM2_COMP],
         }],
         target_domains: vec!["inventory".to_string()],
+        state_callback_id: None,
     }
     .encode_to_vec()
 }
@@ -2216,4 +2224,116 @@ fn a_failing_state_packer_fails_replay_with_its_status() {
     );
     assert_eq!(ret, -9);
     assert_eq!(decode_status(&bytes).1, "PROJECTION_STALE");
+}
+
+// --- applier page context + PM replay
+
+#[test]
+fn appliers_see_their_page_place_through_the_abi() {
+    let router = Router::with_counter();
+    let session = next_session();
+    let mut history = increased_history(2, 2);
+    history.cover = Some(pb::Cover {
+        domain: "counter".to_string(),
+        root: Some(pb::Uuid { value: vec![5] }),
+        ..Default::default()
+    });
+    history.pages[0].header = Some(pb::PageHeader {
+        sequence_type: Some(pb::page_header::SequenceType::Sequence(0)),
+        ..Default::default()
+    });
+    history.pages[1].header = Some(pb::PageHeader {
+        sequence_type: Some(pb::page_header::SequenceType::Sequence(1)),
+        ..Default::default()
+    });
+    let (ret, _) = router.dispatch(
+        session,
+        &command_req(
+            FQ_INCREASE_BY,
+            IncreaseBy { n: 1 }.encode_to_vec(),
+            Some(history.clone()),
+        ),
+    );
+    assert_eq!(ret, 0);
+    assert_eq!(
+        session_snapshot(session).applied_pages,
+        vec![(history.cover.clone(), 0), (history.cover.clone(), 1)]
+    );
+}
+
+/// The order PM with an Increased applier and the state packer.
+fn replayable_pm() -> Router {
+    let mut desc =
+        abi_pb::ProcessManagerDescriptor::decode(pm_descriptor_bytes().as_slice()).unwrap();
+    desc.appliers = vec![abi_pb::CallbackEntry {
+        fq_type: FQ_INCREASED.to_string(),
+        callback_id: CB_APPLIER,
+    }];
+    desc.state_callback_id = Some(CB_PACK_STATE);
+    let bytes = desc.encode_to_vec();
+    let r = angzarr_router_new();
+    assert_eq!(
+        unsafe { angzarr_router_register_process_manager(r, bytes.as_ptr(), bytes.len(), host_cb) },
+        0
+    );
+    Router(r)
+}
+
+#[test]
+fn process_manager_replay_packs_its_state_through_the_abi() {
+    let router = replayable_pm();
+    let call = abi_pb::ReplayCall {
+        domain: "order-pm".to_string(),
+        request: Some(pb::ReplayRequest {
+            base_snapshot: None,
+            events: increased_book(3).pages,
+        }),
+    };
+    let (ret, bytes) = router.call(
+        angzarr_router_dispatch_replay,
+        next_session(),
+        &call.encode_to_vec(),
+    );
+    assert_eq!(ret, 0);
+    let resp = pb::ReplayResponse::decode(bytes.as_slice()).expect("ReplayResponse");
+    assert_eq!(
+        CounterState::decode(resp.state.unwrap().value.as_slice())
+            .unwrap()
+            .value,
+        3
+    );
+}
+
+#[test]
+fn replay_for_an_unknown_domain_is_no_handler() {
+    let router = replayable_pm();
+    let call = abi_pb::ReplayCall {
+        domain: "nobody".to_string(),
+        request: Some(pb::ReplayRequest::default()),
+    };
+    let (ret, bytes) = router.call(
+        angzarr_router_dispatch_replay,
+        next_session(),
+        &call.encode_to_vec(),
+    );
+    assert_eq!(ret, -12);
+    assert_eq!(
+        decode_status(&bytes).1,
+        angzarr_router::error::codes::NO_HANDLER_REGISTERED
+    );
+}
+
+#[test]
+fn process_manager_without_a_state_packer_refuses_replay() {
+    let router = Router::with_process_manager();
+    let call = abi_pb::ReplayCall {
+        domain: "order-pm".to_string(),
+        request: Some(pb::ReplayRequest::default()),
+    };
+    let (ret, _) = router.call(
+        angzarr_router_dispatch_replay,
+        next_session(),
+        &call.encode_to_vec(),
+    );
+    assert_eq!(ret, -12);
 }
