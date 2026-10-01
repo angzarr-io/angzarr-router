@@ -197,6 +197,23 @@ impl<S> AggregateDispatch<S> {
         &self.domain
     }
 
+    /// True when this aggregate declares a handler for the Notification
+    /// carried by `notification_any`: a compensation entry matching its
+    /// RejectionNotification, or an undo handler for its Compensate's
+    /// command type. An undecodable notification is claimed by no one.
+    pub fn claims_notification(&self, notification_any: &Any) -> bool {
+        match crate::decode_notification(notification_any) {
+            Ok((_, NotificationPayload::Rejection(rejection))) => {
+                let (domain, fq) = crate::extract_rejection_key(&rejection);
+                crate::compensation_lookup(&self.rejections, &domain, &fq).is_some()
+            }
+            Ok((_, NotificationPayload::Compensate(compensate))) => {
+                self.undoes.contains_key(&compensate.command_type)
+            }
+            Err(_) => false,
+        }
+    }
+
     /// The registered fully-qualified command type names.
     pub fn command_types(&self) -> Vec<String> {
         self.handlers.keys().cloned().collect()

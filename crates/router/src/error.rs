@@ -38,6 +38,9 @@ pub mod codes {
     pub const MISSING_PM_TRIGGER: &str = "MISSING_PM_TRIGGER";
     pub const DUPLICATE_REGISTRATION: &str = "DUPLICATE_REGISTRATION";
     pub const AMBIGUOUS_COMPENSATION: &str = "AMBIGUOUS_COMPENSATION";
+    pub const NO_HANDLERS_REGISTERED: &str = "NO_HANDLERS_REGISTERED";
+    pub const MIXED_HANDLER_KINDS: &str = "MIXED_HANDLER_KINDS";
+    pub const DUPLICATE_COMMAND_HANDLER: &str = "DUPLICATE_COMMAND_HANDLER";
     pub const NO_UNDO_HANDLER: &str = "NO_UNDO_HANDLER";
     pub const UNKNOWN_NOTIFICATION_PAYLOAD: &str = "UNKNOWN_NOTIFICATION_PAYLOAD";
     pub const COMPENSATE_DECODE_FAILED: &str = "COMPENSATE_DECODE_FAILED";
@@ -61,6 +64,11 @@ pub mod messages {
     pub const MISSING_PM_EVENT_PAYLOAD: &str = "missing event payload on PM trigger";
     pub const AMBIGUOUS_COMPENSATION: &str =
         "a command type is listed both unqualified and domain-qualified";
+    pub const NO_HANDLERS_REGISTERED: &str = "no handlers registered";
+    pub const MIXED_HANDLER_KINDS: &str = "a router hosts components of one kind";
+    pub const DUPLICATE_COMMAND_HANDLER: &str =
+        "two command handlers claim the same (domain, command type)";
+    pub const NO_COMPONENT_OF_KIND: &str = "the router hosts no component of this kind";
     pub const NO_UNDO_HANDLER: &str = "no undo handler for the compensated command type";
     pub const UNKNOWN_NOTIFICATION_PAYLOAD: &str =
         "notification payload is neither a RejectionNotification nor a Compensate";
