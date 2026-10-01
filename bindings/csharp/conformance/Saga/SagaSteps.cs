@@ -1,8 +1,8 @@
+using System.Collections.Generic;
 using Angzarr;
 using Angzarr.Router;
 using NUnit.Framework;
 using Reqnroll;
-using TC = Test.Counter;
 
 namespace Angzarr.Router.Conformance.Saga;
 
@@ -15,14 +15,15 @@ public sealed class SagaSteps
     private Router _router = null!;
     private SagaResponse? _resp;
     private CodedError? _err;
+    private readonly List<uint> _seen = new();
 
     [BeforeScenario]
     public void Before()
     {
         _router = new Router();
-        TC.OrderSagaAngzarr.RegisterOrderSaga(_router, new SagaFixture());
         _resp = null;
         _err = null;
+        _seen.Clear();
     }
 
     [AfterScenario]
@@ -43,11 +44,8 @@ public sealed class SagaSteps
     }
 
     [Given("an order saga delivering to {string}")]
-    public void AnOrderSaga(string target)
-    {
-        // The fixture is registered in Before; the delivery target ("inventory")
-        // is part of the declaration the generated wiring already carries.
-    }
+    public void AnOrderSaga(string target) =>
+        _router.RegisterSaga(SagaFixture.Recording(new SagaFixture(), target, _seen));
 
     [When("an Increased event at sequence {int} is dispatched")]
     public void IncreasedAt(int seq) =>
@@ -79,6 +77,13 @@ public sealed class SagaSteps
     {
         Assert.That(_err, Is.Null, "dispatch unexpectedly failed");
         Steps.AssertDeferred(_resp!.Commands[0], "order", seq, index);
+    }
+
+    [Then("the saga handler saw source sequence {int}")]
+    public void HandlerSawSequence(int seq)
+    {
+        Assert.That(_err, Is.Null, "dispatch unexpectedly failed");
+        Assert.That(_seen, Is.EqualTo(new[] { (uint)seq }), "source sequences the handler saw");
     }
 
     [Then("the saga emits no commands")]

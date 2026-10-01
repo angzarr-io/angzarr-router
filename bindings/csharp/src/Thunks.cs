@@ -72,6 +72,11 @@ public delegate void ProjectorUnknownThunk(string typeUrl);
 /// output domains. Emitted commands are deferred — the router stamps them.</summary>
 public delegate SagaEmission SagaEventThunk(Any @event, Destinations dests, Cover sourceCover);
 
+/// <summary>Translates one source event into a saga emission (stateless),
+/// knowing where the triggering event sits: source carries the source book's
+/// cover and the event's sequence (0 when the page carries none).</summary>
+public delegate SagaEmission SagaEventPageThunk(Any @event, Destinations dests, PageContext source);
+
 /// <summary>Handles one source event in a process manager.</summary>
 public delegate ProcessManagerHandleResponse PmEventThunk<TState>(
     Any @event,

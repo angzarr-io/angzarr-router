@@ -188,6 +188,18 @@ public sealed class PmSteps
         Assert.That(_resp!.ProcessEvents.Count, Is.EqualTo(1), "process events");
     }
 
+    [Then("the process event is addressed to {string}")]
+    public void ProcessEventAddressedTo(string domain)
+    {
+        Assert.That(_err, Is.Null, "dispatch unexpectedly failed");
+        Assert.That(_resp!.ProcessEvents.Count, Is.EqualTo(1), "process events");
+        Assert.That(
+            _resp.ProcessEvents[0].Cover?.Domain,
+            Is.EqualTo(domain),
+            "process event domain"
+        );
+    }
+
     [Then("the process-manager escalates")]
     public void Escalates()
     {

@@ -69,6 +69,9 @@ public sealed class CompensationSteps
     [Given("a payment aggregate compensating Reserve from any domain with {word}")]
     public void PaymentUnqualified(string ev) => RegisterPayment((Reserve, ev));
 
+    [Given("a second payment aggregate compensating Reserve from any domain with {word}")]
+    public void SecondPayment(string ev) => RegisterPayment((Reserve, ev));
+
     [Given(
         "a payment aggregate compensating Reserve from {string} with {word} and from {string} with {word}"
     )]
@@ -135,6 +138,32 @@ public sealed class CompensationSteps
             "an explicit sequence"
         );
         Assert.That((int)pages[0].Header!.Sequence, Is.EqualTo(seq));
+    }
+
+    [Then("the aggregates emit {word} at sequence {int} then {word} at sequence {int}")]
+    public void EmitInOrder(string first, int firstSeq, string second, int secondSeq)
+    {
+        var got = new List<string>();
+        foreach (var page in Pages())
+        {
+            Assert.That(
+                page.Header?.SequenceTypeCase,
+                Is.EqualTo(PageHeader.SequenceTypeOneofCase.Sequence),
+                "an explicit sequence"
+            );
+            got.Add(TypeNames.FromUrl(page.Event.TypeUrl) + "@" + page.Header!.Sequence);
+        }
+        Assert.That(
+            got,
+            Is.EqualTo(
+                new[]
+                {
+                    "test.counter." + first + "@" + firstSeq,
+                    "test.counter." + second + "@" + secondSeq,
+                }
+            ),
+            "events in registration order with continuing sequences"
+        );
     }
 
     [Then("the dispatch fails with {word} as UNIMPLEMENTED")]

@@ -14,7 +14,7 @@ public sealed class SagaDispatch
     internal readonly string Name;
     internal readonly string InputDomain;
     internal readonly IReadOnlyList<string> Targets;
-    internal readonly Dictionary<string, SagaEventThunk> Events = new();
+    internal readonly Dictionary<string, SagaEventPageThunk> Events = new();
 
     /// <summary>Starts a saga registration translating inputDomain events into
     /// commands for targetDomains.</summary>
@@ -26,7 +26,14 @@ public sealed class SagaDispatch
     }
 
     /// <summary>Registers the translation thunk for a fully-qualified event type.</summary>
-    public SagaDispatch OnEvent(string fullName, SagaEventThunk thunk)
+    public SagaDispatch OnEvent(string fullName, SagaEventThunk thunk) =>
+        OnEventWithContext(fullName, (ev, dests, source) => thunk(ev, dests, source.Cover!));
+
+    /// <summary>Registers the translation thunk for a fully-qualified event
+    /// type; the thunk also reads where the triggering event sits
+    /// (<see cref="PageContext"/>: its book's cover and the event's
+    /// sequence).</summary>
+    public SagaDispatch OnEventWithContext(string fullName, SagaEventPageThunk thunk)
     {
         Events[fullName] = thunk;
         return this;
