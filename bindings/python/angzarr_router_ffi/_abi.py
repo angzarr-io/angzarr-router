@@ -82,4 +82,31 @@ def _library_path() -> str:
     raise OSError("router-ffi library not found; build it or set ANGZARR_ROUTER_LIB")
 
 
-lib = ffi.dlopen(_library_path())
+# The router-ffi ABI version this binding is written against
+# (crates/router-ffi/src/abi.rs ABI_VERSION).
+EXPECTED_ABI_VERSION = 1
+
+
+class AbiVersionError(ImportError):
+    """The loaded router-ffi library exposes an ABI version other than the one
+    this binding is written against; the two refuse each other."""
+
+    def __init__(self, expected: int, actual: int, path: str = ""):
+        self.expected = expected
+        self.actual = actual
+        where = f" ({path})" if path else ""
+        super().__init__(
+            f"angzarr router-ffi ABI version mismatch{where}: expected {expected}, got {actual}"
+        )
+
+
+def check_abi_version(actual: int, path: str = "") -> None:
+    """Refuse a router-ffi library whose ABI version is not
+    :data:`EXPECTED_ABI_VERSION`."""
+    if actual != EXPECTED_ABI_VERSION:
+        raise AbiVersionError(EXPECTED_ABI_VERSION, actual, path)
+
+
+_path = _library_path()
+lib = ffi.dlopen(_path)
+check_abi_version(int(lib.angzarr_abi_version()), _path)

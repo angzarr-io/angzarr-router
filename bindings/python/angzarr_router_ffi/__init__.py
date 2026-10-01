@@ -9,9 +9,11 @@ Public surface (engine-shaped, so the unit-6 generator targets it):
     from angzarr_router_ffi import (
         Router, AggregateDispatch, Rebuilder,
         CommandContext, CodedError, reject, GrpcCode, abi_version,
+        AbiVersionError,
     )
 """
 
+from ._abi import AbiVersionError
 from ._dispatch import (
     AggregateDispatch,
     CodedError,
@@ -30,6 +32,7 @@ from ._dispatch import (
 )
 
 __all__ = [
+    "AbiVersionError",
     "AggregateDispatch",
     "CodedError",
     "CommandContext",
