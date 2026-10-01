@@ -192,7 +192,8 @@ cpp-binding-test: cpp-binding-gen
 # Format check the C++ binding (clang-format; generated tree excluded).
 cpp-binding-lint:
     cd {{TOP}}/bindings/cpp && clang-format --dry-run --Werror \
-        include/angzarr/router/*.h src/*.cpp conformance/*.h conformance/*.cpp
+        include/angzarr/router/*.h src/*.cpp conformance/*.h conformance/*.cpp \
+        tests/*.h tests/*.cpp
 
 # --- TypeScript binding (bindings/typescript) ----------------------------
 # Run in the TypeScript image. The binding loads the router-ffi cdylib (built in
