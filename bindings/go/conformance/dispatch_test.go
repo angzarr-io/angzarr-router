@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	. "github.com/angzarr-io/angzarr-router/bindings/go"
+	pb "github.com/angzarr-io/angzarr-router/bindings/go/gen/io/angzarr/v1"
 	counter "github.com/angzarr-io/angzarr-router/bindings/go/gen/test/counter"
 )
 
@@ -99,5 +100,48 @@ func TestDispatch_PriorEventsReachHandlerContext(t *testing.T) {
 	}
 	if prior.cctx.NextSequence != 2 || prior.count != 2 {
 		t.Errorf("prior: ctx=%+v count=%d, want next 2 / count 2", prior.cctx, prior.count)
+	}
+}
+
+// Two compensators registered for one rejected command on one aggregate run
+// across the FFI in registration order, and the core merges their events in
+// that order: the first page comes from the first compensator.
+func TestDispatch_TwoCompensatorsFanOutInRegistrationOrder(t *testing.T) {
+	r := NewRouter()
+	t.Cleanup(r.Close)
+
+	var ran []string
+	compensator := func(name string) RejectionThunk[*counter.CounterState] {
+		return func(*pb.Notification, *pb.RejectionNotification, *counter.CounterState, CommandContext) (*pb.BusinessResponse, error) {
+			ran = append(ran, name)
+			return &pb.BusinessResponse{Result: &pb.BusinessResponse_Events{Events: &pb.EventBook{
+				Pages: []*pb.EventPage{markerPage(name)},
+			}}}, nil
+		}
+	}
+	rebuilder := NewRebuilder(func() *counter.CounterState { return &counter.CounterState{} })
+	d := NewAggregateDispatch("TwoCompensators", "counter", rebuilder).
+		OnRejected(fqReserve, compensator("CompensatedFirst")).
+		OnRejected(fqReserve, compensator("CompensatedSecond"))
+	if err := RegisterAggregate(r, d); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	resp, err := r.Dispatch(rejectionCommand(fqReserve))
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	want := []string{"CompensatedFirst", "CompensatedSecond"}
+	if len(ran) != len(want) || ran[0] != want[0] || ran[1] != want[1] {
+		t.Fatalf("compensators ran %v, want %v", ran, want)
+	}
+	pages := resp.GetEvents().GetPages()
+	if len(pages) != len(want) {
+		t.Fatalf("merged pages = %d, want %d", len(pages), len(want))
+	}
+	for i, p := range pages {
+		if got := fqFromURL(p.GetEvent().GetTypeUrl()); got != "test.counter."+want[i] {
+			t.Errorf("page %d = %s, want test.counter.%s", i, got, want[i])
+		}
 	}
 }
