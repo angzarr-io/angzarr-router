@@ -10,6 +10,7 @@ angzarr-router = { path = "../router" }
 prost = { workspace = true }
 prost-types = { workspace = true }
 prost-reflect = { version = "0.16", features = ["text-format"] }
+uuid = { version = "1", features = ["v5"] }
 
 [build-dependencies]
 prost-build = { workspace = true }
@@ -37,4 +38,8 @@ harness = false
 
 [[test]]
 name = "compensation"
+harness = false
+
+[[test]]
+name = "context"
 harness = false

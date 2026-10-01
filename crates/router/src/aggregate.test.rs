@@ -6,6 +6,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use prost::Message;
 use prost_types::Any;
 
 use crate::aggregate::{AggregateDispatch, CommandContext};
@@ -743,4 +744,132 @@ fn compensate_without_an_undo_handler_is_unimplemented() {
             .map(String::as_str),
         Some(FQ_COUNT)
     );
+}
+
+// --- facts and replay ------------------------------------------------------
+
+fn fact_page(domain: &str) -> pb::EventPage {
+    pb::EventPage {
+        header: Some(pb::PageHeader {
+            sequence_type: Some(pb::page_header::SequenceType::ExternalDeferred(
+                pb::ExternalDeferredSequence {
+                    external_id: format!("ext-{domain}"),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }),
+        ..event_page(cover_any(domain))
+    }
+}
+
+/// An aggregate folding Cover events whose Cover fact handler annotates a
+/// fact with the domains folded so far.
+fn fact_aggregate() -> AggregateDispatch<TestState> {
+    AggregateDispatch::new("agg-test", "ledger", cover_applier(fresh_rebuilder())).on_fact(
+        &cover_full_name(),
+        |fact, state: &TestState| {
+            let folded = pb::Cover::decode(fact.value.as_slice()).unwrap().domain;
+            Ok(cover_any(&format!("{folded}<{}>", state.applied.join(","))))
+        },
+    )
+}
+
+fn recorded_domains(book: &pb::EventBook) -> Vec<String> {
+    book.pages
+        .iter()
+        .map(|p| match page_event(p) {
+            Some(any) => pb::Cover::decode(any.value.as_slice()).unwrap().domain,
+            None => String::new(),
+        })
+        .collect()
+}
+
+#[test]
+fn facts_are_annotated_in_order_and_each_recorded_fact_folds() {
+    let facts = pb::EventBook {
+        cover: Some(pb::Cover {
+            domain: "ledger".to_string(),
+            ..Default::default()
+        }),
+        pages: vec![fact_page("f1"), fact_page("f2")],
+        ..Default::default()
+    };
+    let out = fact_aggregate()
+        .handle_fact(&pb::FactRequest {
+            facts: Some(facts.clone()),
+            prior_events: Some(book_of_covers(&["p"])),
+        })
+        .expect("facts");
+    assert_eq!(out.cover, facts.cover, "the facts' cover is kept");
+    assert_eq!(
+        out.pages
+            .iter()
+            .map(|p| p.header.clone())
+            .collect::<Vec<_>>(),
+        facts
+            .pages
+            .iter()
+            .map(|p| p.header.clone())
+            .collect::<Vec<_>>(),
+        "page headers are kept"
+    );
+    assert_eq!(recorded_domains(&out), vec!["f1<p>", "f2<p,f1<p>>"]);
+}
+
+#[test]
+fn a_fact_without_a_handler_is_recorded_unchanged() {
+    let d = AggregateDispatch::new("agg-test", "ledger", fresh_rebuilder());
+    let facts = pb::EventBook {
+        pages: vec![fact_page("f1")],
+        ..Default::default()
+    };
+    let out = d
+        .handle_fact(&pb::FactRequest {
+            facts: Some(facts.clone()),
+            prior_events: None,
+        })
+        .expect("facts");
+    assert_eq!(out.pages, facts.pages);
+}
+
+#[test]
+fn a_failing_fact_handler_fails_the_request() {
+    let d = AggregateDispatch::new("agg-test", "ledger", fresh_rebuilder())
+        .on_fact(&cover_full_name(), |_f, _s: &TestState| {
+            Err(crate::error::HandlerError::Other("refused".to_string()))
+        });
+    let err = d
+        .handle_fact(&pb::FactRequest {
+            facts: Some(pb::EventBook {
+                pages: vec![fact_page("f1")],
+                ..Default::default()
+            }),
+            prior_events: None,
+        })
+        .expect_err("handler error");
+    assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
+}
+
+#[test]
+fn replay_folds_the_snapshot_then_the_events() {
+    let d = AggregateDispatch::new(
+        "agg-test",
+        "ledger",
+        cover_applier(fresh_rebuilder().with_snapshot(|s, _| {
+            s.applied.push("snapshot".to_string());
+            Ok(())
+        })),
+    );
+    let state = d
+        .replay(&pb::ReplayRequest {
+            base_snapshot: Some(pb::Snapshot {
+                sequence: 1,
+                state: Some(cover_any("snap")),
+                ..Default::default()
+            }),
+            events: book_of_covers(&["a", "b"]).pages,
+        })
+        .expect("replay");
+    assert_eq!(state.applied, vec!["snapshot", "a", "b"]);
 }

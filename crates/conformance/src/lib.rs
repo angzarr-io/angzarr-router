@@ -1019,6 +1019,234 @@ pub fn with_type_url_prefix(mut cmd: pb::ContextualCommand, prefix: &str) -> pb:
     cmd
 }
 
+
+// ---------------------------------------------------------------------------
+// Context fixtures: facts, replay, cover access, PM compensator commands,
+// projector page context (context.feature).
+// ---------------------------------------------------------------------------
+
+/// The root bytes for a label: UUID v5 in the OID namespace.
+pub fn root_of(label: &str) -> Vec<u8> {
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, label.as_bytes())
+        .as_bytes()
+        .to_vec()
+}
+
+/// A cover in `domain` with the root for `label`.
+pub fn cover_of(domain: &str, label: &str) -> pb::Cover {
+    pb::Cover {
+        domain: domain.to_string(),
+        root: Some(pb::Uuid {
+            value: root_of(label),
+        }),
+        ..Default::default()
+    }
+}
+
+/// Covers a handler observed.
+pub type CoverSink = Arc<Mutex<Vec<Option<pb::Cover>>>>;
+
+fn increased_page(seq: Option<u32>) -> pb::EventPage {
+    pb::EventPage {
+        header: seq.map(sequence_header),
+        payload: Some(pb::event_page::Payload::Event(increased_any())),
+        ..Default::default()
+    }
+}
+
+/// The ledger aggregate (domain "ledger") over CounterState: Increased folds
+/// count += 1; a snapshot loads CounterState; IncreaseBy records the handled
+/// cover and emits nothing; an Increased fact is annotated as a CounterState
+/// carrying the folded count.
+pub fn ledger_aggregate(seen: CoverSink) -> AggregateDispatch<CounterState> {
+    let rebuilder = Rebuilder::new(CounterState::default)
+        .apply("test.counter.Increased", |state: &mut CounterState, _| {
+            state.count += 1;
+            Ok(())
+        })
+        .with_snapshot(|state: &mut CounterState, any| {
+            *state = CounterState::decode(any.value.as_slice())?;
+            Ok(())
+        });
+    AggregateDispatch::new("Ledger", "ledger", rebuilder)
+        .on_command("test.counter.IncreaseBy", move |_cmd, _state, cctx| {
+            seen.lock().unwrap().push(cctx.cover.clone());
+            Ok(None)
+        })
+        .on_fact("test.counter.Increased", |_fact, state: &CounterState| {
+            Ok(prost_types::Any {
+                type_url: angzarr_router::type_url("test.counter.CounterState"),
+                value: CounterState { count: state.count }.encode_to_vec(),
+            })
+        })
+}
+
+/// A FactRequest of `facts` pages of `test.counter.<fact>` in "ledger" over
+/// `prior` Increased events.
+pub fn fact_request(fact: &str, facts: u32, prior: u32) -> pb::FactRequest {
+    let page = pb::EventPage {
+        payload: Some(pb::event_page::Payload::Event(prost_types::Any {
+            type_url: angzarr_router::type_url(&format!("test.counter.{fact}")),
+            value: Vec::new(),
+        })),
+        ..Default::default()
+    };
+    pb::FactRequest {
+        facts: Some(pb::EventBook {
+            cover: Some(pb::Cover {
+                domain: "ledger".to_string(),
+                ..Default::default()
+            }),
+            pages: (0..facts).map(|_| page.clone()).collect(),
+            ..Default::default()
+        }),
+        prior_events: Some(pb::EventBook {
+            pages: (0..prior).map(|i| increased_page(Some(i))).collect(),
+            next_sequence: prior,
+            ..Default::default()
+        }),
+    }
+}
+
+/// A ReplayRequest: a snapshot of `count` at sequence 1, then `events`
+/// Increased events at sequences 2...
+pub fn replay_request(count: u32, events: u32) -> pb::ReplayRequest {
+    pb::ReplayRequest {
+        base_snapshot: Some(pb::Snapshot {
+            sequence: 1,
+            state: Some(prost_types::Any {
+                type_url: angzarr_router::type_url("test.counter.CounterState"),
+                value: CounterState { count }.encode_to_vec(),
+            }),
+            ..Default::default()
+        }),
+        events: (0..events).map(|i| increased_page(Some(2 + i))).collect(),
+    }
+}
+
+/// An IncreaseBy command for the ledger root `label`.
+pub fn ledger_command(label: &str) -> pb::ContextualCommand {
+    pb::ContextualCommand {
+        command: Some(pb::CommandBook {
+            cover: Some(cover_of("ledger", label)),
+            pages: vec![pb::CommandPage {
+                payload: Some(pb::command_page::Payload::Command(prost_types::Any {
+                    type_url: angzarr_router::type_url("test.counter.IncreaseBy"),
+                    value: counter::IncreaseBy { n: 1 }.encode_to_vec(),
+                })),
+                ..Default::default()
+            }],
+        }),
+        events: None,
+    }
+}
+
+/// The reserving process-manager (domain "reserving-pm", target
+/// "inventory") over CounterState: an Increased trigger from "counter"
+/// records the trigger cover and emits nothing; a rejected Reserve is
+/// compensated with a Release command to "inventory".
+pub fn reserving_pm(seen: CoverSink) -> ProcessManagerDispatch<CounterState> {
+    ProcessManagerDispatch::new(
+        "Reserving",
+        "reserving-pm",
+        ["inventory"],
+        Rebuilder::new(CounterState::default),
+    )
+    .on_event(
+        "counter",
+        "test.counter.Increased",
+        move |_e, _s, _d, cover| {
+            seen.lock().unwrap().push(cover.cloned());
+            Ok(pb::ProcessManagerHandleResponse::default())
+        },
+    )
+    .on_rejected("test.counter.Reserve", |_n, _r, _s| {
+        let mut release = reserve_command_to("inventory");
+        if let Some(pb::command_page::Payload::Command(any)) = release.pages[0].payload.as_mut() {
+            any.type_url = angzarr_router::type_url("test.counter.Release");
+        }
+        Ok(pb::ProcessManagerHandleResponse {
+            commands: vec![release],
+            ..Default::default()
+        })
+    })
+}
+
+/// An Increased trigger from "counter" root `label` at sequence `seq`.
+pub fn reserving_trigger(label: &str, seq: u32) -> pb::ProcessManagerHandleRequest {
+    pb::ProcessManagerHandleRequest {
+        trigger: Some(pb::EventBook {
+            cover: Some(cover_of("counter", label)),
+            pages: vec![increased_page(Some(seq))],
+            ..Default::default()
+        }),
+        process_state: None,
+    }
+}
+
+/// The rejection of a Reserve sent to `target_domain`, delivered to the
+/// reserving process-manager's own domain at sequence `seq`.
+pub fn reserving_rejection(target_domain: &str, seq: u32) -> pb::ProcessManagerHandleRequest {
+    let rejection = pb::RejectionNotification {
+        rejected_command: Some(reserve_command_to(target_domain)),
+        ..Default::default()
+    };
+    let notification = pb::Notification {
+        payload: Some(prost_types::Any {
+            type_url: angzarr_router::type_url(angzarr_router::REJECTION_NOTIFICATION_FULL_NAME),
+            value: rejection.encode_to_vec(),
+        }),
+        ..Default::default()
+    };
+    pb::ProcessManagerHandleRequest {
+        trigger: Some(pb::EventBook {
+            cover: Some(pb::Cover {
+                domain: "reserving-pm".to_string(),
+                ..Default::default()
+            }),
+            pages: vec![pb::EventPage {
+                header: Some(sequence_header(seq)),
+                payload: Some(pb::event_page::Payload::Event(prost_types::Any {
+                    type_url: angzarr_router::NOTIFICATION_TYPE_URL.to_string(),
+                    value: notification.encode_to_vec(),
+                })),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        process_state: None,
+    }
+}
+
+/// (root bytes, sequence) pairs a projector fold observed.
+pub type PageSink = Arc<Mutex<Vec<(Vec<u8>, u32)>>>;
+
+/// The tracking projector: every Increased fold records its book's root and
+/// the page's sequence.
+pub fn tracking_projector(seen: PageSink) -> ProjectorDispatch<()> {
+    ProjectorDispatch::new("Tracker", || ()).on_event(
+        "test.counter.Increased",
+        move |_p, _e, ctx| {
+            let root = ctx
+                .cover
+                .and_then(|c| c.root.as_ref())
+                .map(|r| r.value.clone())
+                .unwrap_or_default();
+            seen.lock().unwrap().push((root, ctx.sequence));
+            Ok(())
+        },
+    )
+}
+
+/// A book of Increased events of "counter" root `label` at `sequences`.
+pub fn tracked_book(label: &str, sequences: &[u32]) -> pb::EventBook {
+    pb::EventBook {
+        cover: Some(cover_of("counter", label)),
+        pages: sequences.iter().map(|s| increased_page(Some(*s))).collect(),
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod smoke {
     use super::*;
