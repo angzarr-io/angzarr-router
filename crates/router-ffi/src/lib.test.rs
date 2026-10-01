@@ -2158,3 +2158,62 @@ fn ambiguous_compensates_entries_are_refused_at_registration() {
     );
     unsafe { angzarr_router_free(r) };
 }
+
+#[test]
+fn undo_and_fact_handlers_returning_nothing_cross_cleanly() {
+    let mut desc = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
+    desc.undoes = vec![abi_pb::CallbackEntry {
+        fq_type: FQ_RESERVE.to_string(),
+        callback_id: CB_OK_EMPTY,
+    }];
+    desc.facts = vec![abi_pb::CallbackEntry {
+        fq_type: FQ_INCREASED.to_string(),
+        callback_id: CB_OK_EMPTY,
+    }];
+    let r = angzarr_router_new();
+    assert_eq!(register_aggregate_desc(r, desc), 0);
+    let router = Router(r);
+
+    let (ret, bytes) = router.dispatch(next_session(), &compensate_command(FQ_RESERVE, vec![1]));
+    assert_eq!(ret, 0, "an undo handler returning nothing succeeds");
+    assert_eq!(decode_response(&bytes).result, None);
+
+    let facts = book_in_domain("counter", 1);
+    let req = pb::FactRequest {
+        facts: Some(facts.clone()),
+        prior_events: None,
+    };
+    let (ret, bytes) = router.call(
+        angzarr_router_dispatch_fact,
+        next_session(),
+        &req.encode_to_vec(),
+    );
+    assert_eq!(
+        ret, 0,
+        "a fact handler returning nothing records the fact unchanged"
+    );
+    assert_eq!(
+        pb::EventBook::decode(bytes.as_slice()).unwrap().pages,
+        facts.pages
+    );
+}
+
+#[test]
+fn a_failing_state_packer_fails_replay_with_its_status() {
+    let mut desc = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
+    desc.state_callback_id = Some(CB_PROJ_FOLD_REJECTS);
+    let r = angzarr_router_new();
+    assert_eq!(register_aggregate_desc(r, desc), 0);
+    let router = Router(r);
+    let call = abi_pb::ReplayCall {
+        domain: "counter".to_string(),
+        request: Some(pb::ReplayRequest::default()),
+    };
+    let (ret, bytes) = router.call(
+        angzarr_router_dispatch_replay,
+        next_session(),
+        &call.encode_to_vec(),
+    );
+    assert_eq!(ret, -9);
+    assert_eq!(decode_status(&bytes).1, "PROJECTION_STALE");
+}
