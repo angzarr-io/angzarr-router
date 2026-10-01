@@ -48,3 +48,10 @@ target_link_libraries(conformance PRIVATE angzarr_router Catch2::Catch2)
 target_compile_definitions(conformance PRIVATE
     ANGZARR_FEATURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../conformance/features")
 add_test(NAME conformance COMMAND conformance)
+
+# Binding unit tests: the hand-written dispatch surfaces, Router and trampoline
+# exercised against the staticlib without the generated wiring.
+file(GLOB BINDING_TEST_SRCS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp")
+add_executable(binding_test ${BINDING_TEST_SRCS})
+target_link_libraries(binding_test PRIVATE angzarr_router Catch2::Catch2)
+add_test(NAME binding_test COMMAND binding_test)

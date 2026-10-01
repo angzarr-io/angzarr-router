@@ -355,6 +355,12 @@ class Router {
   std::mutex mu_;
 };
 
+// A coded failure as a callback outcome: the google.rpc.Status bytes and the
+// negated wire gRPC code (never 0, which the core would read as success).
+inline InvokerResult ErrorResult(const CodedError& e) {
+  return InvokerResult{ToStatusBytes(e), -static_cast<int32_t>(WireGrpc(e.grpc)), true};
+}
+
 // The single host-callback gateway. One inline definition; passed by address to
 // every registration. Catches every exception and codes it — never unwinds
 // across the boundary.
@@ -379,7 +385,7 @@ extern "C" inline int32_t AngzarrTrampoline(void* host_ctx, uint64_t callback_id
     o->len = r.response.size();
   };
   auto fail = [&](const CodedError& e) {
-    InvokerResult r{ToStatusBytes(e), -static_cast<int32_t>(e.grpc), true};
+    InvokerResult r = ErrorResult(e);
     write_out(out, r);
     return r.status;
   };
@@ -395,10 +401,9 @@ extern "C" inline int32_t AngzarrTrampoline(void* host_ctx, uint64_t callback_id
       result = (*invoker)(*session, read(type_url, type_url_len), read(payload, payload_len),
                           read(aux, aux_len));
     } catch (const CodedError& e) {
-      result = {ToStatusBytes(e), -static_cast<int32_t>(e.grpc), true};
+      result = ErrorResult(e);
     } catch (const std::exception& e) {
-      CodedError ce = CodedError::Unhandled(e.what());
-      result = {ToStatusBytes(ce), -static_cast<int32_t>(ce.grpc), true};
+      result = ErrorResult(CodedError::Unhandled(e.what()));
     }
     write_out(out, result);
     return result.status;
