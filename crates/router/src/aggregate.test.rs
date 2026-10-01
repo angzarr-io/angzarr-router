@@ -873,3 +873,18 @@ fn replay_folds_the_snapshot_then_the_events() {
         .expect("replay");
     assert_eq!(state.applied, vec!["snapshot", "a", "b"]);
 }
+
+#[test]
+fn claims_notification_reflects_declared_compensations_and_undos() {
+    let d = AggregateDispatch::new("agg-test", "inventory", fresh_rebuilder())
+        .on_rejected(&format!("warehouse:{FQ_RESERVE}"), labelled("a"))
+        .on_undo(FQ_ADJUST, |_, _, _: &mut TestState, _| reject_with(None));
+    assert!(d.claims_notification(&rejection_sent_to("warehouse")));
+    assert!(!d.claims_notification(&rejection_sent_to("inventory")));
+    assert!(d.claims_notification(&compensate_command(FQ_ADJUST)));
+    assert!(!d.claims_notification(&compensate_command(FQ_COUNT)));
+    assert!(!d.claims_notification(&Any {
+        type_url: "/io.angzarr.v1.Notification".to_string(),
+        value: vec![0xff, 0xff],
+    }));
+}

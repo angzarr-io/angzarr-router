@@ -14,7 +14,9 @@ pub mod process_manager;
 pub mod projector;
 pub mod proto;
 pub mod rebuild;
+pub mod router;
 pub mod saga;
+pub mod upcaster;
 
 pub use proto::io::angzarr::v1 as pb;
 
