@@ -1,12 +1,19 @@
 """Dispatch through the hand-written aggregate registration API (no generated
-wiring): ordered compensator fan-out across the FFI."""
+wiring): ordered compensator fan-out across the FFI, and the trampoline's
+boundary guard against exceptions that are not ``Exception`` subclasses."""
 
 from __future__ import annotations
 
-from .. import AggregateDispatch, Rebuilder, Router
+import pytest
+
+from .. import AggregateDispatch, CodedError, GrpcCode, Rebuilder, Router
 from ..gen.io.angzarr.v1 import command_handler_pb2
 from ..gen.test.counter import counter_pb2
 from . import builders
+
+
+class _HandlerAbort(BaseException):
+    """A BaseException that is not an Exception, raised by a handler."""
 
 
 def _counter_dispatch() -> AggregateDispatch:
@@ -45,3 +52,22 @@ def test_two_compensators_fan_out_in_registration_order():
         "test.counter.CompensatedFirst",
         "test.counter.CompensatedSecond",
     ]
+
+
+def test_handler_base_exception_surfaces_as_internal_failure():
+    """A handler raising a BaseException that is not an Exception fails the
+    dispatch as an unclassified INTERNAL error rather than passing as
+    success."""
+
+    def abort(cmd, state, cctx):
+        raise _HandlerAbort("handler aborted")
+
+    dispatch = _counter_dispatch().on_command(builders.FQ_INCREASE_BY, abort)
+    with Router() as router:
+        router.register_aggregate(dispatch)
+        with pytest.raises(CodedError) as exc:
+            router.dispatch(builders.increase_command(1))
+
+    assert exc.value.code == "UNHANDLED_HANDLER_ERROR"
+    assert exc.value.grpc == GrpcCode.INTERNAL
+    assert "handler aborted" in exc.value.message

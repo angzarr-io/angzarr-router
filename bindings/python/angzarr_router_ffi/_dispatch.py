@@ -586,15 +586,20 @@ def _write_out(out, data: bytes | None) -> None:
     out.len = len(data)
 
 
-@ffi.callback("angzarr_cb")
+# What cffi returns if the trampoline itself fails to return a value: an
+# INTERNAL status, never STATUS_OK with `out` unset.
+_TRAMPOLINE_ERROR = -int(GrpcCode.INTERNAL)
+
+
+@ffi.callback("angzarr_cb", error=_TRAMPOLINE_ERROR)
 def _trampoline(
     host_ctx, callback_id, type_url, type_url_len, payload, payload_len, aux, aux_len, out
 ):
     """The single C-visible gateway the core calls for every host callback.
     Recovers the dispatch session from host_ctx, routes by callback_id to the
-    registered invoker, and writes the response into out. A Python exception
-    is caught and surfaced as a coded failure — it must never unwind across
-    the boundary into Rust."""
+    registered invoker, and writes the response into out. Any raised
+    BaseException is caught and surfaced as a coded failure — nothing unwinds
+    across the boundary into Rust."""
     try:
         session = ffi.from_handle(host_ctx)
         inv = session.router._registry.get(int(callback_id))
@@ -616,7 +621,7 @@ def _trampoline(
         )
         _write_out(out, data)
         return status
-    except Exception as exc:  # noqa: BLE001 — boundary guard: nothing crosses into Rust
+    except BaseException as exc:  # noqa: BLE001 — boundary guard: nothing crosses into Rust
         data, code = _error_status(exc)
         _write_out(out, data)
         return code
