@@ -1,5 +1,6 @@
 package io.angzarr.router;
 
+import io.angzarr.router.Thunks.SagaEventContextThunk;
 import io.angzarr.router.Thunks.SagaEventThunk;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -15,7 +16,7 @@ public final class SagaDispatch {
   final String name;
   final String inputDomain;
   final List<String> targets;
-  final Map<String, SagaEventThunk> events = new LinkedHashMap<>();
+  final Map<String, SagaEventContextThunk> events = new LinkedHashMap<>();
 
   /** Starts a saga registration translating inputDomain events into commands for targetDomains. */
   public SagaDispatch(String name, String inputDomain, List<String> targetDomains) {
@@ -26,6 +27,15 @@ public final class SagaDispatch {
 
   /** Registers the translation thunk for a fully-qualified event type. */
   public SagaDispatch onEvent(String fullName, SagaEventThunk thunk) {
+    return onEventWithContext(
+        fullName, (event, dests, source) -> thunk.translate(event, dests, source.cover()));
+  }
+
+  /**
+   * Registers the translation thunk for a fully-qualified event type that also reads where the
+   * triggering event sits (its book's cover and the event's sequence).
+   */
+  public SagaDispatch onEventWithContext(String fullName, SagaEventContextThunk thunk) {
     events.put(fullName, thunk);
     return this;
   }

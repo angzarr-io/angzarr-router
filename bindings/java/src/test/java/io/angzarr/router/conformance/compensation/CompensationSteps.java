@@ -76,6 +76,11 @@ public class CompensationSteps {
     payment(RESERVE, event);
   }
 
+  @Given("a second payment aggregate compensating Reserve from any domain with {word}")
+  public void secondPayment(String event) {
+    payment(RESERVE, event);
+  }
+
   @Given(
       "a payment aggregate compensating Reserve from {string} with {word} and from {string} with"
           + " {word}")
@@ -138,6 +143,28 @@ public class CompensationSteps {
     EventPage page = pages().get(0);
     assertTrue(page.getHeader().hasSequence(), "the event carries an explicit sequence");
     assertEquals(seq, page.getHeader().getSequence(), "event sequence");
+  }
+
+  @Then("the aggregates emit {word} at sequence {int} then {word} at sequence {int}")
+  public void emitInOrder(String first, int firstSeq, String second, int secondSeq) {
+    List<EventPage> pages = pages();
+    assertEquals(2, pages.size(), "two events");
+    List<String> got =
+        pages.stream()
+            .map(
+                p -> {
+                  assertTrue(p.hasEvent(), "the page carries an event");
+                  assertTrue(p.getHeader().hasSequence(), "the event carries an explicit sequence");
+                  return Builders.fqOf(p.getEvent().getTypeUrl())
+                      + "@"
+                      + p.getHeader().getSequence();
+                })
+            .toList();
+    assertEquals(
+        List.of(
+            "test.counter." + first + "@" + firstSeq, "test.counter." + second + "@" + secondSeq),
+        got,
+        "events in registration order with continuing sequences");
   }
 
   @Then("the dispatch fails with {word} as UNIMPLEMENTED")

@@ -17,7 +17,8 @@ import io.cucumber.java.Before;
 import io.cucumber.java.en.Given;
 import io.cucumber.java.en.Then;
 import io.cucumber.java.en.When;
-import test.counter.OrderSagaAngzarr;
+import java.util.ArrayList;
+import java.util.List;
 
 /** Step definitions for saga.feature — the OrderSaga translation-side dispatch. */
 public class SagaSteps {
@@ -25,13 +26,14 @@ public class SagaSteps {
   private Router router;
   private SagaResponse resp;
   private CodedError err;
+  private final List<Long> seen = new ArrayList<>();
 
   @Before
   public void before() {
     router = new Router();
-    OrderSagaAngzarr.registerOrderSaga(router, new SagaFixture());
     resp = null;
     err = null;
+    seen.clear();
   }
 
   @After
@@ -53,8 +55,7 @@ public class SagaSteps {
 
   @Given("an order saga delivering to {string}")
   public void anOrderSaga(String target) {
-    // The fixture is registered in @Before; the delivery target ("inventory")
-    // is part of the declaration the generated wiring already carries.
+    router.registerSaga(SagaFixture.recording(new SagaFixture(), target, seen));
   }
 
   @When("an Increased event at sequence {int} is dispatched")
@@ -99,6 +100,12 @@ public class SagaSteps {
       assertEquals(index, d.getCommandIndex(), "command_index is the emission position");
       assertEquals("order", d.getSource().getDomain(), "the source cover is the triggering book's");
     }
+  }
+
+  @Then("the saga handler saw source sequence {int}")
+  public void handlerSawSequence(int seq) {
+    assertNull(err, "dispatch failed");
+    assertEquals(List.of((long) seq), seen, "source sequences the handler saw");
   }
 
   @Then("the saga emits no commands")

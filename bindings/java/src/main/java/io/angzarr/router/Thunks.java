@@ -104,6 +104,15 @@ public final class Thunks {
   }
 
   @FunctionalInterface
+  public interface SagaEventContextThunk {
+    /**
+     * source is where the triggering event sits: the source book's cover (to route emitted commands
+     * by the trigger's identity) and the event's sequence (0 when the page carries none).
+     */
+    SagaEmission translate(Any event, Destinations dests, PageContext source) throws Exception;
+  }
+
+  @FunctionalInterface
   public interface PmEventThunk {
     ProcessManagerHandleResponse handle(Any event, Message.Builder state, Destinations dests)
         throws Exception;

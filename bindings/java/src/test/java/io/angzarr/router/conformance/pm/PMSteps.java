@@ -202,6 +202,13 @@ public class PMSteps {
     assertEquals(1, resp.getProcessEventsList().size(), "process events");
   }
 
+  @Then("the process event is addressed to {string}")
+  public void processEventAddressedTo(String domain) {
+    assertNull(err, "dispatch failed");
+    assertEquals(1, resp.getProcessEventsList().size(), "process events");
+    assertEquals(domain, resp.getProcessEvents(0).getCover().getDomain(), "process event domain");
+  }
+
   @Then("the process-manager escalates")
   public void escalates() {
     assertNull(err, "dispatch failed");

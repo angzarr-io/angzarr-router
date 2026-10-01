@@ -29,7 +29,7 @@ import io.angzarr.router.Thunks.ProjectorFinishThunk;
 import io.angzarr.router.Thunks.ProjectorUnknownThunk;
 import io.angzarr.router.Thunks.RejectionThunk;
 import io.angzarr.router.Thunks.SagaEmission;
-import io.angzarr.router.Thunks.SagaEventThunk;
+import io.angzarr.router.Thunks.SagaEventContextThunk;
 import io.angzarr.router.Thunks.UndoThunk;
 import io.angzarr.router.ffi.v1.Abi;
 import java.lang.foreign.MemorySegment;
@@ -175,7 +175,7 @@ public final class Router implements AutoCloseable {
             .setInputDomain(d.inputDomain)
             .addAllTargetDomains(d.targets);
 
-    for (Map.Entry<String, SagaEventThunk> e : d.events.entrySet()) {
+    for (Map.Entry<String, SagaEventContextThunk> e : d.events.entrySet()) {
       long id = assign(sagaEventInvoker(dests, e.getValue()));
       desc.addEvents(callbackEntry(e.getKey(), id));
     }
@@ -434,10 +434,12 @@ public final class Router implements AutoCloseable {
     };
   }
 
-  private static Invoker sagaEventInvoker(Destinations dests, SagaEventThunk thunk) {
+  private static Invoker sagaEventInvoker(Destinations dests, SagaEventContextThunk thunk) {
     return (session, typeUrl, payload, aux) -> {
       Abi.SagaEventAux sax = Abi.SagaEventAux.parseFrom(aux);
-      SagaEmission emission = thunk.translate(anyOf(typeUrl, payload), dests, sax.getSourceCover());
+      PageContext source =
+          new PageContext(sax.getSourceCover(), Integer.toUnsignedLong(sax.getSourceSeq()));
+      SagaEmission emission = thunk.translate(anyOf(typeUrl, payload), dests, source);
       SagaResponse resp =
           SagaResponse.newBuilder()
               .addAllCommands(emission.commands())
