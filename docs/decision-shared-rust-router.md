@@ -13,7 +13,8 @@
 - §4.1 is superseded by a per-kind ABI: `angzarr_router_new()` takes no
   config, components register through `angzarr_router_register_{aggregate,
   projector,saga,process_manager}` with kind-specific descriptors, and
-  dispatch goes through one `dispatch*` entry point per kind (13 exported
+  dispatch goes through one `dispatch*` entry point per kind plus fact and
+  replay entry points (15 exported
   functions in all; `crates/router-ffi/src/lib.rs`). There is no
   serve/shutdown, transport config, upcaster kind, or composition
   validation in the router; hosts keep their own gRPC serving.

@@ -20,9 +20,10 @@ router.
   `angzarr_client/router/`, client-rust's own router). No client-*
   library links this crate or its FFI yet. client-rust is planned to move
   onto `crates/router`'s Rust-native API (no FFI) and delete its engine;
-  the Rust-native API (`Rebuilder`, `AggregateDispatch`, `SagaDispatch`,
-  `ProcessManagerDispatch` with `select_process_managers`/`merge_response`,
-  `ProjectorDispatch`, `Destinations`, `CodedError`) is therefore a public
+  the Rust-native API (`Rebuilder`, `AggregateDispatch` with undo, facts
+  and replay, `SagaDispatch`, `ProcessManagerDispatch` with
+  `select_process_managers`/`merge_response`, `ProjectorDispatch`,
+  `Destinations`, `stamp_deferred`, `decode_notification`, `CodedError`) is therefore a public
   contract, documented on each item. Until the client engines retire, the
   engine semantics exist in this repo AND in each client library; the
   shared contract between them is the semantics table below and the
@@ -38,7 +39,7 @@ generated wiring  ── typed seam + Register<Component>(router, handler)
         │
 bindings/<lang>    ── registry of callback_id → typed invoker, one trampoline,
         │             a per-dispatch session parked in host_ctx
-        │  C ABI (crates/router-ffi: 13 extern "C" fns)
+        │  C ABI (crates/router-ffi: 15 extern "C" fns)
         ▼
 crates/router-ffi  ── descriptor → core tables, component claims/routing,
         │             host_ctx installed for the duration of one dispatch
@@ -58,9 +59,10 @@ calls thunks keyed by fully-qualified type name.
 
 The exported surface (see `crates/router-ffi/src/lib.rs`):
 `angzarr_abi_version`, `angzarr_buf_alloc`, `angzarr_buf_release`,
-`angzarr_router_new`, `angzarr_router_free`, and per component kind a
+`angzarr_router_new`, `angzarr_router_free`, per component kind a
 `register_*` and a `dispatch*` entry point (aggregate, projector, saga,
-process manager). A component is registered from a serialized descriptor
+process manager), and the aggregate's `dispatch_fact` / `dispatch_replay`
+(ABI version 2). A component is registered from a serialized descriptor
 (`proto/io/angzarr/router/ffi/v1/abi.proto`) listing `(fq_type,
 callback_id)` entries; every callback goes through one host function
 `angzarr_cb(host_ctx, callback_id, type_url, payload, aux, out)`.
@@ -90,17 +92,21 @@ keyed by component, never by session alone.
 | Semantic | Contract |
 |---|---|
 | State rebuild | Snapshot applies first; pages with an explicit sequence at or below a LOADED snapshot's sequence never re-apply (a snapshot with no loader or no state covers nothing); pageless or unknown-type entries are skipped, never terminal; a corrupt persisted payload fails with `PERSISTED_EVENT_CORRUPT` |
-| Aggregate dispatch | Envelope and command type validate BEFORE rebuild (unknown command → `NO_HANDLER_REGISTERED`); handlers receive `CommandContext` (next sequence, had-prior-events) |
-| Fill-only stamping | The command cover's ext propagates onto emitted books, pages without headers get consecutive sequences, saga-emitted commands inherit the source correlation ID — never overriding values the handler set |
-| Saga dispatch | EVERY page of the source book dispatches; undeclared types are skipped and the walk continues (C-0051) |
-| Rejection routing | Keys are fully-qualified command type names; every compensator for a rejection runs, in registration order (C-0042); aggregate compensation events concatenate and the first escalation (Revocation or Notification) wins; PM process events concatenate and the first escalation wins; an undeclared rejection yields an empty response (`DelegateToFramework`) |
-| Process manager | The newest page of the trigger book dispatches; co-resident PMs are selected by identity first — a rejection reaches the PM that issued the command (`angzarr_deferred.source_component`, then its source domain, then the trigger cover domain), a process state reaches the PM owning its cover domain — and otherwise every PM consuming the trigger domain; responses merge in registration order |
-| Projector | Folds every page into one projection instance; undeclared domains fold nothing (C-0032); unmatched types invoke the on-unknown hook or WARN |
-| Errors | One `map_handler_error` table: rejections keep their gRPC code, `NO_HANDLER_REGISTERED` → UNIMPLEMENTED, `PERSISTED_EVENT_CORRUPT` → DATA_LOSS, other coded client errors → INVALID_ARGUMENT, unclassified → INTERNAL + `UNHANDLED_HANDLER_ERROR`. Codes ride a `google.rpc.ErrorInfo` detail (domain `angzarr.io`); assertions key on codes, never message substrings |
+| Aggregate dispatch | Envelope and command type validate BEFORE rebuild (unknown command → `NO_HANDLER_REGISTERED`); handlers receive `CommandContext` (next sequence, had-prior-events, the handled cover) |
+| Fill-only stamping | The command cover's ext propagates onto emitted books and pages without headers get consecutive sequences from the next sequence — for command, compensation and undo events alike — never overriding values the handler set |
+| Deferred commands | Saga and process-manager commands carry `angzarr_deferred` (source cover, source_seq of the triggering page, command_index in emission order) and never an explicit sequence; `source_component` is stamped by the coordinator. Saga commands inherit the source correlation id fill-only. `Destinations` are the declared output domains only |
+| Saga dispatch | EVERY page of the source book dispatches; undeclared types and Notification pages are skipped (C-0051); sagas receive no rejections |
+| Notifications | A Notification's payload is told apart by name: a RejectionNotification routes to compensation handlers, a Compensate to undo handlers |
+| Rejection routing | A `compensates` entry is `"fq.Type"` (any target domain) or `"domain:fq.Type"` (only rejections of commands sent to that domain); a type listed both ways is refused at registration (`AMBIGUOUS_COMPENSATION`); every matching compensator runs, in registration order (C-0042); aggregate compensation events concatenate and the first escalation (Revocation or Notification) wins; PM compensators return full responses (process events, deferred commands, facts) merged in order, first escalation winning; an undeclared rejection yields an empty response (`DelegateToFramework`) |
+| Undo | A Compensate routes to the aggregate's undo handler for its `command_type` with rebuilt state; none (or a Compensate at a process manager) is `NO_UNDO_HANDLER` → UNIMPLEMENTED, which the coordinator dead-letters — never dropped |
+| Facts and replay | `HandleFact` rebuilds from the prior events and walks the facts in order: a fact handler may annotate (not refuse) a fact, and each recorded fact folds before the next; cover and headers are kept. `Replay` folds base snapshot then events into state. Facts route by the facts' cover domain, replay by the requested domain |
+| Process manager | The newest page of the trigger book dispatches; handlers receive the trigger cover; co-resident PMs are selected by identity first — a rejection reaches the PM that issued the command (`angzarr_deferred.source_component`, then its source domain, then the trigger cover domain), a process state reaches the PM owning its cover domain — and otherwise every PM consuming the trigger domain; responses merge in registration order |
+| Projector | Folds every page into one projection instance, each fold seeing the book cover and the page's sequence; undeclared domains fold nothing (C-0032); unmatched types invoke the on-unknown hook or WARN |
+| Type URLs | Emitted type URLs use the bare `/` prefix; incoming ones match by the fully-qualified name after the last `/`, whatever the prefix |
+| Errors | One `map_handler_error` table: rejections keep their gRPC code, `NO_HANDLER_REGISTERED` and `NO_UNDO_HANDLER` → UNIMPLEMENTED, `PERSISTED_EVENT_CORRUPT` → DATA_LOSS, other coded client errors → INVALID_ARGUMENT, unclassified → INTERNAL + `UNHANDLED_HANDLER_ERROR`. Codes ride a `google.rpc.ErrorInfo` detail (domain `angzarr.io`); assertions key on codes, never message substrings |
 
-Not provided here: gRPC serving and transport configuration, upcasters,
-composition validation beyond the claims above (C-0060..C-0065), and
-CloudEvents. Those remain with the host application or the client-*
+Not provided here: gRPC serving, health/readiness and transport
+configuration, and CloudEvents. Those remain with the host application or the client-*
 libraries.
 
 ## Testing
