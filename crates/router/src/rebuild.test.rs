@@ -254,3 +254,94 @@ fn pageless_entries_do_not_end_the_fold() {
         "the gap page is skipped, not terminal"
     );
 }
+
+// A snapshot at sequence 0 covers page 0: the loaded state already holds it.
+#[test]
+fn snapshot_at_sequence_zero_covers_page_zero() {
+    let r = cover_applier(fresh_rebuilder().with_snapshot(|s, _| {
+        s.applied.push("snapshot".to_string());
+        Ok(())
+    }));
+    let book = pb::EventBook {
+        snapshot: Some(pb::Snapshot {
+            sequence: 0,
+            state: Some(cover_any("snap")),
+            ..Default::default()
+        }),
+        pages: vec![
+            sequenced_event_page(0, cover_any("covered0")),
+            sequenced_event_page(1, cover_any("after")),
+        ],
+        ..Default::default()
+    };
+    let (state, info) = r.rebuild(Some(&book)).expect("rebuild");
+    assert_eq!(state.applied, vec!["snapshot", "after"]);
+    assert_eq!(info.applied_count, 1);
+}
+
+// Without a loader the snapshot state never folds, so no page is covered by
+// it: skipping would silently lose that history.
+#[test]
+fn snapshot_without_loader_covers_no_pages() {
+    let r = cover_applier(fresh_rebuilder());
+    let book = pb::EventBook {
+        snapshot: Some(pb::Snapshot {
+            sequence: 2,
+            state: Some(cover_any("snap")),
+            ..Default::default()
+        }),
+        pages: vec![
+            sequenced_event_page(1, cover_any("one")),
+            sequenced_event_page(2, cover_any("two")),
+            sequenced_event_page(3, cover_any("three")),
+        ],
+        ..Default::default()
+    };
+    let (state, _) = r.rebuild(Some(&book)).expect("rebuild");
+    assert_eq!(state.applied, vec!["one", "two", "three"]);
+}
+
+// A snapshot with no state payload loads nothing, so it covers nothing.
+#[test]
+fn stateless_snapshot_covers_no_pages() {
+    let r = cover_applier(fresh_rebuilder().with_snapshot(|s, _| {
+        s.applied.push("snapshot".to_string());
+        Ok(())
+    }));
+    let book = pb::EventBook {
+        snapshot: Some(pb::Snapshot {
+            sequence: 2,
+            ..Default::default()
+        }),
+        pages: vec![
+            sequenced_event_page(1, cover_any("one")),
+            sequenced_event_page(2, cover_any("two")),
+        ],
+        ..Default::default()
+    };
+    let (state, _) = r.rebuild(Some(&book)).expect("rebuild");
+    assert_eq!(state.applied, vec!["one", "two"]);
+}
+
+// A page with no explicit sequence cannot be proven covered, so it folds.
+#[test]
+fn unsequenced_page_is_never_covered() {
+    let r = cover_applier(fresh_rebuilder().with_snapshot(|s, _| {
+        s.applied.push("snapshot".to_string());
+        Ok(())
+    }));
+    let book = pb::EventBook {
+        snapshot: Some(pb::Snapshot {
+            sequence: 4,
+            state: Some(cover_any("snap")),
+            ..Default::default()
+        }),
+        pages: vec![
+            sequenced_event_page(4, cover_any("covered")),
+            event_page(cover_any("unsequenced")),
+        ],
+        ..Default::default()
+    };
+    let (state, _) = r.rebuild(Some(&book)).expect("rebuild");
+    assert_eq!(state.applied, vec!["snapshot", "unsequenced"]);
+}

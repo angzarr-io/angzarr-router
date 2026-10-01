@@ -83,6 +83,11 @@ impl<S> Rebuilder<S> {
         };
         info.had_prior_events = !book.pages.is_empty() || book.snapshot.is_some();
 
+        // Pages a LOADED snapshot already folded must not re-apply — their
+        // effects are in the snapshot state; double-folding corrupts it. A
+        // snapshot that did not load (no loader, no state) covers nothing, and a
+        // page without an explicit sequence is never provably covered.
+        let mut covered_through: Option<u32> = None;
         if let Some(snapshot) = book.snapshot.as_ref() {
             if let (Some(snap_state), Some(loader)) =
                 (snapshot.state.as_ref(), self.snapshot.as_ref())
@@ -90,19 +95,18 @@ impl<S> Rebuilder<S> {
                 if loader(&mut state, snap_state).is_err() {
                     return Err(CodedError::persisted_corrupt(&snap_state.type_url));
                 }
+                covered_through = Some(snapshot.sequence);
             }
         }
-
-        // Pages already folded into the snapshot must not re-apply — their
-        // effects are in the snapshot state; double-folding corrupts it.
-        let covered_through = book.snapshot.as_ref().map_or(0, |s| s.sequence);
 
         for page in &book.pages {
             let Some(event) = crate::page_event(page) else {
                 continue;
             };
-            if covered_through > 0 && crate::page_sequence(page) <= covered_through {
-                continue;
+            if let (Some(covered), Some(seq)) = (covered_through, explicit_sequence(page)) {
+                if seq <= covered {
+                    continue;
+                }
             }
             let Some(thunk) = self
                 .appliers
@@ -116,6 +120,14 @@ impl<S> Rebuilder<S> {
             info.applied_count += 1;
         }
         Ok((state, info))
+    }
+}
+
+/// The page's explicit header sequence, when it carries one.
+fn explicit_sequence(page: &pb::EventPage) -> Option<u32> {
+    match page.header.as_ref()?.sequence_type.as_ref()? {
+        pb::page_header::SequenceType::Sequence(seq) => Some(*seq),
+        _ => None,
     }
 }
 
