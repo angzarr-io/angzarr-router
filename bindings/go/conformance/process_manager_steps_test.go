@@ -315,6 +315,20 @@ func (w *pmWorld) onlyAuditCompensates() error {
 	return nil
 }
 
+func (w *pmWorld) processEventAddressedTo(domain string) error {
+	if w.err != nil {
+		return fmt.Errorf("dispatch failed: %w", w.err)
+	}
+	events := w.resp.GetProcessEvents()
+	if len(events) != 1 {
+		return fmt.Errorf("emitted %d process events, want exactly 1", len(events))
+	}
+	if got := events[0].GetCover().GetDomain(); got != domain {
+		return fmt.Errorf("process event cover domain %q, want %q", got, domain)
+	}
+	return nil
+}
+
 func (w *pmWorld) emitsOneProcessEvent() error {
 	if w.err != nil {
 		return fmt.Errorf("dispatch failed: %w", w.err)
@@ -379,5 +393,6 @@ func initializeProcessManagerScenario(sc *godog.ScenarioContext) {
 	sc.Step(`^the process-manager rebuilt (\d+) prior state events$`, w.rebuiltN)
 	sc.Step(`^the process-manager emits one process event$`, w.emitsOneProcessEvent)
 	sc.Step(`^the process-manager escalates$`, w.escalates)
+	sc.Step(`^the process event is addressed to "([^"]*)"$`, w.processEventAddressedTo)
 	sc.Step(`^the dispatch fails with ([A-Z_]+)$`, w.failsWith)
 }

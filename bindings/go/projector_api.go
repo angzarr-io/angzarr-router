@@ -53,8 +53,11 @@ func NewProjectorDispatch[P any](name string, factory func() P) *ProjectorDispat
 	}
 }
 
+// WildcardDomain, declared as a projector domain, consumes every domain.
+const WildcardDomain = "*"
+
 // ForDomains restricts folding to books whose cover carries one of these
-// domains. Unset (the default) consumes every domain.
+// domains. Unset (the default) or WildcardDomain consumes every domain.
 func (d *ProjectorDispatch[P]) ForDomains(domains ...string) *ProjectorDispatch[P] {
 	d.domains = domains
 	return d

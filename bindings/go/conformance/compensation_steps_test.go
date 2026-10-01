@@ -185,6 +185,29 @@ func (w *compensationWorld) takesSequence(seq int) error {
 	return nil
 }
 
+func (w *compensationWorld) emitInOrder(first string, firstSeq int, second string, secondSeq int) error {
+	pages, err := w.pages()
+	if err != nil {
+		return err
+	}
+	want := []string{
+		fmt.Sprintf("test.counter.%s@%d", first, firstSeq),
+		fmt.Sprintf("test.counter.%s@%d", second, secondSeq),
+	}
+	got := make([]string, len(pages))
+	for i, page := range pages {
+		header := page.GetHeader()
+		if _, ok := header.GetSequenceType().(*pb.PageHeader_Sequence); !ok {
+			return fmt.Errorf("event %d carries no explicit sequence: %v", i, header)
+		}
+		got[i] = fmt.Sprintf("%s@%d", fqFromURL(page.GetEvent().GetTypeUrl()), header.GetSequence())
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		return fmt.Errorf("emitted %v, want %v", got, want)
+	}
+	return nil
+}
+
 func (w *compensationWorld) failsUnimplemented(code string) error {
 	var ce *CodedError
 	if !errors.As(w.err, &ce) {
@@ -211,6 +234,7 @@ func initializeCompensationScenario(sc *godog.ScenarioContext) {
 	})
 
 	sc.Step(`^a payment aggregate compensating Reserve from any domain with (\w+)$`, w.paymentUnqualified)
+	sc.Step(`^a second payment aggregate compensating Reserve from any domain with (\w+)$`, w.paymentUnqualified)
 	sc.Step(`^a payment aggregate compensating Reserve from "([^"]*)" with (\w+) and from "([^"]*)" with (\w+)$`, w.paymentQualified)
 	sc.Step(`^an inventory aggregate undoing AdjustStock with StockAdjustmentReverted and Reserve with StockReleased$`, w.inventory)
 	sc.Step(`^a rejection of (\w+) sent to "([^"]*)" is dispatched to the payment aggregate$`, w.rejectionSentTo)
@@ -218,6 +242,7 @@ func initializeCompensationScenario(sc *godog.ScenarioContext) {
 	sc.Step(`^a Compensate for (\w+) is dispatched to the inventory aggregate$`, w.compensate)
 	sc.Step(`^the aggregate emits one (\w+) event$`, w.emitsOne)
 	sc.Step(`^the aggregate emits nothing$`, w.emitsNothing)
+	sc.Step(`^the aggregates emit (\w+) at sequence (\d+) then (\w+) at sequence (\d+)$`, w.emitInOrder)
 	sc.Step(`^the emitted event takes sequence (\d+)$`, w.takesSequence)
 	sc.Step(`^the dispatch fails with ([A-Z_]+) as UNIMPLEMENTED$`, w.failsUnimplemented)
 }

@@ -40,6 +40,8 @@ type sagaWorld struct {
 	router *Router
 	resp   *pb.SagaResponse
 	err    error
+	// seen records the source sequence the Increased handler was given.
+	seen []uint32
 }
 
 func (w *sagaWorld) reset() {
@@ -49,7 +51,17 @@ func (w *sagaWorld) reset() {
 	w.router = NewRouter()
 	w.resp = nil
 	w.err = nil
-	if err := counter.RegisterOrderSaga(w.router, orderSaga{}); err != nil {
+	w.seen = nil
+	saga := counter.NewOrderSagaDispatch(orderSaga{}).OnEventWithContext(fqIncreased,
+		func(event *anypb.Any, dests *Destinations, source PageContext) ([]*pb.CommandBook, []*pb.EventBook, error) {
+			w.seen = append(w.seen, source.Sequence)
+			var increased counter.Increased
+			if err := event.UnmarshalTo(&increased); err != nil {
+				return nil, nil, err
+			}
+			return orderSaga{}.Increased(&increased, dests, source.Cover)
+		})
+	if err := w.router.RegisterSaga(saga); err != nil {
 		panic(fmt.Sprintf("register saga fixture: %v", err))
 	}
 }
@@ -169,6 +181,16 @@ func (w *sagaWorld) injectsNoEvents() error {
 	return nil
 }
 
+func (w *sagaWorld) handlerSawSequence(seq int) error {
+	if w.err != nil {
+		return fmt.Errorf("dispatch failed: %w", w.err)
+	}
+	if len(w.seen) != 1 || w.seen[0] != uint32(seq) {
+		return fmt.Errorf("saga handler saw source sequences %v, want [%d]", w.seen, seq)
+	}
+	return nil
+}
+
 func (w *sagaWorld) failsWith(code string) error {
 	var ce *CodedError
 	if !errors.As(w.err, &ce) {
@@ -201,5 +223,6 @@ func initializeSagaScenario(sc *godog.ScenarioContext) {
 	sc.Step(`^the command is deferred from source sequence (\d+) at command index (\d+)$`, w.commandIsDeferred)
 	sc.Step(`^the saga emits no commands$`, w.emitsNoCommands)
 	sc.Step(`^the saga injects no events$`, w.injectsNoEvents)
+	sc.Step(`^the saga handler saw source sequence (\d+)$`, w.handlerSawSequence)
 	sc.Step(`^the dispatch fails with ([A-Z_]+)$`, w.failsWith)
 }

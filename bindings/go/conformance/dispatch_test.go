@@ -148,16 +148,19 @@ func TestDispatch_TwoCompensatorsFanOutInRegistrationOrder(t *testing.T) {
 	}
 }
 
-// A saga's Destinations are exactly its registered target domains, and the
-// command it returns comes back stamped deferred by the router.
+// A saga's Destinations are exactly its registered target domains, its
+// handler receives the source cover, and the command it returns comes back
+// stamped deferred by the router.
 func TestDispatchSaga_DestinationsAreTheTargetDomains(t *testing.T) {
 	r := NewRouter()
 	t.Cleanup(r.Close)
 
 	var seen []string
+	var sourceDomain string
 	d := NewSagaDispatch("Shipper", "order", "inventory", "billing").
-		OnEvent(fqIncreased, func(_ *anypb.Any, dests *Destinations, _ *pb.Cover) ([]*pb.CommandBook, []*pb.EventBook, error) {
+		OnEvent(fqIncreased, func(_ *anypb.Any, dests *Destinations, sourceCover *pb.Cover) ([]*pb.CommandBook, []*pb.EventBook, error) {
 			seen = dests.Domains()
+			sourceDomain = sourceCover.GetDomain()
 			return []*pb.CommandBook{reserveCommand()}, nil, nil
 		})
 	if err := r.RegisterSaga(d); err != nil {
@@ -170,6 +173,9 @@ func TestDispatchSaga_DestinationsAreTheTargetDomains(t *testing.T) {
 	}
 	if len(seen) != 2 || seen[0] != "inventory" || seen[1] != "billing" {
 		t.Errorf("saga saw destinations %v, want [inventory billing]", seen)
+	}
+	if sourceDomain != "order" {
+		t.Errorf("saga saw source cover domain %q, want \"order\"", sourceDomain)
 	}
 	if err := assertDeferred(resp.GetCommands()[0], "order", 3, 0); err != nil {
 		t.Error(err)

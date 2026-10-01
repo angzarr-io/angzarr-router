@@ -15,6 +15,11 @@ import (
 // business method.
 type SagaEventThunk func(event *anypb.Any, dests *Destinations, sourceCover *pb.Cover) (commands []*pb.CommandBook, events []*pb.EventBook, err error)
 
+// SagaEventContextThunk is a SagaEventThunk that receives the triggering
+// event's PageContext: the source book's cover and the event's explicit
+// sequence (0 when the page carries none).
+type SagaEventContextThunk func(event *anypb.Any, dests *Destinations, source PageContext) (commands []*pb.CommandBook, events []*pb.EventBook, err error)
+
 // SagaRejectionThunk is the shape of a saga compensator. Sagas receive no
 // rejections, so the router never invokes one.
 type SagaRejectionThunk func(n *pb.Notification, rejection *pb.RejectionNotification) ([]*pb.EventBook, error)
@@ -27,7 +32,7 @@ type SagaDispatch struct {
 	name        string
 	inputDomain string
 	targets     []string
-	events      map[string]SagaEventThunk
+	events      map[string]SagaEventContextThunk
 }
 
 // NewSagaDispatch starts a saga registration translating inputDomain events
@@ -37,12 +42,20 @@ func NewSagaDispatch(name, inputDomain string, targetDomains ...string) *SagaDis
 		name:        name,
 		inputDomain: inputDomain,
 		targets:     targetDomains,
-		events:      make(map[string]SagaEventThunk),
+		events:      make(map[string]SagaEventContextThunk),
 	}
 }
 
 // OnEvent registers the translation thunk for a fully-qualified event type.
 func (d *SagaDispatch) OnEvent(fullName string, thunk SagaEventThunk) *SagaDispatch {
+	return d.OnEventWithContext(fullName, func(event *anypb.Any, dests *Destinations, source PageContext) ([]*pb.CommandBook, []*pb.EventBook, error) {
+		return thunk(event, dests, source.Cover)
+	})
+}
+
+// OnEventWithContext registers the translation thunk for a fully-qualified
+// event type; the thunk also receives the triggering event's PageContext.
+func (d *SagaDispatch) OnEventWithContext(fullName string, thunk SagaEventContextThunk) *SagaDispatch {
 	d.events[fullName] = thunk
 	return d
 }

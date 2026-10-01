@@ -829,14 +829,16 @@ func projectorUnknownInvoker(thunk ProjectorUnknownThunk) invoker {
 
 // sagaEventInvoker bridges a saga event thunk. A saga is stateless, so it
 // never touches the session's host state; it hands the thunk the saga's
-// declared Destinations and the source cover, and returns a SagaResponse.
-func sagaEventInvoker(thunk SagaEventThunk, dests *Destinations) invoker {
+// declared Destinations and the source event's PageContext, and returns a
+// SagaResponse.
+func sagaEventInvoker(thunk SagaEventContextThunk, dests *Destinations) invoker {
 	return func(_ *session, typeURL string, payload, aux []byte) ([]byte, int32) {
 		var sax abipb.SagaEventAux
 		if err := proto.Unmarshal(aux, &sax); err != nil {
 			return errorStatus(fmt.Errorf("unmarshal SagaEventAux: %w", err))
 		}
-		commands, events, err := thunk(&anypb.Any{TypeUrl: typeURL, Value: payload}, dests, sax.SourceCover)
+		source := PageContext{Cover: sax.SourceCover, Sequence: sax.SourceSeq}
+		commands, events, err := thunk(&anypb.Any{TypeUrl: typeURL, Value: payload}, dests, source)
 		if err != nil {
 			return errorStatus(err)
 		}
