@@ -273,6 +273,54 @@ public final class Builders {
         .build();
   }
 
+  /** A SagaHandleRequest whose source carries one Increased event of order root label at seq. */
+  public static SagaHandleRequest sagaRootedSource(String label, int seq) {
+    SagaHandleRequest.Builder req = sagaEventSource("test.counter.Increased", seq).toBuilder();
+    req.getSourceBuilder().setCover(coverOf("order", label));
+    return req.build();
+  }
+
+  /** count bytes counting up from first. */
+  private static ByteString byteRun(int first, int count) {
+    byte[] b = new byte[count];
+    for (int i = 0; i < count; i++) {
+      b[i] = (byte) (first + i);
+    }
+    return ByteString.copyFrom(b);
+  }
+
+  /**
+   * The parity command: cover "inventory", root bytes 10..1f, correlation "corr-1"; one page whose
+   * command is "/example.Foo" carrying 01020304.
+   */
+  public static CommandBook parityCommand() {
+    return CommandBook.newBuilder()
+        .setCover(
+            Cover.newBuilder()
+                .setDomain("inventory")
+                .setRoot(io.angzarr.UUID.newBuilder().setValue(byteRun(0x10, 16)))
+                .setCorrelationId("corr-1"))
+        .addPages(
+            CommandPage.newBuilder()
+                .setCommand(Any.newBuilder().setTypeUrl("/example.Foo").setValue(byteRun(1, 4))))
+        .build();
+  }
+
+  /**
+   * The parity source: one Increased event at sequence seq under cover "order", root bytes 00..0f,
+   * correlation "corr-1".
+   */
+  public static SagaHandleRequest paritySource(int seq) {
+    SagaHandleRequest.Builder req = sagaEventSource("test.counter.Increased", seq).toBuilder();
+    req.getSourceBuilder()
+        .setCover(
+            Cover.newBuilder()
+                .setDomain("order")
+                .setRoot(io.angzarr.UUID.newBuilder().setValue(byteRun(0x00, 16)))
+                .setCorrelationId("corr-1"));
+    return req.build();
+  }
+
   /**
    * A SagaHandleRequest whose source is a rejection Notification for fqCommand — a saga skips it
    * (sagas receive no rejections).
@@ -582,6 +630,21 @@ public final class Builders {
                     CommandPage.newBuilder()
                         .setCommand(Pack.pack(Counter.IncreaseBy.newBuilder().setN(1).build()))))
         .build();
+  }
+
+  /** The parent linkage the ledger sets on its own events. */
+  public static Any ledgerLinkage() {
+    return Any.newBuilder()
+        .setTypeUrl(typeUrl("test.counter.Parent"))
+        .setValue(ByteString.copyFrom(new byte[] {4, 5, 6}))
+        .build();
+  }
+
+  /** An IncreaseBy command for the ledger root label on behalf of a parent. */
+  public static ContextualCommand ledgerCommandWithLinkage(String label) {
+    ContextualCommand.Builder cc = ledgerCommand(label).toBuilder();
+    cc.getCommandBuilder().getCoverBuilder().setExt(parentLinkage());
+    return cc.build();
   }
 
   /** An Increased trigger from "counter" root label at sequence seq. */

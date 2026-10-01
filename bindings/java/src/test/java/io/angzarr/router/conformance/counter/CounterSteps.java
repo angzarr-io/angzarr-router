@@ -1,8 +1,10 @@
 package io.angzarr.router.conformance.counter;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.protobuf.Any;
 import io.angzarr.ContextualCommand;
@@ -192,6 +194,14 @@ public class CounterSteps {
     assertNull(err, "dispatch failed");
     Any ext = resp.getEvents().getCover().getExt();
     assertEquals(Builders.parentLinkage(), ext, "cover ext = parent linkage");
+  }
+
+  @Then("the recorded events carry no parent linkage")
+  public void eventsCarryNoParentLinkage() {
+    assertNull(err, "dispatch failed");
+    EventBook book = resp.getEvents();
+    assertTrue(book.getPagesCount() > 0, "events were recorded");
+    assertFalse(book.getCover().hasExt(), "no command linkage, no handler linkage: none on events");
   }
 
   @Then("the compensations run first then second")

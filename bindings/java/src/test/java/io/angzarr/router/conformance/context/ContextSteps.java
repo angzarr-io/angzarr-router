@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.protobuf.Any;
 import com.google.protobuf.ByteString;
+import io.angzarr.BusinessResponse;
 import io.angzarr.CommandPage;
 import io.angzarr.Cover;
 import io.angzarr.EventBook;
@@ -51,6 +52,7 @@ public class ContextSteps {
   private EventBook facts;
   private Counter.CounterState replayed;
   private ProcessManagerHandleResponse pmResp;
+  private BusinessResponse command;
   private CodedError err;
 
   @Before
@@ -62,6 +64,7 @@ public class ContextSteps {
     facts = null;
     replayed = null;
     pmResp = null;
+    command = null;
     err = null;
   }
 
@@ -94,7 +97,12 @@ public class ContextSteps {
                 "test.counter.IncreaseBy",
                 (cmd, state, cctx) -> {
                   covers.add(cctx.cover());
-                  return null;
+                  return EventBook.newBuilder()
+                      .setCover(Cover.newBuilder().setExt(Builders.ledgerLinkage()))
+                      .addPages(
+                          EventPage.newBuilder()
+                              .setEvent(Pack.pack(Counter.Increased.getDefaultInstance())))
+                      .build();
                 })
             .onFact(
                 INCREASED,
@@ -188,7 +196,12 @@ public class ContextSteps {
 
   @When("an IncreaseBy command for ledger root {string} is dispatched")
   public void ledgerCommand(String label) {
-    router.dispatch(Builders.ledgerCommand(label));
+    command = router.dispatch(Builders.ledgerCommand(label));
+  }
+
+  @When("an IncreaseBy command for ledger root {string} on behalf of a parent is dispatched")
+  public void ledgerCommandWithParent(String label) {
+    command = router.dispatch(Builders.ledgerCommandWithLinkage(label));
   }
 
   @When(
@@ -270,6 +283,17 @@ public class ContextSteps {
     assertEquals(1, covers.size(), "the handler ran once");
     assertTrue(covers.get(0).hasRoot(), "the handler saw a cover with a root");
     return covers.get(0).getRoot().getValue();
+  }
+
+  @Then("the recorded event carries the ledger's own linkage")
+  public void ledgerOwnLinkage() {
+    assertNotNull(command, "a command was dispatched");
+    assertTrue(command.hasEvents(), "expected events");
+    assertEquals(1, command.getEvents().getPagesCount(), "recorded events");
+    assertEquals(
+        Builders.ledgerLinkage(),
+        command.getEvents().getCover().getExt(),
+        "the handler-set linkage is kept over the command's");
   }
 
   @Then("the ledger handler saw root {string}")

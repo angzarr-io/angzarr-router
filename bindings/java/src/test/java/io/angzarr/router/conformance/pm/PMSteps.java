@@ -142,6 +142,18 @@ public class PMSteps {
     }
   }
 
+  @Then("the command leaves its source component to the coordinator")
+  public void noSourceComponent() {
+    assertNull(err, "dispatch failed");
+    for (CommandPage page : resp.getCommands(0).getPagesList()) {
+      assertTrue(page.getHeader().hasAngzarrDeferred(), "command page is not deferred");
+      assertEquals(
+          "",
+          page.getHeader().getAngzarrDeferred().getSourceComponent(),
+          "the coordinator stamps the component");
+    }
+  }
+
   @Then("the process-manager emits no commands")
   public void emitsNoCommands() {
     assertNull(err, "dispatch failed");
