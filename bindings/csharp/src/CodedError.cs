@@ -23,6 +23,9 @@ public sealed class CodedError : Exception
     /// <summary>SCREAMING_SNAKE cross-language identifier (may be empty).</summary>
     public string Code { get; }
 
+    /// <summary>The gRPC status code; never OK — a code of 0 (or below) is
+    /// carried as <see cref="GrpcCode.InvalidArgument"/>, since a failure
+    /// cannot report success.</summary>
     public GrpcCode Grpc { get; }
 
     public IReadOnlyDictionary<string, string> Extras { get; }
@@ -36,7 +39,7 @@ public sealed class CodedError : Exception
         : base(message ?? "")
     {
         Code = code ?? "";
-        Grpc = grpc;
+        Grpc = (int)grpc > 0 ? grpc : GrpcCode.InvalidArgument;
         Extras = extras ?? new Dictionary<string, string>();
     }
 

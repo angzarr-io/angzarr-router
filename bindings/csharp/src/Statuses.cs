@@ -23,7 +23,7 @@ internal static class Statuses
         {
             info.Metadata.Add(kv.Key, kv.Value);
         }
-        var status = new Google.Rpc.Status { Code = (int)err.Grpc, Message = err.Message ?? "" };
+        var status = new Google.Rpc.Status { Code = WireCode(err), Message = err.Message ?? "" };
         status.Details.Add(new Any { TypeUrl = ErrorInfoTypeUrl, Value = info.ToByteString() });
         return status.ToByteArray();
     }
@@ -36,8 +36,14 @@ internal static class Statuses
         var ce =
             t as CodedError
             ?? CodedError.Unhandled(string.IsNullOrEmpty(t.Message) ? t.ToString() : t.Message);
-        return new InvokerResult(ToStatusBytes(ce), -(int)ce.Grpc);
+        return new InvokerResult(ToStatusBytes(ce), -WireCode(ce));
     }
+
+    /// <summary>The failure's gRPC wire code. A failure never carries OK (or a
+    /// non-positive code): those map to INVALID_ARGUMENT, so a rejection can
+    /// never read as a successful callback status.</summary>
+    internal static int WireCode(CodedError err) =>
+        (int)err.Grpc > 0 ? (int)err.Grpc : (int)GrpcCode.InvalidArgument;
 
     /// <summary>Decodes google.rpc.Status bytes into a CodedError; <paramref
     /// name="ret"/> (the negative callback/dispatch return) is the gRPC fallback
