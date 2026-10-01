@@ -37,8 +37,8 @@ struct CommandContext {
   io::angzarr::v1::Cover cover;
 };
 
-// Where a projected event sits: its book's cover and the page's explicit
-// sequence (0 when absent).
+// Where a folded event sits (a projector fold or an applier): its book's cover
+// and the page's explicit sequence (0 when absent).
 struct PageContext {
   io::angzarr::v1::Cover cover;
   uint32_t sequence = 0;
@@ -136,6 +136,10 @@ template <class TState>
 class Rebuilder {
  public:
   using ApplierFn = std::function<void(TState&, const google::protobuf::Any&)>;
+  // An applier that also reads where the event sits (its book's cover and the
+  // page's sequence).
+  using ApplierWithContextFn =
+      std::function<void(TState&, const google::protobuf::Any&, const PageContext&)>;
 
   Rebuilder& WithSnapshot(ApplierFn fn) {
     snapshot = std::move(fn);
@@ -143,12 +147,18 @@ class Rebuilder {
   }
 
   Rebuilder& Apply(std::string full_name, ApplierFn fn) {
+    return ApplyWithContext(std::move(full_name),
+                            [fn = std::move(fn)](TState& state, const google::protobuf::Any& event,
+                                                 const PageContext&) { fn(state, event); });
+  }
+
+  Rebuilder& ApplyWithContext(std::string full_name, ApplierWithContextFn fn) {
     appliers.emplace_back(std::move(full_name), std::move(fn));
     return *this;
   }
 
   ApplierFn snapshot;
-  std::vector<std::pair<std::string, ApplierFn>> appliers;
+  std::vector<std::pair<std::string, ApplierWithContextFn>> appliers;
 };
 
 }  // namespace angzarr::router

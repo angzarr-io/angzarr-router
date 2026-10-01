@@ -39,21 +39,24 @@ struct ContextWorld {
   angzarr::router::Router router;
   std::vector<pb::Cover> covers;
   std::vector<std::pair<std::string, uint32_t>> pages;
+  std::vector<uint32_t> applied;
   std::optional<pb::EventBook> facts;
   std::optional<pb::ReplayResponse> replayed;
   std::optional<pb::ProcessManagerHandleResponse> pm;
 
   // The ledger aggregate (domain "ledger") over CounterState: Increased folds
-  // count += 1; a snapshot loads CounterState; IncreaseBy records the handled
-  // cover and emits nothing; an Increased fact is annotated as a CounterState
-  // carrying the folded count.
+  // count += 1 and records the page sequence it applied; a snapshot loads
+  // CounterState; IncreaseBy records the handled cover and emits nothing; an
+  // Increased fact is annotated as a CounterState carrying the folded count.
   void RegisterLedger() {
     Rebuilder<tc::CounterState> rebuilder;
     rebuilder
-        .Apply("test.counter.Increased",
-               [](tc::CounterState& state, const google::protobuf::Any&) {
-                 state.set_count(state.count() + 1);
-               })
+        .ApplyWithContext(
+            "test.counter.Increased",
+            [this](tc::CounterState& state, const google::protobuf::Any&, const PageContext& ctx) {
+              state.set_count(state.count() + 1);
+              applied.push_back(ctx.sequence);
+            })
         .WithSnapshot([](tc::CounterState& state, const google::protobuf::Any& any) {
           if (!state.ParseFromString(any.value())) throw std::runtime_error("decode snapshot");
         });
@@ -74,12 +77,17 @@ struct ContextWorld {
   }
 
   // The reserving process-manager (domain "reserving-pm", target "inventory")
-  // over CounterState: an Increased trigger from "counter" records the trigger
-  // cover and emits nothing; a rejected Reserve is compensated with a Release
-  // command to "inventory".
+  // over CounterState (Increased folds count += 1): an Increased trigger from
+  // "counter" records the trigger cover and emits nothing; a rejected Reserve
+  // is compensated with a Release command to "inventory".
   void RegisterReservingPm() {
+    Rebuilder<tc::CounterState> rebuilder;
+    rebuilder.Apply("test.counter.Increased",
+                    [](tc::CounterState& state, const google::protobuf::Any&) {
+                      state.set_count(state.count() + 1);
+                    });
     ProcessManagerDispatch<tc::CounterState> pmd("Reserving", "reserving-pm", {"inventory"},
-                                                 Rebuilder<tc::CounterState>{});
+                                                 std::move(rebuilder));
     pmd.OnEventWithCover("counter", "test.counter.Increased",
                          [this](const google::protobuf::Any&, tc::CounterState&,
                                 const Destinations&, const pb::Cover& trigger_cover) {
@@ -148,6 +156,13 @@ void Register(StepRegistry& r, ContextWorld& w) {
          }
          w.replayed = w.router.DispatchReplay("ledger", req);
        });
+  r.On("the reserving process-manager replays {int} Increased events", [&w](const StepArgs& a) {
+    pb::ReplayRequest req;
+    for (int i = 0; i < std::stoi(a[0]); ++i) {
+      *req.add_events() = IncreasedAt(static_cast<uint32_t>(i));
+    }
+    w.replayed = w.router.DispatchReplay("reserving-pm", req);
+  });
   r.On("an IncreaseBy command for ledger root {string} is dispatched", [&w](const StepArgs& a) {
     pb::ContextualCommand cc;
     auto* book = cc.mutable_command();
@@ -215,6 +230,11 @@ void Register(StepRegistry& r, ContextWorld& w) {
     tc::CounterState state;
     REQUIRE(state.ParseFromString(w.replayed->state().value()));
     REQUIRE(static_cast<int>(state.count()) == std::stoi(a[0]));
+  });
+  r.On("the ledger applied Increased events at sequences {int} and {int}", [&w](const StepArgs& a) {
+    const std::vector<uint32_t> want = {static_cast<uint32_t>(std::stoi(a[0])),
+                                        static_cast<uint32_t>(std::stoi(a[1]))};
+    REQUIRE(w.applied == want);
   });
   auto saw_root = [&w](const std::string& label) {
     REQUIRE(w.covers.size() == 1);

@@ -85,7 +85,7 @@ class Router {
       e->set_callback_id(Assign(ApplierInvoker<TState>(key, fn)));
     }
     if (d.rebuilder.snapshot) {
-      desc.set_snapshot_callback_id(Assign(ApplierInvoker<TState>(key, d.rebuilder.snapshot)));
+      desc.set_snapshot_callback_id(Assign(SnapshotInvoker<TState>(key, d.rebuilder.snapshot)));
     }
     for (auto& [fq, fn] : d.commands) {
       auto* e = desc.add_commands();
@@ -157,7 +157,7 @@ class Router {
       e->set_callback_id(Assign(ApplierInvoker<TState>(key, fn)));
     }
     if (d.rebuilder.snapshot) {
-      desc.set_snapshot_callback_id(Assign(ApplierInvoker<TState>(key, d.rebuilder.snapshot)));
+      desc.set_snapshot_callback_id(Assign(SnapshotInvoker<TState>(key, d.rebuilder.snapshot)));
     }
     for (auto& h : d.handlers) {
       auto* e = desc.add_events();
@@ -170,6 +170,7 @@ class Router {
       entry->set_compensates(fq);
       for (auto& fn : fns) entry->add_callback_ids(Assign(PmRejectionInvoker<TState>(key, fn)));
     }
+    desc.set_state_callback_id(Assign(StateInvoker<TState>(key)));
     Register(ffi::angzarr_router_register_process_manager, desc);
   }
 
@@ -199,8 +200,9 @@ class Router {
     return ParseResponse<pb::EventBook>(DispatchVia(request, ffi::angzarr_router_dispatch_fact),
                                         "EventBook");
   }
-  // Replays history into the state of the aggregate claiming domain (empty
-  // selects a sole registered aggregate); returns its packed state.
+  // Replays history into the state of the aggregate claiming domain, else the
+  // process manager whose own domain it is (empty selects a sole registered
+  // aggregate); returns its packed state.
   pb::ReplayResponse DispatchReplay(const std::string& domain, const pb::ReplayRequest& request) {
     abi::ReplayCall call;
     call.set_domain(domain);
@@ -279,9 +281,24 @@ class Router {
   // Each stateful adapter captures its component's key and reaches only that
   // component's state in the session.
 
+  static PageContext PageOf(const std::string& aux) {
+    abi::ProjectorEventAux pax;
+    pax.ParseFromString(aux);
+    return PageContext{pax.cover(), pax.sequence()};
+  }
+
   template <class TState>
   static Invoker ApplierInvoker(ComponentKey key,
-                                std::function<void(TState&, const google::protobuf::Any&)> fn) {
+                                typename Rebuilder<TState>::ApplierWithContextFn fn) {
+    return [key, fn](Session& s, const std::string& tu, const std::string& payload,
+                     const std::string& aux) {
+      fn(s.EnsureState<TState>(key), AnyOf(tu, payload), PageOf(aux));
+      return InvokerResult{"", ffi::kStatusOk, false};
+    };
+  }
+
+  template <class TState>
+  static Invoker SnapshotInvoker(ComponentKey key, typename Rebuilder<TState>::ApplierFn fn) {
     return [key, fn](Session& s, const std::string& tu, const std::string& payload,
                      const std::string&) {
       fn(s.EnsureState<TState>(key), AnyOf(tu, payload));
@@ -359,9 +376,7 @@ class Router {
                                        typename ProjectorDispatch<TState>::EventWithContextFn fn) {
     return [key, fn](Session& s, const std::string& tu, const std::string& payload,
                      const std::string& aux) {
-      abi::ProjectorEventAux pax;
-      pax.ParseFromString(aux);
-      fn(s.EnsureState<TState>(key), AnyOf(tu, payload), PageContext{pax.cover(), pax.sequence()});
+      fn(s.EnsureState<TState>(key), AnyOf(tu, payload), PageOf(aux));
       return InvokerResult{"", ffi::kStatusOk, false};
     };
   }
