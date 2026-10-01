@@ -221,7 +221,7 @@ func RegisterAggregate[S any](r *Router, d *AggregateDispatch[S]) error {
 		desc.Commands = append(desc.Commands, &abipb.CallbackEntry{FqType: fq, CallbackId: id})
 	}
 	for fq, thunks := range d.rejections {
-		entry := &abipb.RejectionEntry{FqCommandType: fq}
+		entry := &abipb.RejectionEntry{Compensates: fq}
 		for _, thunk := range thunks {
 			id := r.assign(rejectionInvoker(key, factory, thunk))
 			entry.CallbackIds = append(entry.CallbackIds, id)
@@ -288,7 +288,7 @@ func RegisterProjector[P any](r *Router, d *ProjectorDispatch[P]) error {
 }
 
 // RegisterSaga registers one saga component: it assigns callback ids to every
-// event/rejection thunk, serializes the SagaDescriptor, and hands it to the
+// event thunk, serializes the SagaDescriptor, and hands it to the
 // core with the shared callback gateway. A method (not a free function) since
 // a saga is stateless — it introduces no state type parameter.
 func (r *Router) RegisterSaga(d *SagaDispatch) error {
@@ -300,17 +300,10 @@ func (r *Router) RegisterSaga(d *SagaDispatch) error {
 		InputDomain:   d.inputDomain,
 		TargetDomains: d.targets,
 	}
+	dests := NewDestinations(d.targets...)
 	for fq, thunk := range d.events {
-		id := r.assign(sagaEventInvoker(thunk))
+		id := r.assign(sagaEventInvoker(thunk, dests))
 		desc.Events = append(desc.Events, &abipb.CallbackEntry{FqType: fq, CallbackId: id})
-	}
-	for fq, thunks := range d.rejections {
-		entry := &abipb.RejectionEntry{FqCommandType: fq}
-		for _, thunk := range thunks {
-			id := r.assign(sagaRejectionInvoker(thunk))
-			entry.CallbackIds = append(entry.CallbackIds, id)
-		}
-		desc.Rejections = append(desc.Rejections, entry)
 	}
 
 	descBytes, err := proto.Marshal(desc)
@@ -370,7 +363,8 @@ func RegisterProcessManager[S any](r *Router, d *ProcessManagerDispatch[S]) erro
 
 	key := r.newComponent()
 	factory := d.rebuilder.factory
-	desc := &abipb.ProcessManagerDescriptor{Name: d.name, PmDomain: d.pmDomain}
+	desc := &abipb.ProcessManagerDescriptor{Name: d.name, PmDomain: d.pmDomain, TargetDomains: d.targets}
+	dests := NewDestinations(d.targets...)
 
 	for fq, thunk := range d.rebuilder.appliers {
 		id := r.assign(applierInvoker(key, factory, thunk))
@@ -382,7 +376,7 @@ func RegisterProcessManager[S any](r *Router, d *ProcessManagerDispatch[S]) erro
 	}
 	for inputDomain, byType := range d.handlers {
 		for fq, thunk := range byType {
-			id := r.assign(pmEventInvoker(key, factory, thunk))
+			id := r.assign(pmEventInvoker(key, factory, thunk, dests))
 			desc.Events = append(desc.Events, &abipb.PmEventEntry{
 				InputDomain: inputDomain,
 				FqType:      fq,
@@ -391,7 +385,7 @@ func RegisterProcessManager[S any](r *Router, d *ProcessManagerDispatch[S]) erro
 		}
 	}
 	for fq, thunks := range d.rejections {
-		entry := &abipb.RejectionEntry{FqCommandType: fq}
+		entry := &abipb.RejectionEntry{Compensates: fq}
 		for _, thunk := range thunks {
 			id := r.assign(pmRejectionInvoker(key, factory, thunk))
 			entry.CallbackIds = append(entry.CallbackIds, id)
@@ -632,17 +626,15 @@ func projectorUnknownInvoker(thunk ProjectorUnknownThunk) invoker {
 	}
 }
 
-// sagaEventInvoker / sagaRejectionInvoker bridge the saga thunks. A saga is
-// stateless, so neither touches the session's host state — the event thunk
-// rebuilds Destinations from the aux and returns a SagaResponse.
-
-func sagaEventInvoker(thunk SagaEventThunk) invoker {
+// sagaEventInvoker bridges a saga event thunk. A saga is stateless, so it
+// never touches the session's host state; it hands the thunk the saga's
+// declared Destinations and the source cover, and returns a SagaResponse.
+func sagaEventInvoker(thunk SagaEventThunk, dests *Destinations) invoker {
 	return func(_ *session, typeURL string, payload, aux []byte) ([]byte, int32) {
 		var sax abipb.SagaEventAux
 		if err := proto.Unmarshal(aux, &sax); err != nil {
 			return errorStatus(fmt.Errorf("unmarshal SagaEventAux: %w", err))
 		}
-		dests := NewDestinations(sax.DestinationSequences)
 		commands, events, err := thunk(&anypb.Any{TypeUrl: typeURL, Value: payload}, dests, sax.SourceCover)
 		if err != nil {
 			return errorStatus(err)
@@ -655,44 +647,17 @@ func sagaEventInvoker(thunk SagaEventThunk) invoker {
 	}
 }
 
-func sagaRejectionInvoker(thunk SagaRejectionThunk) invoker {
-	return func(_ *session, _ string, _, aux []byte) ([]byte, int32) {
-		var rax abipb.RejectionAux
-		if err := proto.Unmarshal(aux, &rax); err != nil {
-			return errorStatus(fmt.Errorf("unmarshal RejectionAux: %w", err))
-		}
-		var n pb.Notification
-		if err := proto.Unmarshal(rax.Notification, &n); err != nil {
-			return errorStatus(fmt.Errorf("unmarshal Notification: %w", err))
-		}
-		var rej pb.RejectionNotification
-		if err := proto.Unmarshal(rax.Rejection, &rej); err != nil {
-			return errorStatus(fmt.Errorf("unmarshal RejectionNotification: %w", err))
-		}
-		events, err := thunk(&n, &rej)
-		if err != nil {
-			return errorStatus(err)
-		}
-		b, err := proto.Marshal(&pb.SagaResponse{Events: events})
-		if err != nil {
-			return errorStatus(fmt.Errorf("marshal SagaResponse: %w", err))
-		}
-		return b, 0
-	}
-}
-
 // pmEventInvoker / pmRejectionInvoker bridge the process-manager thunks. The
 // PM is stateful, so both lazily seed the PM's own state via the rebuilder
 // factory (the appliers fold process_state into it first, exactly as the
 // aggregate does).
 
-func pmEventInvoker[S any](key componentKey, factory func() S, thunk PMEventThunk[S]) invoker {
+func pmEventInvoker[S any](key componentKey, factory func() S, thunk PMEventThunk[S], dests *Destinations) invoker {
 	return func(s *session, typeURL string, payload, aux []byte) ([]byte, int32) {
 		var pax abipb.PmEventAux
 		if err := proto.Unmarshal(aux, &pax); err != nil {
 			return errorStatus(fmt.Errorf("unmarshal PmEventAux: %w", err))
 		}
-		dests := NewDestinations(pax.DestinationSequences)
 		st := ensureState(s, key, factory)
 		resp, err := thunk(&anypb.Any{TypeUrl: typeURL, Value: payload}, st, dests)
 		if err != nil {

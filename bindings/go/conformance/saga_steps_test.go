@@ -59,21 +59,23 @@ func (w *sagaWorld) dispatch(req *pb.SagaHandleRequest) {
 }
 
 // sagaEventSource is a SagaHandleRequest whose source carries one event of fq
-// in the "order" domain, plus the coordinator's destination-sequence map.
-func sagaEventSource(fq string, dest map[string]uint32) *pb.SagaHandleRequest {
+// in the "order" domain, at sequence seq when non-nil.
+func sagaEventSource(fq string, seq *uint32) *pb.SagaHandleRequest {
+	page := &pb.EventPage{Payload: &pb.EventPage_Event{Event: &anypb.Any{TypeUrl: typeURL(fq)}}}
+	if seq != nil {
+		page.Header = sequenceHeader(*seq)
+	}
 	return &pb.SagaHandleRequest{
 		Source: &pb.EventBook{
 			Cover: &pb.Cover{Domain: "order"},
-			Pages: []*pb.EventPage{{Payload: &pb.EventPage_Event{
-				Event: &anypb.Any{TypeUrl: typeURL(fq)},
-			}}},
+			Pages: []*pb.EventPage{page},
 		},
-		DestinationSequences: dest,
 	}
 }
 
 // sagaRejectionSource is a SagaHandleRequest whose source is a rejection
-// Notification for fqCommand — routes to the compensation path.
+// Notification for fqCommand (sagas receive no rejections, so it emits
+// nothing).
 func sagaRejectionSource(fqCommand string) *pb.SagaHandleRequest {
 	rejection := &pb.RejectionNotification{
 		RejectedCommand: &pb.CommandBook{
@@ -104,8 +106,9 @@ func sagaRejectionSource(fqCommand string) *pb.SagaHandleRequest {
 
 // --- When ---
 
-func (w *sagaWorld) increasedWithDestination(seq int) {
-	w.dispatch(sagaEventSource(fqIncreased, map[string]uint32{"inventory": uint32(seq)}))
+func (w *sagaWorld) increasedAt(seq int) {
+	s := uint32(seq)
+	w.dispatch(sagaEventSource(fqIncreased, &s))
 }
 
 func (w *sagaWorld) reserveEvent() {
@@ -124,10 +127,6 @@ func (w *sagaWorld) rejectionReserve() {
 	w.dispatch(sagaRejectionSource(fqReserve))
 }
 
-func (w *sagaWorld) rejectionUnwatched() {
-	w.dispatch(sagaRejectionSource("test.counter.Unwatched"))
-}
-
 // --- Then ---
 
 func (w *sagaWorld) emitsOneCommand(target string) error {
@@ -143,15 +142,11 @@ func (w *sagaWorld) emitsOneCommand(target string) error {
 	return nil
 }
 
-func (w *sagaWorld) commandCarriesSequence(seq int) error {
+func (w *sagaWorld) commandIsDeferred(seq, index int) error {
 	if w.err != nil {
 		return fmt.Errorf("dispatch failed: %w", w.err)
 	}
-	got := w.resp.GetCommands()[0].GetPages()[0].GetHeader().GetSequence()
-	if got != uint32(seq) {
-		return fmt.Errorf("command carries sequence %d, want %d", got, seq)
-	}
-	return nil
+	return assertDeferred(w.resp.GetCommands()[0], "order", seq, index)
 }
 
 func (w *sagaWorld) emitsNoCommands() error {
@@ -160,16 +155,6 @@ func (w *sagaWorld) emitsNoCommands() error {
 	}
 	if got := len(w.resp.GetCommands()); got != 0 {
 		return fmt.Errorf("emitted %d commands, want 0", got)
-	}
-	return nil
-}
-
-func (w *sagaWorld) injectsOneEvent() error {
-	if w.err != nil {
-		return fmt.Errorf("dispatch failed: %w", w.err)
-	}
-	if got := len(w.resp.GetEvents()); got != 1 {
-		return fmt.Errorf("injected %d events, want 1", got)
 	}
 	return nil
 }
@@ -207,16 +192,14 @@ func initializeSagaScenario(sc *godog.ScenarioContext) {
 	})
 
 	sc.Step(`^an order saga delivering to "([^"]*)"$`, func(string) {})
-	sc.Step(`^an Increased event is dispatched with destination inventory sequence (\d+)$`, w.increasedWithDestination)
+	sc.Step(`^an Increased event at sequence (\d+) is dispatched$`, w.increasedAt)
 	sc.Step(`^a Reserve event is dispatched$`, w.reserveEvent)
 	sc.Step(`^a source with no pages is dispatched$`, w.sourceNoPages)
 	sc.Step(`^a request with no source is dispatched$`, w.requestNoSource)
 	sc.Step(`^a rejection of Reserve is dispatched$`, w.rejectionReserve)
-	sc.Step(`^a rejection of Unwatched is dispatched$`, w.rejectionUnwatched)
 	sc.Step(`^the saga emits one command to "([^"]*)"$`, w.emitsOneCommand)
-	sc.Step(`^the command carries destination sequence (\d+)$`, w.commandCarriesSequence)
+	sc.Step(`^the command is deferred from source sequence (\d+) at command index (\d+)$`, w.commandIsDeferred)
 	sc.Step(`^the saga emits no commands$`, w.emitsNoCommands)
-	sc.Step(`^the saga injects one fact event$`, w.injectsOneEvent)
 	sc.Step(`^the saga injects no events$`, w.injectsNoEvents)
 	sc.Step(`^the dispatch fails with ([A-Z_]+)$`, w.failsWith)
 }

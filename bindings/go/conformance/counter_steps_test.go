@@ -24,9 +24,7 @@ func TestConformance(t *testing.T) {
 	suite := godog.TestSuite{
 		ScenarioInitializer: initializeScenario,
 		Options: &godog.Options{
-			Format: "pretty",
-			// counter.feature only for now; projector.feature lands here when
-			// the Go ProjectorDispatch binding + its steps are wired (S1).
+			Format:   "pretty",
 			Paths:    []string{"../../../conformance/features/counter.feature"},
 			TestingT: t,
 			Strict:   true,
@@ -86,6 +84,17 @@ func (w *counterWorld) unregisteredRejected() {
 func (w *counterWorld) commandNoBook()    { w.dispatch(commandMissingBook()) }
 func (w *counterWorld) commandEmptyBook() { w.dispatch(commandMissingPage()) }
 func (w *counterWorld) commandNoPayload() { w.dispatch(commandMissingPayload()) }
+
+// --- Type-URL prefix outline: history and command under one prefix ---
+
+func (w *counterWorld) recordedIncreasesPrefixed(n int, prefix string) {
+	carrier := &pb.ContextualCommand{Events: priorIncreases(uint32(n))}
+	w.prior = withTypeURLPrefix(carrier, prefix).Events
+}
+
+func (w *counterWorld) increaseByPrefixed(n int, prefix string) {
+	w.dispatch(withTypeURLPrefix(increaseCommand(uint32(n)), prefix))
+}
 
 // --- Then: assert the outcome ---
 
@@ -231,11 +240,13 @@ func initializeScenario(sc *godog.ScenarioContext) {
 
 	sc.Step(`^a new counter$`, w.aNewCounter)
 	sc.Step(`^a counter that has already recorded (\d+) increases?$`, w.recordedIncreases)
+	sc.Step(`^a counter that has already recorded (\d+) increases under the "([^"]*)" type-URL prefix$`, w.recordedIncreasesPrefixed)
 	sc.Step(`^a counter whose history holds a corrupt event$`, w.historyHoldsCorrupt)
 	sc.Step(`^a counter restored from a snapshot of 10 with one newer event$`, w.restoredFromSnapshot)
 
 	sc.Step(`^the operator increases the counter by (\d+)$`, w.increaseBy)
 	sc.Step(`^the operator increases the counter by (\d+) on behalf of a parent$`, w.increaseOnBehalf)
+	sc.Step(`^the operator increases the counter by (\d+) under the "([^"]*)" type-URL prefix$`, w.increaseByPrefixed)
 	sc.Step(`^the operator triggers a hard failure$`, w.triggerHardFailure)
 	sc.Step(`^an unhandled command is dispatched$`, w.unhandledDispatched)
 	sc.Step(`^a command with no command book is dispatched$`, w.commandNoBook)

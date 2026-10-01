@@ -7,27 +7,27 @@ import (
 )
 
 // SagaEventThunk translates one source event into commands and/or injected
-// fact events, stamping emitted commands from the supplied Destinations.
-// sourceCover is the source book's cover, so the saga can route emitted
-// commands by the trigger's identity (root, ext). Binding/generated thunks
-// unmarshal to the typed event and call the typed business method.
+// fact events. dests are the saga's declared output domains; emitted commands
+// are returned unstamped and the router stamps them deferred from the
+// triggering event. sourceCover is the source book's cover, so the saga can
+// route emitted commands by the trigger's identity (root, ext).
+// Binding/generated thunks unmarshal to the typed event and call the typed
+// business method.
 type SagaEventThunk func(event *anypb.Any, dests *Destinations, sourceCover *pb.Cover) (commands []*pb.CommandBook, events []*pb.EventBook, err error)
 
-// SagaRejectionThunk compensates a rejected command, returning fact events to
-// inject. Multiple thunks for one command run in registration order (C-0042).
+// SagaRejectionThunk is the shape of a saga compensator. Sagas receive no
+// rejections, so the router never invokes one.
 type SagaRejectionThunk func(n *pb.Notification, rejection *pb.RejectionNotification) ([]*pb.EventBook, error)
 
 // SagaDispatch is one saga component's registration: its name, the input
-// domain it consumes, the domains it issues commands to, its event handlers,
-// and ordered rejection compensators. A saga is stateless — no rebuilder, no
-// state. The shape mirrors the core's so generated wiring (unit 6) targets it
-// with minimal emitter changes.
+// domain it consumes, the domains it issues commands to, and its event
+// handlers. A saga is stateless — no rebuilder, no state — and receives no
+// rejections.
 type SagaDispatch struct {
 	name        string
 	inputDomain string
 	targets     []string
 	events      map[string]SagaEventThunk
-	rejections  map[string][]SagaRejectionThunk
 }
 
 // NewSagaDispatch starts a saga registration translating inputDomain events
@@ -38,7 +38,6 @@ func NewSagaDispatch(name, inputDomain string, targetDomains ...string) *SagaDis
 		inputDomain: inputDomain,
 		targets:     targetDomains,
 		events:      make(map[string]SagaEventThunk),
-		rejections:  make(map[string][]SagaRejectionThunk),
 	}
 }
 
@@ -48,64 +47,40 @@ func (d *SagaDispatch) OnEvent(fullName string, thunk SagaEventThunk) *SagaDispa
 	return d
 }
 
-// OnRejected appends a compensator for one fully-qualified command type;
-// repeated calls register an ordered fan-out (C-0042).
-func (d *SagaDispatch) OnRejected(fqCommand string, thunk SagaRejectionThunk) *SagaDispatch {
-	d.rejections[fqCommand] = append(d.rejections[fqCommand], thunk)
+// OnRejected accepts a saga compensator and registers nothing: sagas receive
+// no rejections (a rejection Notification in a saga's source emits nothing),
+// so the thunk never runs. Compensation belongs to the aggregate or process
+// manager that issued the command.
+//
+// Deprecated: sagas receive no rejections; declare compensates on the issuing
+// aggregate or process manager instead.
+func (d *SagaDispatch) OnRejected(string, SagaRejectionThunk) *SagaDispatch {
 	return d
 }
 
-// Destinations provides the coordinator-supplied next-sequences for command
-// stamping. Sagas and process managers are translators — they stamp emitted
-// commands, they do not rebuild destination state to make decisions.
+// Destinations are a translator's declared output domains: the domains a saga
+// or process manager may issue commands to. Commands are returned unstamped;
+// the router stamps them deferred.
 type Destinations struct {
-	sequences map[string]uint32
+	domains []string
 }
 
-// NewDestinations wraps a domain→next-sequence map (nil becomes empty).
-func NewDestinations(sequences map[string]uint32) *Destinations {
-	if sequences == nil {
-		sequences = map[string]uint32{}
-	}
-	return &Destinations{sequences: sequences}
+// NewDestinations declares the output domains, in order.
+func NewDestinations(domains ...string) *Destinations {
+	return &Destinations{domains: append([]string(nil), domains...)}
 }
 
-// SequenceFor returns the next sequence for a domain, and whether one exists.
-func (d *Destinations) SequenceFor(domain string) (uint32, bool) {
-	seq, ok := d.sequences[domain]
-	return seq, ok
-}
-
-// Has reports whether a sequence exists for the domain.
+// Has reports whether domain is a declared output domain.
 func (d *Destinations) Has(domain string) bool {
-	_, ok := d.sequences[domain]
-	return ok
-}
-
-// Domains returns every domain carrying a sequence (unordered).
-func (d *Destinations) Domains() []string {
-	domains := make([]string, 0, len(d.sequences))
-	for domain := range d.sequences {
-		domains = append(domains, domain)
-	}
-	return domains
-}
-
-// StampCommand stamps every page of cmd with the next sequence for domain.
-// A domain with no supplied sequence is the coded MISSING_DESTINATION_SEQUENCE
-// (check output_domains config).
-func (d *Destinations) StampCommand(cmd *pb.CommandBook, domain string) error {
-	seq, ok := d.sequences[domain]
-	if !ok {
-		return &CodedError{
-			Code:    "MISSING_DESTINATION_SEQUENCE",
-			Message: "no sequence for destination domain",
-			Grpc:    GrpcInvalidArgument,
-			Extras:  map[string]string{"domain": domain},
+	for _, declared := range d.domains {
+		if declared == domain {
+			return true
 		}
 	}
-	for _, page := range cmd.Pages {
-		page.Header = &pb.PageHeader{SequenceType: &pb.PageHeader_Sequence{Sequence: seq}}
-	}
-	return nil
+	return false
+}
+
+// Domains returns the declared output domains in declaration order.
+func (d *Destinations) Domains() []string {
+	return append([]string(nil), d.domains...)
 }

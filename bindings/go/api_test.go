@@ -43,7 +43,28 @@ func TestCheckAbiVersion_RefusesADriftedLibraryNamingBothVersions(t *testing.T) 
 		t.Fatal("checkAbiVersion accepted a mismatched ABI version")
 	}
 	msg := err.Error()
-	if !strings.Contains(msg, "expects ABI version 1") || !strings.Contains(msg, "reports ABI version 2") {
-		t.Errorf("error %q does not name expected (1) and actual (2) versions", msg)
+	if !strings.Contains(msg, "expects ABI version 2") || !strings.Contains(msg, "reports ABI version 3") {
+		t.Errorf("error %q does not name expected (2) and actual (3) versions", msg)
+	}
+}
+
+func TestDestinations_AreTheDeclaredOutputDomains(t *testing.T) {
+	d := NewDestinations("inventory", "billing")
+	if !d.Has("inventory") || !d.Has("billing") {
+		t.Errorf("Has(declared) = false; domains %v", d.Domains())
+	}
+	if d.Has("shipping") {
+		t.Error("Has(undeclared shipping) = true, want false")
+	}
+	got := d.Domains()
+	if len(got) != 2 || got[0] != "inventory" || got[1] != "billing" {
+		t.Errorf("Domains() = %v, want [inventory billing] in declaration order", got)
+	}
+}
+
+func TestDestinations_EmptyDeclaresNothing(t *testing.T) {
+	d := NewDestinations()
+	if d.Has("") || len(d.Domains()) != 0 {
+		t.Errorf("empty Destinations = %v, want none", d.Domains())
 	}
 }

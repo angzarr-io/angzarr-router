@@ -3,6 +3,7 @@
 package conformance
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
@@ -197,4 +198,62 @@ func mustMarshal(m proto.Message) []byte {
 		panic(fmt.Sprintf("marshal %T: %v", m, err))
 	}
 	return b
+}
+
+// sequenceHeader is a page header carrying an explicit sequence.
+func sequenceHeader(seq uint32) *pb.PageHeader {
+	return &pb.PageHeader{SequenceType: &pb.PageHeader_Sequence{Sequence: seq}}
+}
+
+// assertDeferred checks every page of cmd is stamped angzarr_deferred from
+// the triggering page: source cover domain, source_seq and command_index.
+func assertDeferred(cmd *pb.CommandBook, sourceDomain string, seq, index int) error {
+	if len(cmd.GetPages()) == 0 {
+		return errors.New("command carries no pages")
+	}
+	for i, page := range cmd.GetPages() {
+		d := page.GetHeader().GetAngzarrDeferred()
+		if d == nil {
+			return fmt.Errorf("command page %d is not deferred (header %v)", i, page.GetHeader())
+		}
+		if d.GetSourceSeq() != uint32(seq) {
+			return fmt.Errorf("page %d source_seq = %d, want %d", i, d.GetSourceSeq(), seq)
+		}
+		if d.GetCommandIndex() != uint32(index) {
+			return fmt.Errorf("page %d command_index = %d, want %d", i, d.GetCommandIndex(), index)
+		}
+		if got := d.GetSource().GetDomain(); got != sourceDomain {
+			return fmt.Errorf("page %d source domain = %q, want %q", i, got, sourceDomain)
+		}
+	}
+	return nil
+}
+
+// withTypeURLPrefix rewrites every Any type URL of cc's command pages and
+// prior-history pages to prefix + the fully-qualified name.
+func withTypeURLPrefix(cc *pb.ContextualCommand, prefix string) *pb.ContextualCommand {
+	rewrite := func(a *anypb.Any) {
+		if a != nil {
+			a.TypeUrl = prefix + fqFromURL(a.TypeUrl)
+		}
+	}
+	for _, page := range cc.GetCommand().GetPages() {
+		rewrite(page.GetCommand())
+	}
+	for _, page := range cc.GetEvents().GetPages() {
+		rewrite(page.GetEvent())
+	}
+	return cc
+}
+
+// compensatePayload is the Compensate Any for an executed fqCommand.
+func compensatePayload(fqCommand string) *anypb.Any {
+	return &anypb.Any{
+		TypeUrl: typeURL("io.angzarr.v1.Compensate"),
+		Value: mustMarshal(&pb.Compensate{
+			CommandType: fqCommand,
+			Sequences:   []uint32{0},
+			Reason:      "aborted",
+		}),
+	}
 }

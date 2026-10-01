@@ -30,7 +30,7 @@ const errorInfoDomain = "angzarr.io"
 
 // ExpectedAbiVersion is the router-ffi ABI version this binding is written
 // against (crates/router-ffi ABI_VERSION).
-const ExpectedAbiVersion uint32 = 1
+const ExpectedAbiVersion uint32 = 2
 
 // checkAbiVersion refuses a router-ffi library whose ABI version differs from
 // the one this binding marshals for.
@@ -190,8 +190,10 @@ func (d *AggregateDispatch[S]) OnCommand(fullName string, thunk CommandThunk[S])
 	return d
 }
 
-// OnRejected appends a compensator for one fully-qualified command type;
-// repeated calls register an ordered fan-out.
+// OnRejected appends a compensator for one compensates entry — the rejected
+// command's fully-qualified type ("fq.Type", sent to any domain) or
+// "domain:fq.Type" (only when it was sent to that domain); the key passes to
+// the core verbatim. Repeated calls register an ordered fan-out.
 func (d *AggregateDispatch[S]) OnRejected(fqCommand string, thunk RejectionThunk[S]) *AggregateDispatch[S] {
 	d.rejections[fqCommand] = append(d.rejections[fqCommand], thunk)
 	return d

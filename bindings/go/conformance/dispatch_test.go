@@ -6,6 +6,8 @@ import (
 	"errors"
 	"testing"
 
+	"google.golang.org/protobuf/types/known/anypb"
+
 	. "github.com/angzarr-io/angzarr-router/bindings/go"
 	pb "github.com/angzarr-io/angzarr-router/bindings/go/gen/io/angzarr/v1"
 	counter "github.com/angzarr-io/angzarr-router/bindings/go/gen/test/counter"
@@ -143,5 +145,62 @@ func TestDispatch_TwoCompensatorsFanOutInRegistrationOrder(t *testing.T) {
 		if got := fqFromURL(p.GetEvent().GetTypeUrl()); got != "test.counter."+want[i] {
 			t.Errorf("page %d = %s, want test.counter.%s", i, got, want[i])
 		}
+	}
+}
+
+// A saga's Destinations are exactly its registered target domains, and the
+// command it returns comes back stamped deferred by the router.
+func TestDispatchSaga_DestinationsAreTheTargetDomains(t *testing.T) {
+	r := NewRouter()
+	t.Cleanup(r.Close)
+
+	var seen []string
+	d := NewSagaDispatch("Shipper", "order", "inventory", "billing").
+		OnEvent(fqIncreased, func(_ *anypb.Any, dests *Destinations, _ *pb.Cover) ([]*pb.CommandBook, []*pb.EventBook, error) {
+			seen = dests.Domains()
+			return []*pb.CommandBook{reserveCommand()}, nil, nil
+		})
+	if err := r.RegisterSaga(d); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	seq := uint32(3)
+	resp, err := r.DispatchSaga(sagaEventSource(fqIncreased, &seq))
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if len(seen) != 2 || seen[0] != "inventory" || seen[1] != "billing" {
+		t.Errorf("saga saw destinations %v, want [inventory billing]", seen)
+	}
+	if err := assertDeferred(resp.GetCommands()[0], "order", 3, 0); err != nil {
+		t.Error(err)
+	}
+}
+
+// A process manager's Destinations are the target domains given at
+// construction.
+func TestDispatchProcessManager_DestinationsAreTheTargetDomains(t *testing.T) {
+	r := NewRouter()
+	t.Cleanup(r.Close)
+
+	var seen []string
+	rebuilder := NewRebuilder(func() *counter.OrderProcessManagerState { return &counter.OrderProcessManagerState{} })
+	d := NewProcessManagerDispatch("Targeted", "targeted-pm", rebuilder, "inventory").
+		OnEvent("counter", fqIncreased, func(_ *anypb.Any, _ *counter.OrderProcessManagerState, dests *Destinations) (*pb.ProcessManagerHandleResponse, error) {
+			seen = dests.Domains()
+			return &pb.ProcessManagerHandleResponse{Commands: []*pb.CommandBook{reserveCommand()}}, nil
+		})
+	if err := RegisterProcessManager(r, d); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	seq := uint32(9)
+	resp, err := r.DispatchProcessManager(pmTrigger("counter", []string{fqIncreased}, nil, &seq))
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if len(seen) != 1 || seen[0] != "inventory" {
+		t.Errorf("PM saw destinations %v, want [inventory]", seen)
+	}
+	if err := assertDeferred(resp.GetCommands()[0], "counter", 9, 0); err != nil {
+		t.Error(err)
 	}
 }

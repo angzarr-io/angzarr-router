@@ -84,18 +84,10 @@ func markerPage(name string) *pb.EventPage {
 
 type orderSaga struct{}
 
-func (orderSaga) Increased(_ *counter.Increased, dests *Destinations, _ *pb.Cover) ([]*pb.CommandBook, []*pb.EventBook, error) {
-	cmd := reserveCommand()
-	if dests.Has("inventory") {
-		if err := dests.StampCommand(cmd, "inventory"); err != nil {
-			return nil, nil, err
-		}
-	}
-	return []*pb.CommandBook{cmd}, nil, nil
-}
-
-func (orderSaga) OnReserveRejected(*pb.Notification, *pb.RejectionNotification) ([]*pb.EventBook, error) {
-	return []*pb.EventBook{oneFact()}, nil
+// Increased emits one Reserve command for "inventory"; the router stamps it
+// deferred from the triggering event.
+func (orderSaga) Increased(*counter.Increased, *Destinations, *pb.Cover) ([]*pb.CommandBook, []*pb.EventBook, error) {
+	return []*pb.CommandBook{reserveCommand()}, nil, nil
 }
 
 // --- CounterProjector ---
@@ -115,13 +107,10 @@ func (counterProjector) Finish(p *counter.CounterProjectorState, events *pb.Even
 
 type orderPM struct{}
 
-func (orderPM) Increased(_ *counter.Increased, state *counter.OrderProcessManagerState, dests *Destinations) (*pb.ProcessManagerHandleResponse, error) {
+// Increased emits one Reserve command for "inventory" (stamped deferred by the
+// router) plus one fact per prior state event.
+func (orderPM) Increased(_ *counter.Increased, state *counter.OrderProcessManagerState, _ *Destinations) (*pb.ProcessManagerHandleResponse, error) {
 	cmd := reserveCommand()
-	if dests.Has("inventory") {
-		if err := dests.StampCommand(cmd, "inventory"); err != nil {
-			return nil, err
-		}
-	}
 	facts := make([]*pb.EventBook, int(state.Count))
 	for i := range facts {
 		facts[i] = oneFact()

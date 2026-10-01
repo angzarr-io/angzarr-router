@@ -73,16 +73,18 @@ func (w *pmWorld) dispatch(req *pb.ProcessManagerHandleRequest) {
 }
 
 // pmTrigger is a request whose trigger carries the given event pages in
-// domain, plus the PM's prior state and a destination map.
-func pmTrigger(domain string, fqs []string, state *pb.EventBook, dest map[string]uint32) *pb.ProcessManagerHandleRequest {
+// domain (the newest at sequence seq when non-nil), plus the PM's prior state.
+func pmTrigger(domain string, fqs []string, state *pb.EventBook, seq *uint32) *pb.ProcessManagerHandleRequest {
 	pages := make([]*pb.EventPage, len(fqs))
 	for i, fq := range fqs {
 		pages[i] = &pb.EventPage{Payload: &pb.EventPage_Event{Event: &anypb.Any{TypeUrl: typeURL(fq)}}}
 	}
+	if seq != nil && len(pages) > 0 {
+		pages[len(pages)-1].Header = sequenceHeader(*seq)
+	}
 	return &pb.ProcessManagerHandleRequest{
-		Trigger:              &pb.EventBook{Cover: &pb.Cover{Domain: domain}, Pages: pages},
-		ProcessState:         state,
-		DestinationSequences: dest,
+		Trigger:      &pb.EventBook{Cover: &pb.Cover{Domain: domain}, Pages: pages},
+		ProcessState: state,
 	}
 }
 
@@ -149,10 +151,30 @@ func pmIssuedRejection(fqCommand, issuer string) *pb.ProcessManagerHandleRequest
 	return req
 }
 
+// pmCompensate is a request whose trigger, in the order PM's own domain, is a
+// Compensate Notification for an executed fqCommand.
+func pmCompensate(fqCommand string) *pb.ProcessManagerHandleRequest {
+	notification := &pb.Notification{Payload: compensatePayload(fqCommand)}
+	return &pb.ProcessManagerHandleRequest{
+		Trigger: &pb.EventBook{
+			Cover: &pb.Cover{Domain: "order-pm"},
+			Pages: []*pb.EventPage{{Payload: &pb.EventPage_Event{Event: &anypb.Any{
+				TypeUrl: typeURL("io.angzarr.v1.Notification"),
+				Value:   mustMarshal(notification),
+			}}}},
+		},
+	}
+}
+
 // --- When ---
 
-func (w *pmWorld) increasedWithDestination(domain string, seq int) {
-	w.dispatch(pmTrigger(domain, []string{fqIncreased}, nil, map[string]uint32{"inventory": uint32(seq)}))
+func (w *pmWorld) increasedAt(domain string, seq int) {
+	s := uint32(seq)
+	w.dispatch(pmTrigger(domain, []string{fqIncreased}, nil, &s))
+}
+
+func (w *pmWorld) compensateReserve() {
+	w.dispatch(pmCompensate(fqReserve))
 }
 
 func (w *pmWorld) increasedInDomain(domain string) {
@@ -204,15 +226,11 @@ func (w *pmWorld) emitsOneCommand(target string) error {
 	return nil
 }
 
-func (w *pmWorld) commandCarriesSequence(seq int) error {
+func (w *pmWorld) commandIsDeferred(seq, index int) error {
 	if w.err != nil {
 		return fmt.Errorf("dispatch failed: %w", w.err)
 	}
-	got := w.resp.GetCommands()[0].GetPages()[0].GetHeader().GetSequence()
-	if got != uint32(seq) {
-		return fmt.Errorf("command carries sequence %d, want %d", got, seq)
-	}
-	return nil
+	return assertDeferred(w.resp.GetCommands()[0], "counter", seq, index)
 }
 
 func (w *pmWorld) emitsNoCommands() error {
@@ -347,7 +365,8 @@ func initializeProcessManagerScenario(sc *godog.ScenarioContext) {
 	sc.Step(`^the audit process-manager rebuilt (\d+) prior state events$`, w.auditRebuiltN)
 	sc.Step(`^the order process-manager did not react$`, w.orderDidNotReact)
 	sc.Step(`^only the audit process-manager compensates$`, w.onlyAuditCompensates)
-	sc.Step(`^an Increased trigger in domain "([^"]*)" is dispatched with destination inventory sequence (\d+)$`, w.increasedWithDestination)
+	sc.Step(`^an Increased trigger in domain "([^"]*)" at sequence (\d+) is dispatched$`, w.increasedAt)
+	sc.Step(`^a Compensate for Reserve is dispatched to the order process-manager$`, w.compensateReserve)
 	sc.Step(`^an Increased trigger in domain "([^"]*)" is dispatched$`, w.increasedInDomain)
 	sc.Step(`^a trigger whose newest page is an undeclared event is dispatched$`, w.newestUndeclared)
 	sc.Step(`^an Increased trigger is dispatched over a prior state of (\d+) events$`, w.increasedOverState)
@@ -355,7 +374,7 @@ func initializeProcessManagerScenario(sc *godog.ScenarioContext) {
 	sc.Step(`^a trigger with no pages is dispatched$`, w.emptyTrigger)
 	sc.Step(`^a rejection of Reserve is dispatched$`, w.rejectionReserve)
 	sc.Step(`^the process-manager emits one command to "([^"]*)"$`, w.emitsOneCommand)
-	sc.Step(`^the command carries destination sequence (\d+)$`, w.commandCarriesSequence)
+	sc.Step(`^the command is deferred from source sequence (\d+) at command index (\d+)$`, w.commandIsDeferred)
 	sc.Step(`^the process-manager emits no commands$`, w.emitsNoCommands)
 	sc.Step(`^the process-manager rebuilt (\d+) prior state events$`, w.rebuiltN)
 	sc.Step(`^the process-manager emits one process event$`, w.emitsOneProcessEvent)
