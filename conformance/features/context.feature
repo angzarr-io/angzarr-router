@@ -1,7 +1,10 @@
 Feature: Facts, replay and handler context
 
   Beyond commands and events, an aggregate handles facts (external realities
-  it may annotate but not refuse) and replays history into state, as does a
+  of the types it declares, each recorded by its fact handler, optionally
+  followed by events that flag it, never refused; a fact of an undeclared
+  type is refused with NO_FACT_HANDLER and nothing is recorded) and replays
+  history into state, as does a
   process-manager; appliers see each event's sequence; handlers read the
   cover they are handling; a process-manager compensator may issue
   commands; a projector fold knows where each event sits. The ledger
@@ -9,15 +12,15 @@ Feature: Facts, replay and handler context
   through each binding's hand-written API over the fixture's CounterState.
   Roots are UUID v5 (NAMESPACE_OID) of the quoted label.
 
-  Scenario: a fact handler annotates each fact against the folded state
+  Scenario: a fact handler records each fact and flags it against the folded state
     Given a ledger aggregate
     When 2 Increased facts are handled over 3 prior Increased events
-    Then 2 facts are recorded, each annotated with a count of 3
+    Then each Increased fact is recorded, flagged by the counts 4 and 5
 
-  Scenario: a fact with no fact handler is recorded unchanged
+  Scenario: a fact of an undeclared type is refused
     Given a ledger aggregate
     When a Reserve fact is handled over no prior events
-    Then the fact is recorded unchanged
+    Then the facts are refused with NO_FACT_HANDLER as INVALID_ARGUMENT
 
   Scenario: replay yields the state after a snapshot and later events
     Given a ledger aggregate

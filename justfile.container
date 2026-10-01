@@ -34,10 +34,10 @@ fmt:
 lint:
     cargo clippy --manifest-path {{TOP}}/Cargo.toml --workspace --all-targets -- -D warnings
 
-# Lint the router's own protos (io.angzarr.router.ffi.v1) with buf — the
-# pinned plugins come from this image.
+# Lint the router's own protos (io.angzarr.router.ffi.v1) with buf, in the
+# root workspace so their angzarr-project imports resolve.
 buf-lint:
-    cd {{TOP}}/proto && buf lint
+    cd {{TOP}} && buf lint --path proto/io
 
 # Check proto formatting (no rewrite; fails on drift).
 buf-format:

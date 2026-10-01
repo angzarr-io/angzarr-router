@@ -195,7 +195,11 @@ fn a_notification_reaches_the_aggregate_declaring_its_compensation() {
 #[test]
 fn facts_route_to_the_domain_aggregate() {
     let router = RouterBuilder::new()
-        .aggregate(aggregate("order", "order", &["test.Create"]))
+        .aggregate(
+            aggregate("order", "order", &["test.Create"]).on_fact("test.Fact", |fact, _| {
+                Ok(crate::aggregate::FactRecord::from(fact.clone()))
+            }),
+        )
         .build()
         .expect("build");
     let facts = pb::EventBook {
@@ -879,6 +883,9 @@ fn a_compensate_reaches_only_the_aggregate_undoing_its_command() {
 fn a_boxed_aggregate_handles_facts_and_replay() {
     let boxed: Box<dyn CommandHandler> = Box::new(
         AggregateDispatch::new("order", "order", cover_applier(fresh_rebuilder()))
+            .on_fact(&crate::test_support::cover_full_name(), |fact, _| {
+                Ok(crate::aggregate::FactRecord::from(fact.clone()))
+            })
             .with_state_packer(pack_applied),
     );
     let facts = pb::EventBook {

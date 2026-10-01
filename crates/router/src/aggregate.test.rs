@@ -9,11 +9,11 @@ use std::sync::{Arc, Mutex};
 use prost::Message;
 use prost_types::Any;
 
-use crate::aggregate::{AggregateDispatch, CommandContext};
-use crate::error::codes;
+use crate::aggregate::{AggregateDispatch, CommandContext, FactRecord};
+use crate::error::{codes, GrpcCode};
 use crate::pb;
 use crate::test_support::*;
-use crate::{page_event, TYPE_URL_PREFIX};
+use crate::{page_event, type_url, TYPE_URL_PREFIX};
 
 const FQ_RESERVE: &str = "io.angzarr.examples.v1.ReserveStock";
 
@@ -763,14 +763,18 @@ fn fact_page(domain: &str) -> pb::EventPage {
     }
 }
 
-/// An aggregate folding Cover events whose Cover fact handler annotates a
-/// fact with the domains folded so far.
+/// An aggregate folding Cover events whose Cover fact handler records the
+/// fact annotated with the domains folded so far, flagged by one Cover event
+/// naming the fact.
 fn fact_aggregate() -> AggregateDispatch<TestState> {
     AggregateDispatch::new("agg-test", "ledger", cover_applier(fresh_rebuilder())).on_fact(
         &cover_full_name(),
         |fact, state: &TestState| {
             let folded = pb::Cover::decode(fact.value.as_slice()).unwrap().domain;
-            Ok(cover_any(&format!("{folded}<{}>", state.applied.join(","))))
+            Ok(FactRecord {
+                fact: cover_any(&format!("{folded}<{}>", state.applied.join(","))),
+                flags: vec![cover_any(&format!("flag:{folded}"))],
+            })
         },
     )
 }
@@ -785,16 +789,25 @@ fn recorded_domains(book: &pb::EventBook) -> Vec<String> {
         .collect()
 }
 
-#[test]
-fn facts_are_annotated_in_order_and_each_recorded_fact_folds() {
-    let facts = pb::EventBook {
+fn ledger_facts(pages: Vec<pb::EventPage>) -> pb::EventBook {
+    pb::EventBook {
         cover: Some(pb::Cover {
             domain: "ledger".to_string(),
             ..Default::default()
         }),
-        pages: vec![fact_page("f1"), fact_page("f2")],
+        pages,
         ..Default::default()
-    };
+    }
+}
+
+#[test]
+fn each_fact_is_recorded_then_flagged_and_every_recorded_event_folds() {
+    let mut first = fact_page("f1");
+    first.created_at = Some(prost_types::Timestamp {
+        seconds: 42,
+        nanos: 0,
+    });
+    let facts = ledger_facts(vec![first, fact_page("f2")]);
     let out = fact_aggregate()
         .handle_fact(&pb::FactRequest {
             facts: Some(facts.clone()),
@@ -803,27 +816,30 @@ fn facts_are_annotated_in_order_and_each_recorded_fact_folds() {
         .expect("facts");
     assert_eq!(out.cover, facts.cover, "the facts' cover is kept");
     assert_eq!(
-        out.pages
-            .iter()
-            .map(|p| p.header.clone())
-            .collect::<Vec<_>>(),
-        facts
-            .pages
-            .iter()
-            .map(|p| p.header.clone())
-            .collect::<Vec<_>>(),
-        "page headers are kept"
+        recorded_domains(&out),
+        vec!["f1<p>", "flag:f1", "f2<p,f1<p>,flag:f1>", "flag:f2"],
+        "each fact, then its flags; each folds before the next fact"
     );
-    assert_eq!(recorded_domains(&out), vec!["f1<p>", "f2<p,f1<p>>"]);
+    assert_eq!(
+        out.pages[0].header, facts.pages[0].header,
+        "a fact keeps its header"
+    );
+    assert_eq!(out.pages[2].header, facts.pages[1].header);
+    assert_eq!(out.pages[1].header, None, "a flag carries no header");
+    assert_eq!(
+        out.pages[1].created_at, out.pages[0].created_at,
+        "a flag is stamped when its fact was"
+    );
+    assert_eq!(out.pages[3].created_at, None);
 }
 
 #[test]
-fn a_fact_without_a_handler_is_recorded_unchanged() {
-    let d = AggregateDispatch::new("agg-test", "ledger", fresh_rebuilder());
-    let facts = pb::EventBook {
-        pages: vec![fact_page("f1")],
-        ..Default::default()
-    };
+fn a_fact_recorded_as_received_needs_no_flags() {
+    let d = AggregateDispatch::new("agg-test", "ledger", fresh_rebuilder())
+        .on_fact(&cover_full_name(), |fact, _s: &TestState| {
+            Ok(FactRecord::from(fact.clone()))
+        });
+    let facts = ledger_facts(vec![fact_page("f1")]);
     let out = d
         .handle_fact(&pb::FactRequest {
             facts: Some(facts.clone()),
@@ -834,10 +850,67 @@ fn a_fact_without_a_handler_is_recorded_unchanged() {
 }
 
 #[test]
+fn an_undeclared_fact_type_is_refused_before_any_handler_runs() {
+    let ran = std::sync::Arc::new(std::sync::Mutex::new(0));
+    let seen = ran.clone();
+    let d = AggregateDispatch::new("agg-test", "ledger", fresh_rebuilder()).on_fact(
+        &cover_full_name(),
+        move |fact, _s: &TestState| {
+            *seen.lock().unwrap() += 1;
+            Ok(FactRecord::from(fact.clone()))
+        },
+    );
+    let undeclared = event_page(Any {
+        type_url: type_url("test.Undeclared"),
+        value: Vec::new(),
+    });
+    let err = d
+        .handle_fact(&pb::FactRequest {
+            facts: Some(ledger_facts(vec![fact_page("f1"), undeclared])),
+            prior_events: None,
+        })
+        .expect_err("an undeclared fact type");
+    assert_eq!(err.code, codes::NO_FACT_HANDLER);
+    assert_eq!(err.grpc, GrpcCode::InvalidArgument);
+    assert_eq!(
+        err.extras.get("type_url").map(String::as_str),
+        Some(type_url("test.Undeclared").as_str())
+    );
+    assert_eq!(*ran.lock().unwrap(), 0, "no fact handler ran");
+}
+
+#[test]
+fn a_fact_page_without_an_event_is_recorded_unchanged() {
+    let d = AggregateDispatch::new("agg-test", "ledger", fresh_rebuilder());
+    let facts = ledger_facts(vec![pb::EventPage {
+        header: fact_page("f1").header,
+        ..Default::default()
+    }]);
+    let out = d
+        .handle_fact(&pb::FactRequest {
+            facts: Some(facts.clone()),
+            prior_events: None,
+        })
+        .expect("facts");
+    assert_eq!(out.pages, facts.pages);
+}
+
+#[test]
+fn absent_facts_record_nothing() {
+    let out = fact_aggregate()
+        .handle_fact(&pb::FactRequest {
+            facts: None,
+            prior_events: None,
+        })
+        .expect("facts");
+    assert_eq!(out, pb::EventBook::default());
+}
+
+#[test]
 fn a_failing_fact_handler_fails_the_request() {
     let d = AggregateDispatch::new("agg-test", "ledger", fresh_rebuilder())
         .on_fact(&cover_full_name(), |_f, _s: &TestState| {
-            Err(crate::error::HandlerError::Other("refused".to_string()))
+            Err(crate::error::HandlerError::Other("broken".to_string()))
         });
     let err = d
         .handle_fact(&pb::FactRequest {

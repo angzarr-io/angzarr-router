@@ -76,10 +76,28 @@ pub type UndoFn<S> = Box<
         + Sync,
 >;
 
-/// Validates (and may annotate) one fact against the rebuilt state, returning
-/// the fact to record. Generated thunks unmarshal to the typed fact and pack
-/// the typed result.
-pub type FactFn<S> = Box<dyn Fn(&Any, &S) -> Result<Any, HandlerError> + Send + Sync>;
+/// What a fact handler records: the fact (as received, or annotated) and the
+/// events that flag it, in order. A fact cannot be refused, so there is no
+/// way to record nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FactRecord {
+    pub fact: Any,
+    pub flags: Vec<Any>,
+}
+
+impl From<Any> for FactRecord {
+    /// The fact recorded with no flags.
+    fn from(fact: Any) -> Self {
+        FactRecord {
+            fact,
+            flags: Vec::new(),
+        }
+    }
+}
+
+/// Records one fact against the rebuilt state (ComponentOptions.facts).
+/// Generated thunks unmarshal to the typed fact and pack the typed result.
+pub type FactFn<S> = Box<dyn Fn(&Any, &S) -> Result<FactRecord, HandlerError> + Send + Sync>;
 
 /// The dispatch table for one aggregate component.
 pub struct AggregateDispatch<S> {
@@ -196,7 +214,7 @@ impl<S> AggregateDispatch<S> {
     pub fn on_fact(
         mut self,
         fq_fact_type: &str,
-        thunk: impl Fn(&Any, &S) -> Result<Any, HandlerError> + Send + Sync + 'static,
+        thunk: impl Fn(&Any, &S) -> Result<FactRecord, HandlerError> + Send + Sync + 'static,
     ) -> Self {
         self.facts.insert(fq_fact_type.to_string(), Box::new(thunk));
         self
@@ -393,32 +411,61 @@ impl<S> AggregateDispatch<S> {
         thunk(notification, compensate, &mut state, cctx).map_err(map_handler_error)
     }
 
-    /// `CommandHandlerService.HandleFact`: rebuilds state from the prior
-    /// events, then walks the fact pages in order. A fact whose type has a
-    /// fact handler is replaced by what the handler returns (it may annotate
-    /// the fact, never refuse it short of an error); every recorded fact then
-    /// folds into the state the next fact sees. The facts' cover and page
-    /// headers are kept; the coordinator assigns real sequences.
+    /// `CommandHandlerService.HandleFact`: every fact type must have a fact
+    /// handler (ComponentOptions.facts) — an undeclared one refuses the whole
+    /// request with NO_FACT_HANDLER (INVALID_ARGUMENT) before any handler runs,
+    /// so nothing is recorded. Then state rebuilds from the prior events and
+    /// the facts are walked in order: each fact's handler returns the fact to
+    /// record (it may annotate it, never refuse it) followed by the events
+    /// that flag it, and every recorded event folds into the state the next
+    /// fact sees. The facts' cover and each fact's header are kept; a flag
+    /// carries no header and its fact's `created_at`. The coordinator assigns
+    /// real sequences. A page with no event is recorded unchanged.
     pub fn handle_fact(&self, req: &pb::FactRequest) -> Result<pb::EventBook, CodedError> {
+        let pages = req.facts.as_ref().map_or(&[][..], |f| f.pages.as_slice());
+        for event in pages.iter().filter_map(crate::page_event) {
+            if !self
+                .facts
+                .contains_key(crate::type_name_from_url(&event.type_url))
+            {
+                return Err(CodedError::invalid_argument(
+                    codes::NO_FACT_HANDLER,
+                    messages::NO_FACT_HANDLER,
+                    [(extras::TYPE_URL.to_string(), event.type_url.clone())],
+                ));
+            }
+        }
         let (mut state, _) = self.rebuilder.rebuild(req.prior_events.as_ref())?;
         let Some(facts) = req.facts.as_ref() else {
             return Ok(pb::EventBook::default());
         };
+        let cover = facts.cover.as_ref();
         let mut out = pb::EventBook {
             cover: facts.cover.clone(),
             ..Default::default()
         };
         for page in &facts.pages {
-            let mut recorded = page.clone();
-            if let Some(event) = crate::page_event(page) {
-                if let Some(thunk) = self.facts.get(crate::type_name_from_url(&event.type_url)) {
-                    let annotated = thunk(event, &state).map_err(map_handler_error)?;
-                    recorded.payload = Some(pb::event_page::Payload::Event(annotated));
-                }
-            }
-            self.rebuilder
-                .apply_page(&mut state, &recorded, facts.cover.as_ref())?;
+            let Some(event) = crate::page_event(page) else {
+                out.pages.push(page.clone());
+                continue;
+            };
+            let thunk = &self.facts[crate::type_name_from_url(&event.type_url)];
+            let record = thunk(event, &state).map_err(map_handler_error)?;
+            let recorded = pb::EventPage {
+                payload: Some(pb::event_page::Payload::Event(record.fact)),
+                ..page.clone()
+            };
+            self.rebuilder.apply_page(&mut state, &recorded, cover)?;
             out.pages.push(recorded);
+            for flag in record.flags {
+                let flagged = pb::EventPage {
+                    header: None,
+                    created_at: page.created_at,
+                    payload: Some(pb::event_page::Payload::Event(flag)),
+                };
+                self.rebuilder.apply_page(&mut state, &flagged, cover)?;
+                out.pages.push(flagged);
+            }
         }
         Ok(out)
     }

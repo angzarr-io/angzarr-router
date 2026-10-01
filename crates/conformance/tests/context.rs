@@ -112,33 +112,43 @@ fn event_of(page: &pb::EventPage) -> &prost_types::Any {
     }
 }
 
-#[then(regex = r"^(\d+) facts are recorded, each annotated with a count of (\d+)$")]
-async fn annotated(w: &mut ContextWorld, facts: usize, count: u32) {
-    let book = recorded(w);
-    assert_eq!(book.pages.len(), facts);
-    for page in &book.pages {
-        let any = event_of(page);
-        assert_eq!(
-            angzarr_router::type_name_from_url(&any.type_url),
-            "test.counter.CounterState"
-        );
-        assert_eq!(
-            conf::CounterState::decode(any.value.as_slice())
-                .unwrap()
-                .count,
-            count
-        );
-    }
+#[then(regex = r"^each Increased fact is recorded, flagged by the counts (\d+) and (\d+)$")]
+async fn recorded_and_flagged(w: &mut ContextWorld, first: u32, second: u32) {
+    let recorded: Vec<(String, Option<u32>)> = recorded(w)
+        .pages
+        .iter()
+        .map(|page| {
+            let any = event_of(page);
+            let name = angzarr_router::type_name_from_url(&any.type_url).to_string();
+            let count = (name == "test.counter.CounterState").then(|| {
+                conf::CounterState::decode(any.value.as_slice())
+                    .unwrap()
+                    .count
+            });
+            (name, count)
+        })
+        .collect();
+    assert_eq!(
+        recorded,
+        vec![
+            ("test.counter.Increased".to_string(), None),
+            ("test.counter.CounterState".to_string(), Some(first)),
+            ("test.counter.Increased".to_string(), None),
+            ("test.counter.CounterState".to_string(), Some(second)),
+        ]
+    );
 }
 
-#[then("the fact is recorded unchanged")]
-async fn unchanged(w: &mut ContextWorld) {
-    let book = recorded(w);
-    assert_eq!(book.pages.len(), 1);
-    assert_eq!(
-        angzarr_router::type_name_from_url(&event_of(&book.pages[0]).type_url),
-        "test.counter.Reserve"
-    );
+#[then(regex = r"^the facts are refused with ([A-Z_]+) as INVALID_ARGUMENT$")]
+async fn facts_refused(w: &mut ContextWorld, code: String) {
+    let err = w
+        .facts
+        .as_ref()
+        .expect("facts were handled")
+        .as_ref()
+        .expect_err("the facts are refused");
+    assert_eq!(err.code, code);
+    assert_eq!(err.grpc, angzarr_router::error::GrpcCode::InvalidArgument);
 }
 
 #[then(regex = r"^the replayed state has a count of (\d+)$")]

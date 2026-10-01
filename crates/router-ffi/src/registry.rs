@@ -7,7 +7,7 @@ use std::ffi::c_void;
 
 use prost::Message;
 
-use angzarr_router::aggregate::{AggregateDispatch, CommandContext};
+use angzarr_router::aggregate::{AggregateDispatch, CommandContext, FactRecord};
 use angzarr_router::error::{codes, extras, messages, CodedError, HandlerError};
 use angzarr_router::process_manager::{
     merge_response, select_process_managers, ProcessManagerDispatch, ProcessManagerRoute,
@@ -290,13 +290,22 @@ impl FfiRouter {
             dispatch = dispatch.on_fact(&fact.fq_type, move |any, _| {
                 let (ret, bytes) = invoke(cb, id, &any.type_url, &any.value, &[]);
                 match ret {
-                    STATUS_OK => prost_types::Any::decode(bytes.unwrap_or_default().as_slice())
-                        .map_err(|_| {
-                            HandlerError::Other(
-                                "host fact handler returned undecodable Any bytes".to_string(),
-                            )
-                        }),
-                    STATUS_OK_EMPTY => Ok(any.clone()),
+                    STATUS_OK => {
+                        let record =
+                            abi_pb::FactRecord::decode(bytes.unwrap_or_default().as_slice())
+                                .map_err(|_| {
+                                    HandlerError::Other(
+                                        "host fact handler returned undecodable FactRecord bytes"
+                                            .to_string(),
+                                    )
+                                })?;
+                        // A record without a fact records the fact as received.
+                        Ok(FactRecord {
+                            fact: record.fact.unwrap_or_else(|| any.clone()),
+                            flags: record.flags,
+                        })
+                    }
+                    STATUS_OK_EMPTY => Ok(FactRecord::from(any.clone())),
                     _ => Err(host_error(ret, bytes)),
                 }
             });

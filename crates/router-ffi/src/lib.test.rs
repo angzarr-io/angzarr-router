@@ -67,6 +67,8 @@ const CB_UNDO_RESERVE: u64 = 20;
 const CB_FACT_ANNOTATE: u64 = 21;
 const CB_PACK_STATE: u64 = 22;
 const CB_PM_COMP_COMMANDS: u64 = 23;
+const CB_FACT_KEEP: u64 = 24;
+const CB_FACT_GARBAGE: u64 = 25;
 
 const FQ_ORDER_CREATED: &str = "test.order.OrderCreated";
 const FQ_RESERVE_STOCK: &str = "test.order.ReserveStock";
@@ -370,13 +372,29 @@ unsafe extern "C" fn host_cb(
             STATUS_OK
         }
         CB_FACT_ANNOTATE => {
-            // Annotates a fact with the folded counter (the state the fact sees).
+            // Annotates a fact with the folded counter (the state the fact
+            // sees) and flags it with an Increased, which folds in turn.
             let counter = with_session(key, |s| s.counter);
-            let annotated = Any {
-                type_url: "type.googleapis.com/test.counter.CounterState".to_string(),
-                value: CounterState { value: counter }.encode_to_vec(),
+            let record = abi_pb::FactRecord {
+                fact: Some(Any {
+                    type_url: "type.googleapis.com/test.counter.CounterState".to_string(),
+                    value: CounterState { value: counter }.encode_to_vec(),
+                }),
+                flags: vec![Any {
+                    type_url: format!("type.googleapis.com/{FQ_INCREASED}"),
+                    value: Increased {}.encode_to_vec(),
+                }],
             };
-            host_fill(out, &annotated.encode_to_vec());
+            host_fill(out, &record.encode_to_vec());
+            STATUS_OK
+        }
+        CB_FACT_KEEP => {
+            // A record with no fact: the fact is recorded as received.
+            host_fill(out, &abi_pb::FactRecord::default().encode_to_vec());
+            STATUS_OK
+        }
+        CB_FACT_GARBAGE => {
+            host_fill(out, &[0xFF, 0xFF, 0xFF]);
             STATUS_OK
         }
         CB_PACK_STATE => {
@@ -567,8 +585,8 @@ fn increased_history(n: u32, next_sequence: u32) -> pb::EventBook {
 }
 
 #[test]
-fn abi_version_is_two() {
-    assert_eq!(angzarr_abi_version(), 2);
+fn abi_version_is_three() {
+    assert_eq!(angzarr_abi_version(), 3);
 }
 
 #[test]
@@ -2055,19 +2073,32 @@ fn facts_are_annotated_against_folded_state_through_the_abi() {
         out.pages[0].header, facts.pages[0].header,
         "headers are kept"
     );
-    let counters: Vec<u32> = out
+    let recorded: Vec<(String, Option<u32>)> = out
         .pages
         .iter()
         .map(|p| match p.payload.as_ref() {
             Some(pb::event_page::Payload::Event(any)) => {
-                CounterState::decode(any.value.as_slice()).unwrap().value
+                let name = angzarr_router::type_name_from_url(&any.type_url).to_string();
+                let counter = name
+                    .ends_with("CounterState")
+                    .then(|| CounterState::decode(any.value.as_slice()).unwrap().value);
+                (name, counter)
             }
-            _ => panic!("fact page lost its event"),
+            _ => panic!("a recorded page lost its event"),
         })
         .collect();
-    // The annotation replaces the Increased fact, so it does not fold again:
-    // both facts see the 3 prior events.
-    assert_eq!(counters, vec![3, 3]);
+    // Each annotation replaces its Increased fact (no fold); each flag is an
+    // Increased that folds, so the second fact sees one more event.
+    assert_eq!(
+        recorded,
+        vec![
+            ("test.counter.CounterState".to_string(), Some(3)),
+            (FQ_INCREASED.to_string(), None),
+            ("test.counter.CounterState".to_string(), Some(4)),
+            (FQ_INCREASED.to_string(), None),
+        ]
+    );
+    assert_eq!(out.pages[1].header, None, "a flag carries no header");
 }
 
 #[test]
@@ -2105,11 +2136,21 @@ fn facts_route_by_their_cover_domain_through_the_abi() {
             _ => false,
         }
     };
-    assert!(
-        !annotated("counter"),
-        "counter has no fact handler: the fact is unchanged"
-    );
     assert!(annotated("other"), "other's fact handler ran");
+    let req = pb::FactRequest {
+        facts: Some(book_in_domain("counter", 1)),
+        prior_events: None,
+    };
+    let (ret, bytes) = router.call(
+        angzarr_router_dispatch_fact,
+        next_session(),
+        &req.encode_to_vec(),
+    );
+    assert_eq!(ret, -3, "counter declares no fact: INVALID_ARGUMENT");
+    assert_eq!(
+        decode_status(&bytes).1,
+        angzarr_router::error::codes::NO_FACT_HANDLER
+    );
 }
 
 #[test]
@@ -2517,4 +2558,75 @@ fn a_compensate_reaches_only_the_aggregate_of_its_domain_undoing_it() {
     let (ret, bytes) = router.dispatch(next_session(), &compensate_command(FQ_RESERVE, vec![1]));
     assert_eq!(ret, 0, "the counter (no undo for Reserve) never runs");
     assert_eq!(emitted_pages(&bytes), 1);
+}
+
+// --- fact records (ComponentOptions.facts) -----------------------------------
+
+fn counter_with_fact_handler(callback_id: u64) -> Router {
+    let mut desc = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
+    desc.facts = vec![abi_pb::CallbackEntry {
+        fq_type: FQ_INCREASED.to_string(),
+        callback_id,
+    }];
+    let r = angzarr_router_new();
+    assert_eq!(register_aggregate_desc(r, desc), 0);
+    Router(r)
+}
+
+fn handle_facts(router: &Router, facts: pb::EventBook) -> (i32, Vec<u8>) {
+    let req = pb::FactRequest {
+        facts: Some(facts),
+        prior_events: None,
+    };
+    router.call(
+        angzarr_router_dispatch_fact,
+        next_session(),
+        &req.encode_to_vec(),
+    )
+}
+
+#[test]
+fn a_fact_record_without_a_fact_records_the_fact_as_received() {
+    let router = counter_with_fact_handler(CB_FACT_KEEP);
+    let facts = book_in_domain("counter", 1);
+    let (ret, bytes) = handle_facts(&router, facts.clone());
+    assert_eq!(ret, 0);
+    assert_eq!(
+        pb::EventBook::decode(bytes.as_slice()).unwrap().pages,
+        facts.pages
+    );
+}
+
+#[test]
+fn an_undecodable_fact_record_is_an_unhandled_error() {
+    let router = counter_with_fact_handler(CB_FACT_GARBAGE);
+    let (ret, bytes) = handle_facts(&router, book_in_domain("counter", 1));
+    assert_eq!(ret, -13, "INTERNAL");
+    assert_eq!(
+        decode_status(&bytes).1,
+        angzarr_router::error::codes::UNHANDLED_HANDLER_ERROR
+    );
+}
+
+#[test]
+fn an_undeclared_fact_never_reaches_the_host() {
+    let router = counter_with_fact_handler(CB_FACT_ANNOTATE);
+    let session = next_session();
+    let mut facts = book_in_domain("counter", 1);
+    facts.pages.push(event_page_of(FQ_RESERVE));
+    let req = pb::FactRequest {
+        facts: Some(facts),
+        prior_events: Some(increased_history(2, 2)),
+    };
+    let (ret, bytes) = router.call(angzarr_router_dispatch_fact, session, &req.encode_to_vec());
+    assert_eq!(ret, -3, "INVALID_ARGUMENT");
+    assert_eq!(
+        decode_status(&bytes).1,
+        angzarr_router::error::codes::NO_FACT_HANDLER
+    );
+    assert_eq!(
+        session_snapshot(session).counter,
+        0,
+        "refused before any applier or fact handler ran"
+    );
 }

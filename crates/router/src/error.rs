@@ -47,6 +47,7 @@ pub mod codes {
     pub const EMPTY_PM_TRIGGER: &str = "EMPTY_PM_TRIGGER";
     pub const MISSING_PM_EVENT_PAYLOAD: &str = "MISSING_PM_EVENT_PAYLOAD";
     pub const UNDECLARED_OUTPUT_DOMAIN: &str = "UNDECLARED_OUTPUT_DOMAIN";
+    pub const NO_FACT_HANDLER: &str = "NO_FACT_HANDLER";
 }
 
 /// Canonical static message text (byte-equal across languages).
@@ -76,6 +77,7 @@ pub mod messages {
     pub const COMPENSATE_DECODE_FAILED: &str = "failed to decode Compensate payload";
     pub const UNDECLARED_OUTPUT_DOMAIN: &str = "domain is not a declared output domain";
     pub const REPLAY_UNSUPPORTED: &str = "the component does not support Replay";
+    pub const NO_FACT_HANDLER: &str = "no fact handler for the fact type";
 }
 
 /// Cross-language detail-key constants.

@@ -1,6 +1,7 @@
 syntax = "proto3";
 package io.angzarr.router.ffi.v1;
 
+import "google/protobuf/any.proto";
 import "io/angzarr/v1/command_handler.proto";
 import "io/angzarr/v1/types.proto";
 
@@ -42,14 +43,24 @@ message AggregateDescriptor {
   // Undo handlers keyed by the FULLY-QUALIFIED type of the executed command
   // a Compensate undoes (fq_type = Compensate.command_type).
   repeated CallbackEntry undoes = 7;
-  // Fact handlers keyed by FULLY-QUALIFIED fact (event) type. The callback
-  // receives the fact Any (type_url / payload) with the session state rebuilt,
-  // and returns the fact to record as serialized google.protobuf.Any
-  // (STATUS_OK) or STATUS_OK_EMPTY to record it unchanged.
+  // Fact handlers keyed by FULLY-QUALIFIED fact (event) type: the aggregate's
+  // declared facts (ComponentOptions.facts). The callback receives the fact
+  // Any (type_url / payload) with the session state rebuilt, and returns a
+  // serialized FactRecord (STATUS_OK) or STATUS_OK_EMPTY to record the fact
+  // unchanged with no flags. A fact of an undeclared type never reaches the
+  // host: the router refuses it with NO_FACT_HANDLER.
   repeated CallbackEntry facts = 8;
   // Packs the session's current state into a serialized google.protobuf.Any
   // (for Replay); absent when the aggregate does not support Replay.
   optional uint64 state_callback_id = 9;
+}
+
+// Response bytes of a fact callback (STATUS_OK): the fact to record (as
+// received, or annotated) and the events that flag it, in order. Each folds
+// through the appliers before the next fact.
+message FactRecord {
+  google.protobuf.Any fact = 1;
+  repeated google.protobuf.Any flags = 2;
 }
 
 // Registration payload for one projector component. Folds cross the
@@ -166,7 +177,7 @@ message ReplayCall {
 // facts, escalation).
 message RejectionAux {
   bytes notification = 1; // serialized angzarr Notification
-  bytes rejection = 2;    // serialized angzarr RejectionNotification
+  bytes rejection = 2; // serialized angzarr RejectionNotification
   CommandContextAux cctx = 3;
 }
 
@@ -174,6 +185,6 @@ message RejectionAux {
 // command type).
 message UndoAux {
   bytes notification = 1; // serialized angzarr Notification
-  bytes compensate = 2;   // serialized angzarr Compensate
+  bytes compensate = 2; // serialized angzarr Compensate
   CommandContextAux cctx = 3;
 }

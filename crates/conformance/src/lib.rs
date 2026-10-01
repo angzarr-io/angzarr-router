@@ -6,7 +6,7 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use angzarr_router::aggregate::AggregateDispatch;
+use angzarr_router::aggregate::{AggregateDispatch, FactRecord};
 use angzarr_router::error::{CodedError, HandlerError};
 use angzarr_router::process_manager::ProcessManagerDispatch;
 use angzarr_router::projector::ProjectorDispatch;
@@ -1061,9 +1061,10 @@ fn increased_page(seq: Option<u32>) -> pb::EventPage {
 }
 
 /// The ledger aggregate (domain "ledger") over CounterState: Increased folds
-/// count += 1 and records the page sequence it applied; a snapshot loads CounterState; IncreaseBy records the handled
-/// cover and emits nothing; an Increased fact is annotated as a CounterState
-/// carrying the folded count.
+/// count += 1 and records the page sequence it applied; a snapshot loads
+/// CounterState; IncreaseBy records the handled cover and emits nothing; the
+/// only declared fact, Increased, is recorded as received and flagged by a
+/// CounterState carrying the count it brings the ledger to.
 pub fn ledger_aggregate(seen: CoverSink, applied: SequenceSink) -> AggregateDispatch<CounterState> {
     let rebuilder = Rebuilder::new(CounterState::default)
         .apply_with_context(
@@ -1083,10 +1084,16 @@ pub fn ledger_aggregate(seen: CoverSink, applied: SequenceSink) -> AggregateDisp
             seen.lock().unwrap().push(cctx.cover.clone());
             Ok(None)
         })
-        .on_fact("test.counter.Increased", |_fact, state: &CounterState| {
-            Ok(prost_types::Any {
-                type_url: angzarr_router::type_url("test.counter.CounterState"),
-                value: CounterState { count: state.count }.encode_to_vec(),
+        .on_fact("test.counter.Increased", |fact, state: &CounterState| {
+            Ok(FactRecord {
+                fact: fact.clone(),
+                flags: vec![prost_types::Any {
+                    type_url: angzarr_router::type_url("test.counter.CounterState"),
+                    value: CounterState {
+                        count: state.count + 1,
+                    }
+                    .encode_to_vec(),
+                }],
             })
         })
 }
