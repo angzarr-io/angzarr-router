@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Linq;
 using Angzarr;
 using Angzarr.Router;
 using NUnit.Framework;
@@ -8,7 +9,8 @@ using TC = Test.Counter;
 namespace Angzarr.Router.Conformance.Pm;
 
 /// <summary>Step definitions for process_manager.feature — the
-/// OrderProcessManager stateful trigger-side dispatch.</summary>
+/// OrderProcessManager stateful trigger-side dispatch, alone or co-resident
+/// with the AuditProcessManager on one router.</summary>
 [Binding]
 [Scope(Feature = "Order process-manager dispatch")]
 public sealed class PmSteps
@@ -21,7 +23,6 @@ public sealed class PmSteps
     public void Before()
     {
         _router = new Router();
-        TC.OrderProcessManagerAngzarr.RegisterOrderProcessManager(_router, new PmFixture());
         _resp = null;
         _err = null;
     }
@@ -44,9 +45,14 @@ public sealed class PmSteps
     }
 
     [Given("an order process-manager")]
-    public void AnOrderProcessManager()
+    public void AnOrderProcessManager() =>
+        TC.OrderProcessManagerAngzarr.RegisterOrderProcessManager(_router, new PmFixture());
+
+    [Given("co-resident order and audit process-managers")]
+    public void CoResidentOrderAndAudit()
     {
-        // The fixture is registered in Before.
+        TC.OrderProcessManagerAngzarr.RegisterOrderProcessManager(_router, new PmFixture());
+        TC.AuditProcessManagerAngzarr.RegisterAuditProcessManager(_router, new AuditPmFixture());
     }
 
     [When(
@@ -88,6 +94,21 @@ public sealed class PmSteps
             )
         );
 
+    [When("an Increased trigger is dispatched over a prior {string} state of {int} events")]
+    public void IncreasedOverOwnedState(string owner, int n) =>
+        Dispatch(
+            Builders.PmTrigger(
+                "counter",
+                new[] { "test.counter.Increased" },
+                Builders.PmStateIn(owner, n),
+                null
+            )
+        );
+
+    [When("a rejection of Reserve issued by {string} is dispatched")]
+    public void RejectionIssuedBy(string issuer) =>
+        Dispatch(Builders.PmIssuedRejection("test.counter.Reserve", issuer));
+
     [When("a request with no trigger is dispatched")]
     public void NoTrigger() => Dispatch(Builders.PmNoTrigger());
 
@@ -121,6 +142,43 @@ public sealed class PmSteps
     {
         Assert.That(_err, Is.Null, "dispatch unexpectedly failed");
         Assert.That(_resp!.Facts.Count, Is.EqualTo(n), "rebuilt prior state events");
+    }
+
+    private ProcessManagerHandleResponse Succeeded()
+    {
+        Assert.That(_err, Is.Null, "dispatch unexpectedly failed: " + _err?.Message);
+        return _resp!;
+    }
+
+    private int FactsMarked(bool audit) =>
+        Succeeded().Facts.Count(f => (f.Cover?.Domain == AuditPmFixture.Mark) == audit);
+
+    [Then("the order process-manager rebuilt {int} prior state events")]
+    public void OrderRebuiltN(int n) =>
+        Assert.That(FactsMarked(false), Is.EqualTo(n), "order PM facts = its rebuilt events");
+
+    [Then("the audit process-manager rebuilt {int} prior state events")]
+    public void AuditRebuiltN(int n) =>
+        Assert.That(FactsMarked(true), Is.EqualTo(n), "audit PM facts = its rebuilt events");
+
+    [Then("the order process-manager did not react")]
+    public void OrderDidNotReact()
+    {
+        Assert.That(Succeeded().Commands.Count, Is.EqualTo(0), "the order PM emitted no command");
+        Assert.That(FactsMarked(false), Is.EqualTo(0), "the order PM emitted no fact");
+    }
+
+    [Then("only the audit process-manager compensates")]
+    public void OnlyAuditCompensates()
+    {
+        var resp = Succeeded();
+        Assert.That(resp.ProcessEvents.Count, Is.EqualTo(1), "exactly one compensation");
+        Assert.That(
+            resp.ProcessEvents[0].Cover?.Domain,
+            Is.EqualTo(AuditPmFixture.Mark),
+            "the audit PM compensated"
+        );
+        Assert.That(resp.Notification, Is.Null, "the order PM did not escalate");
     }
 
     [Then("the dispatch fails with {word}")]

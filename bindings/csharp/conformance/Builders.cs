@@ -312,6 +312,52 @@ public static class Builders
         };
     }
 
+    /// <summary>A process state of n Increased pages owned by (covered with)
+    /// the given PM domain.</summary>
+    public static EventBook PmStateIn(string owner, int n)
+    {
+        var book = PmStateOf(n);
+        book.Cover = new Cover { Domain = owner };
+        return book;
+    }
+
+    /// <summary>A rejection of fqCommand addressed to the issuing PM's domain:
+    /// the trigger cover is the issuer, and the rejected command's
+    /// angzarr_deferred header names the issuer as its source.</summary>
+    public static ProcessManagerHandleRequest PmIssuedRejection(string fqCommand, string issuer)
+    {
+        var rejection = new RejectionNotification
+        {
+            RejectedCommand = new CommandBook
+            {
+                Cover = new Cover { Domain = "inventory" },
+                Pages =
+                {
+                    new CommandPage
+                    {
+                        Command = AnyEmpty(fqCommand),
+                        Header = new PageHeader
+                        {
+                            AngzarrDeferred = new AngzarrDeferredSequence
+                            {
+                                Source = new Cover { Domain = issuer },
+                            },
+                        },
+                    },
+                },
+            },
+        };
+        var notification = new Notification { Payload = Pack.Wrap(rejection) };
+        return new ProcessManagerHandleRequest
+        {
+            Trigger = new EventBook
+            {
+                Cover = new Cover { Domain = issuer },
+                Pages = { new EventPage { Event = Pack.Wrap(notification) } },
+            },
+        };
+    }
+
     public static ProcessManagerHandleRequest PmNoTrigger() => new();
 
     public static ProcessManagerHandleRequest PmEmptyTrigger() =>
