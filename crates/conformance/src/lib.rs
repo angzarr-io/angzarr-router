@@ -1019,7 +1019,6 @@ pub fn with_type_url_prefix(mut cmd: pb::ContextualCommand, prefix: &str) -> pb:
     cmd
 }
 
-
 // ---------------------------------------------------------------------------
 // Context fixtures: facts, replay, cover access, PM compensator commands,
 // projector page context (context.feature).
