@@ -7,6 +7,7 @@ import { After, Before, Given, Then, When } from "@cucumber/cucumber";
 import {
   AggregateDispatch,
   type BusinessResponse,
+  BusinessResponseSchema,
   CodedError,
   EventBookSchema,
   EventPageSchema,
@@ -132,5 +133,56 @@ Then(
   "the binding dispatch fails with {word} as INVALID_ARGUMENT",
   function (code: string) {
     assertCoded(bctx.err, code, GrpcCode.InvalidArgument);
+  },
+);
+
+// --- ordered compensator fan-out --------------------------------------------
+
+Given("a binding counter aggregate with two Reserve compensators", function () {
+  bctx.router = new Router();
+  const compensator = (name: string) => (): BusinessResponse => {
+    bctx.calls.push(name);
+    return create(BusinessResponseSchema, {
+      result: {
+        case: "events",
+        value: create(EventBookSchema, { pages: [markerPage(name)] }),
+      },
+    });
+  };
+  bctx.router.registerAggregate(
+    counterDispatch()
+      .onRejected("test.counter.Reserve", compensator("CompensatedFirst"))
+      .onRejected("test.counter.Reserve", compensator("CompensatedSecond")),
+  );
+});
+
+When(
+  "a Reserve rejection is dispatched through the binding router",
+  function () {
+    capture(() =>
+      bctx.router!.dispatch(B.rejectionCommand("test.counter.Reserve")),
+    );
+  },
+);
+
+Then("the compensators ran first then second", function () {
+  assert.equal(bctx.err, undefined, `dispatch failed: ${bctx.err}`);
+  assert.deepEqual(bctx.calls, ["CompensatedFirst", "CompensatedSecond"]);
+});
+
+Then(
+  "the compensation merged {int} events, the first from the first compensator",
+  function (n: number) {
+    const r = bctx.resp!;
+    assert.equal(r.result.case, "events", "compensation recorded events");
+    const pages = r.result.case === "events" ? r.result.value.pages : [];
+    assert.equal(pages.length, n, "merged compensation events");
+    const urls = pages.map((p) =>
+      p.payload.case === "event" ? p.payload.value.typeUrl : "",
+    );
+    assert.deepEqual(urls, [
+      "/test.counter.CompensatedFirst",
+      "/test.counter.CompensatedSecond",
+    ]);
   },
 );
