@@ -19,6 +19,12 @@ export interface Outcome {
   status: number;
 }
 
+/** The gRPC code a failure crosses the boundary with: OK (0) is never a
+ * failure code, so a CodedError carrying it is an invalid argument. */
+export function failureGrpc(err: CodedError): GrpcCode {
+  return err.grpc === 0 ? GrpcCode.InvalidArgument : err.grpc;
+}
+
 /** Serializes a CodedError as google.rpc.Status bytes carrying a
  * google.rpc.ErrorInfo detail — the exact shape the core decodes. */
 export function toStatusBytes(err: CodedError): Uint8Array {
@@ -28,7 +34,7 @@ export function toStatusBytes(err: CodedError): Uint8Array {
     metadata: { ...err.extras },
   });
   const status = create(StatusSchema, {
-    code: err.grpc,
+    code: failureGrpc(err),
     message: err.message,
     details: [
       create(AnySchema, {
@@ -41,7 +47,8 @@ export function toStatusBytes(err: CodedError): Uint8Array {
 }
 
 /** Maps any thrown value to (Status bytes, negative gRPC code): a CodedError
- * keeps its code; anything else is UNHANDLED_HANDLER_ERROR / Internal. */
+ * keeps its code (OK becoming InvalidArgument); anything else is
+ * UNHANDLED_HANDLER_ERROR / Internal. */
 export function errorResult(err: unknown): Outcome {
   const ce =
     err instanceof CodedError
@@ -49,7 +56,7 @@ export function errorResult(err: unknown): Outcome {
       : unhandled(
           err instanceof Error && err.message ? err.message : String(err),
         );
-  return { response: toStatusBytes(ce), status: -ce.grpc };
+  return { response: toStatusBytes(ce), status: -failureGrpc(ce) };
 }
 
 /** Decodes google.rpc.Status bytes into a CodedError; `ret` (the negative

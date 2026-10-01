@@ -109,3 +109,28 @@ Then("registering on the router fails with {word}", function (code: string) {
   }
   assertCoded(err, code, GrpcCode.FailedPrecondition);
 });
+
+// --- coded error with gRPC OK -----------------------------------------------
+
+Given(
+  "a binding counter aggregate whose handler throws {word} with gRPC code {int}",
+  function (code: string, grpc: number) {
+    bctx.router = new Router();
+    bctx.router.registerAggregate(
+      counterDispatch().onCommand("test.counter.IncreaseBy", () => {
+        throw new CodedError(code, "handler refused", grpc as GrpcCode);
+      }),
+    );
+  },
+);
+
+When("a command is dispatched through the binding router", function () {
+  capture(() => bctx.router!.dispatch(B.increaseCommand(1)));
+});
+
+Then(
+  "the binding dispatch fails with {word} as INVALID_ARGUMENT",
+  function (code: string) {
+    assertCoded(bctx.err, code, GrpcCode.InvalidArgument);
+  },
+);
