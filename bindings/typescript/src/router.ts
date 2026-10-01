@@ -21,6 +21,7 @@ import { type Session } from "./session";
 import { errorResult, fromStatusBytes, type Outcome } from "./statuses";
 import { CommandContext } from "./thunks";
 import {
+  type ApplierContextThunk,
   type ApplierThunk,
   type CommandThunk,
   type FactThunk,
@@ -169,7 +170,7 @@ export class Router {
       desc.appliers.push(
         create(CallbackEntrySchema, {
           fqType: fq,
-          callbackId: this.assign(applierInvoker(state, thunk)),
+          callbackId: this.assign(applierContextInvoker(state, thunk)),
         }),
       );
     }
@@ -283,7 +284,7 @@ export class Router {
       desc.appliers.push(
         create(CallbackEntrySchema, {
           fqType: fq,
-          callbackId: this.assign(applierInvoker(state, thunk)),
+          callbackId: this.assign(applierContextInvoker(state, thunk)),
         }),
       );
     }
@@ -309,6 +310,10 @@ export class Router {
         entry.callbackIds.push(this.assign(pmRejectionInvoker(state, thunk)));
       }
       desc.rejections.push(entry);
+    }
+    const schema = d.rebuilder.stateSchema;
+    if (schema) {
+      desc.stateCallbackId = this.assign(stateInvoker(state, schema));
     }
     this.check(
       Ffi.register(
@@ -377,8 +382,10 @@ export class Router {
   }
 
   /** Replays history into the state of the aggregate claiming `domain` (empty
-   * selects a sole registered aggregate); the response carries the state
-   * packed as an Any. */
+   * selects a sole registered aggregate), or of the process manager whose own
+   * domain it is when no aggregate claims it; the response carries the state
+   * packed as an Any. A component whose rebuilder declares no state schema
+   * does not support Replay (NO_HANDLER_REGISTERED). */
   dispatchReplay(domain: string, request: ReplayRequest): ReplayResponse {
     const call = create(ReplayCallSchema, { domain, request });
     return this.parse(
@@ -482,6 +489,20 @@ const OK_EMPTY: Outcome = { response: null, status: Ffi.STATUS_OK_EMPTY };
 function applierInvoker<T>(state: StateOf<T>, thunk: ApplierThunk<T>): Invoker {
   return (session, typeUrl, payload) => {
     thunk(ensure(session, state), anyOf(typeUrl, payload));
+    return OK;
+  };
+}
+
+function applierContextInvoker<T>(
+  state: StateOf<T>,
+  thunk: ApplierContextThunk<T>,
+): Invoker {
+  return (session, typeUrl, payload, aux) => {
+    const pax = fromBinary(ProjectorEventAuxSchema, aux);
+    thunk(ensure(session, state), anyOf(typeUrl, payload), {
+      cover: pax.cover,
+      sequence: pax.sequence,
+    });
     return OK;
   };
 }

@@ -1,16 +1,17 @@
 import { type DescMessage } from "@bufbuild/protobuf";
 
-import { type ApplierThunk } from "./thunks";
+import { type ApplierContextThunk, type ApplierThunk } from "./thunks";
 
 /**
  * Folds a component's prior events (and optional snapshot) into a state message
  * before a handler runs. The factory produces a fresh state message; appliers
  * mutate it page by page. Generic in the state message so appliers stay typed.
- * When the state's protobuf schema is known, an aggregate registered with this
- * rebuilder supports Replay (the router packs the replayed state with it).
+ * When the state's protobuf schema is known, an aggregate or process manager
+ * registered with this rebuilder supports Replay (the router packs the
+ * replayed state with it).
  */
 export class Rebuilder<T> {
-  readonly appliers = new Map<string, ApplierThunk<T>>();
+  readonly appliers = new Map<string, ApplierContextThunk<T>>();
   snapshot?: ApplierThunk<T>;
   stateSchema?: DescMessage;
 
@@ -25,6 +26,15 @@ export class Rebuilder<T> {
 
   /** Registers an applier for one fully-qualified event type. */
   apply(fullName: string, thunk: ApplierThunk<T>): this {
+    return this.applyWithContext(fullName, (state, event) =>
+      thunk(state, event),
+    );
+  }
+
+  /** Registers an applier for one fully-qualified event type that also
+   * receives the event's PageContext (its book's cover and the page's
+   * sequence). */
+  applyWithContext(fullName: string, thunk: ApplierContextThunk<T>): this {
     this.appliers.set(fullName, thunk);
     return this;
   }

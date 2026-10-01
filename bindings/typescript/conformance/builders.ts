@@ -622,6 +622,14 @@ export function replayRequest(count: number, events: number): ReplayRequest {
   });
 }
 
+/** A ReplayRequest of `events` Increased events at sequences 0... and no
+ * snapshot. */
+export function eventsReplayRequest(events: number): ReplayRequest {
+  return create(ReplayRequestSchema, {
+    events: Array.from({ length: events }, (_, i) => increasedPage(i)),
+  });
+}
+
 /** An IncreaseBy command for the ledger root `label`. */
 export function ledgerCommand(label: string): ContextualCommand {
   return create(ContextualCommandSchema, {

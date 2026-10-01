@@ -20,6 +20,7 @@ import { ledgerAggregate, reservingPm, trackingProjector } from "./hand_built";
 interface ContextCtx {
   router?: Router;
   covers: (Cover | undefined)[];
+  applied: number[];
   pages: [Uint8Array, number][];
   facts?: EventBook;
   replayed?: ReplayResponse;
@@ -29,7 +30,7 @@ interface ContextCtx {
 let xctx: ContextCtx;
 
 Before(() => {
-  xctx = { covers: [], pages: [] };
+  xctx = { covers: [], applied: [], pages: [] };
 });
 
 After(() => {
@@ -43,7 +44,7 @@ function router(): Router {
 
 Given("a ledger aggregate", function () {
   xctx.router = new Router();
-  xctx.router.registerAggregate(ledgerAggregate(xctx.covers));
+  xctx.router.registerAggregate(ledgerAggregate(xctx.covers, xctx.applied));
 });
 
 Given("a reserving process-manager", function () {
@@ -76,6 +77,23 @@ When(
       "ledger",
       B.replayRequest(count, events),
     );
+  },
+);
+
+When(
+  "the reserving process-manager replays {int} Increased events",
+  function (events: number) {
+    xctx.replayed = router().dispatchReplay(
+      "reserving-pm",
+      B.eventsReplayRequest(events),
+    );
+  },
+);
+
+Then(
+  "the ledger applied Increased events at sequences {int} and {int}",
+  function (first: number, second: number) {
+    assert.deepEqual(xctx.applied, [first, second]);
   },
 );
 

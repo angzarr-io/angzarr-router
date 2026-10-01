@@ -46,6 +46,14 @@ export interface PageContext {
 /** Folds one event into rebuilding state. */
 export type ApplierThunk<T> = (state: T, event: Any) => void;
 
+/** Folds one event into rebuilding state; `ctx` says where the event sits
+ * (its book's cover and the page's sequence). */
+export type ApplierContextThunk<T> = (
+  state: T,
+  event: Any,
+  ctx: PageContext,
+) => void;
+
 /** Handles a command; returns the EventBook to persist, or undefined for nothing. */
 export type CommandThunk<T> = (
   command: Any,

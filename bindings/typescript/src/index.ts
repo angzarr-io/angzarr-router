@@ -27,6 +27,7 @@ export {
 export { GrpcCode, grpcFromWire } from "./grpcCode";
 export {
   CommandContext,
+  type ApplierContextThunk,
   type ApplierThunk,
   type CommandThunk,
   type FactThunk,

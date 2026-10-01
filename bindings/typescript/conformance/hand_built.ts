@@ -49,18 +49,20 @@ export function inventoryAggregate(): AggregateDispatch<object> {
 }
 
 /** The ledger aggregate (domain "ledger") over CounterState: Increased folds
- * count += 1; a snapshot loads CounterState; IncreaseBy records the handled
+ * count += 1 and records the page sequence it applied; a snapshot loads CounterState; IncreaseBy records the handled
  * cover and emits nothing; an Increased fact is annotated as a CounterState
  * carrying the folded count. */
 export function ledgerAggregate(
   seen: (Cover | undefined)[],
+  applied: number[],
 ): AggregateDispatch<CounterState> {
   const rebuilder = new Rebuilder<CounterState>(
     () => create(CounterStateSchema),
     CounterStateSchema,
   )
-    .apply("test.counter.Increased", (state) => {
+    .applyWithContext("test.counter.Increased", (state, _event, ctx) => {
       state.count += 1;
+      applied.push(ctx.sequence);
     })
     .withSnapshot((state, any) => Pack.merge(CounterStateSchema, state, any));
   return new AggregateDispatch<CounterState>("Ledger", "ledger", rebuilder)
@@ -77,7 +79,7 @@ export function ledgerAggregate(
 }
 
 /** The reserving process-manager (domain "reserving-pm", target "inventory")
- * over CounterState: an Increased trigger from "counter" records the trigger
+ * over CounterState (Increased folds count += 1): an Increased trigger from "counter" records the trigger
  * cover and emits nothing; a rejected Reserve is compensated with a Release
  * command to "inventory". */
 export function reservingPm(
@@ -86,7 +88,12 @@ export function reservingPm(
   return new ProcessManagerDispatch<CounterState>(
     "Reserving",
     "reserving-pm",
-    new Rebuilder(() => create(CounterStateSchema)),
+    new Rebuilder<CounterState>(
+      () => create(CounterStateSchema),
+      CounterStateSchema,
+    ).apply("test.counter.Increased", (state) => {
+      state.count += 1;
+    }),
     ["inventory"],
   )
     .onEvent(
