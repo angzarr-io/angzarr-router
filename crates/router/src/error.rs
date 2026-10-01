@@ -46,6 +46,7 @@ pub mod codes {
     pub const COMPENSATE_DECODE_FAILED: &str = "COMPENSATE_DECODE_FAILED";
     pub const EMPTY_PM_TRIGGER: &str = "EMPTY_PM_TRIGGER";
     pub const MISSING_PM_EVENT_PAYLOAD: &str = "MISSING_PM_EVENT_PAYLOAD";
+    pub const UNDECLARED_OUTPUT_DOMAIN: &str = "UNDECLARED_OUTPUT_DOMAIN";
 }
 
 /// Canonical static message text (byte-equal across languages).
@@ -73,6 +74,8 @@ pub mod messages {
     pub const UNKNOWN_NOTIFICATION_PAYLOAD: &str =
         "notification payload is neither a RejectionNotification nor a Compensate";
     pub const COMPENSATE_DECODE_FAILED: &str = "failed to decode Compensate payload";
+    pub const UNDECLARED_OUTPUT_DOMAIN: &str = "domain is not a declared output domain";
+    pub const REPLAY_UNSUPPORTED: &str = "the component does not support Replay";
 }
 
 /// Cross-language detail-key constants.

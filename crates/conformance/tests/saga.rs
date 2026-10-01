@@ -12,11 +12,13 @@ use cucumber::{given, then, when, World};
 struct SagaWorld {
     /// Outcome of the dispatched source.
     result: Option<Result<pb::SagaResponse, CodedError>>,
+    /// The source sequences the saga handler saw.
+    seen: conf::SequenceSink,
 }
 
 impl SagaWorld {
     fn dispatch(&mut self, req: pb::SagaHandleRequest) {
-        self.result = Some(conf::order_saga().dispatch(&req));
+        self.result = Some(conf::order_saga(self.seen.clone()).dispatch(&req));
     }
 
     fn response(&self) -> &pb::SagaResponse {
@@ -88,6 +90,11 @@ async fn command_is_deferred(w: &mut SagaWorld, seq: u32, index: u32) {
             "the source cover is the triggering book's"
         );
     }
+}
+
+#[then(regex = r"^the saga handler saw source sequence (\d+)$")]
+async fn handler_saw_sequence(w: &mut SagaWorld, seq: u32) {
+    assert_eq!(*w.seen.lock().unwrap(), vec![seq]);
 }
 
 #[then("the saga emits no commands")]

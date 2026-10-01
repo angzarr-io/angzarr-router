@@ -3,7 +3,8 @@ Feature: Order saga dispatch
   The OrderSaga proves the translation-side dispatch mechanisms the shared
   router must implement identically in every language: a declared source
   event emits a deferred command (angzarr_deferred provenance from the
-  triggering event, never an explicit sequence), an undeclared event emits
+  triggering event, never an explicit sequence) and its handler sees the
+  triggering event's sequence, an undeclared event emits
   nothing, a source missing or empty is refused with a coded error, and a
   rejection notification in a saga's source emits nothing (sagas receive no
   rejections).
@@ -34,3 +35,8 @@ Feature: Order saga dispatch
     When a rejection of Reserve is dispatched
     Then the saga emits no commands
     And the saga injects no events
+
+  Scenario: a saga handler sees the triggering event's sequence
+    Given an order saga delivering to "inventory"
+    When an Increased event at sequence 7 is dispatched
+    Then the saga handler saw source sequence 7

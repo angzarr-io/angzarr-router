@@ -1,17 +1,19 @@
 //! Cucumber harness for the compensation-routing suite: drives the shared
 //! `compensation.feature` against hand-built aggregates on the Rust core
-//! natively. The bindings run the same feature through their own hand-written
-//! aggregate APIs.
+//! natively, dispatched through a Router so several aggregates can share a
+//! domain. The bindings run the same feature through their own hand-written
+//! aggregate APIs and routers.
 
 use angzarr_router::aggregate::AggregateDispatch;
 use angzarr_router::error::{CodedError, GrpcCode};
 use angzarr_router::pb;
+use angzarr_router::router::RouterBuilder;
 use angzarr_router_conformance as conf;
 use cucumber::{given, then, when, World};
 
 #[derive(Default, World)]
 struct CompensationWorld {
-    aggregate: Option<AggregateDispatch<()>>,
+    aggregates: Vec<AggregateDispatch<()>>,
     result: Option<Result<pb::BusinessResponse, CodedError>>,
 }
 
@@ -25,8 +27,14 @@ impl std::fmt::Debug for CompensationWorld {
 
 impl CompensationWorld {
     fn dispatch(&mut self, cmd: pb::ContextualCommand) {
-        let agg = self.aggregate.as_ref().expect("an aggregate was built");
-        self.result = Some(agg.dispatch(&cmd));
+        let aggregates = std::mem::take(&mut self.aggregates);
+        assert!(!aggregates.is_empty(), "an aggregate was built");
+        let router = aggregates
+            .into_iter()
+            .fold(RouterBuilder::new(), RouterBuilder::aggregate)
+            .build()
+            .expect("the router builds");
+        self.result = Some(router.dispatch_command(&cmd));
     }
 
     fn pages(&self) -> Vec<pb::EventPage> {
@@ -46,7 +54,14 @@ impl CompensationWorld {
 
 #[given(regex = r"^a payment aggregate compensating Reserve from any domain with (\w+)$")]
 async fn payment_unqualified(w: &mut CompensationWorld, event: String) {
-    w.aggregate = Some(conf::payment_aggregate(&[("test.counter.Reserve", &event)]));
+    w.aggregates
+        .push(conf::payment_aggregate(&[("test.counter.Reserve", &event)]));
+}
+
+#[given(regex = r"^a second payment aggregate compensating Reserve from any domain with (\w+)$")]
+async fn second_payment(w: &mut CompensationWorld, event: String) {
+    w.aggregates
+        .push(conf::payment_aggregate(&[("test.counter.Reserve", &event)]));
 }
 
 #[given(
@@ -61,7 +76,7 @@ async fn payment_qualified(
 ) {
     let first = format!("{first_domain}:test.counter.Reserve");
     let second = format!("{second_domain}:test.counter.Reserve");
-    w.aggregate = Some(conf::payment_aggregate(&[
+    w.aggregates.push(conf::payment_aggregate(&[
         (&first, &first_event),
         (&second, &second_event),
     ]));
@@ -71,7 +86,7 @@ async fn payment_qualified(
     "an inventory aggregate undoing AdjustStock with StockAdjustmentReverted and Reserve with StockReleased"
 )]
 async fn inventory(w: &mut CompensationWorld) {
-    w.aggregate = Some(conf::inventory_aggregate());
+    w.aggregates.push(conf::inventory_aggregate());
 }
 
 #[when(
@@ -111,6 +126,41 @@ async fn emits_one(w: &mut CompensationWorld, event: String) {
     );
 }
 
+#[then(regex = r"^the aggregates emit (\w+) at sequence (\d+) then (\w+) at sequence (\d+)$")]
+async fn emit_in_order(
+    w: &mut CompensationWorld,
+    first: String,
+    first_seq: u32,
+    second: String,
+    second_seq: u32,
+) {
+    let got: Vec<(String, u32)> = w
+        .pages()
+        .iter()
+        .map(|page| {
+            let Some(pb::event_page::Payload::Event(any)) = page.payload.as_ref() else {
+                panic!("the page carries no event");
+            };
+            let name = angzarr_router::type_name_from_url(&any.type_url).to_string();
+            (name, explicit_sequence(page))
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (format!("test.counter.{first}"), first_seq),
+            (format!("test.counter.{second}"), second_seq),
+        ]
+    );
+}
+
+fn explicit_sequence(page: &pb::EventPage) -> u32 {
+    match page.header.as_ref().and_then(|h| h.sequence_type.as_ref()) {
+        Some(pb::page_header::SequenceType::Sequence(s)) => *s,
+        other => panic!("no explicit sequence: {other:?}"),
+    }
+}
+
 #[then("the aggregate emits nothing")]
 async fn emits_nothing(w: &mut CompensationWorld) {
     assert!(w.pages().is_empty(), "no events");
@@ -118,16 +168,7 @@ async fn emits_nothing(w: &mut CompensationWorld) {
 
 #[then(regex = r"^the emitted event takes sequence (\d+)$")]
 async fn takes_sequence(w: &mut CompensationWorld, seq: u32) {
-    let pages = w.pages();
-    let got = match pages[0]
-        .header
-        .as_ref()
-        .and_then(|h| h.sequence_type.as_ref())
-    {
-        Some(pb::page_header::SequenceType::Sequence(s)) => *s,
-        other => panic!("no explicit sequence: {other:?}"),
-    };
-    assert_eq!(got, seq);
+    assert_eq!(explicit_sequence(&w.pages()[0]), seq);
 }
 
 #[then(regex = r"^the dispatch fails with ([A-Z_]+) as UNIMPLEMENTED$")]

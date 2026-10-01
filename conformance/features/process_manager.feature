@@ -7,7 +7,8 @@ Feature: Order process-manager dispatch
   of an undeclared type does nothing, a missing or empty trigger is refused
   with a coded error, the PM's own state is rebuilt before the handler, and a
   rejection notification routes to the registered compensator with its
-  escalation.
+  escalation. A process event the handler leaves unaddressed belongs to the
+  process-manager's own domain.
 
   Co-resident process-managers share one router: each rebuilds only its own
   state (never another PM's, even within one dispatch), a process state reaches
@@ -78,3 +79,8 @@ Feature: Order process-manager dispatch
     Given an order process-manager
     When a Compensate for Reserve is dispatched to the order process-manager
     Then the dispatch fails with NO_UNDO_HANDLER
+
+  Scenario: an unaddressed process event belongs to the process-manager's own domain
+    Given an order process-manager
+    When a rejection of Reserve is dispatched
+    Then the process event is addressed to "order-pm"

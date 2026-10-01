@@ -53,7 +53,8 @@ impl<P> ProjectorDispatch<P> {
         }
     }
 
-    /// Restricts folding to books whose cover carries one of these domains.
+    /// Restricts folding to books whose cover carries one of these domains;
+    /// [`crate::WILDCARD_DOMAIN`] (`"*"`) among them consumes every domain.
     /// Unset (the default) consumes every domain.
     pub fn for_domains(mut self, domains: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.domains = Some(domains.into_iter().map(Into::into).collect());
@@ -120,7 +121,7 @@ impl<P> ProjectorDispatch<P> {
 
         let mut projection = (self.factory)();
         let consumed = match self.domains.as_ref() {
-            Some(set) => set.contains(&cover.domain),
+            Some(set) => set.contains(crate::WILDCARD_DOMAIN) || set.contains(&cover.domain),
             None => true,
         };
 

@@ -1,7 +1,8 @@
 //! angzarr-router-ffi — the C ABI over the core. Dispatch semantics live in
 //! the core; this layer owns the marshaling plus the registry's component
-//! claims: routing a command to its aggregate by domain (a sole aggregate
-//! claims everything), one projector per router, sagas by source domain, and
+//! claims: routing a command to its aggregate through the core's
+//! CommandHandlers (by domain and command type; a sole aggregate claims
+//! every domain), one projector per router, sagas by source domain, and
 //! co-resident PMs through the core's selection. Those rules are
 //! mutation-tested with the core.
 //!
@@ -390,7 +391,7 @@ pub unsafe extern "C" fn angzarr_router_dispatch_fact(
     }
 }
 
-/// Dispatches `io.angzarr.router.ffi.v1.ReplayCall` bytes through the replay of the aggregate claiming its domain. On success returns 0 and fills `out`
+/// Dispatches `io.angzarr.router.ffi.v1.ReplayCall` bytes through the replay of the first aggregate of its domain, else the process manager owning it. On success returns 0 and fills `out`
 /// with `io.angzarr.v1.ReplayResponse` bytes; on failure returns the negated gRPC code and fills
 /// `out` with `google.rpc.Status` bytes. Either way the host releases `out`
 /// with `angzarr_buf_release`.

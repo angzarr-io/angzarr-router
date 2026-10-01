@@ -950,3 +950,151 @@ fn replay_folds_the_snapshot_then_the_events() {
         .expect("replay");
     assert_eq!(state.applied, vec!["snapshot", "a", "b"]);
 }
+
+// --- process events address the PM's own stream (C-0477) -------------------
+
+fn trigger_with_correlation(domain: &str, correlation_id: &str) -> pb::EventBook {
+    let mut book = trigger(domain, vec![ev(FQ_SHIPPED)]);
+    book.cover.as_mut().unwrap().correlation_id = correlation_id.to_string();
+    book
+}
+
+fn process_state_at(domain: &str, root: &[u8]) -> pb::EventBook {
+    pb::EventBook {
+        cover: Some(pb::Cover {
+            domain: domain.to_string(),
+            root: Some(pb::Uuid {
+                value: root.to_vec(),
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+fn pm_recording(process_events: fn() -> Vec<pb::EventBook>) -> ProcessManagerDispatch<TestState> {
+    ProcessManagerDispatch::new(
+        "fulfillment-pm",
+        "fulfillment",
+        ["inventory"],
+        fresh_rebuilder(),
+    )
+    .on_event(IN_DOMAIN, FQ_SHIPPED, move |_e, _s, _d, _cover| {
+        Ok(pb::ProcessManagerHandleResponse {
+            process_events: process_events(),
+            ..Default::default()
+        })
+    })
+    .on_rejected(FQ_RESERVE, move |_n, _r, _s| {
+        Ok(pb::ProcessManagerHandleResponse {
+            process_events: process_events(),
+            ..Default::default()
+        })
+    })
+}
+
+#[test]
+fn an_uncovered_process_event_is_addressed_to_the_pm_stream() {
+    let d = pm_recording(|| vec![pb::EventBook::default()]);
+    let resp = d
+        .dispatch(&request(
+            Some(trigger_with_correlation(IN_DOMAIN, "corr-7")),
+            Some(process_state_at("fulfillment", &[7; 16])),
+        ))
+        .expect("dispatch");
+    let cover = resp.process_events[0].cover.as_ref().expect("a cover");
+    assert_eq!(cover.domain, "fulfillment");
+    assert_eq!(
+        cover.root.as_ref().map(|r| r.value.clone()),
+        Some(vec![7; 16])
+    );
+    assert_eq!(cover.correlation_id, "corr-7");
+}
+
+#[test]
+fn an_unaddressed_process_event_cover_is_filled_and_kept() {
+    let d = pm_recording(|| {
+        vec![pb::EventBook {
+            cover: Some(pb::Cover {
+                root: Some(pb::Uuid { value: vec![9; 16] }),
+                correlation_id: "own".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }]
+    });
+    let resp = d
+        .dispatch(&request(
+            Some(trigger_with_correlation(IN_DOMAIN, "corr-7")),
+            Some(process_state_at("fulfillment", &[7; 16])),
+        ))
+        .expect("dispatch");
+    let cover = resp.process_events[0].cover.as_ref().expect("a cover");
+    assert_eq!(cover.domain, "fulfillment", "the domain is filled");
+    assert_eq!(
+        cover.root.as_ref().map(|r| r.value.clone()),
+        Some(vec![9; 16]),
+        "the handler's root is kept"
+    );
+    assert_eq!(
+        cover.correlation_id, "own",
+        "the handler's correlation is kept"
+    );
+}
+
+#[test]
+fn an_addressed_process_event_is_left_alone() {
+    let d = pm_recording(|| vec![tagged_book("elsewhere")]);
+    let resp = d
+        .dispatch(&request(
+            Some(trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED)])),
+            None,
+        ))
+        .expect("dispatch");
+    assert_eq!(
+        book_domains(&resp.process_events),
+        vec!["elsewhere".to_string()]
+    );
+    assert_eq!(resp.process_events[0].cover.as_ref().unwrap().root, None);
+}
+
+#[test]
+fn compensator_process_events_are_addressed_to_the_pm_stream() {
+    let d = pm_recording(|| vec![pb::EventBook::default(), pb::EventBook::default()]);
+    let resp = d
+        .dispatch(&request(
+            Some(trigger(
+                "inventory",
+                vec![notification_page_for(FQ_RESERVE)],
+            )),
+            None,
+        ))
+        .expect("dispatch");
+    assert_eq!(
+        book_domains(&resp.process_events),
+        vec!["fulfillment".to_string(), "fulfillment".to_string()]
+    );
+}
+
+#[test]
+fn facts_are_not_readdressed() {
+    let d = ProcessManagerDispatch::new(
+        "fulfillment-pm",
+        "fulfillment",
+        ["inventory"],
+        fresh_rebuilder(),
+    )
+    .on_event(IN_DOMAIN, FQ_SHIPPED, |_e, _s, _d, _cover| {
+        Ok(pb::ProcessManagerHandleResponse {
+            facts: vec![pb::EventBook::default()],
+            ..Default::default()
+        })
+    });
+    let resp = d
+        .dispatch(&request(
+            Some(trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED)])),
+            None,
+        ))
+        .expect("dispatch");
+    assert_eq!(resp.facts[0].cover, None);
+}

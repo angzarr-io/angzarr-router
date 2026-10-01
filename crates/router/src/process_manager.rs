@@ -26,7 +26,7 @@ use prost_types::Any;
 use crate::destinations::Destinations;
 use crate::error::{codes, extras, map_handler_error, messages, CodedError, HandlerError};
 use crate::pb;
-use crate::rebuild::Rebuilder;
+use crate::rebuild::{pack_message_state, Rebuilder, StatePackFn};
 use crate::NotificationPayload;
 
 /// Handles the newest trigger event against rebuilt PM state, returning the
@@ -66,6 +66,7 @@ pub struct ProcessManagerDispatch<S> {
     /// input domain → fully-qualified event type → thunk.
     handlers: HashMap<String, HashMap<String, EventFn<S>>>,
     rejections: HashMap<String, Vec<RejectionFn<S>>>,
+    state_packer: Option<StatePackFn<S>>,
 }
 
 impl<S> ProcessManagerDispatch<S> {
@@ -85,7 +86,27 @@ impl<S> ProcessManagerDispatch<S> {
             rebuilder,
             handlers: HashMap::new(),
             rejections: HashMap::new(),
+            state_packer: None,
         }
+    }
+
+    /// Supports Replay through the router: replayed state is packed by
+    /// `packer` into the response's `Any`.
+    pub fn with_state_packer(
+        mut self,
+        packer: impl Fn(&S) -> Result<Any, HandlerError> + Send + Sync + 'static,
+    ) -> Self {
+        self.state_packer = Some(Box::new(packer));
+        self
+    }
+
+    /// Supports Replay through the router for a protobuf-message state,
+    /// packed under its fully-qualified name.
+    pub fn with_message_state(self) -> Self
+    where
+        S: prost::Message + prost::Name + 'static,
+    {
+        self.with_state_packer(pack_message_state::<S>)
     }
 
     /// Registers the thunk for (input domain, fully-qualified event type).
@@ -138,12 +159,14 @@ impl<S> ProcessManagerDispatch<S> {
     /// then the events, in order — the process-manager counterpart of the
     /// aggregate's `Replay`.
     pub fn replay(&self, req: &pb::ReplayRequest) -> Result<S, CodedError> {
-        let book = pb::EventBook {
-            snapshot: req.base_snapshot.clone(),
-            pages: req.events.clone(),
-            ..Default::default()
-        };
-        Ok(self.rebuilder.rebuild(Some(&book))?.0)
+        self.rebuilder.replay(req)
+    }
+
+    /// [`Self::replay`] packed by the state packer; without one the process
+    /// manager does not support Replay (NO_HANDLER_REGISTERED).
+    pub fn packed_replay(&self, req: &pb::ReplayRequest) -> Result<pb::ReplayResponse, CodedError> {
+        self.rebuilder
+            .packed_replay(self.state_packer.as_ref(), &self.pm_domain, req)
     }
 
     /// Refuses a table whose `compensates` entries list one command type both
@@ -218,6 +241,7 @@ impl<S> ProcessManagerDispatch<S> {
                 trigger.cover.as_ref(),
                 crate::page_sequence(last),
             );
+            self.address_process_events(&mut resp, trigger, req.process_state.as_ref());
             return Ok(resp);
         }
 
@@ -242,7 +266,38 @@ impl<S> ProcessManagerDispatch<S> {
             trigger.cover.as_ref(),
             crate::page_sequence(last),
         );
+        self.address_process_events(&mut resp, trigger, req.process_state.as_ref());
         Ok(resp)
+    }
+
+    /// FILL-ONLY addressing of the PM's own stream (C-0477): a process event
+    /// the handler left unaddressed takes the PM's domain, the process
+    /// state's root and the trigger's correlation id; whatever the handler
+    /// set is kept.
+    fn address_process_events(
+        &self,
+        resp: &mut pb::ProcessManagerHandleResponse,
+        trigger: &pb::EventBook,
+        process_state: Option<&pb::EventBook>,
+    ) {
+        let state_root = process_state
+            .and_then(|s| s.cover.as_ref())
+            .and_then(|c| c.root.as_ref());
+        let correlation_id = trigger.cover.as_ref().map(|c| c.correlation_id.as_str());
+        for book in &mut resp.process_events {
+            let cover = book.cover.get_or_insert_with(pb::Cover::default);
+            if cover.domain.is_empty() {
+                cover.domain = self.pm_domain.clone();
+            }
+            if cover.root.is_none() {
+                cover.root = state_root.cloned();
+            }
+            if cover.correlation_id.is_empty() {
+                if let Some(id) = correlation_id {
+                    cover.correlation_id = id.to_string();
+                }
+            }
+        }
     }
 
     /// Routes a Notification trigger: a RejectionNotification goes to the

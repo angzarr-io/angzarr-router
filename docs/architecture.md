@@ -15,19 +15,19 @@ router.
   `bindings/<language>`; the conformance fixtures in this repo are the
   first consumer of that generated code. examples-python runs on the
   Python binding.
-- **Not consumers (yet).** The `angzarr-client-*` libraries still carry
-  their own engines (client-go `engine*.go`, client-python
-  `angzarr_client/router/`, client-rust's own router). No client-*
-  library links this crate or its FFI yet. client-rust is planned to move
-  onto `crates/router`'s Rust-native API (no FFI) and delete its engine;
-  the Rust-native API (`Rebuilder`, `AggregateDispatch` with undo, facts
-  and replay, `SagaDispatch`, `ProcessManagerDispatch` with
-  `select_process_managers`/`merge_response`, `ProjectorDispatch`,
-  `Destinations`, `stamp_deferred`, `decode_notification`, `CodedError`) is therefore a public
-  contract, documented on each item. Until the client engines retire, the
-  engine semantics exist in this repo AND in each client library; the
-  shared contract between them is the semantics table below and the
-  angzarr-project feature suite, not shared code.
+- **client-rust** dispatches through `crates/router`'s Rust-native API (no
+  FFI) and has no engine of its own. That API (`Rebuilder`,
+  `AggregateDispatch` with undo, facts and replay, `SagaDispatch`,
+  `ProcessManagerDispatch` with `select_process_managers`/`merge_response`,
+  `ProjectorDispatch`, `RouterBuilder`/`Router`/`CommandHandlers`,
+  `Destinations`, `stamp_deferred`, `decode_notification`, `CodedError`) is
+  therefore a public contract, documented on each item; components may be
+  registered boxed (`Box<dyn CommandHandler>` and so on).
+- **Not consumers (yet).** The other `angzarr-client-*` libraries still
+  carry their own engines (client-go `engine*.go`, client-python
+  `angzarr_client/router/`). Until they retire, the engine semantics exist
+  in this repo AND in each of them; the shared contract is the semantics
+  table below and the angzarr-project feature suite, not shared code.
 
 ## Layers
 
@@ -70,9 +70,11 @@ callback_id)` entries; every callback goes through one host function
 The registry owns the component claims, which are mutation-tested with the
 core:
 
-- a command routes to the aggregate registered for its cover domain (a sole
-  aggregate claims every command); a second aggregate for a domain is
-  refused at registration;
+- aggregates register into the core's `CommandHandlers`, the same table
+  the Rust-native `Router` uses: a command routes by (cover domain, command
+  type), several aggregates may share a domain, and a second claim of one
+  (domain, command type) is refused at registration
+  (`DUPLICATE_COMMAND_HANDLER`); a sole aggregate claims every domain;
 - a router hosts at most one projector (one `Projection` per `EventBook`);
 - a saga source routes to every saga whose input domain matches;
 - a process-manager request routes through the core's
@@ -94,14 +96,14 @@ keyed by component, never by session alone.
 | State rebuild | Snapshot applies first; pages with an explicit sequence at or below a LOADED snapshot's sequence never re-apply (a snapshot with no loader or no state covers nothing); pageless or unknown-type entries are skipped, never terminal; a corrupt persisted payload fails with `PERSISTED_EVENT_CORRUPT` |
 | Aggregate dispatch | Envelope and command type validate BEFORE rebuild (unknown command → `NO_HANDLER_REGISTERED`); handlers receive `CommandContext` (next sequence, had-prior-events, the handled cover) |
 | Fill-only stamping | The command cover's ext propagates onto emitted books and pages without headers get consecutive sequences from the next sequence — for command, compensation and undo events alike — never overriding values the handler set |
-| Deferred commands | Saga and process-manager commands carry `angzarr_deferred` (source cover, source_seq of the triggering page, command_index in emission order) and never an explicit sequence; `source_component` is stamped by the coordinator. Saga commands inherit the source correlation id fill-only. `Destinations` are the declared output domains only |
+| Deferred commands | Saga and process-manager commands carry `angzarr_deferred` (source cover, source_seq of the triggering page, command_index in emission order) and never an explicit sequence; `source_component` is stamped by the coordinator. Saga commands inherit the source correlation id fill-only. A saga handler sees the triggering page's cover and sequence. `Destinations` are the declared output domains only; `Destinations::stamp_command` stamps one command the same way, refusing an undeclared domain (`UNDECLARED_OUTPUT_DOMAIN`) |
 | Saga dispatch | EVERY page of the source book dispatches; undeclared types and Notification pages are skipped (C-0051); sagas receive no rejections |
 | Notifications | A Notification's payload is told apart by name: a RejectionNotification routes to compensation handlers, a Compensate to undo handlers |
-| Rejection routing | A `compensates` entry is `"fq.Type"` (any target domain) or `"domain:fq.Type"` (only rejections of commands sent to that domain); a type listed both ways is refused at registration (`AMBIGUOUS_COMPENSATION`); every matching compensator runs, in registration order (C-0042); aggregate compensation events concatenate and the first escalation (Revocation or Notification) wins; PM compensators return full responses (process events, deferred commands, facts) merged in order, first escalation winning; an undeclared rejection yields an empty response (`DelegateToFramework`) |
+| Rejection routing | A `compensates` entry is `"fq.Type"` (any target domain) or `"domain:fq.Type"` (only rejections of commands sent to that domain); a type listed both ways is refused at registration (`AMBIGUOUS_COMPENSATION`); every matching compensator runs, in registration order (C-0042) — across every aggregate of the domain that claims the rejection, each later aggregate's sequenced pages continuing after those already merged; aggregate compensation events concatenate and the first escalation (Revocation or Notification) wins; PM compensators return full responses (process events, deferred commands, facts) merged in order, first escalation winning; an undeclared rejection yields an empty response (`DelegateToFramework`) |
 | Undo | A Compensate routes to the aggregate's undo handler for its `command_type` with rebuilt state; none (or a Compensate at a process manager) is `NO_UNDO_HANDLER` → UNIMPLEMENTED, which the coordinator dead-letters — never dropped |
-| Facts and replay | `HandleFact` rebuilds from the prior events and walks the facts in order: a fact handler may annotate (not refuse) a fact, and each recorded fact folds before the next; cover and headers are kept. `Replay` folds base snapshot then events into state. Facts route by the facts' cover domain, replay by the requested domain |
-| Process manager | The newest page of the trigger book dispatches; handlers receive the trigger cover; co-resident PMs are selected by identity first — a rejection reaches the PM that issued the command (`angzarr_deferred.source_component`, then its source domain, then the trigger cover domain), a process state reaches the PM owning its cover domain — and otherwise every PM consuming the trigger domain; responses merge in registration order |
-| Projector | Folds every page into one projection instance, each fold seeing the book cover and the page's sequence; undeclared domains fold nothing (C-0032); unmatched types invoke the on-unknown hook or WARN |
+| Facts and replay | `HandleFact` rebuilds from the prior events and walks the facts in order: a fact handler may annotate (not refuse) a fact, and each recorded fact folds before the next; cover and headers are kept. `Replay` folds base snapshot then events into state, packed by the component's state packer (none: `NO_HANDLER_REGISTERED`). Facts route by the facts' cover domain; replay by the requested domain, to its first aggregate, else to the process manager whose own domain it is |
+| Process manager | The newest page of the trigger book dispatches; handlers receive the trigger cover; co-resident PMs are selected by identity first — a rejection reaches the PM that issued the command (`angzarr_deferred.source_component`, then its source domain, then the trigger cover domain), a process state reaches the PM owning its cover domain — and otherwise every PM consuming the trigger domain; responses merge in registration order. A process event the handler leaves unaddressed takes, fill-only, the PM's own domain, the process state's root and the trigger's correlation id (C-0477) |
+| Projector | Folds every page into one projection instance, each fold seeing the book cover and the page's sequence; undeclared domains fold nothing (C-0032), and a projector declaring `"*"` consumes every domain; unmatched types invoke the on-unknown hook or WARN |
 | Type URLs | Emitted type URLs use the bare `/` prefix; incoming ones match by the fully-qualified name after the last `/`, whatever the prefix |
 | Errors | One `map_handler_error` table: rejections keep their gRPC code, `NO_HANDLER_REGISTERED` and `NO_UNDO_HANDLER` → UNIMPLEMENTED, `PERSISTED_EVENT_CORRUPT` → DATA_LOSS, other coded client errors → INVALID_ARGUMENT, unclassified → INTERNAL + `UNHANDLED_HANDLER_ERROR`. Codes ride a `google.rpc.ErrorInfo` detail (domain `angzarr.io`); assertions key on codes, never message substrings |
 

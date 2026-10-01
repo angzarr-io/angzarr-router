@@ -126,6 +126,24 @@ fn declared_domain_folds() {
 }
 
 #[test]
+fn the_wildcard_domain_folds_every_domain() {
+    let d = counting_projector(Some(&[crate::WILDCARD_DOMAIN]));
+    let proj = d
+        .dispatch(&book("inventory", cover_pages("inventory", 3)))
+        .expect("dispatch");
+    assert_eq!(proj.sequence, 3, "\"*\" consumes every domain");
+}
+
+#[test]
+fn the_wildcard_beside_named_domains_still_folds_every_domain() {
+    let d = counting_projector(Some(&["order", crate::WILDCARD_DOMAIN]));
+    let proj = d
+        .dispatch(&book("billing", cover_pages("billing", 2)))
+        .expect("dispatch");
+    assert_eq!(proj.sequence, 2);
+}
+
+#[test]
 fn empty_book_finishes_with_zero_folds() {
     let d = counting_projector(None);
     let proj = d.dispatch(&book("order", vec![])).expect("dispatch");

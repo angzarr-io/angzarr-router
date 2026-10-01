@@ -234,7 +234,10 @@ unsafe extern "C" fn host_cb(
         CB_SAGA_EVENT => {
             // Host translates the source event into one stamped command,
             // stamping from the coordinator-supplied destination sequences.
-            abi_pb::SagaEventAux::decode(aux).expect("saga event aux");
+            let saux = abi_pb::SagaEventAux::decode(aux).expect("saga event aux");
+            with_session(key, |s| {
+                s.observed_pages.push((saux.source_cover, saux.source_seq));
+            });
             let cmd = pb::CommandBook {
                 cover: Some(pb::Cover {
                     domain: "inventory".to_string(),
@@ -1147,6 +1150,30 @@ fn saga_emits_deferred_command_through_the_abi() {
 }
 
 #[test]
+fn a_saga_handler_receives_the_source_cover_and_sequence() {
+    let router = Router::with_saga();
+    let session = next_session();
+    let mut first = event_page_of(FQ_ORDER_CREATED);
+    first.header = Some(pb::PageHeader {
+        sequence_type: Some(pb::page_header::SequenceType::Sequence(3)),
+        ..Default::default()
+    });
+    let req = saga_request("order", vec![first, event_page_of(FQ_ORDER_CREATED)]);
+    let (ret, _) = router.dispatch_saga(session, &req);
+    assert_eq!(ret, 0);
+    let observed: Vec<(String, u32)> = session_snapshot(session)
+        .observed_pages
+        .into_iter()
+        .map(|(cover, seq)| (cover.map(|c| c.domain).unwrap_or_default(), seq))
+        .collect();
+    assert_eq!(
+        observed,
+        vec![("order".to_string(), 3), ("order".to_string(), 0)],
+        "each trigger's cover and sequence (0 when unsequenced)"
+    );
+}
+
+#[test]
 fn saga_missing_source_through_the_abi_is_missing_saga_source() {
     // Source-shape validation must precede domain routing: a request with no
     // source has no cover domain, matches no saga, and must report
@@ -1522,12 +1549,17 @@ fn uncovered_process_state_fans_the_trigger_out_in_registration_order() {
 // --- registration-time claims + host fold status
 
 #[test]
-fn second_aggregate_for_a_domain_is_refused_at_registration() {
+fn a_second_claim_of_a_domain_command_is_refused_at_registration() {
     let router = Router::with_counter();
-    let desc = descriptor_bytes();
-    let ret =
-        unsafe { angzarr_router_register_aggregate(router.0, desc.as_ptr(), desc.len(), host_cb) };
-    assert_eq!(ret, -3, "a duplicate domain claim is an invalid argument");
+    let mut desc = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
+    desc.name = "Rival".to_string();
+    desc.commands.truncate(1);
+    desc.rejections.clear();
+    assert_eq!(
+        register_aggregate_desc(router.0, desc),
+        -3,
+        "a duplicate (domain, command) claim is an invalid argument"
+    );
     // The first registration still serves the domain.
     let (ret, _) = router.dispatch(
         next_session(),
@@ -2336,4 +2368,153 @@ fn process_manager_without_a_state_packer_refuses_replay() {
         &call.encode_to_vec(),
     );
     assert_eq!(ret, -12);
+}
+
+// --- several aggregates in one domain (C-0010, C-0042) ----------------------
+
+const FQ_AUDIT: &str = "test.counter.Audit";
+
+/// The counter aggregate plus a second "counter" aggregate handling Audit
+/// (empty reply) and compensating Reserve with comp-b.
+fn counter_and_auditor() -> Router {
+    let router = Router::with_counter();
+    let auditor = abi_pb::AggregateDescriptor {
+        name: "Auditor".to_string(),
+        domain: "counter".to_string(),
+        commands: vec![abi_pb::CallbackEntry {
+            fq_type: FQ_AUDIT.to_string(),
+            callback_id: CB_OK_EMPTY,
+        }],
+        rejections: vec![abi_pb::RejectionEntry {
+            compensates: FQ_RESERVE.to_string(),
+            callback_ids: vec![CB_COMP_B],
+        }],
+        ..Default::default()
+    };
+    assert_eq!(register_aggregate_desc(router.0, auditor), 0);
+    router
+}
+
+fn reserve_rejection_delivery() -> pb::ContextualCommand {
+    pb::ContextualCommand {
+        command: Some(pb::CommandBook {
+            cover: Some(pb::Cover {
+                domain: "counter".to_string(),
+                ..Default::default()
+            }),
+            pages: vec![pb::CommandPage {
+                payload: Some(pb::command_page::Payload::Command(notification_command(
+                    FQ_RESERVE,
+                ))),
+                ..Default::default()
+            }],
+        }),
+        events: Some(pb::EventBook {
+            next_sequence: 5,
+            ..Default::default()
+        }),
+    }
+}
+
+#[test]
+fn aggregates_sharing_a_domain_route_commands_by_type() {
+    let router = counter_and_auditor();
+    let (ret, bytes) = router.dispatch(next_session(), &increase_in("counter"));
+    assert_eq!(ret, 0);
+    assert_eq!(
+        emitted_pages(&bytes),
+        1,
+        "the counter aggregate handled IncreaseBy"
+    );
+    let (ret, bytes) = router.dispatch(next_session(), &command_req(FQ_AUDIT, Vec::new(), None));
+    assert_eq!(ret, 0);
+    assert_eq!(emitted_pages(&bytes), 0, "the auditor handled Audit");
+}
+
+#[test]
+fn every_aggregate_of_a_domain_compensating_a_rejection_runs_in_order() {
+    let router = counter_and_auditor();
+    let session = next_session();
+    let (ret, bytes) = router.dispatch(session, &reserve_rejection_delivery());
+    assert_eq!(ret, 0);
+    assert_eq!(
+        session_snapshot(session).markers,
+        vec!["comp-a", "comp-b", "comp-b"],
+        "the counter's compensators, then the auditor's"
+    );
+    let Some(pb::business_response::Result::Events(book)) = decode_response(&bytes).result else {
+        panic!("expected merged events");
+    };
+    let sequences: Vec<u32> = book
+        .pages
+        .iter()
+        .map(
+            |p| match p.header.as_ref().and_then(|h| h.sequence_type.as_ref()) {
+                Some(pb::page_header::SequenceType::Sequence(s)) => *s,
+                other => panic!("no sequence: {other:?}"),
+            },
+        )
+        .collect();
+    assert_eq!(
+        sequences,
+        vec![5, 6, 7],
+        "sequences continue across aggregates"
+    );
+}
+
+#[test]
+fn replay_of_a_shared_domain_goes_to_its_first_aggregate() {
+    let r = angzarr_router_new();
+    let mut counter = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
+    counter.state_callback_id = Some(CB_PACK_STATE);
+    assert_eq!(register_aggregate_desc(r, counter), 0);
+    let auditor = abi_pb::AggregateDescriptor {
+        name: "Auditor".to_string(),
+        domain: "counter".to_string(),
+        commands: vec![abi_pb::CallbackEntry {
+            fq_type: FQ_AUDIT.to_string(),
+            callback_id: CB_OK_EMPTY,
+        }],
+        ..Default::default()
+    };
+    assert_eq!(register_aggregate_desc(r, auditor), 0);
+    let router = Router(r);
+    let call = abi_pb::ReplayCall {
+        domain: "counter".to_string(),
+        request: Some(pb::ReplayRequest {
+            events: increased_history(2, 2).pages,
+            ..Default::default()
+        }),
+    };
+    let (ret, bytes) = router.call(
+        angzarr_router_dispatch_replay,
+        next_session(),
+        &call.encode_to_vec(),
+    );
+    assert_eq!(ret, 0, "the counter (registered first) packs its state");
+    let resp = pb::ReplayResponse::decode(bytes.as_slice()).expect("ReplayResponse");
+    let state = CounterState::decode(resp.state.expect("state").value.as_slice()).unwrap();
+    assert_eq!(state.value, 2, "the counter's appliers folded both events");
+}
+
+#[test]
+fn a_compensate_reaches_only_the_aggregate_of_its_domain_undoing_it() {
+    let router = Router::with_counter();
+    let undoer = abi_pb::AggregateDescriptor {
+        name: "Undoer".to_string(),
+        domain: "counter".to_string(),
+        appliers: vec![abi_pb::CallbackEntry {
+            fq_type: FQ_INCREASED.to_string(),
+            callback_id: CB_APPLIER,
+        }],
+        undoes: vec![abi_pb::CallbackEntry {
+            fq_type: FQ_RESERVE.to_string(),
+            callback_id: CB_UNDO_RESERVE,
+        }],
+        ..Default::default()
+    };
+    assert_eq!(register_aggregate_desc(router.0, undoer), 0);
+    let (ret, bytes) = router.dispatch(next_session(), &compensate_command(FQ_RESERVE, vec![1]));
+    assert_eq!(ret, 0, "the counter (no undo for Reserve) never runs");
+    assert_eq!(emitted_pages(&bytes), 1);
 }

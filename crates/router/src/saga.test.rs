@@ -409,3 +409,62 @@ fn accessors_report_name_domains_and_types() {
         Some(&vec![FQ_ORDER_CREATED.to_string()])
     );
 }
+
+// --- handler context: the triggering page's cover and sequence (X-037) ----
+
+#[test]
+fn a_context_handler_sees_each_triggering_page() {
+    let seen: Arc<Mutex<Vec<(String, u32)>>> = Arc::default();
+    let sink = seen.clone();
+    let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory"]).on_event_with_context(
+        FQ_ORDER_CREATED,
+        move |_e, _d, source| {
+            let domain = source.cover.map(|c| c.domain.clone()).unwrap_or_default();
+            sink.lock().unwrap().push((domain, source.sequence));
+            Ok((vec![command_to("inventory")], vec![]))
+        },
+    );
+    let resp = saga
+        .dispatch(&request(Some(source_book(
+            "order",
+            vec![
+                sequenced_page_of(FQ_ORDER_CREATED, 4),
+                sequenced_page_of(FQ_STOCK_RESERVED, 5),
+                sequenced_page_of(FQ_ORDER_CREATED, 6),
+            ],
+        ))))
+        .expect("dispatch");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![("order".to_string(), 4), ("order".to_string(), 6)]
+    );
+    let source_seqs: Vec<u32> = resp
+        .commands
+        .iter()
+        .map(|c| cmd_page_deferred(&c.pages[0]).expect("deferred").source_seq)
+        .collect();
+    assert_eq!(
+        source_seqs,
+        vec![4, 6],
+        "provenance matches what the handler saw"
+    );
+}
+
+#[test]
+fn a_context_handler_sees_sequence_zero_for_an_unsequenced_page() {
+    let seen: Arc<Mutex<Vec<u32>>> = Arc::default();
+    let sink = seen.clone();
+    let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory"]).on_event_with_context(
+        FQ_ORDER_CREATED,
+        move |_e, _d, source| {
+            sink.lock().unwrap().push(source.sequence);
+            Ok((vec![], vec![]))
+        },
+    );
+    saga.dispatch(&request(Some(source_book(
+        "order",
+        vec![event_page_of(FQ_ORDER_CREATED)],
+    ))))
+    .expect("dispatch");
+    assert_eq!(*seen.lock().unwrap(), vec![0]);
+}

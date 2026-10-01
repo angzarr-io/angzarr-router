@@ -17,16 +17,19 @@ use prost_types::Any;
 use crate::destinations::Destinations;
 use crate::error::{codes, map_handler_error, messages, CodedError, HandlerError};
 use crate::pb;
+use crate::PageContext;
 
 /// Translates one source event into commands and/or injected fact events.
 /// Generated thunks unmarshal to the typed event, call the typed business
-/// method; the declared output domains arrive as Destinations and the router
-/// stamps the emitted commands deferred.
+/// method; the declared output domains arrive as Destinations, the source
+/// event's place as a [`PageContext`] (the source book's cover and the
+/// event's sequence, which the router records as the commands' `source_seq`),
+/// and the router stamps the emitted commands deferred.
 pub type EventFn = Box<
-    dyn Fn(
+    dyn for<'a> Fn(
             &Any,
             &Destinations,
-            Option<&pb::Cover>,
+            &PageContext<'a>,
         ) -> Result<(Vec<pb::CommandBook>, Vec<pb::EventBook>), HandlerError>
         + Send
         + Sync,
@@ -56,15 +59,37 @@ impl SagaDispatch {
         }
     }
 
-    /// Registers the translation thunk for a fully-qualified event type.
+    /// Registers the translation thunk for a fully-qualified event type; it
+    /// receives the source book's cover.
     pub fn on_event(
-        mut self,
+        self,
         full_name: &str,
         thunk: impl Fn(
                 &Any,
                 &Destinations,
                 Option<&pb::Cover>,
             ) -> Result<(Vec<pb::CommandBook>, Vec<pb::EventBook>), HandlerError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.on_event_with_context(full_name, move |any, dests, source| {
+            thunk(any, dests, source.cover)
+        })
+    }
+
+    /// Registers the translation thunk for a fully-qualified event type; it
+    /// receives the source event's [`PageContext`]: the source book's cover
+    /// and the event's sequence (0 when the page carries none).
+    pub fn on_event_with_context(
+        mut self,
+        full_name: &str,
+        thunk: impl for<'a> Fn(
+                &Any,
+                &Destinations,
+                &PageContext<'a>,
+            )
+                -> Result<(Vec<pb::CommandBook>, Vec<pb::EventBook>), HandlerError>
             + Send
             + Sync
             + 'static,
@@ -134,13 +159,13 @@ impl SagaDispatch {
             else {
                 continue; // saga only reacts to declared types (spec C-0051)
             };
+            let context = PageContext {
+                cover: source.cover.as_ref(),
+                sequence: crate::page_sequence(page),
+            };
             let (mut commands, events) =
-                thunk(event_any, &dests, source.cover.as_ref()).map_err(map_handler_error)?;
-            crate::stamp_deferred(
-                &mut commands,
-                source.cover.as_ref(),
-                crate::page_sequence(page),
-            );
+                thunk(event_any, &dests, &context).map_err(map_handler_error)?;
+            crate::stamp_deferred(&mut commands, context.cover, context.sequence);
             resp.commands.extend(commands);
             resp.events.extend(events);
         }

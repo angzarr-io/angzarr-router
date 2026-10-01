@@ -11,8 +11,13 @@ Feature: Compensation routing
   dead-letters it — never silently dropped. Events a compensation or undo
   handler returns append after the aggregate's prior history.
 
+  Several aggregates may share a domain. Every one of them whose
+  `compensates` entries match a rejection runs, in registration order; their
+  events concatenate into one book whose sequences continue after the
+  domain's prior history.
+
   The payment and inventory aggregates are built through each binding's
-  hand-written aggregate API.
+  hand-written aggregate API and dispatched through its router.
 
   Scenario: an unqualified compensates entry matches a rejection sent to any domain
     Given a payment aggregate compensating Reserve from any domain with FundsReleased
@@ -43,3 +48,9 @@ Feature: Compensation routing
     Given an inventory aggregate undoing AdjustStock with StockAdjustmentReverted and Reserve with StockReleased
     When a Compensate for CountStock is dispatched to the inventory aggregate
     Then the dispatch fails with NO_UNDO_HANDLER as UNIMPLEMENTED
+
+  Scenario: every aggregate of a domain that compensates a rejection runs in registration order
+    Given a payment aggregate compensating Reserve from any domain with FundsReleased
+    And a second payment aggregate compensating Reserve from any domain with WorkflowFailed
+    When a rejection of Reserve sent to "inventory" is dispatched to the payment aggregate over history ending at sequence 6
+    Then the aggregates emit FundsReleased at sequence 7 then WorkflowFailed at sequence 8

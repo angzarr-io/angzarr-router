@@ -181,13 +181,13 @@ pub struct ProjectorState {
     pub count: u32,
 }
 
-/// Build the CounterProjector dispatch table: over the "counter" domain it
-/// folds each Increased event into a running count, then finishes into a
-/// Projection whose sequence carries that count and whose payload is the
-/// CounterState. A book from any other domain folds nothing (C-0032).
-pub fn counter_projector() -> ProjectorDispatch<ProjectorState> {
+/// Build the CounterProjector dispatch table: over `domains` (`"*"` is every
+/// domain) it folds each Increased event into a running count, then finishes
+/// into a Projection whose sequence carries that count and whose payload is
+/// the CounterState. A book from any other domain folds nothing (C-0032).
+pub fn counter_projector(domains: &[&str]) -> ProjectorDispatch<ProjectorState> {
     ProjectorDispatch::new("counter-projector", ProjectorState::default)
-        .for_domains(["counter"])
+        .for_domains(domains.iter().copied())
         .on_event(
             "test.counter.Increased",
             |state: &mut ProjectorState, event, _ctx| {
@@ -244,12 +244,16 @@ pub fn delivery_without_cover(n: u32) -> pb::EventBook {
 
 /// Build the OrderSaga dispatch table: it translates each Increased source
 /// event into one Reserve command for "inventory" (deferred: the router stamps
-/// its provenance). Undeclared events and Notification pages are skipped.
-pub fn order_saga() -> SagaDispatch {
-    SagaDispatch::new("order-saga", "order", ["inventory"])
-        .on_event("test.counter.Increased", |_any, _dests, _c| {
+/// its provenance), recording each triggering event's sequence in `seen`.
+/// Undeclared events and Notification pages are skipped.
+pub fn order_saga(seen: SequenceSink) -> SagaDispatch {
+    SagaDispatch::new("order-saga", "order", ["inventory"]).on_event_with_context(
+        "test.counter.Increased",
+        move |_any, _dests, source| {
+            seen.lock().unwrap().push(source.sequence);
             Ok((vec![reserve_command_to("inventory")], Vec::new()))
-        })
+        },
+    )
 }
 
 fn reserve_command_to(domain: &str) -> pb::CommandBook {

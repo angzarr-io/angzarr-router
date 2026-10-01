@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use prost_types::Any;
 
-use crate::error::CodedError;
+use crate::error::{codes, extras, map_handler_error, messages, CodedError, HandlerError};
 use crate::pb;
 use crate::PageContext;
 
@@ -21,6 +21,17 @@ pub type ApplierFn<S> = Box<
         + Send
         + Sync,
 >;
+
+/// Packs replayed state into the `Any` a `ReplayResponse` carries.
+pub type StatePackFn<S> = Box<dyn Fn(&S) -> Result<Any, HandlerError> + Send + Sync>;
+
+/// Packs a protobuf-message state under its fully-qualified name.
+pub fn pack_message_state<S: prost::Message + prost::Name>(state: &S) -> Result<Any, HandlerError> {
+    Ok(Any {
+        type_url: crate::type_url(&S::full_name()),
+        value: state.encode_to_vec(),
+    })
+}
 
 /// Loads snapshot state into fresh state.
 pub type SnapshotFn<S> =
@@ -103,6 +114,39 @@ impl<S> Rebuilder<S> {
     ) -> Self {
         self.snapshot = Some(Box::new(thunk));
         self
+    }
+
+    /// `Replay`: the state after folding the base snapshot (when present)
+    /// and then the events, in order.
+    pub fn replay(&self, req: &pb::ReplayRequest) -> Result<S, CodedError> {
+        let book = pb::EventBook {
+            snapshot: req.base_snapshot.clone(),
+            pages: req.events.clone(),
+            ..Default::default()
+        };
+        Ok(self.rebuild(Some(&book))?.0)
+    }
+
+    /// [`Self::replay`] packed by `packer` into a `ReplayResponse`. A
+    /// component with no packer does not support Replay
+    /// (NO_HANDLER_REGISTERED, with its `domain`).
+    pub fn packed_replay(
+        &self,
+        packer: Option<&StatePackFn<S>>,
+        domain: &str,
+        req: &pb::ReplayRequest,
+    ) -> Result<pb::ReplayResponse, CodedError> {
+        let Some(packer) = packer else {
+            return Err(CodedError::invalid_argument(
+                codes::NO_HANDLER_REGISTERED,
+                messages::REPLAY_UNSUPPORTED,
+                [(extras::DOMAIN.to_string(), domain.to_string())],
+            ));
+        };
+        let state = self.replay(req)?;
+        Ok(pb::ReplayResponse {
+            state: Some(packer(&state).map_err(map_handler_error)?),
+        })
     }
 
     /// Folds the book into fresh state. An absent book normalizes to an

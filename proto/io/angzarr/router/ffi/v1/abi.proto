@@ -101,6 +101,9 @@ message SagaEventAux {
   // deserialization) so the saga can route emitted commands by the trigger's
   // identity (root, ext).
   io.angzarr.v1.Cover source_cover = 2;
+  // The source event's explicit sequence (0 when the page carries none): the
+  // source_seq the router records on the emitted commands.
+  uint32 source_seq = 3;
 }
 
 // Registration payload for one process-manager component. STATEFUL: the PM

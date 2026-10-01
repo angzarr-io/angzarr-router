@@ -7,10 +7,13 @@
 //! and each table's own validation (ambiguous `compensates` entries) runs once.
 //! The built [`Router`] dispatches:
 //!
-//! - commands by (cover domain, command type); a Notification to the
-//!   aggregate in its domain that declares a handler for it (else the first
-//!   aggregate of the domain, which answers DelegateToFramework or
-//!   NO_UNDO_HANDLER); facts by the facts' cover domain;
+//! - commands by (cover domain, command type); a Notification to every
+//!   aggregate in its domain that declares a handler for it, in registration
+//!   order, their results merged (C-0042) — else to the first aggregate of
+//!   the domain, which answers DelegateToFramework or NO_UNDO_HANDLER; facts
+//!   by the facts' cover domain;
+//! - a Replay to the first aggregate of its domain, else to the process
+//!   manager owning it (by its own domain), packed by its state packer;
 //! - saga sources to every saga consuming the source domain, merged in
 //!   registration order (C-0013);
 //! - process-manager requests through [`select_process_managers`], merged;
@@ -18,11 +21,13 @@
 //! - an UpcastRequest through every upcaster of its domain, in registration
 //!   order, each one's output feeding the next (C-0136).
 //!
+//! Components may be registered boxed (`Box<dyn CommandHandler>` and so on).
+//!
 //! Transport (gRPC servers), health and readiness stay with the host.
 
 use std::collections::HashMap;
 
-use crate::aggregate::AggregateDispatch;
+use crate::aggregate::{merge_compensation, AggregateDispatch};
 use crate::error::{codes, extras, messages, CodedError};
 use crate::pb;
 use crate::process_manager::{
@@ -46,6 +51,45 @@ pub trait CommandHandler: Send + Sync {
     fn dispatch(&self, req: &pb::ContextualCommand) -> Result<pb::BusinessResponse, CodedError>;
     /// `CommandHandlerService.HandleFact`.
     fn handle_fact(&self, req: &pb::FactRequest) -> Result<pb::EventBook, CodedError>;
+    /// `CommandHandlerService.Replay`: the rebuilt state, packed. A handler
+    /// that cannot pack its state does not support Replay
+    /// (NO_HANDLER_REGISTERED).
+    fn replay(&self, req: &pb::ReplayRequest) -> Result<pb::ReplayResponse, CodedError> {
+        let _ = req;
+        Err(replay_unsupported(self.domain()))
+    }
+}
+
+fn replay_unsupported(domain: &str) -> CodedError {
+    CodedError::invalid_argument(
+        codes::NO_HANDLER_REGISTERED,
+        messages::REPLAY_UNSUPPORTED,
+        [(extras::DOMAIN.to_string(), domain.to_string())],
+    )
+}
+
+impl<T: CommandHandler + ?Sized> CommandHandler for Box<T> {
+    fn domain(&self) -> &str {
+        (**self).domain()
+    }
+    fn command_types(&self) -> Vec<String> {
+        (**self).command_types()
+    }
+    fn claims_notification(&self, notification_any: &prost_types::Any) -> bool {
+        (**self).claims_notification(notification_any)
+    }
+    fn validate(&self) -> Result<(), CodedError> {
+        (**self).validate()
+    }
+    fn dispatch(&self, req: &pb::ContextualCommand) -> Result<pb::BusinessResponse, CodedError> {
+        (**self).dispatch(req)
+    }
+    fn handle_fact(&self, req: &pb::FactRequest) -> Result<pb::EventBook, CodedError> {
+        (**self).handle_fact(req)
+    }
+    fn replay(&self, req: &pb::ReplayRequest) -> Result<pb::ReplayResponse, CodedError> {
+        (**self).replay(req)
+    }
 }
 
 impl<S> CommandHandler for AggregateDispatch<S> {
@@ -67,6 +111,9 @@ impl<S> CommandHandler for AggregateDispatch<S> {
     fn handle_fact(&self, req: &pb::FactRequest) -> Result<pb::EventBook, CodedError> {
         AggregateDispatch::handle_fact(self, req)
     }
+    fn replay(&self, req: &pb::ReplayRequest) -> Result<pb::ReplayResponse, CodedError> {
+        AggregateDispatch::packed_replay(self, req)
+    }
 }
 
 /// A process manager as the router sees it, whatever its state type.
@@ -78,6 +125,39 @@ pub trait ProcessManagerHandler: ProcessManagerRoute + Send + Sync {
         &self,
         req: &pb::ProcessManagerHandleRequest,
     ) -> Result<pb::ProcessManagerHandleResponse, CodedError>;
+    /// The PM's rebuilt state, packed. A PM that cannot pack its state does
+    /// not support Replay (NO_HANDLER_REGISTERED).
+    fn replay(&self, req: &pb::ReplayRequest) -> Result<pb::ReplayResponse, CodedError> {
+        let _ = req;
+        Err(replay_unsupported(self.pm_domain()))
+    }
+}
+
+impl<T: ProcessManagerRoute + ?Sized> ProcessManagerRoute for Box<T> {
+    fn name(&self) -> &str {
+        (**self).name()
+    }
+    fn pm_domain(&self) -> &str {
+        (**self).pm_domain()
+    }
+    fn consumes(&self, domain: &str) -> bool {
+        (**self).consumes(domain)
+    }
+}
+
+impl<T: ProcessManagerHandler + ?Sized> ProcessManagerHandler for Box<T> {
+    fn validate(&self) -> Result<(), CodedError> {
+        (**self).validate()
+    }
+    fn dispatch(
+        &self,
+        req: &pb::ProcessManagerHandleRequest,
+    ) -> Result<pb::ProcessManagerHandleResponse, CodedError> {
+        (**self).dispatch(req)
+    }
+    fn replay(&self, req: &pb::ReplayRequest) -> Result<pb::ReplayResponse, CodedError> {
+        (**self).replay(req)
+    }
 }
 
 impl<S> ProcessManagerHandler for ProcessManagerDispatch<S> {
@@ -90,12 +170,21 @@ impl<S> ProcessManagerHandler for ProcessManagerDispatch<S> {
     ) -> Result<pb::ProcessManagerHandleResponse, CodedError> {
         ProcessManagerDispatch::dispatch(self, req)
     }
+    fn replay(&self, req: &pb::ReplayRequest) -> Result<pb::ReplayResponse, CodedError> {
+        ProcessManagerDispatch::packed_replay(self, req)
+    }
 }
 
 /// A projector as the router sees it, whatever its projection type.
 pub trait ProjectorHandler: Send + Sync {
     /// `ProjectorService.Handle`.
     fn dispatch(&self, events: &pb::EventBook) -> Result<pb::Projection, CodedError>;
+}
+
+impl<T: ProjectorHandler + ?Sized> ProjectorHandler for Box<T> {
+    fn dispatch(&self, events: &pb::EventBook) -> Result<pb::Projection, CodedError> {
+        (**self).dispatch(events)
+    }
 }
 
 impl<P> ProjectorHandler for ProjectorDispatch<P> {
@@ -205,7 +294,11 @@ impl RouterBuilder {
             }
         }
         let inner = if !aggregates.is_empty() {
-            Inner::CommandHandlers(CommandHandlers::new(aggregates)?)
+            let mut handlers = CommandHandlers::new();
+            for aggregate in aggregates {
+                handlers.push(aggregate)?;
+            }
+            Inner::CommandHandlers(handlers)
         } else if !sagas.is_empty() {
             Inner::Sagas(sagas)
         } else if !pms.is_empty() {
@@ -222,32 +315,60 @@ impl RouterBuilder {
     }
 }
 
-struct CommandHandlers {
+/// The command handlers of one router, in registration order, with their
+/// (domain, command type) claims read once, at registration (C-0065).
+#[derive(Default)]
+pub struct CommandHandlers {
     handlers: Vec<Box<dyn CommandHandler>>,
-    /// (domain, command type) → handler index; claims are read once, at build.
+    /// (domain, command type) → handler index.
     claims: HashMap<(String, String), usize>,
 }
 
 impl CommandHandlers {
-    fn new(handlers: Vec<Box<dyn CommandHandler>>) -> Result<Self, CodedError> {
-        let mut claims = HashMap::new();
-        for (index, handler) in handlers.iter().enumerate() {
-            handler.validate()?;
-            for command in handler.command_types() {
-                let key = (handler.domain().to_string(), command);
-                if claims.insert(key.clone(), index).is_some() {
-                    return Err(CodedError::invalid_argument(
-                        codes::DUPLICATE_COMMAND_HANDLER,
-                        messages::DUPLICATE_COMMAND_HANDLER,
-                        [
-                            (extras::DOMAIN.to_string(), key.0),
-                            (extras::COMMAND_TYPE.to_string(), key.1),
-                        ],
-                    ));
-                }
+    /// No handlers.
+    pub fn new() -> Self {
+        CommandHandlers::default()
+    }
+
+    /// Validates `handler` and adds it. Two handlers claiming one (domain,
+    /// command type) is DUPLICATE_COMMAND_HANDLER (C-0064); the table is left
+    /// unchanged.
+    pub fn push(&mut self, handler: Box<dyn CommandHandler>) -> Result<(), CodedError> {
+        handler.validate()?;
+        let index = self.handlers.len();
+        let keys: Vec<(String, String)> = handler
+            .command_types()
+            .into_iter()
+            .map(|command| (handler.domain().to_string(), command))
+            .collect();
+        for (n, key) in keys.iter().enumerate() {
+            if self.claims.contains_key(key) || keys[..n].contains(key) {
+                return Err(CodedError::invalid_argument(
+                    codes::DUPLICATE_COMMAND_HANDLER,
+                    messages::DUPLICATE_COMMAND_HANDLER,
+                    [
+                        (extras::DOMAIN.to_string(), key.0.clone()),
+                        (extras::COMMAND_TYPE.to_string(), key.1.clone()),
+                    ],
+                ));
             }
         }
-        Ok(CommandHandlers { handlers, claims })
+        self.claims.extend(keys.into_iter().map(|key| (key, index)));
+        self.handlers.push(handler);
+        Ok(())
+    }
+
+    /// The only registered handler, when exactly one is.
+    pub fn sole(&self) -> Option<&dyn CommandHandler> {
+        match self.handlers.as_slice() {
+            [only] => Some(only.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// True when some handler serves `domain`.
+    pub fn serves(&self, domain: &str) -> bool {
+        self.in_domain(domain).next().is_some()
     }
 
     fn in_domain<'a>(&'a self, domain: &'a str) -> impl Iterator<Item = &'a dyn CommandHandler> {
@@ -265,7 +386,17 @@ impl CommandHandlers {
         )
     }
 
-    fn dispatch(&self, req: &pb::ContextualCommand) -> Result<pb::BusinessResponse, CodedError> {
+    /// Routes a command by (cover domain, command type). A Notification runs
+    /// every handler of its domain that claims it, in registration order;
+    /// their results merge as one aggregate's compensators do (events
+    /// concatenate, each later claimant's sequenced pages shifted past those
+    /// already merged so sequences continue after prior history; the first
+    /// escalation wins). An unclaimed Notification goes to the domain's first
+    /// handler (DelegateToFramework or NO_UNDO_HANDLER).
+    pub fn dispatch(
+        &self,
+        req: &pb::ContextualCommand,
+    ) -> Result<pb::BusinessResponse, CodedError> {
         let book = req.command.as_ref();
         let domain = book
             .and_then(|b| b.cover.as_ref())
@@ -281,12 +412,7 @@ impl CommandHandlers {
             };
         };
         if crate::is_notification_type_url(&any.type_url) {
-            let handler = self
-                .in_domain(domain)
-                .find(|h| h.claims_notification(any))
-                .or_else(|| self.in_domain(domain).next())
-                .ok_or_else(|| Self::no_handler(domain))?;
-            return handler.dispatch(req);
+            return self.dispatch_notification(req, domain, any);
         }
         let key = (
             domain.to_string(),
@@ -305,7 +431,37 @@ impl CommandHandlers {
         }
     }
 
-    fn handle_fact(&self, req: &pb::FactRequest) -> Result<pb::EventBook, CodedError> {
+    fn dispatch_notification(
+        &self,
+        req: &pb::ContextualCommand,
+        domain: &str,
+        notification: &prost_types::Any,
+    ) -> Result<pb::BusinessResponse, CodedError> {
+        let mut claimants = self
+            .in_domain(domain)
+            .filter(|h| h.claims_notification(notification))
+            .peekable();
+        if claimants.peek().is_none() {
+            return match self.in_domain(domain).next() {
+                Some(handler) => handler.dispatch(req),
+                None => Err(Self::no_handler(domain)),
+            };
+        }
+        let mut merged: Option<pb::business_response::Result> = None;
+        let mut emitted = 0u32;
+        for handler in claimants {
+            let mut result = handler.dispatch(req)?.result;
+            if let Some(pb::business_response::Result::Events(book)) = result.as_mut() {
+                shift_sequences(book, emitted);
+                emitted += book.pages.len() as u32;
+            }
+            merged = merge_compensation(merged, result);
+        }
+        Ok(pb::BusinessResponse { result: merged })
+    }
+
+    /// Routes facts to the first handler of the facts' cover domain.
+    pub fn handle_fact(&self, req: &pb::FactRequest) -> Result<pb::EventBook, CodedError> {
         let domain = req
             .facts
             .as_ref()
@@ -314,6 +470,32 @@ impl CommandHandlers {
         match self.in_domain(domain).next() {
             Some(handler) => handler.handle_fact(req),
             None => Err(Self::no_handler(domain)),
+        }
+    }
+
+    /// Routes a Replay to the first handler of `domain`.
+    pub fn replay(
+        &self,
+        domain: &str,
+        req: &pb::ReplayRequest,
+    ) -> Result<pb::ReplayResponse, CodedError> {
+        match self.in_domain(domain).next() {
+            Some(handler) => handler.replay(req),
+            None => Err(Self::no_handler(domain)),
+        }
+    }
+}
+
+/// Moves every explicitly sequenced page of `book` `by` places on.
+fn shift_sequences(book: &mut pb::EventBook, by: u32) {
+    if by == 0 {
+        return;
+    }
+    for page in &mut book.pages {
+        if let Some(pb::page_header::SequenceType::Sequence(seq)) =
+            page.header.as_mut().and_then(|h| h.sequence_type.as_mut())
+        {
+            *seq += by;
         }
     }
 }
@@ -356,6 +538,25 @@ impl Router {
     pub fn handle_fact(&self, req: &pb::FactRequest) -> Result<pb::EventBook, CodedError> {
         match &self.inner {
             Inner::CommandHandlers(handlers) => handlers.handle_fact(req),
+            _ => Err(wrong_kind()),
+        }
+    }
+
+    /// Replays the state of `domain`'s first aggregate, or of the process
+    /// manager whose own domain it is, packed by its state packer. A domain
+    /// no stateful component serves, or one whose component has no state
+    /// packer, is NO_HANDLER_REGISTERED.
+    pub fn replay(
+        &self,
+        domain: &str,
+        req: &pb::ReplayRequest,
+    ) -> Result<pb::ReplayResponse, CodedError> {
+        match &self.inner {
+            Inner::CommandHandlers(handlers) => handlers.replay(domain, req),
+            Inner::ProcessManagers(pms) => match pms.iter().find(|pm| pm.pm_domain() == domain) {
+                Some(pm) => pm.replay(req),
+                None => Err(CommandHandlers::no_handler(domain)),
+            },
             _ => Err(wrong_kind()),
         }
     }

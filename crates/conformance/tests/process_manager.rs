@@ -184,6 +184,16 @@ async fn emits_one_process_event(w: &mut ProcessManagerWorld) {
     assert_eq!(w.response().process_events.len(), 1, "one process event");
 }
 
+#[then(regex = r#"^the process event is addressed to "([^"]*)"$"#)]
+async fn process_event_addressed_to(w: &mut ProcessManagerWorld, domain: String) {
+    let books = &w.response().process_events;
+    assert_eq!(books.len(), 1, "one process event");
+    assert_eq!(
+        books[0].cover.as_ref().map(|c| c.domain.as_str()),
+        Some(domain.as_str())
+    );
+}
+
 #[then("the process-manager escalates")]
 async fn escalates(w: &mut ProcessManagerWorld) {
     assert!(

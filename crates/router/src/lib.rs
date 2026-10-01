@@ -29,6 +29,9 @@ use prost_types::Any;
 /// segment after it is the fully-qualified proto name — no resolver host.
 pub const TYPE_URL_PREFIX: &str = "/";
 
+/// The domain a projector declares to consume every domain.
+pub const WILDCARD_DOMAIN: &str = "*";
+
 /// Fully-qualified proto name of the cross-domain rejection Notification.
 pub const NOTIFICATION_FULL_NAME: &str = "io.angzarr.v1.Notification";
 
@@ -111,30 +114,16 @@ pub fn extract_rejection_key(rejection: &pb::RejectionNotification) -> (String, 
     (domain, cmd_type)
 }
 
-/// Stamps every page of saga/PM-emitted `commands` as deferred: the page
-/// header becomes `angzarr_deferred` recording the triggering event (its
-/// book's `source_cover` and the event's `source_seq`) and the command's
-/// position in this invocation's output (`command_index`). Any explicit
-/// sequence a handler set is replaced — a deferred command never carries an
-/// expected version; a per-command `sync_mode` is kept. `source_component`
-/// is left for the coordinator, which stamps the registered component name.
+/// Stamps every page of saga/PM-emitted `commands` as deferred (see
+/// [`destinations::stamp_pages`]), each command indexed by its position in
+/// this invocation's output.
 pub fn stamp_deferred(
     commands: &mut [pb::CommandBook],
     source_cover: Option<&pb::Cover>,
     source_seq: u32,
 ) {
     for (index, cmd) in commands.iter_mut().enumerate() {
-        for page in &mut cmd.pages {
-            let header = page.header.get_or_insert_with(pb::PageHeader::default);
-            header.sequence_type = Some(pb::page_header::SequenceType::AngzarrDeferred(
-                pb::AngzarrDeferredSequence {
-                    source: source_cover.cloned(),
-                    source_seq,
-                    source_component: String::new(),
-                    command_index: index as u32,
-                },
-            ));
-        }
+        destinations::stamp_pages(cmd, source_cover, source_seq, index as u32);
     }
 }
 

@@ -19,7 +19,7 @@ use prost_types::Any;
 
 use crate::error::{codes, extras, map_handler_error, messages, CodedError, HandlerError};
 use crate::pb;
-use crate::rebuild::Rebuilder;
+use crate::rebuild::{pack_message_state, Rebuilder, StatePackFn};
 use crate::NotificationPayload;
 
 /// Per-dispatch facts the business method may need beyond its typed
@@ -90,6 +90,7 @@ pub struct AggregateDispatch<S> {
     rejections: HashMap<String, Vec<RejectionFn<S>>>,
     undoes: HashMap<String, UndoFn<S>>,
     facts: HashMap<String, FactFn<S>>,
+    state_packer: Option<StatePackFn<S>>,
 }
 
 impl<S> AggregateDispatch<S> {
@@ -107,7 +108,27 @@ impl<S> AggregateDispatch<S> {
             rejections: HashMap::new(),
             undoes: HashMap::new(),
             facts: HashMap::new(),
+            state_packer: None,
         }
+    }
+
+    /// Supports Replay through the router: replayed state is packed by
+    /// `packer` into the response's `Any`.
+    pub fn with_state_packer(
+        mut self,
+        packer: impl Fn(&S) -> Result<Any, HandlerError> + Send + Sync + 'static,
+    ) -> Self {
+        self.state_packer = Some(Box::new(packer));
+        self
+    }
+
+    /// Supports Replay through the router for a protobuf-message state,
+    /// packed under its fully-qualified name.
+    pub fn with_message_state(self) -> Self
+    where
+        S: prost::Message + prost::Name + 'static,
+    {
+        self.with_state_packer(pack_message_state::<S>)
     }
 
     /// Registers the thunk for a fully-qualified command type name.
@@ -406,12 +427,14 @@ impl<S> AggregateDispatch<S> {
     /// snapshot (when present) and then the events, in order. The caller packs
     /// the state into the response's `Any`.
     pub fn replay(&self, req: &pb::ReplayRequest) -> Result<S, CodedError> {
-        let book = pb::EventBook {
-            snapshot: req.base_snapshot.clone(),
-            pages: req.events.clone(),
-            ..Default::default()
-        };
-        Ok(self.rebuilder.rebuild(Some(&book))?.0)
+        self.rebuilder.replay(req)
+    }
+
+    /// [`Self::replay`] packed by the state packer; without one the aggregate
+    /// does not support Replay (NO_HANDLER_REGISTERED).
+    pub fn packed_replay(&self, req: &pb::ReplayRequest) -> Result<pb::ReplayResponse, CodedError> {
+        self.rebuilder
+            .packed_replay(self.state_packer.as_ref(), &self.domain, req)
     }
 }
 
@@ -421,7 +444,7 @@ impl<S> AggregateDispatch<S> {
 /// Notification) wins over events and over later escalations. A compensator
 /// returning nothing contributes nothing. One compensator's result is
 /// therefore returned unchanged.
-fn merge_compensation(
+pub(crate) fn merge_compensation(
     acc: Option<pb::business_response::Result>,
     next: Option<pb::business_response::Result>,
 ) -> Option<pb::business_response::Result> {
