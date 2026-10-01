@@ -1,7 +1,7 @@
 //! The coded error model — SCREAMING_SNAKE codes, static cross-language
 //! messages, and the single handler-error → gRPC mapping table. Codes and
-//! message text are byte-identical across language clients; assertions key
-//! off codes, never message substrings.
+//! the framework's own message text are byte-identical across language
+//! clients; assertions key off codes, never message substrings.
 
 use std::collections::BTreeMap;
 
@@ -67,9 +67,12 @@ pub mod extras {
 
 /// A coded business/framework error: the form every failure takes before
 /// crossing a boundary. `code` is the cross-language SCREAMING_SNAKE
-/// identifier (travels as ErrorInfo.reason); `message` is static text that
-/// never carries dynamic causes; `grpc` is resolved by the single mapping
-/// table at construction.
+/// identifier (travels as ErrorInfo.reason); `message` is human-readable
+/// text (travels as Status.message): the framework's own codes carry the
+/// static [`messages`] text, while a business rejection carries the
+/// handler's message and UNHANDLED_HANDLER_ERROR carries the escaped
+/// error's (or panic's) text; `grpc` is resolved by the single mapping table
+/// at construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodedError {
     pub code: String,
