@@ -165,6 +165,21 @@ async fn command_is_deferred(w: &mut ProcessManagerWorld, seq: u32, index: u32) 
     }
 }
 
+#[then("the command leaves its source component to the coordinator")]
+async fn no_source_component(w: &mut ProcessManagerWorld) {
+    for page in &w.response().commands[0].pages {
+        let Some(pb::page_header::SequenceType::AngzarrDeferred(d)) =
+            page.header.as_ref().and_then(|h| h.sequence_type.as_ref())
+        else {
+            panic!("command page is not deferred");
+        };
+        assert_eq!(
+            d.source_component, "",
+            "the coordinator stamps the component"
+        );
+    }
+}
+
 #[then("the process-manager emits no commands")]
 async fn emits_no_commands(w: &mut ProcessManagerWorld) {
     assert!(w.response().commands.is_empty(), "no commands emitted");

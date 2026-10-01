@@ -272,6 +272,60 @@ fn reserve_command_to(domain: &str) -> pb::CommandBook {
     }
 }
 
+/// A SagaHandleRequest whose source carries one Increased event of order
+/// root `label` at sequence `seq`.
+pub fn saga_rooted_source(label: &str, seq: u32) -> pb::SagaHandleRequest {
+    let mut req = saga_event_source("test.counter.Increased", Some(seq));
+    req.source.as_mut().unwrap().cover = Some(cover_of("order", label));
+    req
+}
+
+/// The parity saga ("order" → "inventory"): its Increased handler emits
+/// [`parity_command`] twice.
+pub fn parity_saga() -> SagaDispatch {
+    SagaDispatch::new("parity-saga", "order", ["inventory"])
+        .on_event("test.counter.Increased", |_any, _dests, _cover| {
+            Ok((vec![parity_command(), parity_command()], Vec::new()))
+        })
+}
+
+/// The parity command: cover "inventory", root bytes 10..1f, correlation
+/// "corr-1"; one page whose command is "/example.Foo" carrying 01020304.
+pub fn parity_command() -> pb::CommandBook {
+    pb::CommandBook {
+        cover: Some(pb::Cover {
+            domain: "inventory".to_string(),
+            root: Some(pb::Uuid {
+                value: (0x10u8..=0x1f).collect(),
+            }),
+            correlation_id: "corr-1".to_string(),
+            ..Default::default()
+        }),
+        pages: vec![pb::CommandPage {
+            payload: Some(pb::command_page::Payload::Command(prost_types::Any {
+                type_url: "/example.Foo".to_string(),
+                value: vec![1, 2, 3, 4],
+            })),
+            ..Default::default()
+        }],
+    }
+}
+
+/// The parity source: one Increased event at sequence `seq` under cover
+/// "order", root bytes 00..0f, correlation "corr-1".
+pub fn parity_source(seq: u32) -> pb::SagaHandleRequest {
+    let mut req = saga_event_source("test.counter.Increased", Some(seq));
+    req.source.as_mut().unwrap().cover = Some(pb::Cover {
+        domain: "order".to_string(),
+        root: Some(pb::Uuid {
+            value: (0x00u8..=0x0f).collect(),
+        }),
+        correlation_id: "corr-1".to_string(),
+        ..Default::default()
+    });
+    req
+}
+
 /// A SagaHandleRequest whose source carries one event of `event_fq` in the
 /// "order" domain, at sequence `seq` when given.
 pub fn saga_event_source(event_fq: &str, seq: Option<u32>) -> pb::SagaHandleRequest {
@@ -1062,7 +1116,8 @@ fn increased_page(seq: Option<u32>) -> pb::EventPage {
 
 /// The ledger aggregate (domain "ledger") over CounterState: Increased folds
 /// count += 1 and records the page sequence it applied; a snapshot loads
-/// CounterState; IncreaseBy records the handled cover and emits nothing; the
+/// CounterState; IncreaseBy records the handled cover and emits one Increased
+/// whose cover carries the ledger's own linkage ([`ledger_linkage`]); the
 /// only declared fact, Increased, is recorded as received and flagged by a
 /// CounterState carrying the count it brings the ledger to.
 pub fn ledger_aggregate(seen: CoverSink, applied: SequenceSink) -> AggregateDispatch<CounterState> {
@@ -1082,7 +1137,17 @@ pub fn ledger_aggregate(seen: CoverSink, applied: SequenceSink) -> AggregateDisp
     AggregateDispatch::new("Ledger", "ledger", rebuilder)
         .on_command("test.counter.IncreaseBy", move |_cmd, _state, cctx| {
             seen.lock().unwrap().push(cctx.cover.clone());
-            Ok(None)
+            Ok(Some(pb::EventBook {
+                cover: Some(pb::Cover {
+                    ext: Some(ledger_linkage()),
+                    ..Default::default()
+                }),
+                pages: vec![pb::EventPage {
+                    payload: Some(pb::event_page::Payload::Event(increased_any())),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }))
         })
         .on_fact("test.counter.Increased", |fact, state: &CounterState| {
             Ok(FactRecord {
@@ -1150,6 +1215,21 @@ pub fn events_replay_request(events: u32) -> pb::ReplayRequest {
 }
 
 /// An IncreaseBy command for the ledger root `label`.
+/// The parent linkage the ledger sets on its own events.
+pub fn ledger_linkage() -> prost_types::Any {
+    prost_types::Any {
+        type_url: angzarr_router::type_url("test.counter.Parent"),
+        value: vec![4, 5, 6],
+    }
+}
+
+/// [`ledger_command`] on behalf of a parent ([`parent_linkage`]).
+pub fn ledger_command_with_linkage(label: &str) -> pb::ContextualCommand {
+    let mut cc = ledger_command(label);
+    cc.command.as_mut().unwrap().cover.as_mut().unwrap().ext = Some(parent_linkage());
+    cc
+}
+
 pub fn ledger_command(label: &str) -> pb::ContextualCommand {
     pb::ContextualCommand {
         command: Some(pb::CommandBook {

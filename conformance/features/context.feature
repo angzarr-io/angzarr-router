@@ -6,7 +6,8 @@ Feature: Facts, replay and handler context
   type is refused with NO_FACT_HANDLER and nothing is recorded) and replays
   history into state, as does a
   process-manager; appliers see each event's sequence; handlers read the
-  cover they are handling; a process-manager compensator may issue
+  cover they are handling, and a parent linkage (cover.ext) a handler sets on
+  its events is kept over the command's; a process-manager compensator may issue
   commands; a projector fold knows where each event sits. The ledger
   aggregate, reserving process-manager and tracking projector are built
   through each binding's hand-written API over the fixture's CounterState.
@@ -36,6 +37,11 @@ Feature: Facts, replay and handler context
     Given a reserving process-manager
     When the reserving process-manager replays 3 Increased events
     Then the replayed state has a count of 3
+
+  Scenario: a handler's own parent linkage is never overridden
+    Given a ledger aggregate
+    When an IncreaseBy command for ledger root "ledger-1" on behalf of a parent is dispatched
+    Then the recorded event carries the ledger's own linkage
 
   Scenario: a command handler reads its own cover
     Given a ledger aggregate

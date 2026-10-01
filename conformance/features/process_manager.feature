@@ -20,6 +20,7 @@ Feature: Order process-manager dispatch
     When an Increased trigger in domain "counter" at sequence 4 is dispatched
     Then the process-manager emits one command to "inventory"
     And the command is deferred from source sequence 4 at command index 0
+    And the command leaves its source component to the coordinator
 
   Scenario: history does not re-trigger
     Given an order process-manager

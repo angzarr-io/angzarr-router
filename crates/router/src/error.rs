@@ -48,6 +48,7 @@ pub mod codes {
     pub const MISSING_PM_EVENT_PAYLOAD: &str = "MISSING_PM_EVENT_PAYLOAD";
     pub const UNDECLARED_OUTPUT_DOMAIN: &str = "UNDECLARED_OUTPUT_DOMAIN";
     pub const NO_FACT_HANDLER: &str = "NO_FACT_HANDLER";
+    pub const SAGA_COMPENSATES: &str = "SAGA_COMPENSATES";
 }
 
 /// Canonical static message text (byte-equal across languages).
@@ -78,6 +79,8 @@ pub mod messages {
     pub const UNDECLARED_OUTPUT_DOMAIN: &str = "domain is not a declared output domain";
     pub const REPLAY_UNSUPPORTED: &str = "the component does not support Replay";
     pub const NO_FACT_HANDLER: &str = "no fact handler for the fact type";
+    pub const SAGA_COMPENSATES: &str =
+        "a saga never receives rejections, so it cannot declare compensation handlers";
 }
 
 /// Cross-language detail-key constants.

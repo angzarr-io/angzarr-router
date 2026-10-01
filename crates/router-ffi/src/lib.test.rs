@@ -1073,6 +1073,7 @@ fn saga_descriptor_bytes() -> Vec<u8> {
             fq_type: FQ_ORDER_CREATED.to_string(),
             callback_id: CB_SAGA_EVENT,
         }],
+        rejections: Vec::new(),
     }
     .encode_to_vec()
 }
@@ -2628,5 +2629,42 @@ fn an_undeclared_fact_never_reaches_the_host() {
         session_snapshot(session).counter,
         0,
         "refused before any applier or fact handler ran"
+    );
+}
+
+#[test]
+fn a_saga_declaring_a_rejection_handler_is_refused_at_registration() {
+    let r = angzarr_router_new();
+    let mut desc = abi_pb::SagaDescriptor::decode(saga_descriptor_bytes().as_slice()).unwrap();
+    desc.rejections = vec![abi_pb::RejectionEntry {
+        compensates: FQ_RESERVE_STOCK.to_string(),
+        callback_ids: vec![CB_SAGA_COMP],
+    }];
+    let bytes = desc.encode_to_vec();
+    let ret = unsafe { angzarr_router_register_saga(r, bytes.as_ptr(), bytes.len(), host_cb) };
+    assert_eq!(ret, -3, "INVALID_ARGUMENT");
+    let router = Router(r);
+    let (ret, _) = router.dispatch_saga(
+        next_session(),
+        &saga_request("order", vec![event_page_of(FQ_ORDER_CREATED)]),
+    );
+    assert_eq!(ret, -12, "no saga was registered");
+}
+
+#[test]
+fn a_saga_refusal_names_the_code_and_the_saga() {
+    let mut router = registry::FfiRouter::new();
+    let mut desc = abi_pb::SagaDescriptor::decode(saga_descriptor_bytes().as_slice()).unwrap();
+    desc.rejections = vec![abi_pb::RejectionEntry {
+        compensates: FQ_RESERVE_STOCK.to_string(),
+        callback_ids: vec![CB_SAGA_COMP],
+    }];
+    let err = router
+        .register_saga(&desc.encode_to_vec(), host_cb)
+        .unwrap_err();
+    assert_eq!(err.code, angzarr_router::error::codes::SAGA_COMPENSATES);
+    assert_eq!(
+        err.extras.get("saga").map(String::as_str),
+        Some("OrderFulfillment")
     );
 }

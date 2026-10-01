@@ -16,6 +16,7 @@ struct ContextWorld {
     facts: Option<Result<pb::EventBook, CodedError>>,
     replayed: Option<conf::CounterState>,
     pm: Option<Result<pb::ProcessManagerHandleResponse, CodedError>>,
+    command: Option<pb::BusinessResponse>,
 }
 
 #[given("a ledger aggregate")]
@@ -66,9 +67,37 @@ async fn applied_at(w: &mut ContextWorld, first: u32, second: u32) {
 #[when(regex = r#"^an IncreaseBy command for ledger root "([^"]*)" is dispatched$"#)]
 async fn ledger_command(w: &mut ContextWorld, label: String) {
     let ledger = conf::ledger_aggregate(w.covers.clone(), w.applied.clone());
-    ledger
-        .dispatch(&conf::ledger_command(&label))
-        .expect("dispatch");
+    w.command = Some(
+        ledger
+            .dispatch(&conf::ledger_command(&label))
+            .expect("dispatch"),
+    );
+}
+
+#[when(
+    regex = r#"^an IncreaseBy command for ledger root "([^"]*)" on behalf of a parent is dispatched$"#
+)]
+async fn ledger_command_with_parent(w: &mut ContextWorld, label: String) {
+    let ledger = conf::ledger_aggregate(w.covers.clone(), w.applied.clone());
+    w.command = Some(
+        ledger
+            .dispatch(&conf::ledger_command_with_linkage(&label))
+            .expect("dispatch"),
+    );
+}
+
+#[then("the recorded event carries the ledger's own linkage")]
+async fn ledger_own_linkage(w: &mut ContextWorld) {
+    let resp = w.command.as_ref().expect("a command was dispatched");
+    let Some(pb::business_response::Result::Events(book)) = &resp.result else {
+        panic!("expected events, got {:?}", resp.result);
+    };
+    assert_eq!(book.pages.len(), 1);
+    assert_eq!(
+        book.cover.as_ref().and_then(|c| c.ext.as_ref()),
+        Some(&conf::ledger_linkage()),
+        "the handler-set linkage is kept over the command's"
+    );
 }
 
 #[when(
