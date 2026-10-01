@@ -5,18 +5,57 @@
 
 use angzarr_router::error::CodedError;
 use angzarr_router::pb;
+use angzarr_router::process_manager::{
+    merge_response, select_process_managers, ProcessManagerRoute,
+};
 use angzarr_router_conformance as conf;
 use cucumber::{given, then, when, World};
 
 #[derive(Debug, Default, World)]
 struct ProcessManagerWorld {
+    /// True when the audit PM is co-resident with the order PM.
+    co_resident: bool,
     /// Outcome of the dispatched trigger.
     result: Option<Result<pb::ProcessManagerHandleResponse, CodedError>>,
 }
 
 impl ProcessManagerWorld {
     fn dispatch(&mut self, req: pb::ProcessManagerHandleRequest) {
-        self.result = Some(conf::order_pm().dispatch(&req));
+        if !self.co_resident {
+            self.result = Some(conf::order_pm().dispatch(&req));
+            return;
+        }
+        // Co-resident: the router's selection + merge over both PMs, each
+        // dispatching over its own state type.
+        let order = conf::order_pm();
+        let audit = conf::audit_pm();
+        let routes: [&dyn ProcessManagerRoute; 2] = [&order, &audit];
+        let mut merged = pb::ProcessManagerHandleResponse::default();
+        for index in select_process_managers(&routes, &req) {
+            let resp = match index {
+                0 => order.dispatch(&req),
+                _ => audit.dispatch(&req),
+            };
+            match resp {
+                Ok(resp) => merge_response(&mut merged, resp),
+                Err(err) => {
+                    self.result = Some(Err(err));
+                    return;
+                }
+            }
+        }
+        self.result = Some(Ok(merged));
+    }
+
+    fn facts_marked(&self, audit: bool) -> usize {
+        self.response()
+            .facts
+            .iter()
+            .filter(|f| {
+                let domain = f.cover.as_ref().map_or("", |c| c.domain.as_str());
+                (domain == conf::AUDIT_MARK) == audit
+            })
+            .count()
     }
 
     fn response(&self) -> &pb::ProcessManagerHandleResponse {
@@ -152,6 +191,73 @@ async fn fails_with(w: &mut ProcessManagerWorld, code: String) {
         .err()
         .unwrap_or_else(|| panic!("expected failure {code}, got a success"));
     assert_eq!(err.code, code, "coded-error reason");
+}
+
+#[given("co-resident order and audit process-managers")]
+async fn co_resident_pms(w: &mut ProcessManagerWorld) {
+    w.co_resident = true;
+}
+
+#[when(
+    regex = r#"^an Increased trigger is dispatched over a prior "([^"]*)" state of (\d+) events$"#
+)]
+async fn increased_over_owned_state(w: &mut ProcessManagerWorld, owner: String, n: u32) {
+    w.dispatch(conf::pm_trigger_request(
+        "counter",
+        &["test.counter.Increased"],
+        Some(conf::pm_state_in(&owner, n)),
+        &[],
+    ));
+}
+
+#[when(regex = r#"^a rejection of Reserve issued by "([^"]*)" is dispatched$"#)]
+async fn rejection_issued_by(w: &mut ProcessManagerWorld, issuer: String) {
+    w.dispatch(conf::pm_issued_rejection_request(
+        "test.counter.Reserve",
+        &issuer,
+    ));
+}
+
+#[then(regex = r"^the order process-manager rebuilt (\d+) prior state events$")]
+async fn order_rebuilt(w: &mut ProcessManagerWorld, n: usize) {
+    assert_eq!(
+        w.facts_marked(false),
+        n,
+        "order PM facts = its rebuilt events"
+    );
+}
+
+#[then(regex = r"^the audit process-manager rebuilt (\d+) prior state events$")]
+async fn audit_rebuilt(w: &mut ProcessManagerWorld, n: usize) {
+    assert_eq!(
+        w.facts_marked(true),
+        n,
+        "audit PM facts = its rebuilt events"
+    );
+}
+
+#[then("the order process-manager did not react")]
+async fn order_did_not_react(w: &mut ProcessManagerWorld) {
+    assert!(
+        w.response().commands.is_empty(),
+        "the order PM emitted no command"
+    );
+    assert_eq!(w.facts_marked(false), 0, "the order PM emitted no fact");
+}
+
+#[then("only the audit process-manager compensates")]
+async fn only_audit_compensates(w: &mut ProcessManagerWorld) {
+    let resp = w.response();
+    assert_eq!(resp.process_events.len(), 1, "exactly one compensation");
+    assert_eq!(
+        resp.process_events[0]
+            .cover
+            .as_ref()
+            .map(|c| c.domain.as_str()),
+        Some(conf::AUDIT_MARK),
+        "the audit PM compensated"
+    );
+    assert!(resp.notification.is_none(), "the order PM did not escalate");
 }
 
 #[tokio::main]

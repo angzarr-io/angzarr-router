@@ -412,6 +412,113 @@ pub fn order_pm() -> ProcessManagerDispatch<ProcessManagerState> {
         })
 }
 
+/// The AuditProcessManager's own state: a different type from
+/// [`ProcessManagerState`], so a PM folding into another's state is detectable.
+#[derive(Default)]
+pub struct AuditState {
+    pub seen: Vec<String>,
+}
+
+/// Cover domain the AuditProcessManager stamps on its facts and process
+/// events, so scenarios can tell its reactions from the order PM's.
+pub const AUDIT_MARK: &str = "audit";
+
+/// Build the AuditProcessManager dispatch table (domain "audit-pm"): co-resident
+/// with the order PM over the same "counter" Increased trigger and the same
+/// rejected Reserve, but over its own state type. It reacts with one "audit"
+/// fact per prior state event and no commands, and compensates with one
+/// "audit" process event and no escalation.
+pub fn audit_pm() -> ProcessManagerDispatch<AuditState> {
+    let rebuilder = Rebuilder::new(AuditState::default).apply(
+        "test.counter.Increased",
+        |state: &mut AuditState, event| {
+            counter::Increased::decode(event.value.as_slice())?;
+            state.seen.push("Increased".to_string());
+            Ok(())
+        },
+    );
+
+    ProcessManagerDispatch::new("AuditProcessManager", "audit-pm", rebuilder)
+        .on_event(
+            "counter",
+            "test.counter.Increased",
+            |_event, state: &mut AuditState, _dests| {
+                let facts = state.seen.iter().map(|_| audit_book()).collect();
+                Ok(pb::ProcessManagerHandleResponse {
+                    facts,
+                    ..Default::default()
+                })
+            },
+        )
+        .on_rejected("test.counter.Reserve", |_n, _r, _state| {
+            Ok((vec![audit_book()], None))
+        })
+}
+
+fn audit_book() -> pb::EventBook {
+    pb::EventBook {
+        cover: Some(pb::Cover {
+            domain: AUDIT_MARK.to_string(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// A PM process-state book of `n` Increased events owned by `pm_domain` (its
+/// cover addresses the owning PM).
+pub fn pm_state_in(pm_domain: &str, n: u32) -> pb::EventBook {
+    let mut book = pm_state_of(n);
+    book.cover = Some(pb::Cover {
+        domain: pm_domain.to_string(),
+        ..Default::default()
+    });
+    book
+}
+
+/// A PM request delivering the rejection of a `fq_command` that the PM owning
+/// `issuer_domain` issued: the trigger cover is the issuer's domain and the
+/// rejected command's angzarr_deferred header names it as the source.
+pub fn pm_issued_rejection_request(
+    fq_command: &str,
+    issuer_domain: &str,
+) -> pb::ProcessManagerHandleRequest {
+    let mut req = pm_rejection_request(fq_command);
+    let trigger = req.trigger.as_mut().expect("rejection trigger");
+    trigger.cover = Some(pb::Cover {
+        domain: issuer_domain.to_string(),
+        ..Default::default()
+    });
+    let page = trigger.pages.last_mut().expect("notification page");
+    let Some(pb::event_page::Payload::Event(any)) = page.payload.as_mut() else {
+        unreachable!("rejection trigger carries a Notification event");
+    };
+    let mut notification =
+        pb::Notification::decode(any.value.as_slice()).expect("fixture Notification");
+    let payload = notification.payload.as_mut().expect("rejection payload");
+    let mut rejection = pb::RejectionNotification::decode(payload.value.as_slice())
+        .expect("fixture RejectionNotification");
+    let command = rejection
+        .rejected_command
+        .as_mut()
+        .expect("rejected command");
+    command.pages[0].header = Some(pb::PageHeader {
+        sequence_type: Some(pb::page_header::SequenceType::AngzarrDeferred(
+            pb::AngzarrDeferredSequence {
+                source: Some(pb::Cover {
+                    domain: issuer_domain.to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    });
+    payload.value = rejection.encode_to_vec();
+    any.value = notification.encode_to_vec();
+    req
+}
+
 fn pm_process_event() -> pb::EventBook {
     pb::EventBook {
         pages: vec![pb::EventPage::default()],
