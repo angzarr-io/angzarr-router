@@ -56,9 +56,9 @@ public final class Router implements AutoCloseable {
     this.ptr = Ffi.routerNew();
   }
 
-  /** The ABI version the loaded cdylib reports (always 1 for a compatible lib). */
+  /** The ABI version the loaded router-ffi library reports. */
   public static int abiVersion() {
-    return 1;
+    return Ffi.abiVersion();
   }
 
   /**

@@ -100,15 +100,31 @@ final class Ffi {
   private static final ConcurrentHashMap<Long, Session> SESSIONS = new ConcurrentHashMap<>();
   private static final AtomicLong NEXT_SESSION = new AtomicLong(1);
 
+  /** The router-ffi ABI version this binding is built against. */
+  static final int EXPECTED_ABI_VERSION = 1;
+
   static {
-    int v;
+    checkAbiVersion(abiVersion());
+  }
+
+  /** The ABI version the loaded router-ffi library reports. */
+  static int abiVersion() {
     try {
-      v = (int) ABI_VERSION.invokeExact();
+      return (int) ABI_VERSION.invokeExact();
     } catch (Throwable t) {
-      throw new ExceptionInInitializerError(t);
+      throw rethrow(t);
     }
-    if (v != 1) {
-      throw new IllegalStateException("router-ffi ABI version " + v + " != 1");
+  }
+
+  /** Refuses a router-ffi library whose ABI version is not the one this binding expects. */
+  static void checkAbiVersion(int actual) {
+    if (actual != EXPECTED_ABI_VERSION) {
+      throw new IllegalStateException(
+          "router-ffi ABI version mismatch: expected "
+              + EXPECTED_ABI_VERSION
+              + ", got "
+              + actual
+              + " — rebuild the binding against the loaded library");
     }
   }
 
