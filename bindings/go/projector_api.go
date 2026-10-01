@@ -11,6 +11,17 @@ import (
 // the typed business method.
 type ProjectorEventThunk[P any] func(projection P, event *anypb.Any) error
 
+// PageContext is where a folded event sits: its book's cover and the page's
+// explicit sequence (0 when the page carries none).
+type PageContext struct {
+	Cover    *pb.Cover
+	Sequence uint32
+}
+
+// ProjectorEventContextThunk is a ProjectorEventThunk that also receives the
+// event's PageContext.
+type ProjectorEventContextThunk[P any] func(projection P, event *anypb.Any, ctx PageContext) error
+
 // ProjectorFinishThunk packs the folded projection instance into the wire
 // Projection. When absent, dispatch returns a default Projection (cover +
 // projector name).
@@ -27,7 +38,7 @@ type ProjectorDispatch[P any] struct {
 	name    string
 	factory func() P
 	domains []string
-	events  map[string]ProjectorEventThunk[P]
+	events  map[string]ProjectorEventContextThunk[P]
 	unknown ProjectorUnknownThunk
 	finish  ProjectorFinishThunk[P]
 }
@@ -38,7 +49,7 @@ func NewProjectorDispatch[P any](name string, factory func() P) *ProjectorDispat
 	return &ProjectorDispatch[P]{
 		name:    name,
 		factory: factory,
-		events:  make(map[string]ProjectorEventThunk[P]),
+		events:  make(map[string]ProjectorEventContextThunk[P]),
 	}
 }
 
@@ -51,6 +62,14 @@ func (d *ProjectorDispatch[P]) ForDomains(domains ...string) *ProjectorDispatch[
 
 // OnEvent registers the fold thunk for a fully-qualified event type name.
 func (d *ProjectorDispatch[P]) OnEvent(fullName string, thunk ProjectorEventThunk[P]) *ProjectorDispatch[P] {
+	return d.OnEventWithContext(fullName, func(projection P, event *anypb.Any, _ PageContext) error {
+		return thunk(projection, event)
+	})
+}
+
+// OnEventWithContext registers the fold thunk for a fully-qualified event type
+// name; the thunk also receives the event's PageContext.
+func (d *ProjectorDispatch[P]) OnEventWithContext(fullName string, thunk ProjectorEventContextThunk[P]) *ProjectorDispatch[P] {
 	d.events[fullName] = thunk
 	return d
 }

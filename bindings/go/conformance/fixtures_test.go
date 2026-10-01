@@ -40,6 +40,12 @@ func increasedAny() *anypb.Any {
 	return &anypb.Any{TypeUrl: typeURL(fqIncreased), Value: mustMarshal(&counter.Increased{})}
 }
 
+// noState is the stateless host state of hand-built components that
+// keep none.
+type noState struct{}
+
+func newNoState() noState { return noState{} }
+
 // --- CounterAggregate ---
 
 type counterAggregate struct{ observed *[]observation }

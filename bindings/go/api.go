@@ -121,6 +121,9 @@ type CommandContext struct {
 	// (pages or snapshot) — the "does this aggregate exist" signal a
 	// non-nil zero state cannot convey.
 	HadPriorEvents bool
+	// Cover is the cover of the command (or notification delivery) being
+	// handled: the aggregate's own domain and root.
+	Cover *pb.Cover
 }
 
 // ApplierThunk folds one persisted event into the rebuilding state.
@@ -135,6 +138,17 @@ type CommandThunk[S any] func(cmd *anypb.Any, state S, cctx CommandContext) (*pb
 // RejectionThunk compensates a rejected command. Multiple thunks for one
 // command run in registration order; their responses merge in the core.
 type RejectionThunk[S any] func(n *pb.Notification, rejection *pb.RejectionNotification, state S, cctx CommandContext) (*pb.BusinessResponse, error)
+
+// UndoThunk undoes an executed command: it receives the Notification, the
+// Compensate it carries (Compensate.CommandType is the undone command's
+// fully-qualified type), the rebuilt state and the command context, and
+// returns the compensating events (a nil response emits nothing).
+type UndoThunk[S any] func(n *pb.Notification, compensate *pb.Compensate, state S, cctx CommandContext) (*pb.BusinessResponse, error)
+
+// FactThunk handles one fact (an external reality the aggregate records but
+// cannot refuse) against the rebuilt state, returning the fact to record. A
+// nil Any records the fact unchanged.
+type FactThunk[S any] func(fact *anypb.Any, state S) (*anypb.Any, error)
 
 // Rebuilder folds an aggregate's prior events (and optional snapshot) into
 // state before a command runs.
@@ -162,15 +176,19 @@ func (r *Rebuilder[S]) WithSnapshot(thunk ApplierThunk[S]) *Rebuilder[S] {
 }
 
 // AggregateDispatch is one aggregate component's registration: its name,
-// domain, rebuilder, command handlers, and ordered rejection compensators.
-// The shape mirrors the engine's so generated wiring (unit 6) targets it
-// with minimal emitter changes.
+// domain, rebuilder, command handlers, ordered rejection compensators, undo
+// handlers and fact handlers. The shape mirrors the engine's so generated
+// wiring targets it with minimal emitter changes. An aggregate whose state is
+// a protobuf message also supports Replay: the binding packs its rebuilt
+// state as a google.protobuf.Any.
 type AggregateDispatch[S any] struct {
 	name       string
 	domain     string
 	rebuilder  *Rebuilder[S]
 	commands   map[string]CommandThunk[S]
 	rejections map[string][]RejectionThunk[S]
+	undoes     map[string]UndoThunk[S]
+	facts      map[string]FactThunk[S]
 }
 
 // NewAggregateDispatch starts an aggregate registration.
@@ -181,6 +199,8 @@ func NewAggregateDispatch[S any](name, domain string, rebuilder *Rebuilder[S]) *
 		rebuilder:  rebuilder,
 		commands:   make(map[string]CommandThunk[S]),
 		rejections: make(map[string][]RejectionThunk[S]),
+		undoes:     make(map[string]UndoThunk[S]),
+		facts:      make(map[string]FactThunk[S]),
 	}
 }
 
@@ -196,6 +216,22 @@ func (d *AggregateDispatch[S]) OnCommand(fullName string, thunk CommandThunk[S])
 // the core verbatim. Repeated calls register an ordered fan-out.
 func (d *AggregateDispatch[S]) OnRejected(fqCommand string, thunk RejectionThunk[S]) *AggregateDispatch[S] {
 	d.rejections[fqCommand] = append(d.rejections[fqCommand], thunk)
+	return d
+}
+
+// OnUndo registers the undo handler for one executed command type: a
+// Compensate whose command_type is fqCommandType routes to it. A Compensate
+// with no undo handler is refused by the core as NO_UNDO_HANDLER
+// (UNIMPLEMENTED).
+func (d *AggregateDispatch[S]) OnUndo(fqCommandType string, thunk UndoThunk[S]) *AggregateDispatch[S] {
+	d.undoes[fqCommandType] = thunk
+	return d
+}
+
+// OnFact registers the fact handler for one fully-qualified fact (event)
+// type. Facts with no handler are recorded unchanged.
+func (d *AggregateDispatch[S]) OnFact(fqFactType string, thunk FactThunk[S]) *AggregateDispatch[S] {
+	d.facts[fqFactType] = thunk
 	return d
 }
 

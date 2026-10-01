@@ -257,3 +257,29 @@ func compensatePayload(fqCommand string) *anypb.Any {
 		}),
 	}
 }
+
+// notificationCommand is a Notification command wrapping payload, addressed to
+// domain, over a one-page prior history ending at nextSequence-1 when
+// nextSequence is non-nil.
+func notificationCommand(domain string, payload *anypb.Any, nextSequence *uint32) *pb.ContextualCommand {
+	cc := &pb.ContextualCommand{
+		Command: &pb.CommandBook{
+			Cover: &pb.Cover{Domain: domain},
+			Pages: []*pb.CommandPage{{Payload: &pb.CommandPage_Command{Command: &anypb.Any{
+				TypeUrl: typeURL("io.angzarr.v1.Notification"),
+				Value:   mustMarshal(&pb.Notification{Payload: payload}),
+			}}}},
+		},
+	}
+	if nextSequence != nil {
+		next := *nextSequence
+		cc.Events = &pb.EventBook{
+			NextSequence: next,
+			Pages: []*pb.EventPage{{
+				Header:  sequenceHeader(next - 1),
+				Payload: &pb.EventPage_Event{Event: &anypb.Any{TypeUrl: typeURL("test.counter.Unrelated")}},
+			}},
+		}
+	}
+	return cc
+}

@@ -37,6 +37,8 @@ int32_t  angzarr_router_register_saga(void*, const uint8_t*, size_t, angzarr_cb)
 int32_t  angzarr_router_dispatch_saga(void*, void*, const uint8_t*, size_t, angzarr_buf*);
 int32_t  angzarr_router_register_process_manager(void*, const uint8_t*, size_t, angzarr_cb);
 int32_t  angzarr_router_dispatch_process_manager(void*, void*, const uint8_t*, size_t, angzarr_buf*);
+int32_t  angzarr_router_dispatch_fact(void*, void*, const uint8_t*, size_t, angzarr_buf*);
+int32_t  angzarr_router_dispatch_replay(void*, void*, const uint8_t*, size_t, angzarr_buf*);
 
 // The Go //export trampoline (defined in trampoline.go). Declared with
 // non-const pointers because cgo //export cannot express const.
@@ -89,6 +91,16 @@ static int32_t angzarr_dispatch_saga_h(void* r, uintptr_t ctx,
 static int32_t angzarr_dispatch_process_manager_h(void* r, uintptr_t ctx,
         const uint8_t* req, size_t n, angzarr_buf* out) {
     return angzarr_router_dispatch_process_manager(r, (void*)ctx, req, n, out);
+}
+
+static int32_t angzarr_dispatch_fact_h(void* r, uintptr_t ctx,
+        const uint8_t* req, size_t n, angzarr_buf* out) {
+    return angzarr_router_dispatch_fact(r, (void*)ctx, req, n, out);
+}
+
+static int32_t angzarr_dispatch_replay_h(void* r, uintptr_t ctx,
+        const uint8_t* req, size_t n, angzarr_buf* out) {
+    return angzarr_router_dispatch_replay(r, (void*)ctx, req, n, out);
 }
 */
 import "C"
@@ -197,7 +209,8 @@ func (r *Router) assign(inv invoker) uint64 {
 }
 
 // RegisterAggregate registers one aggregate component: it assigns callback
-// ids to every thunk, serializes the AggregateDescriptor, and hands it to
+// ids to every thunk (plus a state packer for Replay when the state type is a
+// protobuf message), serializes the AggregateDescriptor, and hands it to
 // the core with the shared callback gateway. A free function (not a method)
 // because Go methods cannot introduce the state type parameter.
 func RegisterAggregate[S any](r *Router, d *AggregateDispatch[S]) error {
@@ -227,6 +240,18 @@ func RegisterAggregate[S any](r *Router, d *AggregateDispatch[S]) error {
 			entry.CallbackIds = append(entry.CallbackIds, id)
 		}
 		desc.Rejections = append(desc.Rejections, entry)
+	}
+	for fq, thunk := range d.undoes {
+		id := r.assign(undoInvoker(key, factory, thunk))
+		desc.Undoes = append(desc.Undoes, &abipb.CallbackEntry{FqType: fq, CallbackId: id})
+	}
+	for fq, thunk := range d.facts {
+		id := r.assign(factInvoker(key, factory, thunk))
+		desc.Facts = append(desc.Facts, &abipb.CallbackEntry{FqType: fq, CallbackId: id})
+	}
+	if stateIsMessage[S]() {
+		id := r.assign(statePackInvoker(key, factory))
+		desc.StateCallbackId = &id
 	}
 
 	descBytes, err := proto.Marshal(desc)
@@ -502,6 +527,70 @@ func (r *Router) Dispatch(cc *pb.ContextualCommand) (*pb.BusinessResponse, error
 	return nil, decodeStatus(respBytes, int32(ret))
 }
 
+// DispatchFact runs one FactRequest through the fact handling of the
+// aggregate claiming the facts' cover domain and returns the EventBook of
+// facts to record, or a *CodedError decoded from the core's failure.
+func (r *Router) DispatchFact(req *pb.FactRequest) (*pb.EventBook, error) {
+	reqBytes, err := proto.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal FactRequest: %w", err)
+	}
+
+	h := cgo.NewHandle(newSession(r))
+	defer h.Delete()
+
+	var reqPtr *C.uint8_t
+	if len(reqBytes) > 0 {
+		reqPtr = (*C.uint8_t)(unsafe.Pointer(&reqBytes[0]))
+	}
+	var out C.angzarr_buf
+	ret := C.angzarr_dispatch_fact_h(r.ptr, C.uintptr_t(h), reqPtr, C.size_t(len(reqBytes)), &out)
+	runtime.KeepAlive(reqBytes)
+	respBytes := consumeBuf(&out)
+
+	if ret == 0 {
+		var book pb.EventBook
+		if err := proto.Unmarshal(respBytes, &book); err != nil {
+			return nil, fmt.Errorf("unmarshal EventBook: %w", err)
+		}
+		return &book, nil
+	}
+	return nil, decodeStatus(respBytes, int32(ret))
+}
+
+// DispatchReplay rebuilds the state of the aggregate registered for domain
+// (empty selects a sole registered aggregate) from req and returns it packed
+// in a ReplayResponse, or a *CodedError decoded from the core's failure. An
+// aggregate whose state is not a protobuf message does not support Replay
+// (NO_HANDLER_REGISTERED).
+func (r *Router) DispatchReplay(domain string, req *pb.ReplayRequest) (*pb.ReplayResponse, error) {
+	reqBytes, err := proto.Marshal(&abipb.ReplayCall{Domain: domain, Request: req})
+	if err != nil {
+		return nil, fmt.Errorf("marshal ReplayCall: %w", err)
+	}
+
+	h := cgo.NewHandle(newSession(r))
+	defer h.Delete()
+
+	var reqPtr *C.uint8_t
+	if len(reqBytes) > 0 {
+		reqPtr = (*C.uint8_t)(unsafe.Pointer(&reqBytes[0]))
+	}
+	var out C.angzarr_buf
+	ret := C.angzarr_dispatch_replay_h(r.ptr, C.uintptr_t(h), reqPtr, C.size_t(len(reqBytes)), &out)
+	runtime.KeepAlive(reqBytes)
+	respBytes := consumeBuf(&out)
+
+	if ret == 0 {
+		var resp pb.ReplayResponse
+		if err := proto.Unmarshal(respBytes, &resp); err != nil {
+			return nil, fmt.Errorf("unmarshal ReplayResponse: %w", err)
+		}
+		return &resp, nil
+	}
+	return nil, decodeStatus(respBytes, int32(ret))
+}
+
 // consumeBuf copies a router-allocated out buffer into Go memory and
 // releases it (the dispatch out is router-owned).
 func consumeBuf(b *C.angzarr_buf) []byte {
@@ -515,8 +604,9 @@ func consumeBuf(b *C.angzarr_buf) []byte {
 	return out
 }
 
-// applierInvoker / commandInvoker / rejectionInvoker build the type-erased
-// bridge for one thunk, lazily seeding the component's state on first use.
+// applierInvoker / commandInvoker / rejectionInvoker / undoInvoker /
+// factInvoker build the type-erased bridge for one thunk, lazily seeding the
+// component's state on first use.
 
 func applierInvoker[S any](key componentKey, factory func() S, thunk ApplierThunk[S]) invoker {
 	return func(s *session, typeURL string, payload, _ []byte) ([]byte, int32) {
@@ -534,7 +624,7 @@ func commandInvoker[S any](key componentKey, factory func() S, thunk CommandThun
 		if err := proto.Unmarshal(aux, &cax); err != nil {
 			return errorStatus(fmt.Errorf("unmarshal CommandContextAux: %w", err))
 		}
-		cctx := CommandContext{NextSequence: cax.NextSequence, HadPriorEvents: cax.HadPriorEvents}
+		cctx := commandContextFrom(&cax)
 		st := ensureState(s, key, factory)
 		book, err := thunk(&anypb.Any{TypeUrl: typeURL, Value: payload}, st, cctx)
 		if err != nil {
@@ -565,12 +655,8 @@ func rejectionInvoker[S any](key componentKey, factory func() S, thunk Rejection
 		if err := proto.Unmarshal(rax.Rejection, &rej); err != nil {
 			return errorStatus(fmt.Errorf("unmarshal RejectionNotification: %w", err))
 		}
-		cctx := CommandContext{}
-		if rax.Cctx != nil {
-			cctx = CommandContext{NextSequence: rax.Cctx.NextSequence, HadPriorEvents: rax.Cctx.HadPriorEvents}
-		}
 		st := ensureState(s, key, factory)
-		resp, err := thunk(&n, &rej, st, cctx)
+		resp, err := thunk(&n, &rej, st, commandContextFrom(rax.Cctx))
 		if err != nil {
 			return errorStatus(err)
 		}
@@ -585,13 +671,105 @@ func rejectionInvoker[S any](key componentKey, factory func() S, thunk Rejection
 	}
 }
 
+func undoInvoker[S any](key componentKey, factory func() S, thunk UndoThunk[S]) invoker {
+	return func(s *session, _ string, _, aux []byte) ([]byte, int32) {
+		var uax abipb.UndoAux
+		if err := proto.Unmarshal(aux, &uax); err != nil {
+			return errorStatus(fmt.Errorf("unmarshal UndoAux: %w", err))
+		}
+		var n pb.Notification
+		if err := proto.Unmarshal(uax.Notification, &n); err != nil {
+			return errorStatus(fmt.Errorf("unmarshal Notification: %w", err))
+		}
+		var compensate pb.Compensate
+		if err := proto.Unmarshal(uax.Compensate, &compensate); err != nil {
+			return errorStatus(fmt.Errorf("unmarshal Compensate: %w", err))
+		}
+		st := ensureState(s, key, factory)
+		resp, err := thunk(&n, &compensate, st, commandContextFrom(uax.Cctx))
+		if err != nil {
+			return errorStatus(err)
+		}
+		if resp == nil {
+			return nil, statusOKEmpty
+		}
+		b, err := proto.Marshal(resp)
+		if err != nil {
+			return errorStatus(fmt.Errorf("marshal BusinessResponse: %w", err))
+		}
+		return b, 0
+	}
+}
+
+func factInvoker[S any](key componentKey, factory func() S, thunk FactThunk[S]) invoker {
+	return func(s *session, typeURL string, payload, _ []byte) ([]byte, int32) {
+		st := ensureState(s, key, factory)
+		recorded, err := thunk(&anypb.Any{TypeUrl: typeURL, Value: payload}, st)
+		if err != nil {
+			return errorStatus(err)
+		}
+		if recorded == nil {
+			return nil, statusOKEmpty
+		}
+		b, err := proto.Marshal(recorded)
+		if err != nil {
+			return errorStatus(fmt.Errorf("marshal fact Any: %w", err))
+		}
+		return b, 0
+	}
+}
+
+// statePackInvoker packs the component's current session state as a
+// serialized google.protobuf.Any (bare "/" type-URL prefix) for Replay.
+func statePackInvoker[S any](key componentKey, factory func() S) invoker {
+	return func(s *session, _ string, _, _ []byte) ([]byte, int32) {
+		st := ensureState(s, key, factory)
+		msg, ok := any(st).(proto.Message)
+		if !ok {
+			return errorStatus(fmt.Errorf("aggregate state %T is not a protobuf message", st))
+		}
+		packed, err := Pack(msg)
+		if err != nil {
+			return errorStatus(fmt.Errorf("pack state: %w", err))
+		}
+		b, err := proto.Marshal(packed)
+		if err != nil {
+			return errorStatus(fmt.Errorf("marshal state Any: %w", err))
+		}
+		return b, 0
+	}
+}
+
+// stateIsMessage reports whether the state type S is a protobuf message (and
+// so can be packed for Replay).
+func stateIsMessage[S any]() bool {
+	var zero S
+	_, ok := any(zero).(proto.Message)
+	return ok
+}
+
+// commandContextFrom builds the CommandContext a handler sees from the core's
+// CommandContextAux (nil yields the zero context).
+func commandContextFrom(aux *abipb.CommandContextAux) CommandContext {
+	return CommandContext{
+		NextSequence:   aux.GetNextSequence(),
+		HadPriorEvents: aux.GetHadPriorEvents(),
+		Cover:          aux.GetCover(),
+	}
+}
+
 // projectorEventInvoker / projectorFinishInvoker / projectorUnknownInvoker
 // build the type-erased bridge for the projector thunks.
 
-func projectorEventInvoker[P any](key componentKey, factory func() P, thunk ProjectorEventThunk[P]) invoker {
-	return func(s *session, typeURL string, payload, _ []byte) ([]byte, int32) {
+func projectorEventInvoker[P any](key componentKey, factory func() P, thunk ProjectorEventContextThunk[P]) invoker {
+	return func(s *session, typeURL string, payload, aux []byte) ([]byte, int32) {
+		var pax abipb.ProjectorEventAux
+		if err := proto.Unmarshal(aux, &pax); err != nil {
+			return errorStatus(fmt.Errorf("unmarshal ProjectorEventAux: %w", err))
+		}
+		ctx := PageContext{Cover: pax.Cover, Sequence: pax.Sequence}
 		st := ensureState(s, key, factory)
-		if err := thunk(st, &anypb.Any{TypeUrl: typeURL, Value: payload}); err != nil {
+		if err := thunk(st, &anypb.Any{TypeUrl: typeURL, Value: payload}, ctx); err != nil {
 			return errorStatus(err)
 		}
 		return nil, 0
@@ -652,16 +830,19 @@ func sagaEventInvoker(thunk SagaEventThunk, dests *Destinations) invoker {
 // factory (the appliers fold process_state into it first, exactly as the
 // aggregate does).
 
-func pmEventInvoker[S any](key componentKey, factory func() S, thunk PMEventThunk[S], dests *Destinations) invoker {
+func pmEventInvoker[S any](key componentKey, factory func() S, thunk PMEventCoverThunk[S], dests *Destinations) invoker {
 	return func(s *session, typeURL string, payload, aux []byte) ([]byte, int32) {
 		var pax abipb.PmEventAux
 		if err := proto.Unmarshal(aux, &pax); err != nil {
 			return errorStatus(fmt.Errorf("unmarshal PmEventAux: %w", err))
 		}
 		st := ensureState(s, key, factory)
-		resp, err := thunk(&anypb.Any{TypeUrl: typeURL, Value: payload}, st, dests)
+		resp, err := thunk(&anypb.Any{TypeUrl: typeURL, Value: payload}, st, dests, pax.TriggerCover)
 		if err != nil {
 			return errorStatus(err)
+		}
+		if resp == nil {
+			return nil, statusOKEmpty
 		}
 		b, err := proto.Marshal(resp)
 		if err != nil {
@@ -671,7 +852,7 @@ func pmEventInvoker[S any](key componentKey, factory func() S, thunk PMEventThun
 	}
 }
 
-func pmRejectionInvoker[S any](key componentKey, factory func() S, thunk PMRejectionThunk[S]) invoker {
+func pmRejectionInvoker[S any](key componentKey, factory func() S, thunk PMCompensatorThunk[S]) invoker {
 	return func(s *session, _ string, _, aux []byte) ([]byte, int32) {
 		var rax abipb.RejectionAux
 		if err := proto.Unmarshal(aux, &rax); err != nil {
@@ -686,13 +867,12 @@ func pmRejectionInvoker[S any](key componentKey, factory func() S, thunk PMRejec
 			return errorStatus(fmt.Errorf("unmarshal RejectionNotification: %w", err))
 		}
 		st := ensureState(s, key, factory)
-		processEvents, escalation, err := thunk(&n, &rej, st)
+		resp, err := thunk(&n, &rej, st)
 		if err != nil {
 			return errorStatus(err)
 		}
-		resp := &pb.ProcessManagerHandleResponse{
-			ProcessEvents: processEvents,
-			Notification:  escalation,
+		if resp == nil {
+			return nil, statusOKEmpty
 		}
 		b, err := proto.Marshal(resp)
 		if err != nil {

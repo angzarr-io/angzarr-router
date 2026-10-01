@@ -204,3 +204,88 @@ func TestDispatchProcessManager_DestinationsAreTheTargetDomains(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+// An undo handler receives the Compensate the notification carries and the
+// cover of the delivery it handles.
+func TestDispatch_UndoHandlerSeesCompensateAndCover(t *testing.T) {
+	r := NewRouter()
+	t.Cleanup(r.Close)
+
+	var gotType string
+	var gotCover *pb.Cover
+	d := NewAggregateDispatch("Inventory", "inventory", NewRebuilder(newNoState)).
+		OnUndo(fqReserve, func(_ *pb.Notification, c *pb.Compensate, _ noState, cctx CommandContext) (*pb.BusinessResponse, error) {
+			gotType, gotCover = c.GetCommandType(), cctx.Cover
+			return nil, nil
+		})
+	if err := RegisterAggregate(r, d); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	resp, err := r.Dispatch(notificationCommand("inventory", compensatePayload(fqReserve), nil))
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if gotType != fqReserve {
+		t.Errorf("undo saw command_type %q, want %q", gotType, fqReserve)
+	}
+	if gotCover.GetDomain() != "inventory" {
+		t.Errorf("undo saw cover %v, want domain inventory", gotCover)
+	}
+	if n := len(resp.GetEvents().GetPages()); n != 0 {
+		t.Errorf("a nil undo response emitted %d events, want 0", n)
+	}
+}
+
+// An aggregate whose state is not a protobuf message registers no state
+// packer, so Replay is refused as NO_HANDLER_REGISTERED.
+func TestDispatchReplay_NonMessageStateIsUnsupported(t *testing.T) {
+	r := NewRouter()
+	t.Cleanup(r.Close)
+	if err := RegisterAggregate(r, NewAggregateDispatch("Inventory", "inventory", NewRebuilder(newNoState))); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	_, err := r.DispatchReplay("inventory", &pb.ReplayRequest{})
+	var ce *CodedError
+	if !errors.As(err, &ce) || ce.Code != "NO_HANDLER_REGISTERED" {
+		t.Fatalf("err = %v, want NO_HANDLER_REGISTERED", err)
+	}
+}
+
+// OnRejected and OnRejectedResponse share one ordered fan-out for an entry:
+// process events merge in registration order and the full-response
+// compensator's commands come back stamped deferred.
+func TestDispatchProcessManager_CompensatorVariantsFanOutInOrder(t *testing.T) {
+	r := NewRouter()
+	t.Cleanup(r.Close)
+
+	rebuilder := NewRebuilder(func() *counter.OrderProcessManagerState { return &counter.OrderProcessManagerState{} })
+	d := NewProcessManagerDispatch("Mixed", "mixed-pm", rebuilder, "inventory").
+		OnRejected(fqReserve, func(*pb.Notification, *pb.RejectionNotification, *counter.OrderProcessManagerState) ([]*pb.EventBook, *pb.Notification, error) {
+			return []*pb.EventBook{{Cover: &pb.Cover{Domain: "first"}}}, nil, nil
+		}).
+		OnRejectedResponse(fqReserve, func(*pb.Notification, *pb.RejectionNotification, *counter.OrderProcessManagerState) (*pb.ProcessManagerHandleResponse, error) {
+			return &pb.ProcessManagerHandleResponse{
+				ProcessEvents: []*pb.EventBook{{Cover: &pb.Cover{Domain: "second"}}},
+				Commands:      []*pb.CommandBook{reserveCommand()},
+			}, nil
+		})
+	if err := RegisterProcessManager(r, d); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	req := pmRejection(fqReserve)
+	req.Trigger.Pages[0].Header = sequenceHeader(5)
+	resp, err := r.DispatchProcessManager(req)
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	events := resp.GetProcessEvents()
+	if len(events) != 2 || events[0].GetCover().GetDomain() != "first" || events[1].GetCover().GetDomain() != "second" {
+		t.Fatalf("process events %v, want [first second]", events)
+	}
+	if len(resp.GetCommands()) != 1 {
+		t.Fatalf("commands = %d, want 1", len(resp.GetCommands()))
+	}
+	if d := resp.GetCommands()[0].GetPages()[0].GetHeader().GetAngzarrDeferred(); d == nil || d.GetSourceSeq() != 5 {
+		t.Errorf("compensator command header %v, want deferred from source sequence 5", resp.GetCommands()[0].GetPages()[0].GetHeader())
+	}
+}
