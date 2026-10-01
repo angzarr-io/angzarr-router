@@ -31,6 +31,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
@@ -40,7 +42,11 @@ import java.util.function.Supplier;
  */
 public final class Router implements AutoCloseable {
 
-  private final MemorySegment ptr;
+  // The native router; null once closed. Dispatch and registration hold the
+  // read lock for the duration of their native call, close takes the write
+  // lock, so the router is freed exactly once and never while in use.
+  private MemorySegment ptr;
+  private final ReentrantReadWriteLock lifecycle = new ReentrantReadWriteLock();
   private final ConcurrentHashMap<Long, Invoker> registry = new ConcurrentHashMap<>();
   private final AtomicLong nextId = new AtomicLong(0);
   // Each registered component's key into the per-dispatch Session state map.
@@ -55,9 +61,35 @@ public final class Router implements AutoCloseable {
     return 1;
   }
 
+  /**
+   * Releases the native router. Idempotent: only the first call frees it; afterwards dispatch and
+   * registration throw {@link IllegalStateException}.
+   */
   @Override
   public void close() {
-    Ffi.routerFree(ptr);
+    lifecycle.writeLock().lock();
+    try {
+      if (ptr != null) {
+        MemorySegment p = ptr;
+        ptr = null;
+        Ffi.routerFree(p);
+      }
+    } finally {
+      lifecycle.writeLock().unlock();
+    }
+  }
+
+  /** Runs one native call against the live router, refusing a closed one. */
+  private <T> T withRouter(Function<MemorySegment, T> call) {
+    lifecycle.readLock().lock();
+    try {
+      if (ptr == null) {
+        throw new IllegalStateException("angzarr router is closed");
+      }
+      return call.apply(ptr);
+    } finally {
+      lifecycle.readLock().unlock();
+    }
   }
 
   Invoker invokerFor(long callbackId) {
@@ -97,7 +129,8 @@ public final class Router implements AutoCloseable {
       }
       desc.addRejections(entry);
     }
-    check(Ffi.registerAggregate(ptr, desc.build().toByteArray()));
+    byte[] descriptor = desc.build().toByteArray();
+    check(withRouter(p -> Ffi.registerAggregate(p, descriptor)));
   }
 
   public synchronized void registerProjector(ProjectorDispatch d) {
@@ -116,7 +149,8 @@ public final class Router implements AutoCloseable {
     if (d.finish != null) {
       desc.setFinishCallbackId(assign(projectorFinishInvoker(component, factory, d.finish)));
     }
-    check(Ffi.registerProjector(ptr, desc.build().toByteArray()));
+    byte[] descriptor = desc.build().toByteArray();
+    check(withRouter(p -> Ffi.registerProjector(p, descriptor)));
   }
 
   public synchronized void registerSaga(SagaDispatch d) {
@@ -138,7 +172,8 @@ public final class Router implements AutoCloseable {
       }
       desc.addRejections(entry);
     }
-    check(Ffi.registerSaga(ptr, desc.build().toByteArray()));
+    byte[] descriptor = desc.build().toByteArray();
+    check(withRouter(p -> Ffi.registerSaga(p, descriptor)));
   }
 
   public synchronized void registerProcessManager(ProcessManagerDispatch d) {
@@ -172,7 +207,8 @@ public final class Router implements AutoCloseable {
       }
       desc.addRejections(entry);
     }
-    check(Ffi.registerProcessManager(ptr, desc.build().toByteArray()));
+    byte[] descriptor = desc.build().toByteArray();
+    check(withRouter(p -> Ffi.registerProcessManager(p, descriptor)));
   }
 
   private static Abi.CallbackEntry.Builder callbackEntry(String fqType, long id) {
@@ -220,7 +256,8 @@ public final class Router implements AutoCloseable {
   private Ffi.Dispatched dispatch(Message request, DispatchCall call) {
     long sessionId = Ffi.openSession(new Session(this));
     try {
-      return call.call(ptr, sessionId, request.toByteArray());
+      byte[] bytes = request.toByteArray();
+      return withRouter(p -> call.call(p, sessionId, bytes));
     } finally {
       Ffi.closeSession(sessionId);
     }
