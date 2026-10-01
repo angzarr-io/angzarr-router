@@ -1,9 +1,9 @@
 @binding
 Feature: Handler results across the FFI
 
-  Undo and fact handlers may return nothing: an undo that returns nothing
-  records no events, and a fact handler that returns nothing records the fact
-  unchanged. An aggregate supports Replay when its state schema is known —
+  An undo handler may return nothing, which records no events. A fact handler
+  returns a FactRecord: FactRecord.asReceived records the fact as received
+  with no flags, and each flag is recorded after its fact with no header. An aggregate supports Replay when its state schema is known —
   given to the Rebuilder or attached to generated wiring — and refuses it
   otherwise.
 
@@ -13,10 +13,20 @@ Feature: Handler results across the FFI
     Then the binding dispatch records no events
     And the undo handler saw the "inventory" cover
 
-  Scenario: a fact handler that returns nothing records the fact unchanged
-    Given a binding ledger aggregate whose Increased fact handler returns nothing
+  Scenario: a fact recorded as received is recorded unchanged
+    Given a binding ledger aggregate whose Increased fact handler records it as received
     When an Increased fact is dispatched through the binding router
     Then the binding router records one Increased fact
+
+  Scenario: a fact record's flags follow its fact, with no header
+    Given a binding ledger aggregate whose Increased fact handler flags it with two Increased events
+    When an Increased fact is dispatched through the binding router
+    Then the binding router records the Increased fact then 2 headerless Increased flags
+
+  Scenario: a fact handler that returns no FactRecord fails as unhandled
+    Given a binding ledger aggregate whose Increased fact handler returns nothing
+    When an Increased fact is dispatched through the binding router
+    Then the binding fact dispatch fails with UNHANDLED_HANDLER_ERROR
 
   Scenario: generated wiring with an attached state schema supports Replay
     Given a generated counter aggregate with its state schema attached

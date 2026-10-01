@@ -18,7 +18,7 @@ import { unhandled } from "./codedError";
 import { errorResult, type Outcome } from "./statuses";
 
 /** The router-ffi ABI version this binding speaks. */
-export const ABI_VERSION = 2;
+export const ABI_VERSION = 3;
 const LIB_ENV = "ANGZARR_ROUTER_LIB";
 
 function libraryPath(): string {

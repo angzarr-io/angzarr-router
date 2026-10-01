@@ -4,8 +4,10 @@ import { fromBinary } from "@bufbuild/protobuf";
 import { After, Before, Given, Then, When } from "@cucumber/cucumber";
 
 import {
+  CodedError,
   type Cover,
   type EventBook,
+  GrpcCode,
   type EventPage,
   type ProcessManagerHandleResponse,
   type ReplayResponse,
@@ -23,6 +25,7 @@ interface ContextCtx {
   applied: number[];
   pages: [Uint8Array, number][];
   facts?: EventBook;
+  refusal?: unknown;
   replayed?: ReplayResponse;
   pm?: ProcessManagerHandleResponse;
 }
@@ -67,7 +70,11 @@ When(
 );
 
 When("a Reserve fact is handled over no prior events", function () {
-  xctx.facts = router().dispatchFact(B.factRequest("Reserve", 1, 0));
+  try {
+    xctx.facts = router().dispatchFact(B.factRequest("Reserve", 1, 0));
+  } catch (e) {
+    xctx.refusal = e;
+  }
 });
 
 When(
@@ -137,27 +144,34 @@ function fqOf(url: string): string {
 }
 
 Then(
-  "{int} facts are recorded, each annotated with a count of {int}",
-  function (facts: number, count: number) {
-    const book = xctx.facts!;
-    assert.equal(book.pages.length, facts, "recorded facts");
-    for (const page of book.pages) {
+  "each Increased fact is recorded, flagged by the counts {int} and {int}",
+  function (first: number, second: number) {
+    const recorded = xctx.facts!.pages.map((page) => {
       const any = eventOf(page);
-      assert.equal(fqOf(any.typeUrl), "test.counter.CounterState");
-      assert.equal(fromBinary(CounterStateSchema, any.value).count, count);
-    }
+      const name = fqOf(any.typeUrl);
+      return name === "test.counter.CounterState"
+        ? `${name}(${fromBinary(CounterStateSchema, any.value).count})`
+        : name;
+    });
+    assert.deepEqual(recorded, [
+      "test.counter.Increased",
+      `test.counter.CounterState(${first})`,
+      "test.counter.Increased",
+      `test.counter.CounterState(${second})`,
+    ]);
   },
 );
 
-Then("the fact is recorded unchanged", function () {
-  const book = xctx.facts!;
-  assert.equal(book.pages.length, 1, "one fact recorded");
-  assert.equal(
-    fqOf(eventOf(book.pages[0]).typeUrl),
-    "test.counter.Reserve",
-    "the fact's own type",
-  );
-});
+Then(
+  "the facts are refused with {word} as INVALID_ARGUMENT",
+  function (code: string) {
+    const err = xctx.refusal;
+    assert.equal(xctx.facts, undefined, "nothing was recorded");
+    assert.ok(err instanceof CodedError, `expected ${code}, got ${err}`);
+    assert.equal(err.code, code, "coded reason");
+    assert.equal(err.grpc, GrpcCode.InvalidArgument, "gRPC code");
+  },
+);
 
 Then("the replayed state has a count of {int}", function (count: number) {
   const state = xctx.replayed?.state;

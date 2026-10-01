@@ -78,9 +78,25 @@ export type UndoThunk<T> = (
   cctx: CommandContext,
 ) => BusinessResponse | undefined;
 
-/** Handles one fact against the rebuilt state; returns the fact Any to record
- * (an annotated fact), or undefined to record the fact unchanged. */
-export type FactThunk<T> = (fact: Any, state: T) => Any | undefined;
+/** What a fact handler records for one fact: the fact itself (as received, or
+ * annotated) followed by the events that flag it. Each flag is recorded with
+ * no header and the fact's created_at, and folds into the state the next
+ * fact sees. */
+export interface FactRecord {
+  readonly fact: Any;
+  readonly flags?: readonly Any[];
+}
+
+export const FactRecord = {
+  /** The record of `fact` as received, with no flags. */
+  asReceived(fact: Any): FactRecord {
+    return { fact, flags: [] };
+  },
+};
+
+/** Handles one fact against the rebuilt state; returns the FactRecord to
+ * record. A fact cannot be refused; a thrown error fails the fact request. */
+export type FactThunk<T> = (fact: Any, state: T) => FactRecord;
 
 /** Folds one event into a projection; `ctx` says where the event sits. */
 export type ProjectorEventThunk<T> = (

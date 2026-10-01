@@ -40,6 +40,7 @@ import {
   CallbackEntrySchema,
   type CommandContextAux,
   CommandContextAuxSchema,
+  FactRecordSchema,
   PmEventAuxSchema,
   PmEventEntrySchema,
   ProcessManagerDescriptorSchema,
@@ -561,10 +562,20 @@ function undoInvoker<T>(state: StateOf<T>, thunk: UndoThunk<T>): Invoker {
 
 function factInvoker<T>(state: StateOf<T>, thunk: FactThunk<T>): Invoker {
   return (session, typeUrl, payload) => {
-    const recorded = thunk(anyOf(typeUrl, payload), ensure(session, state));
-    return recorded === undefined
-      ? OK_EMPTY
-      : { response: toBinary(AnySchema, recorded), status: Ffi.STATUS_OK };
+    const record = thunk(anyOf(typeUrl, payload), ensure(session, state));
+    if (record?.fact === undefined) {
+      throw new TypeError(
+        `fact handler for ${typeUrl} returned no FactRecord with a fact`,
+      );
+    }
+    const reply = create(FactRecordSchema, {
+      fact: record.fact,
+      flags: [...(record.flags ?? [])],
+    });
+    return {
+      response: toBinary(FactRecordSchema, reply),
+      status: Ffi.STATUS_OK,
+    };
   };
 }
 

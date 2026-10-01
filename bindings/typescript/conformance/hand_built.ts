@@ -50,8 +50,9 @@ export function inventoryAggregate(): AggregateDispatch<object> {
 
 /** The ledger aggregate (domain "ledger") over CounterState: Increased folds
  * count += 1 and records the page sequence it applied; a snapshot loads CounterState; IncreaseBy records the handled
- * cover and emits nothing; an Increased fact is annotated as a CounterState
- * carrying the folded count. */
+ * cover and emits nothing; the only declared fact, Increased, is recorded as
+ * received and flagged by a CounterState carrying the count it brings the
+ * ledger to. */
 export function ledgerAggregate(
   seen: (Cover | undefined)[],
   applied: number[],
@@ -70,12 +71,15 @@ export function ledgerAggregate(
       seen.push(cctx.cover);
       return undefined;
     })
-    .onFact("test.counter.Increased", (_fact, state) =>
-      Pack.wrap(
-        CounterStateSchema,
-        create(CounterStateSchema, { count: state.count }),
-      ),
-    );
+    .onFact("test.counter.Increased", (fact, state) => ({
+      fact,
+      flags: [
+        Pack.wrap(
+          CounterStateSchema,
+          create(CounterStateSchema, { count: state.count + 1 }),
+        ),
+      ],
+    }));
 }
 
 /** The reserving process-manager (domain "reserving-pm", target "inventory")

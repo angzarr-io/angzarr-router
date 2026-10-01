@@ -31,6 +31,7 @@ export {
   type ApplierContextThunk,
   type ApplierThunk,
   type CommandThunk,
+  FactRecord,
   type FactThunk,
   type PageContext,
   type PmEventThunk,

@@ -14,6 +14,8 @@ import {
   type EventBook,
   EventBookSchema,
   EventPageSchema,
+  FactRecord,
+  type FactThunk,
   GrpcCode,
   ProcessManagerDispatch,
   ProcessManagerHandleResponseSchema,
@@ -392,28 +394,82 @@ Then("the undo handler saw the {string} cover", function (domain: string) {
   assert.equal(bctx.covers[0]?.domain, domain);
 });
 
+const increasedAny = () =>
+  create(AnySchema, { typeUrl: "/test.counter.Increased" });
+
+function bindingLedgerWithFactHandler(handler: FactThunk<CounterState>): void {
+  bctx.router = new Router();
+  bctx.router.registerAggregate(
+    new AggregateDispatch<CounterState>(
+      "Ledger",
+      "ledger",
+      new Rebuilder(() => create(CounterStateSchema)),
+    ).onFact("test.counter.Increased", (fact, state) => {
+      bctx.calls.push(fact.typeUrl);
+      return handler(fact, state);
+    }),
+  );
+}
+
+Given(
+  "a binding ledger aggregate whose Increased fact handler records it as received",
+  function () {
+    bindingLedgerWithFactHandler((fact) => FactRecord.asReceived(fact));
+  },
+);
+
+Given(
+  "a binding ledger aggregate whose Increased fact handler flags it with two Increased events",
+  function () {
+    bindingLedgerWithFactHandler((fact) => ({
+      fact,
+      flags: [increasedAny(), increasedAny()],
+    }));
+  },
+);
+
 Given(
   "a binding ledger aggregate whose Increased fact handler returns nothing",
   function () {
-    bctx.router = new Router();
-    bctx.router.registerAggregate(
-      new AggregateDispatch<CounterState>(
-        "Ledger",
-        "ledger",
-        new Rebuilder(() => create(CounterStateSchema)),
-      ).onFact("test.counter.Increased", (fact) => {
-        bctx.calls.push(fact.typeUrl);
-        return undefined;
-      }),
-    );
+    bindingLedgerWithFactHandler(() => undefined as unknown as FactRecord);
   },
 );
 
 When("an Increased fact is dispatched through the binding router", function () {
-  bctx.facts = bctx.router!.dispatchFact(B.factRequest("Increased", 1, 0));
+  bctx.err = undefined;
+  try {
+    bctx.facts = bctx.router!.dispatchFact(B.factRequest("Increased", 1, 0));
+  } catch (e) {
+    bctx.err = e;
+  }
+});
+
+Then(
+  "the binding router records the Increased fact then {int} headerless Increased flags",
+  function (flags: number) {
+    assert.equal(bctx.err, undefined, `fact dispatch failed: ${bctx.err}`);
+    const pages = bctx.facts!.pages;
+    assert.equal(pages.length, 1 + flags, "the fact and its flags");
+    for (const page of pages) {
+      assert.equal(page.payload.case, "event");
+      assert.equal(
+        page.payload.case === "event" ? page.payload.value.typeUrl : "",
+        "/test.counter.Increased",
+      );
+    }
+    for (const flag of pages.slice(1)) {
+      assert.equal(flag.header, undefined, "a flag carries no header");
+    }
+  },
+);
+
+Then("the binding fact dispatch fails with {word}", function (code: string) {
+  assert.deepEqual(bctx.calls, ["/test.counter.Increased"], "handler ran");
+  assertCoded(bctx.err, code, GrpcCode.Internal);
 });
 
 Then("the binding router records one Increased fact", function () {
+  assert.equal(bctx.err, undefined, `fact dispatch failed: ${bctx.err}`);
   assert.deepEqual(bctx.calls, ["/test.counter.Increased"], "handler ran");
   const pages = bctx.facts!.pages;
   assert.equal(pages.length, 1, "one fact recorded");

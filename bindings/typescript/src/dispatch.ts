@@ -56,7 +56,9 @@ export class AggregateDispatch<T> {
     return this;
   }
 
-  /** Registers the handler for one fully-qualified fact (event) type. */
+  /** Registers the handler for one fully-qualified fact (event) type,
+   * declaring that type. The core refuses a fact of an undeclared type with
+   * NO_FACT_HANDLER (INVALID_ARGUMENT) before any handler runs. */
   onFact(fqFact: string, thunk: FactThunk<T>): this {
     this.facts.set(fqFact, thunk);
     return this;
