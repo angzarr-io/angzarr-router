@@ -129,6 +129,10 @@ type CommandContext struct {
 // ApplierThunk folds one persisted event into the rebuilding state.
 type ApplierThunk[S any] func(state S, payload *anypb.Any) error
 
+// ApplierContextThunk is an ApplierThunk that also receives the event's
+// PageContext (its book's cover and the page's sequence).
+type ApplierContextThunk[S any] func(state S, payload *anypb.Any, ctx PageContext) error
+
 // CommandThunk handles one command: it reads the rebuilt state and the
 // command context and returns the events to persist (a nil EventBook means
 // nothing emitted), or an error — a *CodedError keeps its code, any other
@@ -155,16 +159,24 @@ type FactThunk[S any] func(fact *anypb.Any, state S) (*anypb.Any, error)
 type Rebuilder[S any] struct {
 	factory  func() S
 	snapshot ApplierThunk[S]
-	appliers map[string]ApplierThunk[S]
+	appliers map[string]ApplierContextThunk[S]
 }
 
 // NewRebuilder starts a rebuilder from a zero-state factory.
 func NewRebuilder[S any](factory func() S) *Rebuilder[S] {
-	return &Rebuilder[S]{factory: factory, appliers: make(map[string]ApplierThunk[S])}
+	return &Rebuilder[S]{factory: factory, appliers: make(map[string]ApplierContextThunk[S])}
 }
 
 // Apply registers an applier for one fully-qualified event type.
 func (r *Rebuilder[S]) Apply(fullName string, thunk ApplierThunk[S]) *Rebuilder[S] {
+	return r.ApplyWithContext(fullName, func(state S, payload *anypb.Any, _ PageContext) error {
+		return thunk(state, payload)
+	})
+}
+
+// ApplyWithContext registers an applier for one fully-qualified event type;
+// the applier also receives the event's PageContext.
+func (r *Rebuilder[S]) ApplyWithContext(fullName string, thunk ApplierContextThunk[S]) *Rebuilder[S] {
 	r.appliers[fullName] = thunk
 	return r
 }

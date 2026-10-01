@@ -71,13 +71,15 @@ func increasedPage(seq *uint32) *pb.EventPage {
 func seqPtr(seq uint32) *uint32 { return &seq }
 
 // ledgerAggregate is the "ledger" aggregate over CounterState: Increased folds
-// count += 1; a snapshot loads CounterState; IncreaseBy records the handled
+// count += 1 and records the page sequence it applied; a snapshot loads
+// CounterState; IncreaseBy records the handled
 // cover and emits nothing; an Increased fact is annotated as a CounterState
 // carrying the folded count.
-func ledgerAggregate(seen *[]*pb.Cover) *AggregateDispatch[*counter.CounterState] {
+func ledgerAggregate(seen *[]*pb.Cover, applied *[]uint32) *AggregateDispatch[*counter.CounterState] {
 	rebuilder := NewRebuilder(func() *counter.CounterState { return &counter.CounterState{} }).
-		Apply(fqIncreased, func(state *counter.CounterState, _ *anypb.Any) error {
+		ApplyWithContext(fqIncreased, func(state *counter.CounterState, _ *anypb.Any, ctx PageContext) error {
 			state.Count++
+			*applied = append(*applied, ctx.Sequence)
 			return nil
 		}).
 		WithSnapshot(func(state *counter.CounterState, payload *anypb.Any) error {
@@ -94,11 +96,15 @@ func ledgerAggregate(seen *[]*pb.Cover) *AggregateDispatch[*counter.CounterState
 }
 
 // reservingPM is the "reserving-pm" process manager (target "inventory") over
-// CounterState: an Increased trigger from "counter" records the trigger cover
+// CounterState (Increased folds count += 1): an Increased trigger from "counter" records the trigger cover
 // and emits nothing; a rejected Reserve is compensated with a Release command
 // to "inventory".
 func reservingPM(seen *[]*pb.Cover) *ProcessManagerDispatch[*counter.CounterState] {
-	rebuilder := NewRebuilder(func() *counter.CounterState { return &counter.CounterState{} })
+	rebuilder := NewRebuilder(func() *counter.CounterState { return &counter.CounterState{} }).
+		Apply(fqIncreased, func(state *counter.CounterState, _ *anypb.Any) error {
+			state.Count++
+			return nil
+		})
 	return NewProcessManagerDispatch("Reserving", "reserving-pm", rebuilder, "inventory").
 		OnEventWithCover("counter", fqIncreased, func(_ *anypb.Any, _ *counter.CounterState, _ *Destinations, triggerCover *pb.Cover) (*pb.ProcessManagerHandleResponse, error) {
 			*seen = append(*seen, triggerCover)
@@ -163,6 +169,16 @@ func replayRequest(count, events uint32) *pb.ReplayRequest {
 	}
 }
 
+// eventsReplayRequest is events Increased events at sequences 0... with no
+// snapshot.
+func eventsReplayRequest(events uint32) *pb.ReplayRequest {
+	pages := make([]*pb.EventPage, events)
+	for i := range pages {
+		pages[i] = increasedPage(seqPtr(uint32(i)))
+	}
+	return &pb.ReplayRequest{Events: pages}
+}
+
 // ledgerCommand is an IncreaseBy command for the ledger root of label.
 func ledgerCommand(label string) *pb.ContextualCommand {
 	return &pb.ContextualCommand{Command: &pb.CommandBook{
@@ -216,6 +232,7 @@ func trackedBook(label string, sequences ...uint32) *pb.EventBook {
 type contextWorld struct {
 	router   *Router
 	covers   []*pb.Cover
+	applied  []uint32
 	pages    []trackedPage
 	facts    *pb.EventBook
 	replayed *pb.ReplayResponse
@@ -233,7 +250,7 @@ func (w *contextWorld) reset() {
 // --- Given ---
 
 func (w *contextWorld) ledger() error {
-	return RegisterAggregate(w.router, ledgerAggregate(&w.covers))
+	return RegisterAggregate(w.router, ledgerAggregate(&w.covers, &w.applied))
 }
 
 func (w *contextWorld) reserving() error {
@@ -256,6 +273,10 @@ func (w *contextWorld) reserveFact() {
 
 func (w *contextWorld) replay(count, events int) {
 	w.replayed, w.err = w.router.DispatchReplay("ledger", replayRequest(uint32(count), uint32(events)))
+}
+
+func (w *contextWorld) pmReplay(events int) {
+	w.replayed, w.err = w.router.DispatchReplay("reserving-pm", eventsReplayRequest(uint32(events)))
 }
 
 func (w *contextWorld) ledgerCommand(label string) {
@@ -338,6 +359,17 @@ func (w *contextWorld) replayedCount(count int) error {
 	return nil
 }
 
+func (w *contextWorld) appliedAt(first, second int) error {
+	if w.err != nil {
+		return fmt.Errorf("replay failed: %w", w.err)
+	}
+	want := []uint32{uint32(first), uint32(second)}
+	if len(w.applied) != len(want) || w.applied[0] != want[0] || w.applied[1] != want[1] {
+		return fmt.Errorf("the ledger applied Increased at sequences %v, want %v", w.applied, want)
+	}
+	return nil
+}
+
 func (w *contextWorld) sawRoot(label string) error {
 	if w.err != nil {
 		return fmt.Errorf("dispatch failed: %w", w.err)
@@ -407,6 +439,7 @@ func initializeContextScenario(sc *godog.ScenarioContext) {
 	sc.Step(`^(\d+) Increased facts are handled over (\d+) prior Increased events$`, w.increasedFacts)
 	sc.Step(`^a Reserve fact is handled over no prior events$`, w.reserveFact)
 	sc.Step(`^the ledger replays a snapshot of (\d+) then (\d+) Increased events$`, w.replay)
+	sc.Step(`^the reserving process-manager replays (\d+) Increased events$`, w.pmReplay)
 	sc.Step(`^an IncreaseBy command for ledger root "([^"]*)" is dispatched$`, w.ledgerCommand)
 	sc.Step(`^an Increased trigger of counter root "([^"]*)" at sequence (\d+) is dispatched to the reserving process-manager$`, w.reservingTrigger)
 	sc.Step(`^a rejection of Reserve sent to "([^"]*)" at sequence (\d+) is dispatched to the reserving process-manager$`, w.reservingRejection)
@@ -414,6 +447,7 @@ func initializeContextScenario(sc *godog.ScenarioContext) {
 	sc.Step(`^(\d+) facts are recorded, each annotated with a count of (\d+)$`, w.annotated)
 	sc.Step(`^the fact is recorded unchanged$`, w.unchanged)
 	sc.Step(`^the replayed state has a count of (\d+)$`, w.replayedCount)
+	sc.Step(`^the ledger applied Increased events at sequences (\d+) and (\d+)$`, w.appliedAt)
 	sc.Step(`^the ledger handler saw root "([^"]*)"$`, w.sawRoot)
 	sc.Step(`^the reserving process-manager saw trigger root "([^"]*)"$`, w.sawRoot)
 	sc.Step(`^the reserving process-manager emits one Release command deferred from source sequence (\d+)$`, w.release)

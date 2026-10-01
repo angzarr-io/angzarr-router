@@ -222,7 +222,7 @@ func RegisterAggregate[S any](r *Router, d *AggregateDispatch[S]) error {
 	desc := &abipb.AggregateDescriptor{Name: d.name, Domain: d.domain}
 
 	for fq, thunk := range d.rebuilder.appliers {
-		id := r.assign(applierInvoker(key, factory, thunk))
+		id := r.assign(applierContextInvoker(key, factory, thunk))
 		desc.Appliers = append(desc.Appliers, &abipb.CallbackEntry{FqType: fq, CallbackId: id})
 	}
 	if d.rebuilder.snapshot != nil {
@@ -378,7 +378,8 @@ func (r *Router) DispatchSaga(req *pb.SagaHandleRequest) (*pb.SagaResponse, erro
 }
 
 // RegisterProcessManager registers one process-manager component: it assigns
-// callback ids to every applier/snapshot/event/rejection thunk, serializes the
+// callback ids to every applier/snapshot/event/rejection thunk (plus a state
+// packer for Replay when the state type is a protobuf message), serializes the
 // ProcessManagerDescriptor, and hands it to the core with the shared callback
 // gateway. A free function (not a method) because Go methods cannot introduce
 // the state type parameter.
@@ -392,7 +393,7 @@ func RegisterProcessManager[S any](r *Router, d *ProcessManagerDispatch[S]) erro
 	dests := NewDestinations(d.targets...)
 
 	for fq, thunk := range d.rebuilder.appliers {
-		id := r.assign(applierInvoker(key, factory, thunk))
+		id := r.assign(applierContextInvoker(key, factory, thunk))
 		desc.Appliers = append(desc.Appliers, &abipb.CallbackEntry{FqType: fq, CallbackId: id})
 	}
 	if d.rebuilder.snapshot != nil {
@@ -416,6 +417,10 @@ func RegisterProcessManager[S any](r *Router, d *ProcessManagerDispatch[S]) erro
 			entry.CallbackIds = append(entry.CallbackIds, id)
 		}
 		desc.Rejections = append(desc.Rejections, entry)
+	}
+	if stateIsMessage[S]() {
+		id := r.assign(statePackInvoker(key, factory))
+		desc.StateCallbackId = &id
 	}
 
 	descBytes, err := proto.Marshal(desc)
@@ -559,10 +564,11 @@ func (r *Router) DispatchFact(req *pb.FactRequest) (*pb.EventBook, error) {
 }
 
 // DispatchReplay rebuilds the state of the aggregate registered for domain
-// (empty selects a sole registered aggregate) from req and returns it packed
-// in a ReplayResponse, or a *CodedError decoded from the core's failure. An
-// aggregate whose state is not a protobuf message does not support Replay
-// (NO_HANDLER_REGISTERED).
+// (empty selects a sole registered aggregate), or of the process manager
+// whose own domain it is when no aggregate claims it, from req and returns it
+// packed in a ReplayResponse, or a *CodedError decoded from the core's
+// failure. A component whose state is not a protobuf message does not
+// support Replay (NO_HANDLER_REGISTERED).
 func (r *Router) DispatchReplay(domain string, req *pb.ReplayRequest) (*pb.ReplayResponse, error) {
 	reqBytes, err := proto.Marshal(&abipb.ReplayCall{Domain: domain, Request: req})
 	if err != nil {
@@ -602,6 +608,23 @@ func consumeBuf(b *C.angzarr_buf) []byte {
 	b.data = nil
 	b.len = 0
 	return out
+}
+
+// applierContextInvoker decodes the applier's ProjectorEventAux into the
+// PageContext the thunk receives.
+func applierContextInvoker[S any](key componentKey, factory func() S, thunk ApplierContextThunk[S]) invoker {
+	return func(s *session, typeURL string, payload, aux []byte) ([]byte, int32) {
+		var pax abipb.ProjectorEventAux
+		if err := proto.Unmarshal(aux, &pax); err != nil {
+			return errorStatus(fmt.Errorf("unmarshal ProjectorEventAux: %w", err))
+		}
+		ctx := PageContext{Cover: pax.Cover, Sequence: pax.Sequence}
+		st := ensureState(s, key, factory)
+		if err := thunk(st, &anypb.Any{TypeUrl: typeURL, Value: payload}, ctx); err != nil {
+			return errorStatus(err)
+		}
+		return nil, 0
+	}
 }
 
 // applierInvoker / commandInvoker / rejectionInvoker / undoInvoker /
@@ -726,7 +749,7 @@ func statePackInvoker[S any](key componentKey, factory func() S) invoker {
 		st := ensureState(s, key, factory)
 		msg, ok := any(st).(proto.Message)
 		if !ok {
-			return errorStatus(fmt.Errorf("aggregate state %T is not a protobuf message", st))
+			return errorStatus(fmt.Errorf("component state %T is not a protobuf message", st))
 		}
 		packed, err := Pack(msg)
 		if err != nil {
