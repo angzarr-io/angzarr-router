@@ -251,9 +251,11 @@ public sealed class Router : IDisposable
         );
 
     /// <summary>Handles a FactRequest through the aggregate claiming the facts'
-    /// cover domain (a sole aggregate claims everything): each fact folds
-    /// against the state rebuilt from the prior events and its fact handler may
-    /// annotate it. Returns the EventBook of facts to record.</summary>
+    /// cover domain (a sole aggregate claims everything): each fact's handler
+    /// sees the state rebuilt from the prior events and the facts before it,
+    /// and returns the fact to record plus its flagging events. A fact of an
+    /// undeclared type refuses the request with NO_FACT_HANDLER. Returns the
+    /// EventBook of events to record.</summary>
     public EventBook DispatchFact(FactRequest request) =>
         Parse(DispatchVia(request, Ffi.DispatchFact), EventBook.Parser, "EventBook");
 
@@ -418,13 +420,11 @@ public sealed class Router : IDisposable
         where TState : class, IMessage =>
         (session, typeUrl, payload, aux) =>
         {
-            var recorded = thunk(
-                AnyOf(typeUrl, payload),
-                (TState)session.EnsureState(component, factory)
-            );
-            return recorded == null
-                ? new InvokerResult(null, Ffi.StatusOkEmpty)
-                : new InvokerResult(recorded.ToByteArray(), Ffi.StatusOk);
+            var recorded =
+                thunk(AnyOf(typeUrl, payload), (TState)session.EnsureState(component, factory))
+                ?? throw new InvalidOperationException("a fact handler must return a FactRecord");
+            var reply = new Abi.FactRecord { Fact = recorded.Fact, Flags = { recorded.Flags } };
+            return new InvokerResult(reply.ToByteArray(), Ffi.StatusOk);
         };
 
     private static Invoker StateInvoker<TState>(ComponentKey component, Func<TState> factory)

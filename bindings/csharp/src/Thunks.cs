@@ -45,9 +45,10 @@ public delegate BusinessResponse? UndoThunk<TState>(
     where TState : class, IMessage;
 
 /// <summary>Handles one fact against the rebuilt state; returns the fact to
-/// record (an annotation), or null to record it unchanged. A fact is an
-/// external reality: the handler may annotate it but never refuse it.</summary>
-public delegate Any? FactThunk<TState>(Any fact, TState state)
+/// record (as received, or annotated) and the events that flag it. A fact is
+/// an external reality: the handler may annotate and flag it but never refuse
+/// it.</summary>
+public delegate FactRecord FactThunk<TState>(Any fact, TState state)
     where TState : class, IMessage;
 
 /// <summary>Folds one event into a projection.</summary>

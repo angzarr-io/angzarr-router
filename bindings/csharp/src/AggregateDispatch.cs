@@ -62,7 +62,8 @@ public sealed class AggregateDispatch<TState>
     }
 
     /// <summary>Registers the fact handler for one fully-qualified fact (event)
-    /// type. A fact with no handler is recorded unchanged.</summary>
+    /// type: a declared fact. The router refuses a fact of an undeclared type
+    /// with NO_FACT_HANDLER before any handler runs.</summary>
     public AggregateDispatch<TState> OnFact(string fqFactType, FactThunk<TState> thunk)
     {
         Facts[fqFactType] = thunk;

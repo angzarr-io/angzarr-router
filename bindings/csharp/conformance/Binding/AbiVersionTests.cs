@@ -10,14 +10,14 @@ public sealed class AbiVersionTests
 {
     [Test]
     public void TheLoadedLibraryReportsTheExpectedVersion() =>
-        Assert.That(Router.AbiVersion(), Is.EqualTo(2));
+        Assert.That(Router.AbiVersion(), Is.EqualTo(3));
 
     [Test]
     public void AMismatchingVersionIsRefusedNamingBothVersions()
     {
-        var e = Assert.Throws<InvalidOperationException>(() => Ffi.CheckAbiVersion(1));
-        Assert.That(e!.Message, Does.Contain("expected 2"));
-        Assert.That(e.Message, Does.Contain("reports 1"));
+        var e = Assert.Throws<InvalidOperationException>(() => Ffi.CheckAbiVersion(2));
+        Assert.That(e!.Message, Does.Contain("expected 3"));
+        Assert.That(e.Message, Does.Contain("reports 2"));
     }
 
     [Test]

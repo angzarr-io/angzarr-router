@@ -61,7 +61,7 @@ internal static unsafe class Ffi
     }
 
     /// <summary>The router-ffi ABI version this binding is written against.</summary>
-    internal const uint ExpectedAbiVersion = 2;
+    internal const uint ExpectedAbiVersion = 3;
 
     /// <summary>Refuses a router-ffi library whose ABI version differs from
     /// <see cref="ExpectedAbiVersion"/>.</summary>

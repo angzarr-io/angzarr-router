@@ -147,4 +147,134 @@ public sealed class AggregateDispatchTests
         Assert.That(TypeNames.FromUrl(resp.State.TypeUrl), Is.EqualTo("test.counter.CounterState"));
         Assert.That(TC.CounterState.Parser.ParseFrom(resp.State.Value).Count, Is.EqualTo(7u));
     }
+
+    private static AggregateDispatch<TC.CounterState> Ledger() =>
+        new(
+            "Ledger",
+            "ledger",
+            new Rebuilder<TC.CounterState>(() => new TC.CounterState()).Apply(
+                "test.counter.Increased",
+                (state, ev) => state.Count += 1
+            )
+        );
+
+    private static List<string> TypesOf(EventBook book)
+    {
+        var types = new List<string>();
+        foreach (var page in book.Pages)
+        {
+            types.Add(TypeNames.FromUrl(page.Event.TypeUrl));
+        }
+        return types;
+    }
+
+    [Test]
+    public void AFactConvertedFromItsAnyIsRecordedAsReceived()
+    {
+        var saw = new List<uint>();
+        using var router = new Router();
+        router.RegisterAggregate(
+            Ledger()
+                .OnFact(
+                    "test.counter.Increased",
+                    (fact, state) =>
+                    {
+                        saw.Add(state.Count);
+                        return fact;
+                    }
+                )
+        );
+
+        var recorded = router.DispatchFact(Builders.FactsOver("Increased", 2, 2));
+
+        Assert.That(
+            TypesOf(recorded),
+            Is.EqualTo(new[] { "test.counter.Increased", "test.counter.Increased" })
+        );
+        Assert.That(saw, Is.EqualTo(new uint[] { 2, 3 }), "each fact folds before the next");
+    }
+
+    [Test]
+    public void AFactHandlerReplacesTheFactAndAppendsItsFlagsInOrder()
+    {
+        using var router = new Router();
+        router.RegisterAggregate(
+            Ledger()
+                .OnFact(
+                    "test.counter.Increased",
+                    (fact, state) =>
+                        new FactRecord(
+                            Pack.Wrap(new TC.CounterState { Count = 7 }),
+                            Pack.Wrap(new TC.Reserve()),
+                            Pack.Wrap(new TC.CounterState { Count = 9 })
+                        )
+                )
+        );
+
+        var recorded = router.DispatchFact(Builders.FactsOver("Increased", 1, 0));
+
+        Assert.That(
+            TypesOf(recorded),
+            Is.EqualTo(
+                new[]
+                {
+                    "test.counter.CounterState",
+                    "test.counter.Reserve",
+                    "test.counter.CounterState",
+                }
+            )
+        );
+        Assert.That(
+            TC.CounterState.Parser.ParseFrom(recorded.Pages[0].Event.Value).Count,
+            Is.EqualTo(7u)
+        );
+        Assert.That(
+            TC.CounterState.Parser.ParseFrom(recorded.Pages[2].Event.Value).Count,
+            Is.EqualTo(9u)
+        );
+    }
+
+    [Test]
+    public void AFactHandlerReturningNullIsAnUnhandledError()
+    {
+        using var router = new Router();
+        router.RegisterAggregate(Ledger().OnFact("test.counter.Increased", (fact, state) => null!));
+
+        var e = Assert.Throws<CodedError>(() =>
+            router.DispatchFact(Builders.FactsOver("Increased", 1, 0))
+        );
+
+        Assert.That(e!.Code, Is.EqualTo(CodedError.UnhandledHandlerError));
+        Assert.That(e.Grpc, Is.EqualTo(GrpcCode.Internal));
+    }
+
+    [Test]
+    public void AFactOfAnUndeclaredTypeIsRefusedBeforeAnyHandlerRuns()
+    {
+        var ran = 0;
+        using var router = new Router();
+        router.RegisterAggregate(
+            Ledger()
+                .OnFact(
+                    "test.counter.Increased",
+                    (fact, state) =>
+                    {
+                        ran++;
+                        return fact;
+                    }
+                )
+        );
+
+        var e = Assert.Throws<CodedError>(() =>
+            router.DispatchFact(Builders.FactsOver("Reserve", 1, 0))
+        );
+
+        Assert.That(e!.Code, Is.EqualTo("NO_FACT_HANDLER"));
+        Assert.That(e.Grpc, Is.EqualTo(GrpcCode.InvalidArgument));
+        Assert.That(ran, Is.EqualTo(0));
+    }
+
+    [Test]
+    public void AFactRecordRequiresTheFact() =>
+        Assert.Throws<System.ArgumentNullException>(() => FactRecord.AsReceived(null!));
 }

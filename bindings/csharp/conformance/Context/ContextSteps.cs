@@ -24,6 +24,7 @@ public sealed class ContextSteps
     private EventBook? _facts;
     private TC.CounterState? _replayed;
     private ProcessManagerHandleResponse? _pm;
+    private CodedError? _factErr;
 
     [BeforeScenario]
     public void Before()
@@ -35,6 +36,7 @@ public sealed class ContextSteps
         _facts = null;
         _replayed = null;
         _pm = null;
+        _factErr = null;
     }
 
     [AfterScenario]
@@ -43,8 +45,9 @@ public sealed class ContextSteps
     /// <summary>The ledger aggregate (domain "ledger") over CounterState:
     /// Increased folds count += 1 and records the page sequence it applied; a
     /// snapshot loads CounterState; IncreaseBy
-    /// records the handled cover and emits nothing; an Increased fact is
-    /// annotated as a CounterState carrying the folded count.</summary>
+    /// records the handled cover and emits nothing; the only declared fact,
+    /// Increased, is recorded as received and flagged by a CounterState
+    /// carrying the count it brings the ledger to.</summary>
     [Given("a ledger aggregate")]
     public void Ledger() =>
         _router.RegisterAggregate(
@@ -75,7 +78,11 @@ public sealed class ContextSteps
                 )
                 .OnFact(
                     "test.counter.Increased",
-                    (fact, state) => Pack.Wrap(new TC.CounterState { Count = state.Count })
+                    (fact, state) =>
+                        new FactRecord(
+                            fact,
+                            Pack.Wrap(new TC.CounterState { Count = state.Count + 1 })
+                        )
                 )
         );
 
@@ -132,11 +139,24 @@ public sealed class ContextSteps
         );
 
     [When("{int} Increased facts are handled over {int} prior Increased events")]
-    public void IncreasedFacts(int facts, int prior) =>
-        _facts = _router.DispatchFact(Builders.FactsOver("Increased", facts, prior));
+    public void IncreasedFacts(int facts, int prior) => HandleFacts("Increased", facts, prior);
 
     [When("a Reserve fact is handled over no prior events")]
-    public void ReserveFact() => _facts = _router.DispatchFact(Builders.FactsOver("Reserve", 1, 0));
+    public void ReserveFact() => HandleFacts("Reserve", 1, 0);
+
+    private void HandleFacts(string fact, int facts, int prior)
+    {
+        try
+        {
+            _facts = _router.DispatchFact(Builders.FactsOver(fact, facts, prior));
+            _factErr = null;
+        }
+        catch (CodedError e)
+        {
+            _factErr = e;
+            _facts = null;
+        }
+    }
 
     [When("the ledger replays a snapshot of {int} then {int} Increased events")]
     public void Replay(int count, int events)
@@ -181,35 +201,42 @@ public sealed class ContextSteps
     public void Projected(string label, int first, int second) =>
         _router.DispatchProjector(Builders.TrackedBook(label, first, second));
 
-    [Then("{int} facts are recorded, each annotated with a count of {int}")]
-    public void Annotated(int facts, int count)
+    [Then("each Increased fact is recorded, flagged by the counts {int} and {int}")]
+    public void RecordedAndFlagged(int first, int second)
     {
+        Assert.That(_factErr, Is.Null, "fact dispatch failed");
         Assert.That(_facts, Is.Not.Null, "facts were handled");
-        Assert.That(_facts!.Pages.Count, Is.EqualTo(facts), "recorded facts");
-        foreach (var page in _facts.Pages)
+        var recorded = new List<(string Type, int? Count)>();
+        foreach (var page in _facts!.Pages)
         {
-            Assert.That(
-                TypeNames.FromUrl(page.Event.TypeUrl),
-                Is.EqualTo("test.counter.CounterState"),
-                "annotated fact type"
-            );
-            Assert.That(
-                (int)TC.CounterState.Parser.ParseFrom(page.Event.Value).Count,
-                Is.EqualTo(count),
-                "annotated count"
-            );
+            var type = TypeNames.FromUrl(page.Event.TypeUrl);
+            int? count =
+                type == "test.counter.CounterState"
+                    ? (int)TC.CounterState.Parser.ParseFrom(page.Event.Value).Count
+                    : null;
+            recorded.Add((type, count));
         }
+        Assert.That(
+            recorded,
+            Is.EqualTo(
+                new List<(string, int?)>
+                {
+                    ("test.counter.Increased", null),
+                    ("test.counter.CounterState", first),
+                    ("test.counter.Increased", null),
+                    ("test.counter.CounterState", second),
+                }
+            )
+        );
     }
 
-    [Then("the fact is recorded unchanged")]
-    public void Unchanged()
+    [Then("the facts are refused with {word} as INVALID_ARGUMENT")]
+    public void FactsRefused(string code)
     {
-        Assert.That(_facts, Is.Not.Null, "facts were handled");
-        Assert.That(_facts!.Pages.Count, Is.EqualTo(1), "recorded facts");
-        Assert.That(
-            TypeNames.FromUrl(_facts.Pages[0].Event.TypeUrl),
-            Is.EqualTo("test.counter.Reserve")
-        );
+        Assert.That(_facts, Is.Null, "nothing is recorded");
+        Assert.That(_factErr, Is.Not.Null, "the facts are refused");
+        Assert.That(_factErr!.Code, Is.EqualTo(code));
+        Assert.That(_factErr.Grpc, Is.EqualTo(GrpcCode.InvalidArgument));
     }
 
     [Then("the replayed state has a count of {int}")]
