@@ -102,8 +102,8 @@ py-binding-test: py-binding-gen
 
 # Lint + format check the Python binding (ruff; generated code excluded).
 py-binding-lint:
-    cd {{TOP}}/bindings/python && uv run --with ruff ruff check . && \
-        uv run --with ruff ruff format --check .
+    cd {{TOP}}/bindings/python && uv run --with ruff==0.16.9 ruff check . && \
+        uv run --with ruff==0.16.9 ruff format --check .
 
 # --- Java binding (bindings/java) ----------------------------------------
 # Run in the Java image. Panama/FFM loads the router-ffi cdylib, built in the
