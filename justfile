@@ -298,7 +298,7 @@ ts-binding-build: build (_typescript_container "ts-binding-build")
 # Run the TS binding's conformance suite (cucumber-js)
 ts-binding-test: build (_typescript_container "ts-binding-test")
 
-# Format check the TS binding (prettier)
+# Format check (prettier) and type-check (tsc) the TS binding
 ts-binding-lint: (_typescript_container "ts-binding-lint")
 
 # Auto-format the TS binding (prettier)

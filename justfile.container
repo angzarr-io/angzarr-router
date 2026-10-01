@@ -220,9 +220,11 @@ ts-binding-test: ts-binding-gen
         ANGZARR_ROUTER_LIB={{TOP}}/target/debug/libangzarr_router_ffi.so \
         NODE_OPTIONS="--import tsx" npx cucumber-js
 
-# Format check the TS binding (prettier; generated tree + node_modules excluded).
-ts-binding-lint:
+# Format check (prettier; generated tree + node_modules excluded) and type-check
+# (tsc) the TS binding.
+ts-binding-lint: ts-binding-gen
     cd {{TOP}}/bindings/typescript && prettier --check "src/**/*.ts" "conformance/**/*.ts" "*.mjs"
+    cd {{TOP}}/bindings/typescript && npm ci && npx tsc --noEmit -p tsconfig.json
 
 # Auto-format the TS binding (prettier).
 ts-binding-format:

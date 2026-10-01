@@ -22,7 +22,8 @@ export interface Outcome {
 /** The gRPC code a failure crosses the boundary with: OK (0) is never a
  * failure code, so a CodedError carrying it is an invalid argument. */
 export function failureGrpc(err: CodedError): GrpcCode {
-  return err.grpc === 0 ? GrpcCode.InvalidArgument : err.grpc;
+  const wire: number = err.grpc;
+  return wire === 0 ? GrpcCode.InvalidArgument : err.grpc;
 }
 
 /** Serializes a CodedError as google.rpc.Status bytes carrying a
