@@ -9,6 +9,7 @@
 
 #include <functional>
 #include <map>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -19,12 +20,14 @@
 
 namespace angzarr::router {
 
+// A command handler or compensator returning std::nullopt produced no result
+// (STATUS_OK_EMPTY): the core answers with an empty book / no compensation.
 template <class TState>
 class AggregateDispatch {
  public:
-  using CommandFn = std::function<io::angzarr::v1::EventBook(const google::protobuf::Any&, TState&,
-                                                             const CommandContext&)>;
-  using RejectionFn = std::function<io::angzarr::v1::BusinessResponse(
+  using CommandFn = std::function<std::optional<io::angzarr::v1::EventBook>(
+      const google::protobuf::Any&, TState&, const CommandContext&)>;
+  using RejectionFn = std::function<std::optional<io::angzarr::v1::BusinessResponse>(
       const io::angzarr::v1::Notification&, const io::angzarr::v1::RejectionNotification&, TState&,
       const CommandContext&)>;
 
@@ -75,12 +78,16 @@ class SagaDispatch {
   std::map<std::string, std::vector<RejectionFn>> rejections;
 };
 
+// Observes the type URL of a delivered event that has no projector fold.
+using ProjectorUnknownFn = std::function<void(const std::string& type_url)>;
+
 template <class TState>
 class ProjectorDispatch {
  public:
   using EventFn = std::function<void(TState&, const google::protobuf::Any&)>;
   using FinishFn =
       std::function<io::angzarr::v1::Projection(TState&, const io::angzarr::v1::EventBook&)>;
+  using UnknownFn = ProjectorUnknownFn;
 
   explicit ProjectorDispatch(std::string name) : name(std::move(name)) {}
 
@@ -96,11 +103,16 @@ class ProjectorDispatch {
     finish = std::move(fn);
     return *this;
   }
+  ProjectorDispatch& OnUnknown(UnknownFn fn) {
+    unknown = std::move(fn);
+    return *this;
+  }
 
   std::string name;
   std::vector<std::string> domains;
   std::vector<std::pair<std::string, EventFn>> events;
   FinishFn finish;
+  UnknownFn unknown;
 };
 
 template <class TState>

@@ -111,6 +111,9 @@ class Router {
       e->set_fq_type(fq);
       e->set_callback_id(Assign(ApplierInvoker<TState>(key, fn)));
     }
+    if (d.unknown) {
+      desc.set_unknown_callback_id(Assign(ProjectorUnknownInvoker(d.unknown)));
+    }
     if (d.finish) {
       desc.set_finish_callback_id(Assign(ProjectorFinishInvoker<TState>(key, d.finish)));
     }
@@ -269,7 +272,8 @@ class Router {
       cax.ParseFromString(aux);
       CommandContext cctx{cax.next_sequence(), cax.had_prior_events()};
       auto book = fn(AnyOf(tu, payload), s.EnsureState<TState>(key), cctx);
-      return InvokerResult{book.SerializeAsString(), ffi::kStatusOk, true};
+      if (!book) return InvokerResult{"", ffi::kStatusOkEmpty, false};
+      return InvokerResult{book->SerializeAsString(), ffi::kStatusOk, true};
     };
   }
 
@@ -289,7 +293,8 @@ class Router {
         cctx.had_prior_events = rax.cctx().had_prior_events();
       }
       auto resp = fn(n, rej, s.EnsureState<TState>(key), cctx);
-      return InvokerResult{resp.SerializeAsString(), ffi::kStatusOk, true};
+      if (!resp) return InvokerResult{"", ffi::kStatusOkEmpty, false};
+      return InvokerResult{resp->SerializeAsString(), ffi::kStatusOk, true};
     };
   }
 
@@ -303,6 +308,13 @@ class Router {
           auto proj = fn(s.EnsureState<TState>(key), book);
           return InvokerResult{proj.SerializeAsString(), ffi::kStatusOk, true};
         };
+  }
+
+  static Invoker ProjectorUnknownInvoker(ProjectorUnknownFn fn) {
+    return [fn](Session&, const std::string& tu, const std::string&, const std::string&) {
+      fn(tu);
+      return InvokerResult{"", ffi::kStatusOk, false};
+    };
   }
 
   static Invoker SagaEventInvoker(SagaDispatch::EventFn fn) {
