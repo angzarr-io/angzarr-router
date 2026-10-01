@@ -137,6 +137,38 @@ func (orderPM) OnReserveRejected(*pb.Notification, *pb.RejectionNotification, *c
 	return []*pb.EventBook{oneFact()}, &pb.Notification{Cover: &pb.Cover{Domain: "escalated"}}, nil
 }
 
+// --- AuditProcessManager ---
+
+// auditMark is the cover domain the audit PM stamps on its facts and process
+// events, so scenarios can tell its reactions from the order PM's.
+const auditMark = "audit"
+
+// auditPM is co-resident with the order PM over the same trigger and rejected
+// command but folds into its own state type: one "audit" fact per prior state
+// event and no commands; it compensates with one "audit" process event and no
+// escalation.
+type auditPM struct{}
+
+func (auditPM) Increased(_ *counter.Increased, state *counter.AuditProcessManagerState, _ *Destinations) (*pb.ProcessManagerHandleResponse, error) {
+	facts := make([]*pb.EventBook, len(state.Seen))
+	for i := range facts {
+		facts[i] = auditBook()
+	}
+	return &pb.ProcessManagerHandleResponse{Facts: facts}, nil
+}
+
+func (auditPM) ApplyIncreased(state *counter.AuditProcessManagerState, _ *counter.Increased) {
+	state.Seen = append(state.Seen, "Increased")
+}
+
+func (auditPM) OnReserveRejected(*pb.Notification, *pb.RejectionNotification, *counter.AuditProcessManagerState) ([]*pb.EventBook, *pb.Notification, error) {
+	return []*pb.EventBook{auditBook()}, nil, nil
+}
+
+func auditBook() *pb.EventBook {
+	return &pb.EventBook{Cover: &pb.Cover{Domain: auditMark}}
+}
+
 // reserveCommand builds the one-page Reserve command the saga and PM emit for
 // the "inventory" domain.
 func reserveCommand() *pb.CommandBook {

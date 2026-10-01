@@ -47,9 +47,25 @@ func (w *pmWorld) reset() {
 	w.router = NewRouter()
 	w.resp = nil
 	w.err = nil
+}
+
+// --- Given ---
+
+func (w *pmWorld) orderPM() error {
 	if err := counter.RegisterOrderProcessManager(w.router, orderPM{}); err != nil {
-		panic(fmt.Sprintf("register PM fixture: %v", err))
+		return fmt.Errorf("register order PM fixture: %w", err)
 	}
+	return nil
+}
+
+func (w *pmWorld) coResidentPMs() error {
+	if err := w.orderPM(); err != nil {
+		return err
+	}
+	if err := counter.RegisterAuditProcessManager(w.router, auditPM{}); err != nil {
+		return fmt.Errorf("register audit PM fixture: %w", err)
+	}
+	return nil
 }
 
 func (w *pmWorld) dispatch(req *pb.ProcessManagerHandleRequest) {
@@ -90,6 +106,12 @@ func pmRejection(fqCommand string) *pb.ProcessManagerHandleRequest {
 			}}},
 		},
 	}
+	return pmRejectionOf(rejection)
+}
+
+// pmRejectionOf wraps a RejectionNotification as the newest trigger page of a
+// "counter"-covered rejection request.
+func pmRejectionOf(rejection *pb.RejectionNotification) *pb.ProcessManagerHandleRequest {
 	notification := &pb.Notification{
 		Payload: &anypb.Any{
 			TypeUrl: typeURL("io.angzarr.v1.RejectionNotification"),
@@ -105,6 +127,26 @@ func pmRejection(fqCommand string) *pb.ProcessManagerHandleRequest {
 			}}}},
 		},
 	}
+}
+
+// pmIssuedRejection is a rejection of fqCommand issued by the PM owning
+// issuer: the trigger cover is the issuer's domain and the rejected command's
+// first page carries an angzarr_deferred header naming the issuer as source.
+func pmIssuedRejection(fqCommand, issuer string) *pb.ProcessManagerHandleRequest {
+	rejection := &pb.RejectionNotification{
+		RejectedCommand: &pb.CommandBook{
+			Cover: &pb.Cover{Domain: "inventory"},
+			Pages: []*pb.CommandPage{{
+				Header: &pb.PageHeader{SequenceType: &pb.PageHeader_AngzarrDeferred{
+					AngzarrDeferred: &pb.AngzarrDeferredSequence{Source: &pb.Cover{Domain: issuer}},
+				}},
+				Payload: &pb.CommandPage_Command{Command: &anypb.Any{TypeUrl: typeURL(fqCommand)}},
+			}},
+		},
+	}
+	req := pmRejectionOf(rejection)
+	req.Trigger.Cover = &pb.Cover{Domain: issuer}
+	return req
 }
 
 // --- When ---
@@ -135,6 +177,16 @@ func (w *pmWorld) emptyTrigger() {
 
 func (w *pmWorld) rejectionReserve() {
 	w.dispatch(pmRejection(fqReserve))
+}
+
+func (w *pmWorld) increasedOverOwnedState(owner string, n int) {
+	state := pmStateOf(n)
+	state.Cover = &pb.Cover{Domain: owner}
+	w.dispatch(pmTrigger("counter", []string{fqIncreased}, state, nil))
+}
+
+func (w *pmWorld) rejectionIssuedBy(issuer string) {
+	w.dispatch(pmIssuedRejection(fqReserve, issuer))
 }
 
 // --- Then ---
@@ -183,6 +235,68 @@ func (w *pmWorld) rebuiltN(n int) error {
 	return nil
 }
 
+// factsMarked counts the response facts whose cover domain is (audit=true) or
+// is not (audit=false) the audit PM's mark.
+func (w *pmWorld) factsMarked(audit bool) int {
+	n := 0
+	for _, f := range w.resp.GetFacts() {
+		if (f.GetCover().GetDomain() == auditMark) == audit {
+			n++
+		}
+	}
+	return n
+}
+
+func (w *pmWorld) orderRebuiltN(n int) error {
+	if w.err != nil {
+		return fmt.Errorf("dispatch failed: %w", w.err)
+	}
+	if got := w.factsMarked(false); got != n {
+		return fmt.Errorf("order PM rebuilt %d prior state events, want %d", got, n)
+	}
+	return nil
+}
+
+func (w *pmWorld) auditRebuiltN(n int) error {
+	if w.err != nil {
+		return fmt.Errorf("dispatch failed: %w", w.err)
+	}
+	if got := w.factsMarked(true); got != n {
+		return fmt.Errorf("audit PM rebuilt %d prior state events, want %d", got, n)
+	}
+	return nil
+}
+
+func (w *pmWorld) orderDidNotReact() error {
+	if w.err != nil {
+		return fmt.Errorf("dispatch failed: %w", w.err)
+	}
+	if got := len(w.resp.GetCommands()); got != 0 {
+		return fmt.Errorf("order PM emitted %d commands, want 0", got)
+	}
+	if got := w.factsMarked(false); got != 0 {
+		return fmt.Errorf("order PM emitted %d facts, want 0", got)
+	}
+	return nil
+}
+
+func (w *pmWorld) onlyAuditCompensates() error {
+	if w.err != nil {
+		return fmt.Errorf("dispatch failed: %w", w.err)
+	}
+	events := w.resp.GetProcessEvents()
+	if len(events) != 1 {
+		return fmt.Errorf("emitted %d process events, want exactly 1", len(events))
+	}
+	if domain := events[0].GetCover().GetDomain(); domain != auditMark {
+		return fmt.Errorf("process event cover %q, want %q (the audit PM)", domain, auditMark)
+	}
+	if w.resp.GetNotification() != nil {
+		return fmt.Errorf("order PM escalated; only the audit PM should compensate")
+	}
+	return nil
+}
+
 func (w *pmWorld) emitsOneProcessEvent() error {
 	if w.err != nil {
 		return fmt.Errorf("dispatch failed: %w", w.err)
@@ -225,7 +339,14 @@ func initializeProcessManagerScenario(sc *godog.ScenarioContext) {
 		return ctx, nil
 	})
 
-	sc.Step(`^an order process-manager$`, func() {})
+	sc.Step(`^an order process-manager$`, w.orderPM)
+	sc.Step(`^co-resident order and audit process-managers$`, w.coResidentPMs)
+	sc.Step(`^an Increased trigger is dispatched over a prior "([^"]*)" state of (\d+) events$`, w.increasedOverOwnedState)
+	sc.Step(`^a rejection of Reserve issued by "([^"]*)" is dispatched$`, w.rejectionIssuedBy)
+	sc.Step(`^the order process-manager rebuilt (\d+) prior state events$`, w.orderRebuiltN)
+	sc.Step(`^the audit process-manager rebuilt (\d+) prior state events$`, w.auditRebuiltN)
+	sc.Step(`^the order process-manager did not react$`, w.orderDidNotReact)
+	sc.Step(`^only the audit process-manager compensates$`, w.onlyAuditCompensates)
 	sc.Step(`^an Increased trigger in domain "([^"]*)" is dispatched with destination inventory sequence (\d+)$`, w.increasedWithDestination)
 	sc.Step(`^an Increased trigger in domain "([^"]*)" is dispatched$`, w.increasedInDomain)
 	sc.Step(`^a trigger whose newest page is an undeclared event is dispatched$`, w.newestUndeclared)

@@ -125,13 +125,25 @@ func AbiVersion() uint32 {
 // google.rpc.Status bytes are the returned payload).
 type invoker func(s *session, typeURL string, payload, aux []byte) (out []byte, status int32)
 
-// session is one dispatch's host-side state object, reached from callbacks
-// via the host_ctx handle. State never crosses to Rust; it lives here and
-// is created lazily by the first callback to run (all callbacks in one
-// dispatch belong to the same aggregate, so the factory is consistent).
+// componentKey identifies one registered component within a Router. Every
+// invoker registered for a component captures its key, so host state is
+// looked up per component.
+type componentKey uint64
+
+// session is one dispatch's host-side state, reached from callbacks via the
+// host_ctx handle. State never crosses to Rust; it lives here, keyed by
+// component, and each component's state is created lazily by that
+// component's first callback. One dispatch may run several components (e.g.
+// co-resident process managers subscribed to the same domain), and each
+// folds into and reads only its own state.
 type session struct {
 	router *Router
-	state  any
+	states map[componentKey]any
+}
+
+// newSession starts an empty per-dispatch session for r.
+func newSession(r *Router) *session {
+	return &session{router: r, states: make(map[componentKey]any)}
 }
 
 // Router wraps the Rust core router plus the Go-side callback registry the
@@ -143,6 +155,9 @@ type Router struct {
 	mu       sync.Mutex
 	registry map[uint64]invoker
 	nextID   uint64
+	// nextComponent is the last component key handed out; each Register*
+	// call takes a fresh one.
+	nextComponent componentKey
 }
 
 // NewRouter creates an empty router. Close it when done.
@@ -161,6 +176,12 @@ func (r *Router) Close() {
 	}
 }
 
+// newComponent returns a fresh component key (caller holds r.mu).
+func (r *Router) newComponent() componentKey {
+	r.nextComponent++
+	return r.nextComponent
+}
+
 // assign records an invoker under a fresh callback id (caller holds r.mu).
 func (r *Router) assign(inv invoker) uint64 {
 	r.nextID++
@@ -176,25 +197,26 @@ func RegisterAggregate[S any](r *Router, d *AggregateDispatch[S]) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	key := r.newComponent()
 	factory := d.rebuilder.factory
 	desc := &abipb.AggregateDescriptor{Name: d.name, Domain: d.domain}
 
 	for fq, thunk := range d.rebuilder.appliers {
-		id := r.assign(applierInvoker(factory, thunk))
+		id := r.assign(applierInvoker(key, factory, thunk))
 		desc.Appliers = append(desc.Appliers, &abipb.CallbackEntry{FqType: fq, CallbackId: id})
 	}
 	if d.rebuilder.snapshot != nil {
-		id := r.assign(applierInvoker(factory, d.rebuilder.snapshot))
+		id := r.assign(applierInvoker(key, factory, d.rebuilder.snapshot))
 		desc.SnapshotCallbackId = &id
 	}
 	for fq, thunk := range d.commands {
-		id := r.assign(commandInvoker(factory, thunk))
+		id := r.assign(commandInvoker(key, factory, thunk))
 		desc.Commands = append(desc.Commands, &abipb.CallbackEntry{FqType: fq, CallbackId: id})
 	}
 	for fq, thunks := range d.rejections {
 		entry := &abipb.RejectionEntry{FqCommandType: fq}
 		for _, thunk := range thunks {
-			id := r.assign(rejectionInvoker(factory, thunk))
+			id := r.assign(rejectionInvoker(key, factory, thunk))
 			entry.CallbackIds = append(entry.CallbackIds, id)
 		}
 		desc.Rejections = append(desc.Rejections, entry)
@@ -225,11 +247,12 @@ func RegisterProjector[P any](r *Router, d *ProjectorDispatch[P]) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	key := r.newComponent()
 	factory := d.factory
 	desc := &abipb.ProjectorDescriptor{Name: d.name, Domains: d.domains}
 
 	for fq, thunk := range d.events {
-		id := r.assign(projectorEventInvoker(factory, thunk))
+		id := r.assign(projectorEventInvoker(key, factory, thunk))
 		desc.Events = append(desc.Events, &abipb.CallbackEntry{FqType: fq, CallbackId: id})
 	}
 	if d.unknown != nil {
@@ -237,7 +260,7 @@ func RegisterProjector[P any](r *Router, d *ProjectorDispatch[P]) error {
 		desc.UnknownCallbackId = &id
 	}
 	if d.finish != nil {
-		id := r.assign(projectorFinishInvoker(factory, d.finish))
+		id := r.assign(projectorFinishInvoker(key, factory, d.finish))
 		desc.FinishCallbackId = &id
 	}
 
@@ -307,7 +330,7 @@ func (r *Router) DispatchSaga(req *pb.SagaHandleRequest) (*pb.SagaResponse, erro
 		return nil, fmt.Errorf("marshal SagaHandleRequest: %w", err)
 	}
 
-	h := cgo.NewHandle(&session{router: r})
+	h := cgo.NewHandle(newSession(r))
 	defer h.Delete()
 
 	var reqPtr *C.uint8_t
@@ -338,20 +361,21 @@ func RegisterProcessManager[S any](r *Router, d *ProcessManagerDispatch[S]) erro
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	key := r.newComponent()
 	factory := d.rebuilder.factory
 	desc := &abipb.ProcessManagerDescriptor{Name: d.name, PmDomain: d.pmDomain}
 
 	for fq, thunk := range d.rebuilder.appliers {
-		id := r.assign(applierInvoker(factory, thunk))
+		id := r.assign(applierInvoker(key, factory, thunk))
 		desc.Appliers = append(desc.Appliers, &abipb.CallbackEntry{FqType: fq, CallbackId: id})
 	}
 	if d.rebuilder.snapshot != nil {
-		id := r.assign(applierInvoker(factory, d.rebuilder.snapshot))
+		id := r.assign(applierInvoker(key, factory, d.rebuilder.snapshot))
 		desc.SnapshotCallbackId = &id
 	}
 	for inputDomain, byType := range d.handlers {
 		for fq, thunk := range byType {
-			id := r.assign(pmEventInvoker(factory, thunk))
+			id := r.assign(pmEventInvoker(key, factory, thunk))
 			desc.Events = append(desc.Events, &abipb.PmEventEntry{
 				InputDomain: inputDomain,
 				FqType:      fq,
@@ -362,7 +386,7 @@ func RegisterProcessManager[S any](r *Router, d *ProcessManagerDispatch[S]) erro
 	for fq, thunks := range d.rejections {
 		entry := &abipb.RejectionEntry{FqCommandType: fq}
 		for _, thunk := range thunks {
-			id := r.assign(pmRejectionInvoker(factory, thunk))
+			id := r.assign(pmRejectionInvoker(key, factory, thunk))
 			entry.CallbackIds = append(entry.CallbackIds, id)
 		}
 		desc.Rejections = append(desc.Rejections, entry)
@@ -393,7 +417,7 @@ func (r *Router) DispatchProcessManager(req *pb.ProcessManagerHandleRequest) (*p
 		return nil, fmt.Errorf("marshal ProcessManagerHandleRequest: %w", err)
 	}
 
-	h := cgo.NewHandle(&session{router: r})
+	h := cgo.NewHandle(newSession(r))
 	defer h.Delete()
 
 	var reqPtr *C.uint8_t
@@ -423,7 +447,7 @@ func (r *Router) DispatchProjector(book *pb.EventBook) (*pb.Projection, error) {
 		return nil, fmt.Errorf("marshal EventBook: %w", err)
 	}
 
-	h := cgo.NewHandle(&session{router: r})
+	h := cgo.NewHandle(newSession(r))
 	defer h.Delete()
 
 	var reqPtr *C.uint8_t
@@ -455,7 +479,7 @@ func (r *Router) Dispatch(cc *pb.ContextualCommand) (*pb.BusinessResponse, error
 
 	// The session is reached from callbacks via this handle; the core holds
 	// it only for the duration of this synchronous call.
-	h := cgo.NewHandle(&session{router: r})
+	h := cgo.NewHandle(newSession(r))
 	defer h.Delete()
 
 	var reqPtr *C.uint8_t
@@ -491,11 +515,11 @@ func consumeBuf(b *C.angzarr_buf) []byte {
 }
 
 // applierInvoker / commandInvoker / rejectionInvoker build the type-erased
-// bridge for one thunk, lazily seeding the session's state on first use.
+// bridge for one thunk, lazily seeding the component's state on first use.
 
-func applierInvoker[S any](factory func() S, thunk ApplierThunk[S]) invoker {
+func applierInvoker[S any](key componentKey, factory func() S, thunk ApplierThunk[S]) invoker {
 	return func(s *session, typeURL string, payload, _ []byte) ([]byte, int32) {
-		st := ensureState(s, factory)
+		st := ensureState(s, key, factory)
 		if err := thunk(st, &anypb.Any{TypeUrl: typeURL, Value: payload}); err != nil {
 			return errorStatus(err)
 		}
@@ -503,14 +527,14 @@ func applierInvoker[S any](factory func() S, thunk ApplierThunk[S]) invoker {
 	}
 }
 
-func commandInvoker[S any](factory func() S, thunk CommandThunk[S]) invoker {
+func commandInvoker[S any](key componentKey, factory func() S, thunk CommandThunk[S]) invoker {
 	return func(s *session, typeURL string, payload, aux []byte) ([]byte, int32) {
 		var cax abipb.CommandContextAux
 		if err := proto.Unmarshal(aux, &cax); err != nil {
 			return errorStatus(fmt.Errorf("unmarshal CommandContextAux: %w", err))
 		}
 		cctx := CommandContext{NextSequence: cax.NextSequence, HadPriorEvents: cax.HadPriorEvents}
-		st := ensureState(s, factory)
+		st := ensureState(s, key, factory)
 		book, err := thunk(&anypb.Any{TypeUrl: typeURL, Value: payload}, st, cctx)
 		if err != nil {
 			return errorStatus(err)
@@ -526,7 +550,7 @@ func commandInvoker[S any](factory func() S, thunk CommandThunk[S]) invoker {
 	}
 }
 
-func rejectionInvoker[S any](factory func() S, thunk RejectionThunk[S]) invoker {
+func rejectionInvoker[S any](key componentKey, factory func() S, thunk RejectionThunk[S]) invoker {
 	return func(s *session, _ string, _, aux []byte) ([]byte, int32) {
 		var rax abipb.RejectionAux
 		if err := proto.Unmarshal(aux, &rax); err != nil {
@@ -544,7 +568,7 @@ func rejectionInvoker[S any](factory func() S, thunk RejectionThunk[S]) invoker 
 		if rax.Cctx != nil {
 			cctx = CommandContext{NextSequence: rax.Cctx.NextSequence, HadPriorEvents: rax.Cctx.HadPriorEvents}
 		}
-		st := ensureState(s, factory)
+		st := ensureState(s, key, factory)
 		resp, err := thunk(&n, &rej, st, cctx)
 		if err != nil {
 			return errorStatus(err)
@@ -563,9 +587,9 @@ func rejectionInvoker[S any](factory func() S, thunk RejectionThunk[S]) invoker 
 // projectorEventInvoker / projectorFinishInvoker / projectorUnknownInvoker
 // build the type-erased bridge for the projector thunks.
 
-func projectorEventInvoker[P any](factory func() P, thunk ProjectorEventThunk[P]) invoker {
+func projectorEventInvoker[P any](key componentKey, factory func() P, thunk ProjectorEventThunk[P]) invoker {
 	return func(s *session, typeURL string, payload, _ []byte) ([]byte, int32) {
-		st := ensureState(s, factory)
+		st := ensureState(s, key, factory)
 		if err := thunk(st, &anypb.Any{TypeUrl: typeURL, Value: payload}); err != nil {
 			return errorStatus(err)
 		}
@@ -573,7 +597,7 @@ func projectorEventInvoker[P any](factory func() P, thunk ProjectorEventThunk[P]
 	}
 }
 
-func projectorFinishInvoker[P any](factory func() P, thunk ProjectorFinishThunk[P]) invoker {
+func projectorFinishInvoker[P any](key componentKey, factory func() P, thunk ProjectorFinishThunk[P]) invoker {
 	return func(s *session, _ string, payload, _ []byte) ([]byte, int32) {
 		// The core hands the EventBook over as the callback payload so the
 		// finisher can carry its cover onto the Projection.
@@ -581,7 +605,7 @@ func projectorFinishInvoker[P any](factory func() P, thunk ProjectorFinishThunk[
 		if err := proto.Unmarshal(payload, &book); err != nil {
 			return errorStatus(fmt.Errorf("unmarshal EventBook: %w", err))
 		}
-		st := ensureState(s, factory)
+		st := ensureState(s, key, factory)
 		proj, err := thunk(st, &book)
 		if err != nil {
 			return errorStatus(err)
@@ -651,18 +675,18 @@ func sagaRejectionInvoker(thunk SagaRejectionThunk) invoker {
 }
 
 // pmEventInvoker / pmRejectionInvoker bridge the process-manager thunks. The
-// PM is stateful, so both lazily seed the session's state via the rebuilder
+// PM is stateful, so both lazily seed the PM's own state via the rebuilder
 // factory (the appliers fold process_state into it first, exactly as the
 // aggregate does).
 
-func pmEventInvoker[S any](factory func() S, thunk PMEventThunk[S]) invoker {
+func pmEventInvoker[S any](key componentKey, factory func() S, thunk PMEventThunk[S]) invoker {
 	return func(s *session, typeURL string, payload, aux []byte) ([]byte, int32) {
 		var pax abipb.PmEventAux
 		if err := proto.Unmarshal(aux, &pax); err != nil {
 			return errorStatus(fmt.Errorf("unmarshal PmEventAux: %w", err))
 		}
 		dests := NewDestinations(pax.DestinationSequences)
-		st := ensureState(s, factory)
+		st := ensureState(s, key, factory)
 		resp, err := thunk(&anypb.Any{TypeUrl: typeURL, Value: payload}, st, dests)
 		if err != nil {
 			return errorStatus(err)
@@ -675,7 +699,7 @@ func pmEventInvoker[S any](factory func() S, thunk PMEventThunk[S]) invoker {
 	}
 }
 
-func pmRejectionInvoker[S any](factory func() S, thunk PMRejectionThunk[S]) invoker {
+func pmRejectionInvoker[S any](key componentKey, factory func() S, thunk PMRejectionThunk[S]) invoker {
 	return func(s *session, _ string, _, aux []byte) ([]byte, int32) {
 		var rax abipb.RejectionAux
 		if err := proto.Unmarshal(aux, &rax); err != nil {
@@ -689,7 +713,7 @@ func pmRejectionInvoker[S any](factory func() S, thunk PMRejectionThunk[S]) invo
 		if err := proto.Unmarshal(rax.Rejection, &rej); err != nil {
 			return errorStatus(fmt.Errorf("unmarshal RejectionNotification: %w", err))
 		}
-		st := ensureState(s, factory)
+		st := ensureState(s, key, factory)
 		processEvents, escalation, err := thunk(&n, &rej, st)
 		if err != nil {
 			return errorStatus(err)
@@ -706,11 +730,14 @@ func pmRejectionInvoker[S any](factory func() S, thunk PMRejectionThunk[S]) invo
 	}
 }
 
-// ensureState lazily creates the session's host state from the aggregate's
-// factory on first callback, then reuses it across the dispatch.
-func ensureState[S any](s *session, factory func() S) S {
-	if s.state == nil {
-		s.state = factory()
+// ensureState returns the host state of the component identified by key,
+// creating it from that component's factory on its first callback in this
+// dispatch and reusing it for the component's later callbacks.
+func ensureState[S any](s *session, key componentKey, factory func() S) S {
+	st, ok := s.states[key]
+	if !ok {
+		st = factory()
+		s.states[key] = st
 	}
-	return s.state.(S)
+	return st.(S)
 }
