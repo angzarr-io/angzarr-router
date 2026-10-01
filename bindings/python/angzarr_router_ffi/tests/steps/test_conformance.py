@@ -197,6 +197,14 @@ def _carry_parent_linkage(world):
     assert ext == builders.parent_linkage(), f"cover ext = {ext}, want parent linkage"
 
 
+@then("the recorded events carry no parent linkage")
+def _carry_no_parent_linkage(world):
+    assert world.err is None, f"dispatch failed: {world.err}"
+    book = world.resp.events
+    assert len(book.pages) > 0, "events were recorded"
+    assert not book.cover.HasField("ext"), f"cover ext = {book.cover.ext}, want none"
+
+
 @then("the compensations run first then second")
 def _compensations_in_order(world):
     assert world.err is None, f"dispatch failed: {world.err}"

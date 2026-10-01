@@ -5,13 +5,23 @@ layer is new; the behavior spec is shared, unchanged."""
 
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 from pytest_bdd import given, parsers, scenarios, then, when
 
-from ... import CodedError, Router
+from ... import CodedError, GrpcCode, Router, SagaDispatch
+from ...gen.io.angzarr.router.ffi.v1 import abi_pb2
 from ...gen.io.angzarr.v1 import saga_pb2, types_pb2
 from ...gen.test.counter import order_saga_angzarr
-from ..builders import FQ_INCREASED, FQ_RESERVE, assert_deferred, type_url
+from ..builders import (
+    FQ_INCREASED,
+    FQ_RESERVE,
+    assert_deferred,
+    assert_no_source_component,
+    cover_of,
+    type_url,
+)
 from ..fixture import OrderSaga
 
 scenarios("saga.feature")
@@ -36,6 +46,7 @@ class _World:
         self.router.register_saga(saga)
         self.resp = None
         self.err: CodedError | None = None
+        self.refusal: CodedError | None = None
 
     def dispatch(self, request) -> None:
         try:
@@ -87,6 +98,43 @@ def _rejection_source(fq_command: str):
     return req
 
 
+def _parity_command():
+    """The parity command: cover "inventory", root bytes 10..1f, correlation
+    "corr-1"; one page whose command is "/example.Foo" carrying 01020304."""
+    cmd = types_pb2.CommandBook()
+    cmd.cover.domain = "inventory"
+    cmd.cover.root.value = bytes(range(0x10, 0x20))
+    cmd.cover.correlation_id = "corr-1"
+    page = cmd.pages.add()
+    page.command.type_url = "/example.Foo"
+    page.command.value = bytes([1, 2, 3, 4])
+    return cmd
+
+
+def _parity_saga() -> SagaDispatch:
+    """The parity saga ("order" -> "inventory"): its Increased handler emits
+    the parity command twice."""
+    return SagaDispatch("parity-saga", "order", ["inventory"]).on_event(
+        FQ_INCREASED, lambda _event, _dests, _cover: ([_parity_command(), _parity_command()], [])
+    )
+
+
+def _parity_source(seq: int):
+    """One Increased event at ``seq`` under cover "order", root bytes 00..0f,
+    correlation "corr-1"."""
+    req = _event_source(FQ_INCREASED, seq)
+    req.source.cover.root.value = bytes(range(0x10))
+    req.source.cover.correlation_id = "corr-1"
+    return req
+
+
+@given("a parity saga emitting the parity command twice")
+def _a_parity_saga(world):
+    world.router.close()
+    world.router = Router()
+    world.router.register_saga(_parity_saga())
+
+
 @given(parsers.re(r'an order saga delivering to "(?P<target>[^"]*)"'))
 def _an_order_saga(world, target):
     # Each scenario's fresh saga is registered in _World.__init__.
@@ -96,6 +144,38 @@ def _an_order_saga(world, target):
 @when(parsers.re(r"an Increased event at sequence (?P<seq>\d+) is dispatched"))
 def _increased_at(world, seq):
     world.dispatch(_event_source(FQ_INCREASED, int(seq)))
+
+
+@when(
+    parsers.re(
+        r'an Increased event of order root "(?P<label>[^"]*)" at sequence (?P<seq>\d+) is dispatched'
+    )
+)
+def _rooted_increased_at(world, label, seq):
+    req = _event_source(FQ_INCREASED, int(seq))
+    req.source.cover.CopyFrom(cover_of("order", label))
+    world.dispatch(req)
+
+
+@when(parsers.re(r"the parity source event at sequence (?P<seq>\d+) is dispatched"))
+def _parity_source_at(world, seq):
+    world.dispatch(_parity_source(int(seq)))
+
+
+@when("a saga declaring a compensation for Reserve is registered")
+def _register_compensating_saga(world):
+    # The typed SagaDispatch has no way to declare a rejection handler, so the
+    # descriptor goes through the binding's low-level registration entry point.
+    desc = abi_pb2.SagaDescriptor(name="order-saga", input_domain="order")
+    desc.target_domains.append("inventory")
+    desc.rejections.append(abi_pb2.RejectionEntry(compensates=FQ_RESERVE, callback_ids=[1]))
+    router = Router()
+    try:
+        router.register_saga_descriptor(desc)
+    except CodedError as exc:
+        world.refusal = exc
+    finally:
+        router.close()
 
 
 @when("a Reserve event is dispatched")
@@ -135,6 +215,41 @@ def _emits_one_command(world, target):
 def _command_is_deferred(world, seq, index):
     assert world.err is None, f"dispatch failed: {world.err}"
     assert_deferred(world.resp.commands[0], "order", int(seq), int(index))
+
+
+@then("the command leaves its source component to the coordinator")
+def _leaves_source_component(world):
+    assert world.err is None, f"dispatch failed: {world.err}"
+    assert len(world.resp.commands) == 1
+    assert_no_source_component(world.resp.commands[0])
+
+
+@then(parsers.re(r'the command is deferred from order root "(?P<label>[^"]*)"'))
+def _deferred_from_root(world, label):
+    assert world.err is None, f"dispatch failed: {world.err}"
+    assert len(world.resp.commands) == 1
+    for page in world.resp.commands[0].pages:
+        assert page.header.WhichOneof("sequence_type") == "angzarr_deferred"
+        assert page.header.angzarr_deferred.source == cover_of("order", label), (
+            "the source is the triggering book's whole cover"
+        )
+
+
+@then(
+    parsers.re(r'the command at index (?P<index>\d+) hashes to SHA-256 "(?P<digest>[0-9a-f]{64})"')
+)
+def _command_hashes(world, index, digest):
+    assert world.err is None, f"dispatch failed: {world.err}"
+    command = world.resp.commands[int(index)]
+    command.DiscardUnknownFields()
+    encoded = command.SerializeToString(deterministic=True)
+    assert hashlib.sha256(encoded).hexdigest() == digest
+
+
+@then("the registration is refused as INVALID_ARGUMENT")
+def _registration_refused(world):
+    assert world.refusal is not None, "the registration was accepted"
+    assert world.refusal.grpc == GrpcCode.INVALID_ARGUMENT
 
 
 @then(parsers.re(r"the saga handler saw source sequence (?P<seq>\d+)"))

@@ -74,6 +74,19 @@ def assert_deferred(command_book, source_domain: str, source_seq: int, index: in
         assert deferred.source.domain == source_domain, "the source cover is the trigger's"
 
 
+def assert_no_source_component(command_book) -> None:
+    """Every page of ``command_book`` is deferred with an empty
+    source_component: the coordinator stamps the component."""
+    assert command_book.pages, "the command has no pages"
+    for page in command_book.pages:
+        assert page.header.WhichOneof("sequence_type") == "angzarr_deferred", (
+            f"command page is not deferred: {page.header}"
+        )
+        assert page.header.angzarr_deferred.source_component == "", (
+            "the coordinator stamps the component"
+        )
+
+
 def with_type_url_prefix(cc, prefix: str):
     """Rewrite every Any type URL in ``cc``'s command and prior events to
     ``prefix`` + the fully-qualified name."""

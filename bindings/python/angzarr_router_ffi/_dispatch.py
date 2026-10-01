@@ -1092,13 +1092,25 @@ class Router:
             for fq, thunk in dispatch.events.items():
                 cid = self._assign(_saga_event_invoker(targets, thunk))
                 desc.events.append(abi_pb2.CallbackEntry(fq_type=fq, callback_id=cid))
+            self._register_saga_bytes(desc.SerializeToString())
 
-            desc_bytes = desc.SerializeToString()
-            ret = lib.angzarr_router_register_saga(
-                self._ptr, _as_u8(desc_bytes), len(desc_bytes), _trampoline
-            )
-            if ret != 0:
-                raise _decode_status(None, ret)
+    def register_saga_descriptor(self, descriptor) -> None:
+        """The low-level saga registration entry point: hand an already-built
+        ABI ``SagaDescriptor`` to the core as-is, with the shared trampoline.
+        Every callback id it names must already be assigned on this router;
+        :meth:`register_saga` is the typed path that assigns them. The core
+        validates the descriptor (a saga declaring rejections is refused with
+        SAGA_COMPENSATES), and a refusal raises a CodedError."""
+        with self._lock:
+            self._register_saga_bytes(descriptor.SerializeToString())
+
+    def _register_saga_bytes(self, desc_bytes: bytes) -> None:
+        # The caller holds self._lock.
+        ret = lib.angzarr_router_register_saga(
+            self._ptr, _as_u8(desc_bytes), len(desc_bytes), _trampoline
+        )
+        if ret != 0:
+            raise _decode_status(None, ret)
 
     def dispatch_saga(self, saga_request) -> object:
         """Run one SagaHandleRequest through the registered saga and return the

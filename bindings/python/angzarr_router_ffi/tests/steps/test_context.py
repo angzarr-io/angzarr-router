@@ -8,6 +8,7 @@ full-response PM compensator, ``on_event_with_context``)."""
 from __future__ import annotations
 
 import pytest
+from google.protobuf import any_pb2
 from pytest_bdd import given, parsers, scenarios, then, when
 
 from ... import (
@@ -31,6 +32,7 @@ from ..builders import (
     assert_deferred,
     cover_of,
     fq_from_url,
+    parent_linkage,
     root_of,
     type_url,
 )
@@ -59,7 +61,8 @@ def _reserve_to(domain: str, fq: str = FQ_RESERVE):
 def _ledger_aggregate(covers: list, applied: list) -> AggregateDispatch:
     """The ledger aggregate (domain "ledger") over CounterState: Increased
     folds count += 1 and records the page sequence it applied; a snapshot loads CounterState; IncreaseBy records the
-    handled cover and emits nothing; the only declared fact, Increased, is
+    handled cover and emits one Increased whose cover carries the ledger's own
+    linkage (:func:`_ledger_linkage`); the only declared fact, Increased, is
     recorded as received and flagged by a CounterState carrying the count it
     brings the ledger to."""
 
@@ -72,6 +75,10 @@ def _ledger_aggregate(covers: list, applied: list) -> AggregateDispatch:
 
     def increase_by(_cmd, _state, cctx):
         covers.append(cctx.cover)
+        book = types_pb2.EventBook()
+        book.cover.ext.CopyFrom(_ledger_linkage())
+        book.pages.append(_increased_page())
+        return book
 
     def record_increased(fact, state):
         return FactRecord(fact, [counter_pb2.CounterState(count=state.count + 1)])
@@ -160,9 +167,16 @@ def _events_replay_request(events: int):
     return req
 
 
-def _ledger_command(label: str):
+def _ledger_linkage() -> any_pb2.Any:
+    """The parent linkage the ledger sets on its own events."""
+    return any_pb2.Any(type_url=type_url("test.counter.Parent"), value=bytes([4, 5, 6]))
+
+
+def _ledger_command(label: str, on_behalf_of_parent: bool = False):
     cc = types_pb2.ContextualCommand()
     cc.command.cover.CopyFrom(cover_of("ledger", label))
+    if on_behalf_of_parent:
+        cc.command.cover.ext.CopyFrom(parent_linkage())
     cc.command.pages.add().command.CopyFrom(pack(counter_pb2.IncreaseBy(n=1)))
     return cc
 
@@ -208,6 +222,7 @@ class _World:
         self.refusal = None
         self.replayed = None
         self.pm = None
+        self.command = None
 
     def close(self) -> None:
         self.router.close()
@@ -280,7 +295,25 @@ def _applied_at(world, first, second):
 
 @when(parsers.re(r'an IncreaseBy command for ledger root "(?P<label>[^"]*)" is dispatched'))
 def _ledger_command_step(world, label):
-    world.router.dispatch(_ledger_command(label))
+    world.command = world.router.dispatch(_ledger_command(label))
+
+
+@when(
+    parsers.re(
+        r'an IncreaseBy command for ledger root "(?P<label>[^"]*)" on behalf of a parent is dispatched'
+    )
+)
+def _ledger_command_on_behalf_step(world, label):
+    world.command = world.router.dispatch(_ledger_command(label, on_behalf_of_parent=True))
+
+
+@then("the recorded event carries the ledger's own linkage")
+def _carries_ledger_linkage(world):
+    book = world.command.events
+    assert len(book.pages) == 1, f"recorded {len(book.pages)} events, want 1"
+    assert book.cover.ext == _ledger_linkage(), (
+        f"cover ext = {book.cover.ext}, want the ledger's own linkage"
+    )
 
 
 @when(

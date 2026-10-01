@@ -12,7 +12,13 @@ from pytest_bdd import given, parsers, scenarios, then, when
 from ... import CodedError, Router
 from ...gen.io.angzarr.v1 import process_manager_pb2, types_pb2
 from ...gen.test.counter import audit_process_manager_angzarr, order_process_manager_angzarr
-from ..builders import FQ_INCREASED, FQ_RESERVE, assert_deferred, type_url
+from ..builders import (
+    FQ_INCREASED,
+    FQ_RESERVE,
+    assert_deferred,
+    assert_no_source_component,
+    type_url,
+)
 from ..fixture import AUDIT_MARK, AuditProcessManager, OrderProcessManager
 
 scenarios("process_manager.feature")
@@ -206,6 +212,13 @@ def _emits_one_command(world, target):
 def _command_is_deferred(world, seq, index):
     assert world.err is None, f"dispatch failed: {world.err}"
     assert_deferred(world.resp.commands[0], "counter", int(seq), int(index))
+
+
+@then("the command leaves its source component to the coordinator")
+def _leaves_source_component(world):
+    assert world.err is None, f"dispatch failed: {world.err}"
+    assert world.resp.commands, "no command emitted"
+    assert_no_source_component(world.resp.commands[0])
 
 
 @then("the process-manager emits no commands")
