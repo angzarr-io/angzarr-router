@@ -25,7 +25,6 @@ TOP := `git rev-parse --show-toplevel`
 # Override either with the matching env var to pin a git-SHA tag.
 ROUTER_IMAGE := env_var_or_default("ANGZARR_ROUTER_IMAGE", "ghcr.io/angzarr-io/angzarr-rust:latest")
 ROUTER_GO_IMAGE := env_var_or_default("ANGZARR_ROUTER_GO_IMAGE", "ghcr.io/angzarr-io/angzarr-go:latest")
-ROUTER_PYTHON_IMAGE := env_var_or_default("ANGZARR_ROUTER_PYTHON_IMAGE", "ghcr.io/angzarr-io/angzarr-python:latest")
 ROUTER_JAVA_IMAGE := env_var_or_default("ANGZARR_ROUTER_JAVA_IMAGE", "ghcr.io/angzarr-io/angzarr-java:latest")
 ROUTER_CSHARP_IMAGE := env_var_or_default("ANGZARR_ROUTER_CSHARP_IMAGE", "ghcr.io/angzarr-io/angzarr-csharp:latest")
 ROUTER_CPP_IMAGE := env_var_or_default("ANGZARR_ROUTER_CPP_IMAGE", "ghcr.io/angzarr-io/angzarr-cpp:latest")
@@ -36,7 +35,7 @@ CONTAINER_CMD := `command -v docker 2>/dev/null || echo ""`
 # host UID). With ROOTLESS docker that is WRONG: the userns maps
 # container-root → host UID, so -u $(id -u) remaps onto an unowned subuid and
 # breaks bind-mount writes. Force -u 0:0 instead of relying on the image's
-# default user — images that set a non-root USER (the python image runs as
+# default user — images that set a non-root USER (e.g. one running as
 # `angzarr`) otherwise land on a subuid that cannot write the mount (and trips
 # git's dubious-ownership guard). Running as container-root maps to the host UID.
 CONTAINER_USER_ARG := if `docker info 2>/dev/null | grep -q rootless && echo yes || echo no` == "yes" { "-u 0:0" } else { "-u $(id -u):$(id -g)" }
@@ -76,24 +75,6 @@ _go_container +ARGS:
             -w /workspace \
             -e ANGZARR_PROJECT_PROTO=/workspace/angzarr-project/proto \
             "{{ROUTER_GO_IMAGE}}" just {{ARGS}}
-    fi
-
-# Same delegation, into the Python toolchain image (python + uv + buf +
-# grpcio-tools). The router-ffi cdylib the binding dlopens is built first in
-# the rust image and carried forward via the shared target/ mount.
-[private]
-_py_container +ARGS:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [ "${DEVCONTAINER:-}" = "true" ]; then
-        just --justfile "{{TOP}}/justfile.container" {{ARGS}}
-    else
-        {{CONTAINER_RUN}} --network=host \
-            -v "{{TOP}}:/workspace:Z" \
-            -v "{{TOP}}/justfile.container:/workspace/justfile:ro" \
-            -w /workspace \
-            -e ANGZARR_PROJECT_PROTO=/workspace/angzarr-project/proto \
-            "{{ROUTER_PYTHON_IMAGE}}" just {{ARGS}}
     fi
 
 # Same delegation, into the Java toolchain image (JDK 25 + Gradle + buf +
@@ -206,25 +187,6 @@ go-binding-test: build (_go_container "go-binding-test")
 
 # Format check + vet the Go binding
 go-binding-lint: (_go_container "go-binding-lint")
-
-# --- Python binding (bindings/python) -----------------------------------
-# Runs in the Python image (like client-python); the router-ffi cdylib is
-# built in the rust image (`build`) and carried forward via the shared
-# target/ mount — dlopen'd by cffi. The ABI is exercised a second way (cffi
-# vs cgo) before it freezes (§4). Generated protobuf code is never committed
-# (regenerate on need), so build/test regenerate first.
-
-# Regenerate the Python binding's protobuf types (buf + import fixup)
-py-binding-gen: (_py_container "py-binding-gen")
-
-# Build the Python binding env (cdylib in the rust image, then uv sync)
-py-binding-build: build (_py_container "py-binding-build")
-
-# Run the Python binding's conformance suite (pytest-bdd) + property sweep
-py-binding-test: build (_py_container "py-binding-test")
-
-# Lint + format check the Python binding (ruff)
-py-binding-lint: (_py_container "py-binding-lint")
 
 # --- Java binding (bindings/java) ----------------------------------------
 # Runs in the Java image; the router-ffi cdylib is built in the rust image
