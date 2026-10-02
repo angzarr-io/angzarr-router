@@ -14,6 +14,8 @@ use cucumber::{given, then, when, World};
 #[derive(Default, World)]
 struct CompensationWorld {
     aggregates: Vec<AggregateDispatch<()>>,
+    /// The (code, message) of each rejection a compensator handled.
+    seen: conf::RejectionSink,
     result: Option<Result<pb::BusinessResponse, CodedError>>,
 }
 
@@ -54,14 +56,18 @@ impl CompensationWorld {
 
 #[given(regex = r"^a payment aggregate compensating Reserve from any domain with (\w+)$")]
 async fn payment_unqualified(w: &mut CompensationWorld, event: String) {
-    w.aggregates
-        .push(conf::payment_aggregate(&[("test.counter.Reserve", &event)]));
+    w.aggregates.push(conf::payment_aggregate(
+        &[("test.counter.Reserve", &event)],
+        w.seen.clone(),
+    ));
 }
 
 #[given(regex = r"^a second payment aggregate compensating Reserve from any domain with (\w+)$")]
 async fn second_payment(w: &mut CompensationWorld, event: String) {
-    w.aggregates
-        .push(conf::payment_aggregate(&[("test.counter.Reserve", &event)]));
+    w.aggregates.push(conf::payment_aggregate(
+        &[("test.counter.Reserve", &event)],
+        w.seen.clone(),
+    ));
 }
 
 #[given(
@@ -76,10 +82,10 @@ async fn payment_qualified(
 ) {
     let first = format!("{first_domain}:test.counter.Reserve");
     let second = format!("{second_domain}:test.counter.Reserve");
-    w.aggregates.push(conf::payment_aggregate(&[
-        (&first, &first_event),
-        (&second, &second_event),
-    ]));
+    w.aggregates.push(conf::payment_aggregate(
+        &[(&first, &first_event), (&second, &second_event)],
+        w.seen.clone(),
+    ));
 }
 
 #[given(
@@ -106,6 +112,47 @@ async fn rejection_over_history(
     last: u32,
 ) {
     w.dispatch(conf::rejection_sent_to(&command, &domain, Some(last + 1)));
+}
+
+#[when(
+    regex = r#"^a rejection of (\w+) with code "([^"]*)" and message "([^"]*)" is dispatched to the payment aggregate$"#
+)]
+async fn rejection_with_code(
+    w: &mut CompensationWorld,
+    command: String,
+    code: String,
+    message: String,
+) {
+    w.dispatch(conf::rejection_with(
+        &command,
+        "inventory",
+        None,
+        &code,
+        &message,
+    ));
+}
+
+#[when(
+    regex = r#"^a rejection of (\w+) with no code and message "([^"]*)" is dispatched to the payment aggregate$"#
+)]
+async fn rejection_without_code(w: &mut CompensationWorld, command: String, message: String) {
+    w.dispatch(conf::rejection_with(
+        &command,
+        "inventory",
+        None,
+        "",
+        &message,
+    ));
+}
+
+#[then(regex = r#"^the compensation handler saw code "([^"]*)" and message "([^"]*)"$"#)]
+async fn saw_code(w: &mut CompensationWorld, code: String, message: String) {
+    assert_eq!(*w.seen.lock().unwrap(), vec![(code, message)]);
+}
+
+#[then(regex = r#"^the compensation handler saw an empty code and message "([^"]*)"$"#)]
+async fn saw_no_code(w: &mut CompensationWorld, message: String) {
+    assert_eq!(*w.seen.lock().unwrap(), vec![(String::new(), message)]);
 }
 
 #[when(regex = r"^a Compensate for (\w+) is dispatched to the inventory aggregate$")]

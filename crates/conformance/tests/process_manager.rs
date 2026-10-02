@@ -15,6 +15,8 @@ use cucumber::{given, then, when, World};
 struct ProcessManagerWorld {
     /// True when the audit PM is co-resident with the order PM.
     co_resident: bool,
+    /// The (code, message) of each rejection the order PM compensated.
+    seen: conf::RejectionSink,
     /// Outcome of the dispatched trigger.
     result: Option<Result<pb::ProcessManagerHandleResponse, CodedError>>,
 }
@@ -22,12 +24,12 @@ struct ProcessManagerWorld {
 impl ProcessManagerWorld {
     fn dispatch(&mut self, req: pb::ProcessManagerHandleRequest) {
         if !self.co_resident {
-            self.result = Some(conf::order_pm().dispatch(&req));
+            self.result = Some(conf::order_pm(self.seen.clone()).dispatch(&req));
             return;
         }
         // Co-resident: the router's selection + merge over both PMs, each
         // dispatching over its own state type.
-        let order = conf::order_pm();
+        let order = conf::order_pm(self.seen.clone());
         let audit = conf::audit_pm();
         let routes: [&dyn ProcessManagerRoute; 2] = [&order, &audit];
         let mut merged = pb::ProcessManagerHandleResponse::default();
@@ -178,6 +180,22 @@ async fn no_source_component(w: &mut ProcessManagerWorld) {
             "the coordinator stamps the component"
         );
     }
+}
+
+#[when(
+    regex = r#"^a rejection of Reserve with code "([^"]*)" and message "([^"]*)" is dispatched$"#
+)]
+async fn rejection_with_code(w: &mut ProcessManagerWorld, code: String, message: String) {
+    w.dispatch(conf::pm_rejection_with(
+        "test.counter.Reserve",
+        &code,
+        &message,
+    ));
+}
+
+#[then(regex = r#"^the process-manager compensator saw code "([^"]*)" and message "([^"]*)"$"#)]
+async fn compensator_saw_code(w: &mut ProcessManagerWorld, code: String, message: String) {
+    assert_eq!(*w.seen.lock().unwrap(), vec![(code, message)]);
 }
 
 #[then("the process-manager emits no commands")]

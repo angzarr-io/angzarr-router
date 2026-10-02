@@ -424,10 +424,11 @@ pub struct ProcessManagerState {
 
 /// Build the OrderProcessManager dispatch table: over the "counter" domain it
 /// reacts to the NEWEST Increased trigger by emitting one Reserve command for
-/// "inventory" (deferred) plus a process event; a rejected Reserve compensates with a process event and an
-/// escalation. Its own state counts prior Increased process events, so a
+/// "inventory" (deferred) plus a process event; a rejected Reserve records the
+/// rejection's code and message in `seen` and compensates with a process event
+/// and an escalation. Its own state counts prior Increased process events, so a
 /// rebuild is observable.
-pub fn order_pm() -> ProcessManagerDispatch<ProcessManagerState> {
+pub fn order_pm(seen: RejectionSink) -> ProcessManagerDispatch<ProcessManagerState> {
     let rebuilder = Rebuilder::new(ProcessManagerState::default).apply(
         "test.counter.Increased",
         |state: &mut ProcessManagerState, event| {
@@ -453,7 +454,10 @@ pub fn order_pm() -> ProcessManagerDispatch<ProcessManagerState> {
                 })
             },
         )
-        .on_rejected("test.counter.Reserve", |_n, _r, _state| {
+        .on_rejected("test.counter.Reserve", move |_n, r, _state| {
+            seen.lock()
+                .unwrap()
+                .push((r.code.clone(), r.rejection_reason.clone()));
             Ok(pb::ProcessManagerHandleResponse {
                 process_events: vec![pm_process_event()],
                 notification: Some(pm_escalation()),
@@ -633,13 +637,23 @@ pub fn pm_trigger_request(
 /// A PM request whose trigger's newest page is a rejection Notification for
 /// `fq_command`.
 pub fn pm_rejection_request(fq_command: &str) -> pb::ProcessManagerHandleRequest {
+    pm_rejection_with(fq_command, "", "")
+}
+
+/// [`pm_rejection_request`] whose rejection carries `code` and `message`.
+pub fn pm_rejection_with(
+    fq_command: &str,
+    code: &str,
+    message: &str,
+) -> pb::ProcessManagerHandleRequest {
     let mut rejected = reserve_command_to("inventory");
     if let Some(pb::command_page::Payload::Command(any)) = rejected.pages[0].payload.as_mut() {
         any.type_url = angzarr_router::type_url(fq_command);
     }
     let rejection = pb::RejectionNotification {
         rejected_command: Some(rejected),
-        ..Default::default()
+        rejection_reason: message.to_string(),
+        code: code.to_string(),
     };
     let notification = pb::Notification {
         payload: Some(prost_types::Any {
@@ -917,15 +931,25 @@ pub fn one_event(name: &str) -> pb::BusinessResponse {
 }
 
 /// The payment aggregate (domain "payment"): one compensation handler per
-/// `(compensates entry, emitted event name)` pair.
-pub fn payment_aggregate(entries: &[(&str, &str)]) -> AggregateDispatch<()> {
+/// `(compensates entry, emitted event name)` pair, each recording the
+/// rejection's code and message in `seen`.
+pub fn payment_aggregate(entries: &[(&str, &str)], seen: RejectionSink) -> AggregateDispatch<()> {
     let mut agg = AggregateDispatch::new("Payment", "payment", Rebuilder::new(|| ()));
     for (key, event) in entries {
         let event = event.to_string();
-        agg = agg.on_rejected(key, move |_n, _r, _s: &mut (), _c| Ok(one_event(&event)));
+        let seen = seen.clone();
+        agg = agg.on_rejected(key, move |_n, r, _s: &mut (), _c| {
+            seen.lock()
+                .unwrap()
+                .push((r.code.clone(), r.rejection_reason.clone()));
+            Ok(one_event(&event))
+        });
     }
     agg
 }
+
+/// The (code, rejection_reason) of each rejection a compensator handled.
+pub type RejectionSink = Arc<Mutex<Vec<(String, String)>>>;
 
 /// The inventory aggregate (domain "inventory"): undoes
 /// `test.counter.AdjustStock` with StockAdjustmentReverted and
@@ -988,13 +1012,26 @@ pub fn rejection_sent_to(
     target_domain: &str,
     next_sequence: Option<u32>,
 ) -> pb::ContextualCommand {
+    rejection_with(command, target_domain, next_sequence, "", "")
+}
+
+/// [`rejection_sent_to`] whose rejection carries `code` (its machine code)
+/// and `message` (its rejection_reason).
+pub fn rejection_with(
+    command: &str,
+    target_domain: &str,
+    next_sequence: Option<u32>,
+    code: &str,
+    message: &str,
+) -> pb::ContextualCommand {
     let mut rejected = reserve_command_to(target_domain);
     if let Some(pb::command_page::Payload::Command(any)) = rejected.pages[0].payload.as_mut() {
         any.type_url = angzarr_router::type_url(&format!("test.counter.{command}"));
     }
     let rejection = pb::RejectionNotification {
         rejected_command: Some(rejected),
-        ..Default::default()
+        rejection_reason: message.to_string(),
+        code: code.to_string(),
     };
     notification_command(
         "payment",
