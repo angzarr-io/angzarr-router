@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using Angzarr;
 using Angzarr.Router;
 using TC = Test.Counter;
@@ -6,9 +7,14 @@ namespace Angzarr.Router.Conformance.Pm;
 
 /// <summary>The conformance OrderProcessManager fixture: the newest trigger
 /// reacts with a Reserve command (stamped deferred by the router) plus one fact per rebuilt prior-state
-/// event; a rejection injects one process event and escalates.</summary>
+/// event; a rejection injects one process event and escalates, recording the
+/// rejection's code and message in Seen.</summary>
 internal sealed class PmFixture : TC.OrderProcessManagerAngzarr.OrderProcessManagerHandler
 {
+    /// <summary>The (code, rejection_reason) of each rejection the Reserve
+    /// compensator handled.</summary>
+    public List<(string Code, string Message)> Seen { get; } = new();
+
     public ProcessManagerHandleResponse Increased(
         TC.Increased ev,
         TC.OrderProcessManagerState state,
@@ -33,6 +39,7 @@ internal sealed class PmFixture : TC.OrderProcessManagerAngzarr.OrderProcessMana
         TC.OrderProcessManagerState state
     )
     {
+        Seen.Add((rejection.Code, rejection.RejectionReason));
         var escalation = new Notification { Cover = new Cover { Domain = "escalated" } };
         return new PmRejection(new[] { Builders.OneFact() }, escalation);
     }

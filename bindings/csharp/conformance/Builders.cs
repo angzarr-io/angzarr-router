@@ -223,7 +223,12 @@ public static class Builders
     /// <summary>A single empty fact-event book the compensators inject.</summary>
     public static EventBook OneFact() => new() { Pages = { new EventPage() } };
 
-    private static Notification RejectionNotificationFor(string fqCommand, string domain)
+    private static Notification RejectionNotificationFor(
+        string fqCommand,
+        string domain,
+        string code = "",
+        string message = ""
+    )
     {
         var rejection = new RejectionNotification
         {
@@ -232,6 +237,8 @@ public static class Builders
                 Cover = new Cover { Domain = domain },
                 Pages = { new CommandPage { Command = AnyEmpty(fqCommand) } },
             },
+            RejectionReason = message,
+            Code = code,
         };
         return new Notification { Payload = Pack.Wrap(rejection) };
     }
@@ -421,9 +428,18 @@ public static class Builders
         return book;
     }
 
-    public static ProcessManagerHandleRequest PmRejection(string fqCommand)
+    public static ProcessManagerHandleRequest PmRejection(string fqCommand) =>
+        PmRejectionWith(fqCommand, "", "");
+
+    /// <summary>A rejection of fqCommand whose RejectionNotification carries
+    /// code and message.</summary>
+    public static ProcessManagerHandleRequest PmRejectionWith(
+        string fqCommand,
+        string code,
+        string message
+    )
     {
-        var notification = RejectionNotificationFor(fqCommand, "inventory");
+        var notification = RejectionNotificationFor(fqCommand, "inventory", code, message);
         return new ProcessManagerHandleRequest
         {
             Trigger = new EventBook
@@ -542,6 +558,16 @@ public static class Builders
         string command,
         string targetDomain,
         uint? nextSequence
+    ) => RejectionWith(command, targetDomain, nextSequence, "", "");
+
+    /// <summary>RejectionSentTo whose RejectionNotification carries code (its
+    /// machine code) and message (its rejection_reason).</summary>
+    public static ContextualCommand RejectionWith(
+        string command,
+        string targetDomain,
+        uint? nextSequence,
+        string code,
+        string message
     )
     {
         var rejection = new RejectionNotification
@@ -551,6 +577,8 @@ public static class Builders
                 Cover = new Cover { Domain = targetDomain },
                 Pages = { new CommandPage { Command = AnyEmpty("test.counter." + command) } },
             },
+            RejectionReason = message,
+            Code = code,
         };
         return NotificationCommand("payment", Pack.Wrap(rejection), nextSequence);
     }

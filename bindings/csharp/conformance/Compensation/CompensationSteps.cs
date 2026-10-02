@@ -21,12 +21,17 @@ public sealed class CompensationSteps
     private BusinessResponse? _resp;
     private CodedError? _err;
 
+    /// <summary>The (code, rejection_reason) of each rejection a payment
+    /// compensator handled.</summary>
+    private readonly List<(string Code, string Message)> _seen = new();
+
     [BeforeScenario]
     public void Before()
     {
         _router = new Router();
         _resp = null;
         _err = null;
+        _seen.Clear();
     }
 
     [AfterScenario]
@@ -35,13 +40,21 @@ public sealed class CompensationSteps
     private static Rebuilder<Empty> Stateless() => new(() => new Empty());
 
     /// <summary>The payment aggregate (domain "payment"): one compensation
-    /// handler per (compensates entry, emitted event name) pair.</summary>
+    /// handler per (compensates entry, emitted event name) pair, each recording
+    /// the rejection's code and message.</summary>
     private void RegisterPayment(params (string Compensates, string Event)[] entries)
     {
         var payment = new AggregateDispatch<Empty>("Payment", "payment", Stateless());
         foreach (var (compensates, ev) in entries)
         {
-            payment.OnRejected(compensates, (n, rejection, state, cctx) => Builders.OneEvent(ev));
+            payment.OnRejected(
+                compensates,
+                (n, rejection, state, cctx) =>
+                {
+                    _seen.Add((rejection.Code, rejection.RejectionReason));
+                    return Builders.OneEvent(ev);
+                }
+            );
         }
         _router.RegisterAggregate(payment);
     }
@@ -108,6 +121,32 @@ public sealed class CompensationSteps
     )]
     public void RejectionOverHistory(string command, string domain, int last) =>
         Dispatch(Builders.RejectionSentTo(command, domain, (uint)(last + 1)));
+
+    [When(
+        "a rejection of {word} with code {string} and message {string} is dispatched to the payment aggregate"
+    )]
+    public void RejectionWithCode(string command, string code, string message) =>
+        Dispatch(Builders.RejectionWith(command, "inventory", null, code, message));
+
+    [When(
+        "a rejection of {word} with no code and message {string} is dispatched to the payment aggregate"
+    )]
+    public void RejectionWithoutCode(string command, string message) =>
+        Dispatch(Builders.RejectionWith(command, "inventory", null, "", message));
+
+    [Then("the compensation handler saw code {string} and message {string}")]
+    public void SawCode(string code, string message)
+    {
+        Assert.That(_err, Is.Null, "dispatch unexpectedly failed: " + _err?.Message);
+        Assert.That(_seen, Is.EqualTo(new[] { (code, message) }), "(code, message) seen");
+    }
+
+    [Then("the compensation handler saw an empty code and message {string}")]
+    public void SawNoCode(string message)
+    {
+        Assert.That(_err, Is.Null, "dispatch unexpectedly failed: " + _err?.Message);
+        Assert.That(_seen, Is.EqualTo(new[] { ("", message) }), "(code, message) seen");
+    }
 
     [When("a Compensate for {word} is dispatched to the inventory aggregate")]
     public void CompensateFor(string command) => Dispatch(Builders.CompensateFor(command));
