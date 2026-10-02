@@ -481,15 +481,10 @@ Then("the binding router records one Increased fact", function () {
   );
 });
 
-Given(
-  "a generated counter aggregate with its state schema attached",
-  function () {
-    bctx.router = new Router();
-    const dispatch = newCounterAggregateDispatch(new CounterFixture([]));
-    dispatch.rebuilder.withStateSchema(CounterStateSchema);
-    bctx.router.registerAggregate(dispatch);
-  },
-);
+Given("a binding counter aggregate with no state schema", function () {
+  bctx.router = new Router();
+  bctx.router.registerAggregate(counterDispatch());
+});
 
 Given("a generated counter aggregate", function () {
   bctx.router = new Router();

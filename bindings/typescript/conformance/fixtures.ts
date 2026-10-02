@@ -13,7 +13,7 @@ import {
   EventPageSchema,
   type Notification,
   NotificationSchema,
-  type PmRejection,
+  type PageContext,
   type ProcessManagerHandleResponse,
   ProcessManagerHandleResponseSchema,
   type Projection,
@@ -78,7 +78,7 @@ export class CounterFixture implements CounterAggregateHandler {
     throw new Error("hard failure");
   }
 
-  applyIncreased(state: CounterState, _ev: Increased): void {
+  applyIncreased(state: CounterState, _ev: Increased, _ctx: PageContext): void {
     state.count += 1;
   }
 
@@ -117,7 +117,7 @@ export class SagaFixture implements OrderSagaHandler {
   increased(
     _ev: Increased,
     _dests: Destinations,
-    _sourceCover?: Cover,
+    _source: PageContext,
   ): SagaEmission {
     return { commands: [reserveCommand()], events: [] };
   }
@@ -126,7 +126,11 @@ export class SagaFixture implements OrderSagaHandler {
 /** The conformance CounterProjector fixture: every delivered event folds into
  * one projection; the finisher carries the cover and folded count. */
 export class ProjectorFixture implements CounterProjectorHandler {
-  increased(projection: CounterProjectorState, _ev: Increased): void {
+  increased(
+    projection: CounterProjectorState,
+    _ev: Increased,
+    _ctx: PageContext,
+  ): void {
     projection.count += 1;
   }
 
@@ -151,6 +155,7 @@ export class PmFixture implements OrderProcessManagerHandler {
     _ev: Increased,
     state: OrderProcessManagerState,
     _dests: Destinations,
+    _triggerCover?: Cover,
   ): ProcessManagerHandleResponse {
     return create(ProcessManagerHandleResponseSchema, {
       commands: [reserveCommand()],
@@ -158,7 +163,11 @@ export class PmFixture implements OrderProcessManagerHandler {
     });
   }
 
-  applyIncreased(state: OrderProcessManagerState, _ev: Increased): void {
+  applyIncreased(
+    state: OrderProcessManagerState,
+    _ev: Increased,
+    _ctx: PageContext,
+  ): void {
     state.count += 1;
   }
 
@@ -166,14 +175,14 @@ export class PmFixture implements OrderProcessManagerHandler {
     _n: Notification,
     rejection: RejectionNotification,
     _state: OrderProcessManagerState,
-  ): PmRejection {
+  ): ProcessManagerHandleResponse {
     this.seen.push([rejection.code, rejection.rejectionReason]);
-    return {
+    return create(ProcessManagerHandleResponseSchema, {
       processEvents: [oneFact()],
-      escalation: create(NotificationSchema, {
+      notification: create(NotificationSchema, {
         cover: create(CoverSchema, { domain: "escalated" }),
       }),
-    };
+    });
   }
 }
 
@@ -195,13 +204,18 @@ export class AuditPmFixture implements AuditProcessManagerHandler {
     _ev: Increased,
     state: AuditProcessManagerState,
     _dests: Destinations,
+    _triggerCover?: Cover,
   ): ProcessManagerHandleResponse {
     return create(ProcessManagerHandleResponseSchema, {
       facts: state.seen.map(() => auditBook()),
     });
   }
 
-  applyIncreased(state: AuditProcessManagerState, _ev: Increased): void {
+  applyIncreased(
+    state: AuditProcessManagerState,
+    _ev: Increased,
+    _ctx: PageContext,
+  ): void {
     state.seen.push("Increased");
   }
 
@@ -209,7 +223,9 @@ export class AuditPmFixture implements AuditProcessManagerHandler {
     _n: Notification,
     _rejection: RejectionNotification,
     _state: AuditProcessManagerState,
-  ): PmRejection {
-    return { processEvents: [auditBook()] };
+  ): ProcessManagerHandleResponse {
+    return create(ProcessManagerHandleResponseSchema, {
+      processEvents: [auditBook()],
+    });
   }
 }

@@ -4,7 +4,7 @@ Feature: Handler results across the FFI
   An undo handler may return nothing, which records no events. A fact handler
   returns a FactRecord: FactRecord.asReceived records the fact as received
   with no flags, and each flag is recorded after its fact with no header. An aggregate supports Replay when its state schema is known —
-  given to the Rebuilder or attached to generated wiring — and refuses it
+  given to the Rebuilder, as generated wiring does — and refuses it
   otherwise.
 
   Scenario: an undo handler that returns nothing records no events
@@ -28,12 +28,12 @@ Feature: Handler results across the FFI
     When an Increased fact is dispatched through the binding router
     Then the binding fact dispatch fails with UNHANDLED_HANDLER_ERROR
 
-  Scenario: generated wiring with an attached state schema supports Replay
-    Given a generated counter aggregate with its state schema attached
+  Scenario: generated wiring supports Replay
+    Given a generated counter aggregate
     When the binding router replays a snapshot of 4 then 3 Increased events
     Then the binding replay yields a counter of 7
 
   Scenario: an aggregate with no known state schema refuses Replay
-    Given a generated counter aggregate
+    Given a binding counter aggregate with no state schema
     When the binding router replays a snapshot of 4 then 3 Increased events
     Then the binding replay fails with NO_HANDLER_REGISTERED
