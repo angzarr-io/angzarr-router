@@ -59,9 +59,9 @@ plugins:
   - protoc_builtin: python
     protoc_path: .tools/protoc/python/bin/protoc
     out: bindings/python/angzarr_router_ffi/gen
-  # angzarr dispatch wiring for declared components. Baked into the python image
-  # (build/images/python) and invoked as a local plugin. The scaffold
-  # (`angzarr scaffold python`) is an end-user command, not run here.
+  # angzarr dispatch wiring for declared components, from the angzarr CLI
+  # pinned by justfile.container (CLI_REF) and built into .tools/bin. The
+  # scaffold (`angzarr scaffold python`) is an end-user command, not run here.
   - local: ["angzarr", "codegen", "python"]
     out: bindings/python/angzarr_router_ffi/gen
     opt: paths=source_relative

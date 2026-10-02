@@ -18,9 +18,10 @@ plugins:
   # protobuf C++ generated code is version-locked to the runtime.
   - protoc_builtin: cpp
     out: bindings/cpp/gen
-  # angzarr dispatch wiring for declared components (test.counter). Baked into
-  # the base image and invoked as a local plugin. The conformance fixtures
-  # hand-implement the generated <Component>Handler interfaces.
+  # angzarr dispatch wiring for declared components (test.counter), from the
+  # angzarr CLI pinned by justfile.container (CLI_REF) and built into .tools/bin.
+  # The conformance fixtures hand-implement the generated <Component>Handler
+  # interfaces.
   - local: ["angzarr", "codegen", "cpp"]
     out: bindings/cpp/gen
     opt: paths=source_relative
