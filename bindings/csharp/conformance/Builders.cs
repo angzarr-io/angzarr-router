@@ -223,7 +223,12 @@ public static class Builders
     /// <summary>A single empty fact-event book the compensators inject.</summary>
     public static EventBook OneFact() => new() { Pages = { new EventPage() } };
 
-    private static Notification RejectionNotificationFor(string fqCommand, string domain)
+    private static Notification RejectionNotificationFor(
+        string fqCommand,
+        string domain,
+        string code = "",
+        string message = ""
+    )
     {
         var rejection = new RejectionNotification
         {
@@ -232,6 +237,8 @@ public static class Builders
                 Cover = new Cover { Domain = domain },
                 Pages = { new CommandPage { Command = AnyEmpty(fqCommand) } },
             },
+            RejectionReason = message,
+            Code = code,
         };
         return new Notification { Payload = Pack.Wrap(rejection) };
     }
@@ -255,6 +262,61 @@ public static class Builders
                 Pages = { page },
             },
         };
+    }
+
+    /// <summary>A saga source of one Increased event of order root label at
+    /// sequence seq.</summary>
+    public static SagaHandleRequest SagaRootedSource(string label, uint seq)
+    {
+        var req = SagaEventSource("test.counter.Increased", seq);
+        req.Source.Cover = CoverOf("order", label);
+        return req;
+    }
+
+    /// <summary>count bytes counting up from first.</summary>
+    private static ByteString ByteRun(int first, int count)
+    {
+        var b = new byte[count];
+        for (var i = 0; i < count; i++)
+        {
+            b[i] = (byte)(first + i);
+        }
+        return ByteString.CopyFrom(b);
+    }
+
+    /// <summary>The parity command: cover "inventory", root bytes 10..1f,
+    /// correlation "corr-1"; one page whose command is "/example.Foo" carrying
+    /// 01020304.</summary>
+    public static CommandBook ParityCommand() =>
+        new()
+        {
+            Cover = new Cover
+            {
+                Domain = "inventory",
+                Root = new UUID { Value = ByteRun(0x10, 16) },
+                CorrelationId = "corr-1",
+            },
+            Pages =
+            {
+                new CommandPage
+                {
+                    Command = new Any { TypeUrl = "/example.Foo", Value = ByteRun(1, 4) },
+                },
+            },
+        };
+
+    /// <summary>The parity source: one Increased event at sequence seq under
+    /// cover "order", root bytes 00..0f, correlation "corr-1".</summary>
+    public static SagaHandleRequest ParitySource(uint seq)
+    {
+        var req = SagaEventSource("test.counter.Increased", seq);
+        req.Source.Cover = new Cover
+        {
+            Domain = "order",
+            Root = new UUID { Value = ByteRun(0x00, 16) },
+            CorrelationId = "corr-1",
+        };
+        return req;
     }
 
     public static SagaHandleRequest SagaRejectionSource(string fqCommand)
@@ -366,9 +428,18 @@ public static class Builders
         return book;
     }
 
-    public static ProcessManagerHandleRequest PmRejection(string fqCommand)
+    public static ProcessManagerHandleRequest PmRejection(string fqCommand) =>
+        PmRejectionWith(fqCommand, "", "");
+
+    /// <summary>A rejection of fqCommand whose RejectionNotification carries
+    /// code and message.</summary>
+    public static ProcessManagerHandleRequest PmRejectionWith(
+        string fqCommand,
+        string code,
+        string message
+    )
     {
-        var notification = RejectionNotificationFor(fqCommand, "inventory");
+        var notification = RejectionNotificationFor(fqCommand, "inventory", code, message);
         return new ProcessManagerHandleRequest
         {
             Trigger = new EventBook
@@ -487,6 +558,16 @@ public static class Builders
         string command,
         string targetDomain,
         uint? nextSequence
+    ) => RejectionWith(command, targetDomain, nextSequence, "", "");
+
+    /// <summary>RejectionSentTo whose RejectionNotification carries code (its
+    /// machine code) and message (its rejection_reason).</summary>
+    public static ContextualCommand RejectionWith(
+        string command,
+        string targetDomain,
+        uint? nextSequence,
+        string code,
+        string message
     )
     {
         var rejection = new RejectionNotification
@@ -496,6 +577,8 @@ public static class Builders
                 Cover = new Cover { Domain = targetDomain },
                 Pages = { new CommandPage { Command = AnyEmpty("test.counter." + command) } },
             },
+            RejectionReason = message,
+            Code = code,
         };
         return NotificationCommand("payment", Pack.Wrap(rejection), nextSequence);
     }
@@ -602,6 +685,19 @@ public static class Builders
                 },
             },
         };
+
+    /// <summary>The parent linkage the ledger sets on its own events.</summary>
+    public static Any LedgerLinkage() =>
+        AnyOf("test.counter.Parent", ByteString.CopyFrom(new byte[] { 4, 5, 6 }));
+
+    /// <summary>An IncreaseBy command for the ledger root label on behalf of a
+    /// parent.</summary>
+    public static ContextualCommand LedgerCommandWithLinkage(string label)
+    {
+        var cc = LedgerCommand(label);
+        cc.Command.Cover.Ext = ParentLinkage();
+        return cc;
+    }
 
     /// <summary>An Increased trigger from "counter" root label at sequence
     /// seq.</summary>

@@ -40,7 +40,16 @@ add_test(NAME smoke COMMAND smoke)
 # Conformance: the shared behavioral features (read at runtime from the canonical
 # conformance/features via ANGZARR_FEATURES_DIR) run through a small Gherkin
 # feature-runner on Catch2.
-find_package(Catch2 2 REQUIRED)
+# Catch2 v2 from the image when it has one, else fetched at a pinned tag.
+find_package(Catch2 2 QUIET)
+if(NOT Catch2_FOUND)
+    include(FetchContent)
+    FetchContent_Declare(Catch2
+        GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+        GIT_TAG v2.13.10
+        GIT_SHALLOW TRUE)
+    FetchContent_MakeAvailable(Catch2)
+endif()
 file(GLOB CONFORMANCE_SRCS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/conformance/*.cpp")
 add_executable(conformance ${CONFORMANCE_SRCS})
 target_include_directories(conformance PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/conformance")

@@ -23,15 +23,22 @@ pb::BusinessResponse OneEvent(const std::string& name) {
   return resp;
 }
 
+// The (code, rejection_reason) of each rejection a compensator handled.
+using RejectionSink = std::vector<std::pair<std::string, std::string>>;
+
 // The payment aggregate (domain "payment"): one compensator per (compensates
-// entry, emitted event name) pair.
+// entry, emitted event name) pair, each recording the rejection's code and
+// message in seen.
 AggregateDispatch<tc::CounterState> PaymentAggregate(
-    const std::vector<std::pair<std::string, std::string>>& entries) {
+    const std::vector<std::pair<std::string, std::string>>& entries, RejectionSink& seen) {
   AggregateDispatch<tc::CounterState> agg("Payment", "payment", Rebuilder<tc::CounterState>{});
   for (const auto& [key, event] : entries) {
     agg.OnRejected(
-        key, [event](const pb::Notification&, const pb::RejectionNotification&, tc::CounterState&,
-                     const CommandContext&) { return std::optional(OneEvent(event)); });
+        key, [event, &seen](const pb::Notification&, const pb::RejectionNotification& rejection,
+                            tc::CounterState&, const CommandContext&) {
+          seen.emplace_back(rejection.code(), rejection.rejection_reason());
+          return std::optional(OneEvent(event));
+        });
   }
   return agg;
 }
@@ -70,18 +77,23 @@ pb::ContextualCommand NotificationCommand(const std::string& domain,
   return cc;
 }
 
-// The rejection of test.counter.<command> sent to target_domain, delivered to
-// the payment aggregate.
+// The rejection of test.counter.<command> sent to target_domain, carrying code
+// and message, delivered to the payment aggregate.
 pb::ContextualCommand RejectionSentTo(const std::string& command, const std::string& target_domain,
-                                      std::optional<uint32_t> next_sequence) {
+                                      std::optional<uint32_t> next_sequence,
+                                      const std::string& code = "",
+                                      const std::string& message = "") {
   pb::RejectionNotification rejection;
   auto* rc = rejection.mutable_rejected_command();
   rc->mutable_cover()->set_domain(target_domain);
   SetAnyEmpty(rc->add_pages()->mutable_command(), "test.counter." + command);
+  rejection.set_rejection_reason(message);
+  rejection.set_code(code);
   return NotificationCommand("payment", angzarr::router::Pack::Wrap(rejection), next_sequence);
 }
 
 struct CompensationWorld {
+  RejectionSink seen;
   angzarr::router::Router router;
   std::optional<pb::BusinessResponse> resp;
   std::optional<CodedError> err;
@@ -106,18 +118,19 @@ struct CompensationWorld {
 void Register(StepRegistry& r, CompensationWorld& w) {
   r.On("a payment aggregate compensating Reserve from any domain with {word}",
        [&w](const StepArgs& a) {
-         w.router.RegisterAggregate(PaymentAggregate({{"test.counter.Reserve", a[0]}}));
+         w.router.RegisterAggregate(PaymentAggregate({{"test.counter.Reserve", a[0]}}, w.seen));
        });
   r.On("a second payment aggregate compensating Reserve from any domain with {word}",
        [&w](const StepArgs& a) {
-         w.router.RegisterAggregate(PaymentAggregate({{"test.counter.Reserve", a[0]}}));
+         w.router.RegisterAggregate(PaymentAggregate({{"test.counter.Reserve", a[0]}}, w.seen));
        });
   r.On(
       "a payment aggregate compensating Reserve from {string} with {word} and from {string} with "
       "{word}",
       [&w](const StepArgs& a) {
         w.router.RegisterAggregate(PaymentAggregate(
-            {{a[0] + ":test.counter.Reserve", a[1]}, {a[2] + ":test.counter.Reserve", a[3]}}));
+            {{a[0] + ":test.counter.Reserve", a[1]}, {a[2] + ":test.counter.Reserve", a[3]}},
+            w.seen));
       });
   r.On(
       "an inventory aggregate undoing AdjustStock with StockAdjustmentReverted and Reserve with "
@@ -132,6 +145,18 @@ void Register(StepRegistry& r, CompensationWorld& w) {
       });
   r.On("a rejection of {word} sent to {string} is dispatched to the payment aggregate",
        [&w](const StepArgs& a) { w.Dispatch(RejectionSentTo(a[0], a[1], std::nullopt)); });
+  r.On(
+      "a rejection of {word} with code {string} and message {string} is dispatched to the payment "
+      "aggregate",
+      [&w](const StepArgs& a) {
+        w.Dispatch(RejectionSentTo(a[0], "inventory", std::nullopt, a[1], a[2]));
+      });
+  r.On(
+      "a rejection of {word} with no code and message {string} is dispatched to the payment "
+      "aggregate",
+      [&w](const StepArgs& a) {
+        w.Dispatch(RejectionSentTo(a[0], "inventory", std::nullopt, "", a[1]));
+      });
   r.On("a Compensate for {word} is dispatched to the inventory aggregate", [&w](const StepArgs& a) {
     w.Dispatch(NotificationCommand("inventory", CompensatePayload(a[0]), std::nullopt));
   });
@@ -165,6 +190,14 @@ void Register(StepRegistry& r, CompensationWorld& w) {
              {"test.counter." + a[0], std::stoi(a[1])}, {"test.counter." + a[2], std::stoi(a[3])}};
          REQUIRE(got == want);
        });
+  r.On("the compensation handler saw code {string} and message {string}", [&w](const StepArgs& a) {
+    REQUIRE_FALSE(w.err.has_value());
+    REQUIRE(w.seen == RejectionSink{{a[0], a[1]}});
+  });
+  r.On("the compensation handler saw an empty code and message {string}", [&w](const StepArgs& a) {
+    REQUIRE_FALSE(w.err.has_value());
+    REQUIRE(w.seen == RejectionSink{{"", a[0]}});
+  });
   r.On("the dispatch fails with {word} as UNIMPLEMENTED", [&w](const StepArgs& a) {
     REQUIRE(w.err.has_value());
     REQUIRE(w.err->code == a[0]);

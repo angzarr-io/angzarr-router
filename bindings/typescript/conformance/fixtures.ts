@@ -13,7 +13,7 @@ import {
   EventPageSchema,
   type Notification,
   NotificationSchema,
-  type PmRejection,
+  type PageContext,
   type ProcessManagerHandleResponse,
   ProcessManagerHandleResponseSchema,
   type Projection,
@@ -38,6 +38,9 @@ import {
   type OrderProcessManagerState,
 } from "../gen/test/counter/counter_pb";
 import { oneFact, reserveCommand } from "./builders";
+
+/** The (code, rejection_reason) of a rejection a compensator handled. */
+export type RejectionSeen = [code: string, message: string];
 
 /** The historical-state evidence a command handler saw — what the suite
  * asserts, since state never crosses the boundary. */
@@ -75,7 +78,7 @@ export class CounterFixture implements CounterAggregateHandler {
     throw new Error("hard failure");
   }
 
-  applyIncreased(state: CounterState, _ev: Increased): void {
+  applyIncreased(state: CounterState, _ev: Increased, _ctx: PageContext): void {
     state.count += 1;
   }
 
@@ -114,7 +117,7 @@ export class SagaFixture implements OrderSagaHandler {
   increased(
     _ev: Increased,
     _dests: Destinations,
-    _sourceCover?: Cover,
+    _source: PageContext,
   ): SagaEmission {
     return { commands: [reserveCommand()], events: [] };
   }
@@ -123,7 +126,11 @@ export class SagaFixture implements OrderSagaHandler {
 /** The conformance CounterProjector fixture: every delivered event folds into
  * one projection; the finisher carries the cover and folded count. */
 export class ProjectorFixture implements CounterProjectorHandler {
-  increased(projection: CounterProjectorState, _ev: Increased): void {
+  increased(
+    projection: CounterProjectorState,
+    _ev: Increased,
+    _ctx: PageContext,
+  ): void {
     projection.count += 1;
   }
 
@@ -140,10 +147,15 @@ export class ProjectorFixture implements CounterProjectorHandler {
  * Reserve command (the router stamps it deferred) plus one fact per rebuilt
  * prior-state event; a rejection injects one process event and escalates. */
 export class PmFixture implements OrderProcessManagerHandler {
+  /** `seen` collects the (code, rejection_reason) of each rejection the
+   * fixture compensates. */
+  constructor(readonly seen: RejectionSeen[] = []) {}
+
   increased(
     _ev: Increased,
     state: OrderProcessManagerState,
     _dests: Destinations,
+    _triggerCover?: Cover,
   ): ProcessManagerHandleResponse {
     return create(ProcessManagerHandleResponseSchema, {
       commands: [reserveCommand()],
@@ -151,21 +163,26 @@ export class PmFixture implements OrderProcessManagerHandler {
     });
   }
 
-  applyIncreased(state: OrderProcessManagerState, _ev: Increased): void {
+  applyIncreased(
+    state: OrderProcessManagerState,
+    _ev: Increased,
+    _ctx: PageContext,
+  ): void {
     state.count += 1;
   }
 
   onReserveRejected(
     _n: Notification,
-    _rejection: RejectionNotification,
+    rejection: RejectionNotification,
     _state: OrderProcessManagerState,
-  ): PmRejection {
-    return {
+  ): ProcessManagerHandleResponse {
+    this.seen.push([rejection.code, rejection.rejectionReason]);
+    return create(ProcessManagerHandleResponseSchema, {
       processEvents: [oneFact()],
-      escalation: create(NotificationSchema, {
+      notification: create(NotificationSchema, {
         cover: create(CoverSchema, { domain: "escalated" }),
       }),
-    };
+    });
   }
 }
 
@@ -187,13 +204,18 @@ export class AuditPmFixture implements AuditProcessManagerHandler {
     _ev: Increased,
     state: AuditProcessManagerState,
     _dests: Destinations,
+    _triggerCover?: Cover,
   ): ProcessManagerHandleResponse {
     return create(ProcessManagerHandleResponseSchema, {
       facts: state.seen.map(() => auditBook()),
     });
   }
 
-  applyIncreased(state: AuditProcessManagerState, _ev: Increased): void {
+  applyIncreased(
+    state: AuditProcessManagerState,
+    _ev: Increased,
+    _ctx: PageContext,
+  ): void {
     state.seen.push("Increased");
   }
 
@@ -201,7 +223,9 @@ export class AuditPmFixture implements AuditProcessManagerHandler {
     _n: Notification,
     _rejection: RejectionNotification,
     _state: AuditProcessManagerState,
-  ): PmRejection {
-    return { processEvents: [auditBook()] };
+  ): ProcessManagerHandleResponse {
+    return create(ProcessManagerHandleResponseSchema, {
+      processEvents: [auditBook()],
+    });
   }
 }

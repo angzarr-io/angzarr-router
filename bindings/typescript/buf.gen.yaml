@@ -19,7 +19,8 @@ managed:
     - file_option: go_package_prefix
       value: github.com/angzarr-io/angzarr-router/bindings/typescript/gen
 plugins:
-  - remote: buf.build/bufbuild/es:v2.2.0
+  # The binding's pinned @bufbuild/protoc-gen-es (devDependency; npm ci first).
+  - local: bindings/typescript/node_modules/.bin/protoc-gen-es
     out: bindings/typescript/gen
     opt:
       - target=ts

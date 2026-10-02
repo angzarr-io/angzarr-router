@@ -17,6 +17,7 @@ public sealed class PmSteps
     private Router _router = null!;
     private ProcessManagerHandleResponse? _resp;
     private CodedError? _err;
+    private PmFixture _order = null!;
 
     [BeforeScenario]
     public void Before()
@@ -24,6 +25,7 @@ public sealed class PmSteps
         _router = new Router();
         _resp = null;
         _err = null;
+        _order = new PmFixture();
     }
 
     [AfterScenario]
@@ -45,12 +47,12 @@ public sealed class PmSteps
 
     [Given("an order process-manager")]
     public void AnOrderProcessManager() =>
-        TC.OrderProcessManagerAngzarr.RegisterOrderProcessManager(_router, new PmFixture());
+        TC.OrderProcessManagerAngzarr.RegisterOrderProcessManager(_router, _order);
 
     [Given("co-resident order and audit process-managers")]
     public void CoResidentOrderAndAudit()
     {
-        TC.OrderProcessManagerAngzarr.RegisterOrderProcessManager(_router, new PmFixture());
+        TC.OrderProcessManagerAngzarr.RegisterOrderProcessManager(_router, _order);
         TC.AuditProcessManagerAngzarr.RegisterAuditProcessManager(_router, new AuditPmFixture());
     }
 
@@ -102,6 +104,17 @@ public sealed class PmSteps
     public void RejectionIssuedBy(string issuer) =>
         Dispatch(Builders.PmIssuedRejection("test.counter.Reserve", issuer));
 
+    [When("a rejection of Reserve with code {string} and message {string} is dispatched")]
+    public void RejectionWithCode(string code, string message) =>
+        Dispatch(Builders.PmRejectionWith("test.counter.Reserve", code, message));
+
+    [Then("the process-manager compensator saw code {string} and message {string}")]
+    public void CompensatorSawCode(string code, string message)
+    {
+        Assert.That(_err, Is.Null, "dispatch unexpectedly failed: " + _err?.Message);
+        Assert.That(_order.Seen, Is.EqualTo(new[] { (code, message) }), "(code, message) seen");
+    }
+
     [When("a request with no trigger is dispatched")]
     public void NoTrigger() => Dispatch(Builders.PmNoTrigger());
 
@@ -122,6 +135,9 @@ public sealed class PmSteps
     [Then("the command is deferred from source sequence {int} at command index {int}")]
     public void CommandIsDeferred(int seq, int index) =>
         Steps.AssertDeferred(Succeeded().Commands[0], "counter", seq, index);
+
+    [Then("the command leaves its source component to the coordinator")]
+    public void NoSourceComponent() => Steps.AssertNoSourceComponent(Succeeded().Commands[0]);
 
     [Then("the process-manager emits no commands")]
     public void EmitsNoCommands()

@@ -2,6 +2,7 @@ package ffirouter
 
 import (
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -66,5 +67,20 @@ func TestDestinations_EmptyDeclaresNothing(t *testing.T) {
 	d := NewDestinations()
 	if d.Has("") || len(d.Domains()) != 0 {
 		t.Errorf("empty Destinations = %v, want none", d.Domains())
+	}
+}
+
+// A saga receives no rejections, so its API offers no way to declare a
+// rejection handler (C-0484); compensation belongs to the issuing aggregate
+// or process manager.
+func TestSagaDispatch_CannotDeclareARejectionHandler(t *testing.T) {
+	saga := reflect.TypeOf(&SagaDispatch{})
+	for i := 0; i < saga.NumMethod(); i++ {
+		if name := saga.Method(i).Name; strings.Contains(name, "Reject") {
+			t.Errorf("SagaDispatch.%s declares a rejection handler", name)
+		}
+	}
+	if _, ok := saga.MethodByName("OnEvent"); !ok {
+		t.Fatal("the method listing is not SagaDispatch's")
 	}
 }

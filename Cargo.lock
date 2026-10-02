@@ -27,12 +27,14 @@ name = "angzarr-router-conformance"
 version = "0.1.0"
 dependencies = [
  "angzarr-router",
+ "angzarr-router-ffi",
  "cucumber",
  "futures",
  "prost",
  "prost-build",
  "prost-reflect",
  "prost-types",
+ "sha2",
  "tokio",
  "uuid",
 ]

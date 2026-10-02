@@ -3,6 +3,9 @@ import { create } from "@bufbuild/protobuf";
 import {
   AggregateDispatch,
   type Cover,
+  CoverSchema,
+  EventBookSchema,
+  EventPageSchema,
   Pack,
   ProcessManagerDispatch,
   ProcessManagerHandleResponseSchema,
@@ -12,16 +15,20 @@ import {
 import {
   type CounterState,
   CounterStateSchema,
+  IncreasedSchema,
 } from "../gen/test/counter/counter_pb";
-import { oneEvent, releaseCommand } from "./builders";
+import { ledgerLinkage, oneEvent, releaseCommand } from "./builders";
+import { type RejectionSeen } from "./fixtures";
 
 // Components built through the binding's hand-written API (compensation.feature
 // and context.feature), mirroring the Rust reference fixtures.
 
 /** The payment aggregate (domain "payment"): one compensator per
- * (compensates entry, emitted event name) pair. */
+ * (compensates entry, emitted event name) pair, each recording the rejection's
+ * code and message in `seen`. */
 export function paymentAggregate(
   entries: [key: string, event: string][],
+  seen: RejectionSeen[],
 ): AggregateDispatch<object> {
   const agg = new AggregateDispatch<object>(
     "Payment",
@@ -29,7 +36,10 @@ export function paymentAggregate(
     new Rebuilder(() => ({})),
   );
   for (const [key, event] of entries) {
-    agg.onRejected(key, () => oneEvent(event));
+    agg.onRejected(key, (_n, rejection) => {
+      seen.push([rejection.code, rejection.rejectionReason]);
+      return oneEvent(event);
+    });
   }
   return agg;
 }
@@ -50,7 +60,8 @@ export function inventoryAggregate(): AggregateDispatch<object> {
 
 /** The ledger aggregate (domain "ledger") over CounterState: Increased folds
  * count += 1 and records the page sequence it applied; a snapshot loads CounterState; IncreaseBy records the handled
- * cover and emits nothing; the only declared fact, Increased, is recorded as
+ * cover and emits one Increased whose cover carries the ledger's own linkage
+ * ({@link ledgerLinkage}); the only declared fact, Increased, is recorded as
  * received and flagged by a CounterState carrying the count it brings the
  * ledger to. */
 export function ledgerAggregate(
@@ -69,7 +80,17 @@ export function ledgerAggregate(
   return new AggregateDispatch<CounterState>("Ledger", "ledger", rebuilder)
     .onCommand("test.counter.IncreaseBy", (_cmd, _state, cctx) => {
       seen.push(cctx.cover);
-      return undefined;
+      return create(EventBookSchema, {
+        cover: create(CoverSchema, { ext: ledgerLinkage() }),
+        pages: [
+          create(EventPageSchema, {
+            payload: {
+              case: "event",
+              value: Pack.wrap(IncreasedSchema, create(IncreasedSchema)),
+            },
+          }),
+        ],
+      });
     })
     .onFact("test.counter.Increased", (fact, state) => ({
       fact,

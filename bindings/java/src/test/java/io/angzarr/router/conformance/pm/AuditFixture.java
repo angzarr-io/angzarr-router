@@ -6,7 +6,7 @@ import io.angzarr.Notification;
 import io.angzarr.ProcessManagerHandleResponse;
 import io.angzarr.RejectionNotification;
 import io.angzarr.router.Destinations;
-import io.angzarr.router.Thunks.PmRejection;
+import io.angzarr.router.PageContext;
 import java.util.ArrayList;
 import java.util.List;
 import test.counter.AuditProcessManagerAngzarr;
@@ -24,7 +24,10 @@ final class AuditFixture implements AuditProcessManagerAngzarr.AuditProcessManag
 
   @Override
   public ProcessManagerHandleResponse increased(
-      Counter.Increased event, Counter.AuditProcessManagerState.Builder state, Destinations dests) {
+      Counter.Increased event,
+      Counter.AuditProcessManagerState.Builder state,
+      Destinations dests,
+      Cover triggerCover) {
     List<EventBook> facts = new ArrayList<>();
     for (int i = 0; i < state.getSeenCount(); i++) {
       facts.add(auditBook());
@@ -34,16 +37,16 @@ final class AuditFixture implements AuditProcessManagerAngzarr.AuditProcessManag
 
   @Override
   public void applyIncreased(
-      Counter.AuditProcessManagerState.Builder state, Counter.Increased event) {
+      Counter.AuditProcessManagerState.Builder state, Counter.Increased event, PageContext ctx) {
     state.addSeen("Increased");
   }
 
   @Override
-  public PmRejection onReserveRejected(
+  public ProcessManagerHandleResponse onReserveRejected(
       Notification n,
       RejectionNotification rejection,
       Counter.AuditProcessManagerState.Builder state) {
-    return new PmRejection(List.of(auditBook()), null);
+    return ProcessManagerHandleResponse.newBuilder().addProcessEvents(auditBook()).build();
   }
 
   private static EventBook auditBook() {

@@ -87,8 +87,10 @@ message SagaDescriptor {
   string input_domain = 2;
   repeated string target_domains = 3;
   repeated CallbackEntry events = 4;
-  reserved 5;
-  reserved "rejections";
+  // Sagas never receive rejections (the source aggregate compensates), so a
+  // saga declaring any is refused at registration (SAGA_COMPENSATES,
+  // INVALID_ARGUMENT).
+  repeated RejectionEntry rejections = 5;
 }
 
 // aux payload for command-handler callbacks.

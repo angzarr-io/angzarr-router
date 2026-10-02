@@ -534,6 +534,13 @@ impl FfiRouter {
                 [],
             )
         })?;
+        if !desc.rejections.is_empty() {
+            return Err(CodedError::invalid_argument(
+                codes::SAGA_COMPENSATES,
+                messages::SAGA_COMPENSATES,
+                [("saga".to_string(), desc.name.clone())],
+            ));
+        }
 
         let mut dispatch = SagaDispatch::new(
             desc.name.clone(),

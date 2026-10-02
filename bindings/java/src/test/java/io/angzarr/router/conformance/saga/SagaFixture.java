@@ -1,8 +1,8 @@
 package io.angzarr.router.conformance.saga;
 
-import io.angzarr.Cover;
 import io.angzarr.router.CodedError;
 import io.angzarr.router.Destinations;
+import io.angzarr.router.PageContext;
 import io.angzarr.router.SagaDispatch;
 import io.angzarr.router.Thunks.SagaEmission;
 import io.angzarr.router.conformance.Builders;
@@ -17,7 +17,7 @@ import test.counter.OrderSagaAngzarr;
 final class SagaFixture implements OrderSagaAngzarr.OrderSagaHandler {
 
   @Override
-  public SagaEmission increased(Counter.Increased event, Destinations dests, Cover sourceCover) {
+  public SagaEmission increased(Counter.Increased event, Destinations dests, PageContext source) {
     return new SagaEmission(List.of(Builders.reserveCommand()), List.of());
   }
 
@@ -32,7 +32,7 @@ final class SagaFixture implements OrderSagaAngzarr.OrderSagaHandler {
             (eventAny, dests, source) -> {
               seen.add(source.sequence());
               Counter.Increased event = CodedError.parse(Counter.Increased.parser(), eventAny);
-              return fixture.increased(event, dests, source.cover());
+              return fixture.increased(event, dests, source);
             });
   }
 }

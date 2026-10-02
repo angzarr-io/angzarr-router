@@ -10,6 +10,7 @@ package conformance
 
 import (
 	"errors"
+	"fmt"
 
 	"google.golang.org/protobuf/types/known/anypb"
 
@@ -68,7 +69,7 @@ func (counterAggregate) FailHard(*counter.FailHard, *counter.CounterState, Comma
 	return nil, errors.New("hard failure")
 }
 
-func (counterAggregate) ApplyIncreased(state *counter.CounterState, _ *counter.Increased) {
+func (counterAggregate) ApplyIncreased(state *counter.CounterState, _ *counter.Increased, _ PageContext) {
 	state.Count++
 }
 
@@ -92,7 +93,7 @@ type orderSaga struct{}
 
 // Increased emits one Reserve command for "inventory"; the router stamps it
 // deferred from the triggering event.
-func (orderSaga) Increased(*counter.Increased, *Destinations, *pb.Cover) ([]*pb.CommandBook, []*pb.EventBook, error) {
+func (orderSaga) Increased(*counter.Increased, *Destinations, PageContext) ([]*pb.CommandBook, []*pb.EventBook, error) {
 	return []*pb.CommandBook{reserveCommand()}, nil, nil
 }
 
@@ -100,7 +101,7 @@ func (orderSaga) Increased(*counter.Increased, *Destinations, *pb.Cover) ([]*pb.
 
 type counterProjector struct{}
 
-func (counterProjector) Increased(p *counter.CounterProjectorState, _ *counter.Increased) error {
+func (counterProjector) Increased(p *counter.CounterProjectorState, _ *counter.Increased, _ PageContext) error {
 	p.Count++
 	return nil
 }
@@ -111,11 +112,13 @@ func (counterProjector) Finish(p *counter.CounterProjectorState, events *pb.Even
 
 // --- OrderProcessManager ---
 
-type orderPM struct{}
+type orderPM struct {
+	seen *rejectionSink
+}
 
 // Increased emits one Reserve command for "inventory" (stamped deferred by the
 // router) plus one fact per prior state event.
-func (orderPM) Increased(_ *counter.Increased, state *counter.OrderProcessManagerState, _ *Destinations) (*pb.ProcessManagerHandleResponse, error) {
+func (orderPM) Increased(_ *counter.Increased, state *counter.OrderProcessManagerState, _ *Destinations, _ *pb.Cover) (*pb.ProcessManagerHandleResponse, error) {
 	cmd := reserveCommand()
 	facts := make([]*pb.EventBook, int(state.Count))
 	for i := range facts {
@@ -124,12 +127,36 @@ func (orderPM) Increased(_ *counter.Increased, state *counter.OrderProcessManage
 	return &pb.ProcessManagerHandleResponse{Commands: []*pb.CommandBook{cmd}, Facts: facts}, nil
 }
 
-func (orderPM) ApplyIncreased(state *counter.OrderProcessManagerState, _ *counter.Increased) {
+func (orderPM) ApplyIncreased(state *counter.OrderProcessManagerState, _ *counter.Increased, _ PageContext) {
 	state.Count++
 }
 
-func (orderPM) OnReserveRejected(*pb.Notification, *pb.RejectionNotification, *counter.OrderProcessManagerState) ([]*pb.EventBook, *pb.Notification, error) {
-	return []*pb.EventBook{oneFact()}, &pb.Notification{Cover: &pb.Cover{Domain: "escalated"}}, nil
+// OnReserveRejected records the rejection's code and message, then
+// compensates with one fact and an escalation.
+func (p orderPM) OnReserveRejected(_ *pb.Notification, r *pb.RejectionNotification, _ *counter.OrderProcessManagerState) (*pb.ProcessManagerHandleResponse, error) {
+	p.seen.record(r)
+	return &pb.ProcessManagerHandleResponse{
+		ProcessEvents: []*pb.EventBook{oneFact()},
+		Notification:  &pb.Notification{Cover: &pb.Cover{Domain: "escalated"}},
+	}, nil
+}
+
+// rejectionSink holds the (code, rejection_reason) of each rejection a
+// compensator handled.
+type rejectionSink [][2]string
+
+func (s *rejectionSink) record(r *pb.RejectionNotification) {
+	*s = append(*s, [2]string{r.GetCode(), r.GetRejectionReason()})
+}
+
+// exactly reports whether exactly one rejection was handled, with code and
+// message.
+func (s *rejectionSink) exactly(code, message string) error {
+	want := [][2]string{{code, message}}
+	if fmt.Sprintf("%q", *s) != fmt.Sprintf("%q", want) {
+		return fmt.Errorf("compensators saw (code, message) %q, want %q", *s, want)
+	}
+	return nil
 }
 
 // --- AuditProcessManager ---
@@ -144,7 +171,7 @@ const auditMark = "audit"
 // escalation.
 type auditPM struct{}
 
-func (auditPM) Increased(_ *counter.Increased, state *counter.AuditProcessManagerState, _ *Destinations) (*pb.ProcessManagerHandleResponse, error) {
+func (auditPM) Increased(_ *counter.Increased, state *counter.AuditProcessManagerState, _ *Destinations, _ *pb.Cover) (*pb.ProcessManagerHandleResponse, error) {
 	facts := make([]*pb.EventBook, len(state.Seen))
 	for i := range facts {
 		facts[i] = auditBook()
@@ -152,12 +179,12 @@ func (auditPM) Increased(_ *counter.Increased, state *counter.AuditProcessManage
 	return &pb.ProcessManagerHandleResponse{Facts: facts}, nil
 }
 
-func (auditPM) ApplyIncreased(state *counter.AuditProcessManagerState, _ *counter.Increased) {
+func (auditPM) ApplyIncreased(state *counter.AuditProcessManagerState, _ *counter.Increased, _ PageContext) {
 	state.Seen = append(state.Seen, "Increased")
 }
 
-func (auditPM) OnReserveRejected(*pb.Notification, *pb.RejectionNotification, *counter.AuditProcessManagerState) ([]*pb.EventBook, *pb.Notification, error) {
-	return []*pb.EventBook{auditBook()}, nil, nil
+func (auditPM) OnReserveRejected(*pb.Notification, *pb.RejectionNotification, *counter.AuditProcessManagerState) (*pb.ProcessManagerHandleResponse, error) {
+	return &pb.ProcessManagerHandleResponse{ProcessEvents: []*pb.EventBook{auditBook()}}, nil
 }
 
 func auditBook() *pb.EventBook {

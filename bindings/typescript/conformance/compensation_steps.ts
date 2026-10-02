@@ -12,12 +12,14 @@ import {
   Router,
 } from "@angzarr/router";
 import * as B from "./builders";
+import { type RejectionSeen } from "./fixtures";
 import { inventoryAggregate, paymentAggregate } from "./hand_built";
 
 // compensation.feature: rejection and Compensate routing through aggregates
 // built with the binding's hand-written aggregate API.
 interface CompensationCtx {
   router?: Router;
+  seen: RejectionSeen[];
   resp?: BusinessResponse;
   err?: unknown;
 }
@@ -25,7 +27,7 @@ interface CompensationCtx {
 let cctx: CompensationCtx;
 
 Before(() => {
-  cctx = {};
+  cctx = { seen: [] };
 });
 
 After(() => {
@@ -66,14 +68,14 @@ function fqOf(page: EventPage): string {
 Given(
   "a payment aggregate compensating Reserve from any domain with {word}",
   function (event: string) {
-    build(paymentAggregate([["test.counter.Reserve", event]]));
+    build(paymentAggregate([["test.counter.Reserve", event]], cctx.seen));
   },
 );
 
 Given(
   "a second payment aggregate compensating Reserve from any domain with {word}",
   function (event: string) {
-    build(paymentAggregate([["test.counter.Reserve", event]]));
+    build(paymentAggregate([["test.counter.Reserve", event]], cctx.seen));
   },
 );
 
@@ -81,10 +83,13 @@ Given(
   "a payment aggregate compensating Reserve from {string} with {word} and from {string} with {word}",
   function (d1: string, e1: string, d2: string, e2: string) {
     build(
-      paymentAggregate([
-        [`${d1}:test.counter.Reserve`, e1],
-        [`${d2}:test.counter.Reserve`, e2],
-      ]),
+      paymentAggregate(
+        [
+          [`${d1}:test.counter.Reserve`, e1],
+          [`${d2}:test.counter.Reserve`, e2],
+        ],
+        cctx.seen,
+      ),
     );
   },
 );
@@ -107,6 +112,20 @@ When(
   "a rejection of {word} sent to {string} is dispatched to the payment aggregate over history ending at sequence {int}",
   function (command: string, domain: string, last: number) {
     dispatch(B.rejectionSentTo(command, domain, last + 1));
+  },
+);
+
+When(
+  "a rejection of {word} with code {string} and message {string} is dispatched to the payment aggregate",
+  function (command: string, code: string, message: string) {
+    dispatch(B.rejectionSentTo(command, "inventory", undefined, code, message));
+  },
+);
+
+When(
+  "a rejection of {word} with no code and message {string} is dispatched to the payment aggregate",
+  function (command: string, message: string) {
+    dispatch(B.rejectionSentTo(command, "inventory", undefined, "", message));
   },
 );
 
@@ -163,5 +182,21 @@ Then(
     assert.ok(err instanceof CodedError, `expected ${code}, got ${err}`);
     assert.equal(err.code, code);
     assert.equal(err.grpc, GrpcCode.Unimplemented);
+  },
+);
+
+Then(
+  "the compensation handler saw code {string} and message {string}",
+  function (code: string, message: string) {
+    assert.equal(cctx.err, undefined, `dispatch failed: ${cctx.err}`);
+    assert.deepEqual(cctx.seen, [[code, message]]);
+  },
+);
+
+Then(
+  "the compensation handler saw an empty code and message {string}",
+  function (message: string) {
+    assert.equal(cctx.err, undefined, `dispatch failed: ${cctx.err}`);
+    assert.deepEqual(cctx.seen, [["", message]]);
   },
 );

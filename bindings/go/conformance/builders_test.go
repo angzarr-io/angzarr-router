@@ -229,6 +229,24 @@ func assertDeferred(cmd *pb.CommandBook, sourceDomain string, seq, index int) er
 	return nil
 }
 
+// assertNoSourceComponent checks every page of cmd is stamped angzarr_deferred
+// with an empty source_component: the coordinator stamps the component.
+func assertNoSourceComponent(cmd *pb.CommandBook) error {
+	if len(cmd.GetPages()) == 0 {
+		return errors.New("command carries no pages")
+	}
+	for i, page := range cmd.GetPages() {
+		d := page.GetHeader().GetAngzarrDeferred()
+		if d == nil {
+			return fmt.Errorf("command page %d is not deferred (header %v)", i, page.GetHeader())
+		}
+		if got := d.GetSourceComponent(); got != "" {
+			return fmt.Errorf("page %d source_component = %q, want it left to the coordinator", i, got)
+		}
+	}
+	return nil
+}
+
 // withTypeURLPrefix rewrites every Any type URL of cc's command pages and
 // prior-history pages to prefix + the fully-qualified name.
 func withTypeURLPrefix(cc *pb.ContextualCommand, prefix string) *pb.ContextualCommand {

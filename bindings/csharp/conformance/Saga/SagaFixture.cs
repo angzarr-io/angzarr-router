@@ -10,7 +10,7 @@ namespace Angzarr.Router.Conformance.Saga;
 /// Reserve command for "inventory", which the router stamps deferred.</summary>
 internal sealed class SagaFixture : TC.OrderSagaAngzarr.OrderSagaHandler
 {
-    public SagaEmission Increased(TC.Increased ev, Destinations dests, Cover sourceCover) =>
+    public SagaEmission Increased(TC.Increased ev, Destinations dests, PageContext source) =>
         new(new[] { Builders.ReserveCommand() }, Array.Empty<EventBook>());
 
     /// <summary>The OrderSaga dispatch delivering to target, built through the
@@ -23,7 +23,7 @@ internal sealed class SagaFixture : TC.OrderSagaAngzarr.OrderSagaHandler
             {
                 seen.Add(source.Sequence);
                 var ev = CodedError.Parse(TC.Increased.Parser, eventAny);
-                return fixture.Increased(ev, dests, source.Cover!);
+                return fixture.Increased(ev, dests, source);
             }
         );
 }

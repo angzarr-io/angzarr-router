@@ -335,6 +335,29 @@ func (r *Router) RegisterSaga(d *SagaDispatch) error {
 	if err != nil {
 		return fmt.Errorf("marshal SagaDescriptor: %w", err)
 	}
+	return r.registerSagaBytes(descBytes)
+}
+
+// RegisterSagaDescriptor is the low-level saga registration entry point: it
+// hands an already-built ABI SagaDescriptor to the core as-is, with the shared
+// callback gateway. Every callback id it names must already be assigned on
+// this router; RegisterSaga is the typed path that assigns them. The core
+// validates the descriptor (a saga declaring rejections is refused with
+// SAGA_COMPENSATES), and a refusal surfaces as a *CodedError.
+func (r *Router) RegisterSagaDescriptor(desc *abipb.SagaDescriptor) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	descBytes, err := proto.Marshal(desc)
+	if err != nil {
+		return fmt.Errorf("marshal SagaDescriptor: %w", err)
+	}
+	return r.registerSagaBytes(descBytes)
+}
+
+// registerSagaBytes passes serialized SagaDescriptor bytes to the core; the
+// caller holds r.mu.
+func (r *Router) registerSagaBytes(descBytes []byte) error {
 	var dptr *C.uint8_t
 	if len(descBytes) > 0 {
 		dptr = (*C.uint8_t)(unsafe.Pointer(&descBytes[0]))

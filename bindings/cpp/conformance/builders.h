@@ -21,6 +21,7 @@
 #include "io/angzarr/v1/saga.pb.h"
 #include "io/angzarr/v1/types.pb.h"
 #include "test/counter/counter.pb.h"
+#include "uuid5.h"
 
 namespace angzarr::conformance {
 
@@ -47,6 +48,28 @@ inline google::protobuf::Any ParentLinkage() {
   google::protobuf::Any any;
   SetAny(&any, "test.counter.Parent", std::string({1, 2, 3}));
   return any;
+}
+
+// A cover in domain with the root for label.
+inline pb::Cover CoverOf(const std::string& domain, const std::string& label) {
+  pb::Cover cover;
+  cover.set_domain(domain);
+  cover.mutable_root()->set_value(RootOf(label));
+  return cover;
+}
+
+// The parent linkage the ledger sets on its own events.
+inline google::protobuf::Any LedgerLinkage() {
+  google::protobuf::Any any;
+  SetAny(&any, "test.counter.Parent", std::string({4, 5, 6}));
+  return any;
+}
+
+// count bytes counting up from first.
+inline std::string ByteRun(int first, int count) {
+  std::string bytes;
+  for (int i = 0; i < count; ++i) bytes.push_back(static_cast<char>(first + i));
+  return bytes;
 }
 
 // --- commands -------------------------------------------------------------
@@ -77,12 +100,18 @@ inline pb::ContextualCommand EmptyCommand(const std::string& fq) {
 inline pb::ContextualCommand FailHardCommand() { return EmptyCommand("test.counter.FailHard"); }
 inline pb::ContextualCommand UnhandledCommand() { return EmptyCommand("test.counter.Reserve"); }
 
+// A rejection Notification for fq_command sent to domain, carrying code (its
+// machine code) and message (its rejection_reason).
 inline pb::Notification RejectionNotificationFor(const std::string& fq_command,
-                                                 const std::string& domain) {
+                                                 const std::string& domain,
+                                                 const std::string& code = "",
+                                                 const std::string& message = "") {
   pb::RejectionNotification rejection;
   auto* rc = rejection.mutable_rejected_command();
   rc->mutable_cover()->set_domain(domain);
   SetAnyEmpty(rc->add_pages()->mutable_command(), fq_command);
+  rejection.set_rejection_reason(message);
+  rejection.set_code(code);
   pb::Notification n;
   *n.mutable_payload() = angzarr::router::Pack::Wrap(rejection);
   return n;
@@ -187,6 +216,38 @@ inline pb::SagaHandleRequest SagaEventSource(const std::string& fq,
   return req;
 }
 
+// A saga source of one Increased event of order root label at sequence seq.
+inline pb::SagaHandleRequest SagaRootedSource(const std::string& label, uint32_t seq) {
+  auto req = SagaEventSource("test.counter.Increased", seq);
+  *req.mutable_source()->mutable_cover() = CoverOf("order", label);
+  return req;
+}
+
+// The parity command: cover "inventory", root bytes 10..1f, correlation
+// "corr-1"; one page whose command is "/example.Foo" carrying 01020304.
+inline pb::CommandBook ParityCommand() {
+  pb::CommandBook cmd;
+  auto* cover = cmd.mutable_cover();
+  cover->set_domain("inventory");
+  cover->mutable_root()->set_value(ByteRun(0x10, 16));
+  cover->set_correlation_id("corr-1");
+  auto* any = cmd.add_pages()->mutable_command();
+  any->set_type_url("/example.Foo");
+  any->set_value(ByteRun(1, 4));
+  return cmd;
+}
+
+// The parity source: one Increased event at sequence seq under cover "order",
+// root bytes 00..0f, correlation "corr-1".
+inline pb::SagaHandleRequest ParitySource(uint32_t seq) {
+  auto req = SagaEventSource("test.counter.Increased", seq);
+  auto* cover = req.mutable_source()->mutable_cover();
+  cover->set_domain("order");
+  cover->mutable_root()->set_value(ByteRun(0x00, 16));
+  cover->set_correlation_id("corr-1");
+  return req;
+}
+
 inline pb::SagaHandleRequest SagaRejectionSource(const std::string& fq_command) {
   pb::SagaHandleRequest req;
   auto* source = req.mutable_source();
@@ -241,13 +302,20 @@ inline pb::EventBook PmStateOf(int n) {
   return book;
 }
 
-inline pb::ProcessManagerHandleRequest PmRejection(const std::string& fq_command) {
+// A rejection of fq_command whose RejectionNotification carries code and message.
+inline pb::ProcessManagerHandleRequest PmRejectionWith(const std::string& fq_command,
+                                                       const std::string& code,
+                                                       const std::string& message) {
   pb::ProcessManagerHandleRequest req;
   auto* trigger = req.mutable_trigger();
   trigger->mutable_cover()->set_domain("counter");
   *trigger->add_pages()->mutable_event() =
-      angzarr::router::Pack::Wrap(RejectionNotificationFor(fq_command, "inventory"));
+      angzarr::router::Pack::Wrap(RejectionNotificationFor(fq_command, "inventory", code, message));
   return req;
+}
+
+inline pb::ProcessManagerHandleRequest PmRejection(const std::string& fq_command) {
+  return PmRejectionWith(fq_command, "", "");
 }
 
 // The rejection of fq_command issued by the PM owning issuer_domain: the trigger
@@ -330,6 +398,16 @@ inline void RequireDeferred(const pb::CommandBook& cmd, const std::string& sourc
     REQUIRE(static_cast<int>(d.source_seq()) == std::stoi(args.at(0)));
     REQUIRE(static_cast<int>(d.command_index()) == std::stoi(args.at(1)));
     REQUIRE(d.source().domain() == source_domain);
+  }
+}
+
+// Asserts every page of cmd is deferred and leaves its source_component empty
+// for the coordinator to stamp.
+inline void RequireNoSourceComponent(const pb::CommandBook& cmd) {
+  REQUIRE(cmd.pages_size() > 0);
+  for (const auto& page : cmd.pages()) {
+    REQUIRE(page.header().sequence_type_case() == pb::PageHeader::kAngzarrDeferred);
+    REQUIRE(page.header().angzarr_deferred().source_component().empty());
   }
 }
 

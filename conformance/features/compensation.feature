@@ -11,6 +11,11 @@ Feature: Compensation routing
   dead-letters it — never silently dropped. Events a compensation or undo
   handler returns append after the aggregate's prior history.
 
+  A compensation handler receives the rejection whole: its `code` (the
+  rejecting handler's machine code, empty when it gave none) and its
+  `rejection_reason` (the human-readable message) are separate fields, and
+  handlers branch on the code.
+
   Several aggregates may share a domain. Every one of them whose
   `compensates` entries match a rejection runs, in registration order; their
   events concatenate into one book whose sequences continue after the
@@ -54,3 +59,13 @@ Feature: Compensation routing
     And a second payment aggregate compensating Reserve from any domain with WorkflowFailed
     When a rejection of Reserve sent to "inventory" is dispatched to the payment aggregate over history ending at sequence 6
     Then the aggregates emit FundsReleased at sequence 7 then WorkflowFailed at sequence 8
+
+  Scenario: a compensation handler reads the rejection's code and message separately
+    Given a payment aggregate compensating Reserve from any domain with FundsReleased
+    When a rejection of Reserve with code "OUT_OF_STOCK" and message "no stock left" is dispatched to the payment aggregate
+    Then the compensation handler saw code "OUT_OF_STOCK" and message "no stock left"
+
+  Scenario: a rejection without a code reaches the compensation handler with an empty code
+    Given a payment aggregate compensating Reserve from any domain with FundsReleased
+    When a rejection of Reserve with no code and message "no stock left" is dispatched to the payment aggregate
+    Then the compensation handler saw an empty code and message "no stock left"

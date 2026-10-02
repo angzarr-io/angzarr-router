@@ -26,4 +26,24 @@ internal static class Steps
             Assert.That(d.Source?.Domain, Is.EqualTo(sourceDomain), "source cover");
         }
     }
+
+    /// <summary>Every page of <paramref name="cmd"/> is deferred and leaves its
+    /// source_component empty for the coordinator to stamp.</summary>
+    internal static void AssertNoSourceComponent(CommandBook cmd)
+    {
+        Assert.That(cmd.Pages, Is.Not.Empty, "command pages");
+        foreach (var page in cmd.Pages)
+        {
+            Assert.That(
+                page.Header?.SequenceTypeCase,
+                Is.EqualTo(PageHeader.SequenceTypeOneofCase.AngzarrDeferred),
+                "command page is deferred"
+            );
+            Assert.That(
+                page.Header!.AngzarrDeferred.SourceComponent,
+                Is.Empty,
+                "the coordinator stamps the component"
+            );
+        }
+    }
 }

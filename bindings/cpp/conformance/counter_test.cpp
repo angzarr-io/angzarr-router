@@ -36,7 +36,8 @@ class CounterFixture : public tc::CounterAggregateHandler {
   pb::EventBook FailHard(const tc::FailHard&, tc::CounterState&, const CommandContext&) override {
     throw std::runtime_error("hard failure");
   }
-  void ApplyIncreased(tc::CounterState& state, const tc::Increased&) override {
+  void ApplyIncreased(tc::CounterState& state, const tc::Increased&,
+                      const angzarr::router::PageContext&) override {
     state.set_count(state.count() + 1);
   }
   pb::BusinessResponse OnReserveRejected(const pb::Notification&, const pb::RejectionNotification&,
@@ -141,6 +142,12 @@ void Register(StepRegistry& r, CounterWorld& w) {
     REQUIRE(w.resp.has_value());
     REQUIRE(w.resp->events().cover().ext().SerializeAsString() ==
             ParentLinkage().SerializeAsString());
+  });
+  r.On("the recorded events carry no parent linkage", [&w](const StepArgs&) {
+    REQUIRE_FALSE(w.err.has_value());
+    REQUIRE(w.resp.has_value());
+    REQUIRE(w.resp->events().pages_size() > 0);
+    REQUIRE_FALSE(w.resp->events().cover().has_ext());
   });
   r.On("the compensations run first then second", [&w](const StepArgs&) {
     REQUIRE_FALSE(w.err.has_value());

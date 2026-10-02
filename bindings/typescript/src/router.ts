@@ -49,6 +49,7 @@ import {
   RejectionAuxSchema,
   RejectionEntrySchema,
   ReplayCallSchema,
+  type SagaDescriptor,
   SagaDescriptorSchema,
   SagaEventAuxSchema,
   UndoAuxSchema,
@@ -239,6 +240,18 @@ export class Router {
         }),
       );
     }
+    this.registerSagaDescriptor(desc);
+  }
+
+  /**
+   * The low-level saga registration entry point: hands an already-built ABI
+   * SagaDescriptor to the core as-is, with the shared callback gateway. Every
+   * callback id it names must already be assigned on this router;
+   * {@link registerSaga} is the typed path that assigns them. The core
+   * validates the descriptor (a saga declaring rejections is refused with
+   * SAGA_COMPENSATES), and a refusal throws a CodedError.
+   */
+  registerSagaDescriptor(desc: SagaDescriptor): void {
     this.check(
       Ffi.register("saga", this.native(), toBinary(SagaDescriptorSchema, desc)),
     );

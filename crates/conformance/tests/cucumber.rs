@@ -161,6 +161,25 @@ async fn carry_linkage(w: &mut CounterWorld) {
     );
 }
 
+#[then("the recorded events carry no parent linkage")]
+async fn carry_no_linkage(w: &mut CounterWorld) {
+    let resp = w
+        .result
+        .as_ref()
+        .expect("a command was dispatched")
+        .as_ref()
+        .expect("expected a successful response");
+    let Some(pb::business_response::Result::Events(book)) = &resp.result else {
+        panic!("expected an events response, got {:?}", resp.result);
+    };
+    assert!(!book.pages.is_empty(), "events were recorded");
+    assert_eq!(
+        book.cover.as_ref().and_then(|c| c.ext.as_ref()),
+        None,
+        "no command linkage, no handler linkage: none on the events"
+    );
+}
+
 #[then("the compensations run first then second")]
 async fn compensations_in_order(w: &mut CounterWorld) {
     let resp = w

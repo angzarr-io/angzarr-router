@@ -7,7 +7,8 @@ Feature: Order process-manager dispatch
   of an undeclared type does nothing, a missing or empty trigger is refused
   with a coded error, the PM's own state is rebuilt before the handler, and a
   rejection notification routes to the registered compensator with its
-  escalation. A process event the handler leaves unaddressed belongs to the
+  escalation; the compensator reads the rejection's code and message as
+  separate fields. A process event the handler leaves unaddressed belongs to the
   process-manager's own domain.
 
   Co-resident process-managers share one router: each rebuilds only its own
@@ -20,6 +21,7 @@ Feature: Order process-manager dispatch
     When an Increased trigger in domain "counter" at sequence 4 is dispatched
     Then the process-manager emits one command to "inventory"
     And the command is deferred from source sequence 4 at command index 0
+    And the command leaves its source component to the coordinator
 
   Scenario: history does not re-trigger
     Given an order process-manager
@@ -84,3 +86,8 @@ Feature: Order process-manager dispatch
     Given an order process-manager
     When a rejection of Reserve is dispatched
     Then the process event is addressed to "order-pm"
+
+  Scenario: a process-manager compensator reads the rejection's code and message separately
+    Given an order process-manager
+    When a rejection of Reserve with code "OUT_OF_STOCK" and message "no stock left" is dispatched
+    Then the process-manager compensator saw code "OUT_OF_STOCK" and message "no stock left"

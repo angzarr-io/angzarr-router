@@ -22,13 +22,14 @@ TOP := `git rev-parse --show-toplevel`
 # client-go uses. The cdylib is the ABI boundary and is carried forward
 # between the two (built once in rust, linked in go via the shared target/
 # mount), so no single all-languages image is required.
-# Override either with the matching env var to pin a git-SHA tag.
-ROUTER_IMAGE := env_var_or_default("ANGZARR_ROUTER_IMAGE", "ghcr.io/angzarr-io/angzarr-rust:latest")
-ROUTER_GO_IMAGE := env_var_or_default("ANGZARR_ROUTER_GO_IMAGE", "ghcr.io/angzarr-io/angzarr-go:latest")
-ROUTER_JAVA_IMAGE := env_var_or_default("ANGZARR_ROUTER_JAVA_IMAGE", "ghcr.io/angzarr-io/angzarr-java:latest")
-ROUTER_CSHARP_IMAGE := env_var_or_default("ANGZARR_ROUTER_CSHARP_IMAGE", "ghcr.io/angzarr-io/angzarr-csharp:latest")
-ROUTER_CPP_IMAGE := env_var_or_default("ANGZARR_ROUTER_CPP_IMAGE", "ghcr.io/angzarr-io/angzarr-cpp:latest")
-ROUTER_TYPESCRIPT_IMAGE := env_var_or_default("ANGZARR_ROUTER_TYPESCRIPT_IMAGE", "ghcr.io/angzarr-io/angzarr-typescript:latest")
+# Each is pinned by tag and digest (the image actually tested); override with
+# the matching env var.
+ROUTER_IMAGE := env_var_or_default("ANGZARR_ROUTER_IMAGE", "ghcr.io/angzarr-io/angzarr-rust:9e07ae0@sha256:1f70b5de243d50aab989103ce87be393b6282c538ecabccef5f07c15760ac156")
+ROUTER_GO_IMAGE := env_var_or_default("ANGZARR_ROUTER_GO_IMAGE", "ghcr.io/angzarr-io/angzarr-go:latest@sha256:b57cce65c7bc14aaa67845d94d0eb3c7f7bddae43190299ec8f02bb8e92ee6d8")
+ROUTER_JAVA_IMAGE := env_var_or_default("ANGZARR_ROUTER_JAVA_IMAGE", "ghcr.io/angzarr-io/angzarr-java:531d91e@sha256:3c64d5337aa53c1a5a2c7bf34737b7012464acfdb5c2dc39f55a119f3441e96e")
+ROUTER_CSHARP_IMAGE := env_var_or_default("ANGZARR_ROUTER_CSHARP_IMAGE", "ghcr.io/angzarr-io/angzarr-csharp:latest@sha256:32c482820b2021ec7639a800d8778a51db27e604edbe1359a8a328c6c65b5991")
+ROUTER_CPP_IMAGE := env_var_or_default("ANGZARR_ROUTER_CPP_IMAGE", "ghcr.io/angzarr-io/angzarr-cpp:latest@sha256:3c66dd0ffc7d2dd727c355d1b22c2741abce4d570baea4517c77fd5d40d97bfe")
+ROUTER_TYPESCRIPT_IMAGE := env_var_or_default("ANGZARR_ROUTER_TYPESCRIPT_IMAGE", "ghcr.io/angzarr-io/angzarr-typescript:531d91e@sha256:6121d654662bcbba25162d89b6fe03d41b6d9c364346dd7e6fee394123ef02b3")
 # Container runtime: docker (rootless or rootful). Empty inside a container.
 CONTAINER_CMD := `command -v docker 2>/dev/null || echo ""`
 # `-u $(id -u):$(id -g)` is right for ROOTFUL docker (bind-mount files get the
@@ -38,8 +39,12 @@ CONTAINER_CMD := `command -v docker 2>/dev/null || echo ""`
 # default user — images that set a non-root USER (e.g. one running as
 # `angzarr`) otherwise land on a subuid that cannot write the mount (and trips
 # git's dubious-ownership guard). Running as container-root maps to the host UID.
-CONTAINER_USER_ARG := if `docker info 2>/dev/null | grep -q rootless && echo yes || echo no` == "yes" { "-u 0:0" } else { "-u $(id -u):$(id -g)" }
-CONTAINER_RUN := CONTAINER_CMD + " run --rm " + CONTAINER_USER_ARG
+# ANGZARR_CONTAINER_USER overrides it (CI runs the toolchains as container-root
+# so their HOME-based caches work).
+CONTAINER_USER_ARG := if env_var_or_default("ANGZARR_CONTAINER_USER", "") != "" { "-u " + env_var("ANGZARR_CONTAINER_USER") } else if `docker info 2>/dev/null | grep -q rootless && echo yes || echo no` == "yes" { "-u 0:0" } else { "-u $(id -u):$(id -g)" }
+# The checkout is owned by the host user, not the container user: let git use it.
+CONTAINER_GIT_ENV := "-e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*'"
+CONTAINER_RUN := CONTAINER_CMD + " run --rm " + CONTAINER_USER_ARG + " " + CONTAINER_GIT_ENV
 
 # Delegate a container-side recipe: run directly inside a devcontainer,
 # otherwise in the pinned image with justfile.container overlaid as justfile.
@@ -155,6 +160,12 @@ build: (_container "build")
 # Run the unit test bank
 test: (_container "test")
 
+# Check Rust formatting (no rewrite; fails on drift)
+fmt-check: (_container "fmt-check")
+
+# Build the pinned angzarr CLI (the codegen plugin) into .tools/bin
+cli: (_go_container "cli")
+
 # Mutation-test the core modules and the FFI registry
 mutation-test: (_container "mutation-test")
 
@@ -177,16 +188,16 @@ buf-format: (_container "buf-format")
 # architecture. No unified all-languages image needed.
 
 # Regenerate the Go binding's protobuf types (buf + protoc-gen-go)
-go-binding-gen: (_go_container "go-binding-gen")
+go-binding-gen: cli (_go_container "go-binding-gen")
 
 # Build the Go binding (cdylib in the rust image, then go in the go image)
-go-binding-build: build (_go_container "go-binding-build")
+go-binding-build: build cli (_go_container "go-binding-build")
 
 # Run the Go binding's conformance suite (godog) + property sweep
-go-binding-test: build (_go_container "go-binding-test")
+go-binding-test: build cli (_go_container "go-binding-test")
 
 # Format check + vet the Go binding
-go-binding-lint: (_go_container "go-binding-lint")
+go-binding-lint: cli (_go_container "go-binding-lint")
 
 # --- Java binding (bindings/java) ----------------------------------------
 # Runs in the Java image; the router-ffi cdylib is built in the rust image
@@ -195,19 +206,19 @@ go-binding-lint: (_go_container "go-binding-lint")
 # wiring is never committed (regenerate on need), so build/test regenerate first.
 
 # Regenerate the Java binding's protobuf types + angzarr dispatch wiring (buf)
-java-binding-gen: (_java_container "java-binding-gen")
+java-binding-gen: cli (_java_container "java-binding-gen")
 
 # Build the Java binding (cdylib in the rust image, then gradle in the java image)
-java-binding-build: build (_java_container "java-binding-build")
+java-binding-build: build cli (_java_container "java-binding-build")
 
 # Run the Java binding's conformance suite (Cucumber-JVM) + property sweep
-java-binding-test: build (_java_container "java-binding-test")
+java-binding-test: build cli (_java_container "java-binding-test")
 
 # Lint + format check the Java binding
-java-binding-lint: (_java_container "java-binding-lint")
+java-binding-lint: cli (_java_container "java-binding-lint")
 
 # Auto-format the Java binding (spotless)
-java-binding-format: (_java_container "java-binding-format")
+java-binding-format: cli (_java_container "java-binding-format")
 
 # --- C# binding (bindings/csharp) ----------------------------------------
 # Runs in the C# image; the router-ffi cdylib is built in the rust image
@@ -215,13 +226,13 @@ java-binding-format: (_java_container "java-binding-format")
 # via P/Invoke. Generated protobuf + angzarr wiring is never committed.
 
 # Regenerate the C# binding's protobuf types + angzarr wiring (buf) + features
-csharp-binding-gen: (_csharp_container "csharp-binding-gen")
+csharp-binding-gen: cli (_csharp_container "csharp-binding-gen")
 
 # Build the C# binding (cdylib in the rust image, then dotnet in the csharp image)
-csharp-binding-build: build (_csharp_container "csharp-binding-build")
+csharp-binding-build: build cli (_csharp_container "csharp-binding-build")
 
 # Run the C# binding's conformance suite (Reqnroll/NUnit)
-csharp-binding-test: build (_csharp_container "csharp-binding-test")
+csharp-binding-test: build cli (_csharp_container "csharp-binding-test")
 
 # Lint + format check the C# binding (csharpier)
 csharp-binding-lint: (_csharp_container "csharp-binding-lint")
@@ -235,13 +246,13 @@ csharp-binding-format: (_csharp_container "csharp-binding-format")
 # (no runtime .so). Generated protobuf + angzarr wiring is never committed.
 
 # Regenerate the C++ binding's protobuf types + angzarr wiring (buf)
-cpp-binding-gen: (_cpp_container "cpp-binding-gen")
+cpp-binding-gen: cli (_cpp_container "cpp-binding-gen")
 
 # Build the C++ binding (staticlib in the rust image, then cmake in the cpp image)
-cpp-binding-build: build (_cpp_container "cpp-binding-build")
+cpp-binding-build: build cli (_cpp_container "cpp-binding-build")
 
 # Run the C++ binding's conformance suite (Catch2 feature-runner)
-cpp-binding-test: build (_cpp_container "cpp-binding-test")
+cpp-binding-test: build cli (_cpp_container "cpp-binding-test")
 
 # Format check the C++ binding (clang-format)
 cpp-binding-lint: (_cpp_container "cpp-binding-lint")
@@ -252,16 +263,16 @@ cpp-binding-lint: (_cpp_container "cpp-binding-lint")
 # via koffi. Generated protobuf-es types + angzarr wiring is never committed.
 
 # Regenerate the TS binding's protobuf-es types + angzarr wiring (buf)
-ts-binding-gen: (_typescript_container "ts-binding-gen")
+ts-binding-gen: cli (_typescript_container "ts-binding-gen")
 
 # Build the TS binding (cdylib in the rust image, then npm ci in the ts image)
-ts-binding-build: build (_typescript_container "ts-binding-build")
+ts-binding-build: build cli (_typescript_container "ts-binding-build")
 
 # Run the TS binding's conformance suite (cucumber-js)
-ts-binding-test: build (_typescript_container "ts-binding-test")
+ts-binding-test: build cli (_typescript_container "ts-binding-test")
 
 # Format check (prettier) and type-check (tsc) the TS binding
-ts-binding-lint: (_typescript_container "ts-binding-lint")
+ts-binding-lint: cli (_typescript_container "ts-binding-lint")
 
 # Auto-format the TS binding (prettier)
 ts-binding-format: (_typescript_container "ts-binding-format")
