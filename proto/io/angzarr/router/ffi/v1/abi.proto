@@ -1,6 +1,8 @@
 syntax = "proto3";
 package io.angzarr.router.ffi.v1;
 
+import "google/protobuf/any.proto";
+import "io/angzarr/v1/command_handler.proto";
 import "io/angzarr/v1/types.proto";
 
 // Auxiliary payloads crossing the C ABI. These are internal to the FFI
@@ -19,9 +21,12 @@ message CallbackEntry {
 }
 
 // Rejection rows carry ORDERED callback lists: multiple compensators for
-// one rejected command all run, in registration order.
+// one compensates entry all run, in registration order.
 message RejectionEntry {
-  string fq_command_type = 1; // FULLY-QUALIFIED; short names never match
+  // The declared compensates entry: the rejected command's FULLY-QUALIFIED
+  // type ("fq.Type", sent to any domain) or "domain:fq.Type" (only when it was
+  // sent to that domain). Short names never match.
+  string compensates = 1;
   repeated uint64 callback_ids = 2;
 }
 
@@ -35,6 +40,27 @@ message AggregateDescriptor {
   repeated RejectionEntry rejections = 5;
   // Snapshot loader callback; absent when the aggregate takes no snapshots.
   optional uint64 snapshot_callback_id = 6;
+  // Undo handlers keyed by the FULLY-QUALIFIED type of the executed command
+  // a Compensate undoes (fq_type = Compensate.command_type).
+  repeated CallbackEntry undoes = 7;
+  // Fact handlers keyed by FULLY-QUALIFIED fact (event) type: the aggregate's
+  // declared facts (ComponentOptions.facts). The callback receives the fact
+  // Any (type_url / payload) with the session state rebuilt, and returns a
+  // serialized FactRecord (STATUS_OK) or STATUS_OK_EMPTY to record the fact
+  // unchanged with no flags. A fact of an undeclared type never reaches the
+  // host: the router refuses it with NO_FACT_HANDLER.
+  repeated CallbackEntry facts = 8;
+  // Packs the session's current state into a serialized google.protobuf.Any
+  // (for Replay); absent when the aggregate does not support Replay.
+  optional uint64 state_callback_id = 9;
+}
+
+// Response bytes of a fact callback (STATUS_OK): the fact to record (as
+// received, or annotated) and the events that flag it, in order. Each folds
+// through the appliers before the next fact.
+message FactRecord {
+  google.protobuf.Any fact = 1;
+  repeated google.protobuf.Any flags = 2;
 }
 
 // Registration payload for one projector component. Folds cross the
@@ -53,14 +79,17 @@ message ProjectorDescriptor {
 }
 
 // Registration payload for one saga component. A stateless translator:
-// declared events emit commands (the host stamps them from the supplied
-// destination sequences) and/or injected fact events; rejection rows carry
-// ORDERED compensators (C-0042). Empty `target_domains` is allowed.
+// declared events emit commands (deferred; the router stamps their
+// provenance) and/or injected fact events. Sagas receive no rejections.
+// Empty `target_domains` is allowed.
 message SagaDescriptor {
   string name = 1;
   string input_domain = 2;
   repeated string target_domains = 3;
   repeated CallbackEntry events = 4;
+  // Sagas never receive rejections (the source aggregate compensates), so a
+  // saga declaring any is refused at registration (SAGA_COMPENSATES,
+  // INVALID_ARGUMENT).
   repeated RejectionEntry rejections = 5;
 }
 
@@ -68,26 +97,34 @@ message SagaDescriptor {
 message CommandContextAux {
   uint32 next_sequence = 1;
   bool had_prior_events = 2;
+  // The cover of the command (or notification delivery) being handled: the
+  // aggregate's own domain and root.
+  io.angzarr.v1.Cover cover = 3;
 }
 
-// aux payload for saga event callbacks: the coordinator-supplied
-// destination next-sequences the host stamps emitted commands from, plus the
-// source event's cover passed through whole (serialized angzarr Cover) so the
-// saga can route emitted commands by the trigger's identity (root, ext). The
-// host returns a SagaResponse (commands + injected fact events).
+// aux payload for saga event callbacks: the source event's cover passed
+// through whole (serialized angzarr Cover) so the saga can route emitted
+// commands by the trigger's identity (root, ext). The host returns a
+// SagaResponse (commands + injected fact events); the router stamps the
+// commands deferred.
 message SagaEventAux {
-  map<string, uint32> destination_sequences = 1;
+  reserved 1;
+  reserved "destination_sequences";
   // The source book's cover, passed through whole and typed (Rust owns the
   // deserialization) so the saga can route emitted commands by the trigger's
   // identity (root, ext).
   io.angzarr.v1.Cover source_cover = 2;
+  // The source event's explicit sequence (0 when the page carries none): the
+  // source_seq the router records on the emitted commands.
+  uint32 source_seq = 3;
 }
 
 // Registration payload for one process-manager component. STATEFUL: the PM
 // rebuilds its own event-sourced state (the appliers/snapshot) before each
 // handler. Event handlers are keyed by (input domain, fully-qualified event
 // type) — a 2-level table; rejection rows carry ORDERED compensators
-// (C-0042), the first escalation winning.
+// (C-0042), the first escalation winning. `target_domains` are the PM's
+// declared output domains (its command targets).
 message ProcessManagerDescriptor {
   string name = 1;
   string pm_domain = 2;
@@ -95,6 +132,11 @@ message ProcessManagerDescriptor {
   optional uint64 snapshot_callback_id = 4;
   repeated PmEventEntry events = 5;
   repeated RejectionEntry rejections = 6;
+  repeated string target_domains = 7;
+  // Packs the session's current PM state into a serialized
+  // google.protobuf.Any (for Replay); absent when the PM does not support
+  // Replay.
+  optional uint64 state_callback_id = 8;
 }
 
 // One ((input domain, fully-qualified event type) → host callback) row for a
@@ -105,16 +147,46 @@ message PmEventEntry {
   uint64 callback_id = 3;
 }
 
-// aux payload for process-manager event callbacks: the coordinator-supplied
-// destination next-sequences the host stamps emitted commands from. The host
-// returns a ProcessManagerHandleResponse.
+// aux payload for process-manager event callbacks: the trigger book's cover.
+// The host returns a ProcessManagerHandleResponse; the router stamps its
+// commands deferred.
 message PmEventAux {
-  map<string, uint32> destination_sequences = 1;
+  reserved 1;
+  reserved "destination_sequences";
+  io.angzarr.v1.Cover trigger_cover = 2;
 }
 
-// aux payload for rejection (compensation) callbacks.
+// aux payload for projector fold callbacks AND for aggregate / process-manager
+// applier callbacks: where the folded event sits (its book's cover and the
+// page's explicit sequence, 0 when absent).
+message ProjectorEventAux {
+  io.angzarr.v1.Cover cover = 1;
+  uint32 sequence = 2;
+}
+
+// Request bytes of angzarr_router_dispatch_replay: the domain the replay is
+// for — an aggregate's domain, or a process manager's own (pm) domain when no
+// aggregate claims it; empty selects a sole registered aggregate — and the
+// request itself.
+message ReplayCall {
+  string domain = 1;
+  io.angzarr.v1.ReplayRequest request = 2;
+}
+
+// aux payload for rejection (compensation) callbacks. An aggregate
+// compensator returns a BusinessResponse; a process-manager compensator
+// returns a full ProcessManagerHandleResponse (process events, commands,
+// facts, escalation).
 message RejectionAux {
   bytes notification = 1; // serialized angzarr Notification
-  bytes rejection = 2;    // serialized angzarr RejectionNotification
+  bytes rejection = 2; // serialized angzarr RejectionNotification
+  CommandContextAux cctx = 3;
+}
+
+// aux payload for undo callbacks (a Compensate routed to the handler for its
+// command type).
+message UndoAux {
+  bytes notification = 1; // serialized angzarr Notification
+  bytes compensate = 2; // serialized angzarr Compensate
   CommandContextAux cctx = 3;
 }

@@ -1,16 +1,18 @@
 package io.angzarr.router.conformance.counter;
 
-import io.angzarr.router.conformance.Builders;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.protobuf.Any;
 import io.angzarr.ContextualCommand;
 import io.angzarr.EventBook;
-import io.angzarr.router.conformance.counter.CounterFixture.Observation;
 import io.angzarr.router.CodedError;
 import io.angzarr.router.Router;
+import io.angzarr.router.conformance.Builders;
+import io.angzarr.router.conformance.counter.CounterFixture.Observation;
 import io.cucumber.java.After;
 import io.cucumber.java.Before;
 import io.cucumber.java.en.Given;
@@ -21,9 +23,9 @@ import java.util.List;
 import test.counter.CounterAggregateAngzarr;
 
 /**
- * Step definitions for counter.feature — the shared cross-language behavior
- * suite, run against the Java binding via Cucumber-JVM. Only this step layer is
- * new; the features and fixtures are the same the Rust harness runs.
+ * Step definitions for counter.feature — the shared cross-language behavior suite, run against the
+ * Java binding via Cucumber-JVM. Only this step layer is new; the features and fixtures are the
+ * same the Rust harness runs.
  */
 public class CounterSteps {
 
@@ -75,6 +77,11 @@ public class CounterSteps {
     prior = Builders.priorIncreases(n);
   }
 
+  @Given("a counter that has already recorded {int} increases under the {string} type-URL prefix")
+  public void recordedIncreasesUnderPrefix(int n, String prefix) {
+    prior = Builders.withTypeUrlPrefix(Builders.priorIncreases(n), prefix);
+  }
+
   @Given("a counter whose history holds a corrupt event")
   public void historyHoldsCorrupt() {
     prior = Builders.corruptHistory();
@@ -90,6 +97,11 @@ public class CounterSteps {
   @When("the operator increases the counter by {int}")
   public void increaseBy(int n) {
     dispatch(Builders.increaseCommand(n));
+  }
+
+  @When("the operator increases the counter by {int} under the {string} type-URL prefix")
+  public void increaseByUnderPrefix(int n, String prefix) {
+    dispatch(Builders.withTypeUrlPrefix(Builders.increaseCommand(n), prefix));
   }
 
   @When("the operator increases the counter by {int} on behalf of a parent")
@@ -149,7 +161,8 @@ public class CounterSteps {
     EventBook book = resp.getEvents();
     assertEquals(count, book.getPagesCount(), "recorded events");
     for (int i = 0; i < count; i++) {
-      assertEquals(start + i, book.getPages(i).getHeader().getSequence(), "event " + i + " sequence");
+      assertEquals(
+          start + i, book.getPages(i).getHeader().getSequence(), "event " + i + " sequence");
     }
   }
 
@@ -183,6 +196,14 @@ public class CounterSteps {
     assertEquals(Builders.parentLinkage(), ext, "cover ext = parent linkage");
   }
 
+  @Then("the recorded events carry no parent linkage")
+  public void eventsCarryNoParentLinkage() {
+    assertNull(err, "dispatch failed");
+    EventBook book = resp.getEvents();
+    assertTrue(book.getPagesCount() > 0, "events were recorded");
+    assertFalse(book.getCover().hasExt(), "no command linkage, no handler linkage: none on events");
+  }
+
   @Then("the compensations run first then second")
   public void compensationsFirstThenSecond() {
     assertNull(err, "dispatch failed");
@@ -190,7 +211,8 @@ public class CounterSteps {
     List<String> want = List.of("test.counter.CompensatedFirst", "test.counter.CompensatedSecond");
     assertEquals(want.size(), book.getPagesCount(), "compensation events");
     for (int i = 0; i < want.size(); i++) {
-      assertEquals(want.get(i), fqFromUrl(book.getPages(i).getEvent().getTypeUrl()), "compensation " + i);
+      assertEquals(
+          want.get(i), fqFromUrl(book.getPages(i).getEvent().getTypeUrl()), "compensation " + i);
     }
   }
 

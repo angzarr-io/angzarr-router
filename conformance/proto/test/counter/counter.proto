@@ -20,8 +20,9 @@ import "io/angzarr/v1/options.proto";
 
 // --- event ---
 
-// Increased folds into the aggregate (count += 1), folds the projector and the
-// process manager's own state, and triggers the saga and the process manager.
+// Increased folds into the aggregate (count += 1), folds the projector and both
+// process managers' own states, and triggers the saga and both process
+// managers.
 // One (event) entry per consuming component (multiple subscribers are modelled
 // as multiple components).
 message Increased {
@@ -40,6 +41,14 @@ message Increased {
   };
   option (io.angzarr.v1.event) = {
     component: "test.counter.OrderProcessManagerState"
+    domain: "counter"
+  };
+  option (io.angzarr.v1.event) = {
+    component: "test.counter.AuditProcessManagerState"
+    applies: true
+  };
+  option (io.angzarr.v1.event) = {
+    component: "test.counter.AuditProcessManagerState"
     domain: "counter"
   };
 }
@@ -75,7 +84,7 @@ message Reserve {}
 message CounterState {
   option (io.angzarr.v1.component) = {
     kind: COMPONENT_KIND_AGGREGATE
-    input_domain: "counter"
+    domain: "counter"
     name: "CounterAggregate"
     compensates: "test.counter.Reserve"
   };
@@ -84,15 +93,15 @@ message CounterState {
 
 // --- saga ---
 
-// OrderSaga translates each Increased source event into one Reserve command for
-// "inventory" and compensates a rejected Reserve by injecting one fact event. A
-// stateless saga has no state message, so it is declared on this marker.
+// OrderSaga translates each Increased source event into one deferred Reserve
+// command for "inventory". Sagas receive no rejections (only aggregates and
+// process managers declare compensates). A stateless saga has no state
+// message, so it is declared on this marker.
 message OrderSaga {
   option (io.angzarr.v1.component) = {
     kind: COMPONENT_KIND_SAGA
     input_domain: "order"
     output_domain: "inventory"
-    compensates: "test.counter.Reserve"
   };
 }
 
@@ -112,15 +121,33 @@ message CounterProjectorState {
 // --- process manager ---
 
 // OrderProcessManager folds Increased into its own state (applies) AND reacts to
-// the newest Increased trigger from "counter" by emitting a Reserve command for
-// "inventory" plus one fact per prior state event, compensating a rejected
+// the newest Increased trigger from "counter" by emitting a deferred Reserve
+// command for "inventory" plus one fact per prior state event, compensating a rejected
 // Reserve with a process event and an escalation.
 message OrderProcessManagerState {
   option (io.angzarr.v1.component) = {
     kind: COMPONENT_KIND_PROCESS_MANAGER
-    output_domain: "order-pm"
+    domain: "order-pm"
+    output_domain: "inventory"
     name: "OrderProcessManager"
     compensates: "test.counter.Reserve"
   };
   uint32 count = 1;
+}
+
+// AuditProcessManager is co-resident with OrderProcessManager: it consumes the
+// same "counter" Increased trigger and compensates the same rejected Reserve,
+// but owns a DIFFERENT state type. It folds Increased into its own state
+// (applies) and reacts to the newest Increased trigger with one fact (cover
+// domain "audit") per prior state event and no commands; it compensates a
+// rejected Reserve with one process event (cover domain "audit") and no
+// escalation. Each PM must rebuild only its own state.
+message AuditProcessManagerState {
+  option (io.angzarr.v1.component) = {
+    kind: COMPONENT_KIND_PROCESS_MANAGER
+    domain: "audit-pm"
+    name: "AuditProcessManager"
+    compensates: "test.counter.Reserve"
+  };
+  repeated string seen = 1;
 }

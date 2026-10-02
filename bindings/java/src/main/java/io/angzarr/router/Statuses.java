@@ -7,9 +7,9 @@ import com.google.rpc.Status;
 import java.util.Map;
 
 /**
- * Serializes a {@link CodedError} as {@code google.rpc.Status} bytes carrying a
- * {@code google.rpc.ErrorInfo} detail — the exact shape the core decodes (and
- * that gRPC puts on the wire) — and back.
+ * Serializes a {@link CodedError} as {@code google.rpc.Status} bytes carrying a {@code
+ * google.rpc.ErrorInfo} detail — the exact shape the core decodes (and that gRPC puts on the wire)
+ * — and back.
  */
 final class Statuses {
   private Statuses() {}
@@ -33,8 +33,10 @@ final class Statuses {
         .toByteArray();
   }
 
-  /** Maps any throwable to (Status bytes, negative gRPC code): a CodedError
-   * keeps its code; anything else is UNHANDLED_HANDLER_ERROR / INTERNAL. */
+  /**
+   * Maps any throwable to (Status bytes, negative gRPC code): a CodedError keeps its code; anything
+   * else is UNHANDLED_HANDLER_ERROR / INTERNAL.
+   */
   static Invoker.Result errorResult(Throwable t) {
     CodedError ce =
         (t instanceof CodedError c)
@@ -43,9 +45,10 @@ final class Statuses {
     return new Invoker.Result(toStatusBytes(ce), -ce.grpc.value);
   }
 
-  /** Decodes google.rpc.Status bytes into a CodedError; {@code ret} (the
-   * negative callback/dispatch return) is the gRPC fallback when the bytes are
-   * absent or undecodable. */
+  /**
+   * Decodes google.rpc.Status bytes into a CodedError; {@code ret} (the negative callback/dispatch
+   * return) is the gRPC fallback when the bytes are absent or undecodable.
+   */
   static CodedError fromStatusBytes(byte[] bytes, int ret) {
     GrpcCode fallback = GrpcCode.fromWire(-ret);
     if (bytes == null || bytes.length == 0) {

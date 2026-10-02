@@ -11,7 +11,7 @@ use prost_types::Any;
 
 use crate::error::{codes, HandlerError};
 use crate::pb;
-use crate::projector::ProjectorDispatch;
+use crate::projector::{PageContext, ProjectorDispatch};
 use crate::test_support::*;
 use crate::type_url;
 
@@ -23,7 +23,7 @@ struct Folded {
 }
 
 /// Folds a Cover event into the write log by domain.
-fn fold_cover(p: &mut Folded, any: &Any) -> Result<(), HandlerError> {
+fn fold_cover(p: &mut Folded, any: &Any, _ctx: &PageContext<'_>) -> Result<(), HandlerError> {
     let c =
         pb::Cover::decode(any.value.as_slice()).map_err(|e| HandlerError::Other(e.to_string()))?;
     p.entries.push(c.domain);
@@ -126,6 +126,24 @@ fn declared_domain_folds() {
 }
 
 #[test]
+fn the_wildcard_domain_folds_every_domain() {
+    let d = counting_projector(Some(&[crate::WILDCARD_DOMAIN]));
+    let proj = d
+        .dispatch(&book("inventory", cover_pages("inventory", 3)))
+        .expect("dispatch");
+    assert_eq!(proj.sequence, 3, "\"*\" consumes every domain");
+}
+
+#[test]
+fn the_wildcard_beside_named_domains_still_folds_every_domain() {
+    let d = counting_projector(Some(&["order", crate::WILDCARD_DOMAIN]));
+    let proj = d
+        .dispatch(&book("billing", cover_pages("billing", 2)))
+        .expect("dispatch");
+    assert_eq!(proj.sequence, 2);
+}
+
+#[test]
 fn empty_book_finishes_with_zero_folds() {
     let d = counting_projector(None);
     let proj = d.dispatch(&book("order", vec![])).expect("dispatch");
@@ -205,11 +223,40 @@ fn accessors_report_name_and_registered_types() {
 #[test]
 fn handler_error_propagates_as_unhandled() {
     let d = ProjectorDispatch::new("write-model", Folded::default)
-        .on_event(&cover_full_name(), |_p, _any| {
+        .on_event(&cover_full_name(), |_p, _any, _ctx| {
             Err(HandlerError::Other("boom".to_string()))
         });
     let err = d
         .dispatch(&book("order", cover_pages("order", 1)))
         .expect_err("handler error must fail dispatch");
     assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
+}
+
+// Each fold sees its page's place: the book's cover (root) and the page's
+// explicit sequence (0 when absent), for idempotent per-page handling.
+#[test]
+fn folds_observe_the_book_cover_and_page_sequence() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let captured = seen.clone();
+    let d = ProjectorDispatch::new("write-model", Folded::default).on_event(
+        &cover_full_name(),
+        move |_p, _any, ctx| {
+            captured.lock().unwrap().push((
+                ctx.cover.and_then(|c| c.root.clone()).map(|r| r.value),
+                ctx.sequence,
+            ));
+            Ok(())
+        },
+    );
+    let mut events = book("order", cover_pages("order", 2));
+    events.cover.as_mut().unwrap().root = Some(pb::Uuid { value: vec![9] });
+    events.pages[0].header = Some(pb::PageHeader {
+        sequence_type: Some(pb::page_header::SequenceType::Sequence(4)),
+        ..Default::default()
+    });
+    d.dispatch(&events).expect("dispatch");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![(Some(vec![9]), 4), (Some(vec![9]), 0)]
+    );
 }

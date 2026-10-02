@@ -7,8 +7,59 @@ set shell := ["bash", "-c"]
 
 TOP := `git rev-parse --show-toplevel`
 
+# Pinned codegen toolchain, fetched into .tools/ (gitignored) from GitHub —
+# never from the Buf Schema Registry. Protobuf generated code is version-locked
+# to each binding's runtime: Python's protobuf 7.35.x takes protoc 35.1; Java's
+# protobuf-java 4.28.3 and C#'s Google.Protobuf take protoc 28.3. C++ uses the
+# image's protoc (3.21.12, matching its libprotobuf); TypeScript uses the
+# binding's pinned @bufbuild/protoc-gen-es.
+PROTOC_PYTHON := "35.1"
+PROTOC_JVM := "28.3"
+# The angzarr CLI (the `angzarr codegen <lang>` buf plugin) built from
+# angzarr-io/angzarr-cli at this commit into .tools/bin, which precedes the
+# image's own copy on PATH.
+CLI_REF := "794f457f27508b536cac8fc53adfb518ce1969da"
+# cargo-mutants, installed into the persisted CARGO_HOME when the rust image
+# lacks it (no published image ships it).
+CARGO_MUTANTS := "27.1.0"
+export PATH := TOP + "/.tools/bin:" + env_var("PATH")
+
 default:
     @just --list
+
+# Build the pinned angzarr CLI into .tools/bin (once per CLI_REF). Runs in the
+# Go image.
+cli:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    bin={{TOP}}/.tools/bin
+    if [ -x "$bin/angzarr" ] && [ "$(cat "$bin/angzarr.ref" 2>/dev/null)" = "{{CLI_REF}}" ]; then
+        exit 0
+    fi
+    src={{TOP}}/.tools/src/angzarr-cli
+    git config --global --add safe.directory '*'
+    if [ ! -d "$src/.git" ]; then
+        git clone -q https://github.com/angzarr-io/angzarr-cli "$src"
+    fi
+    git -C "$src" fetch -q origin
+    git -C "$src" checkout -q --detach {{CLI_REF}}
+    mkdir -p "$bin"
+    cd "$src" && GOFLAGS=-buildvcs=false GOCACHE=/tmp/go-cache go build -o "$bin/angzarr" .
+    echo "{{CLI_REF}}" > "$bin/angzarr.ref"
+
+# Fetch protoc VERSION into .tools/protoc/NAME (once per version).
+_protoc NAME VERSION:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir={{TOP}}/.tools/protoc/{{NAME}}
+    if [ -x "$dir/bin/protoc" ] && [ "$(cat "$dir/version" 2>/dev/null)" = "{{VERSION}}" ]; then
+        exit 0
+    fi
+    rm -rf "$dir" && mkdir -p "$dir"
+    curl -sSfL -o "$dir/protoc.zip" \
+        "https://github.com/protocolbuffers/protobuf/releases/download/v{{VERSION}}/protoc-{{VERSION}}-linux-x86_64.zip"
+    unzip -q -o "$dir/protoc.zip" -d "$dir" && rm "$dir/protoc.zip"
+    echo "{{VERSION}}" > "$dir/version"
 
 # Build the workspace
 build:
@@ -18,12 +69,18 @@ build:
 test:
     cargo test --manifest-path {{TOP}}/Cargo.toml --workspace
 
-# Mutation-test the core modules (gate: kill >= 0.95 on rebuild/aggregate).
+# Check formatting (no rewrite; fails on drift)
+fmt-check:
+    cargo fmt --manifest-path {{TOP}}/Cargo.toml --all --check
+
+# Mutation-test the core modules and the FFI registry's routing/claim rules
+# (gate: kill >= 0.95).
 # cargo-mutants copies the source tree, so the proto root must be an absolute
 # path that survives the copy — ANGZARR_PROJECT_PROTO points build.rs at the
 # real submodule checkout.
 mutation-test:
-    cd {{TOP}} && ANGZARR_PROJECT_PROTO=${ANGZARR_PROJECT_PROTO:-{{TOP}}/angzarr-project/proto} cargo mutants -f crates/router/src/rebuild.rs -f crates/router/src/aggregate.rs -f crates/router/src/projector.rs -f crates/router/src/saga.rs -f crates/router/src/destinations.rs -f crates/router/src/process_manager.rs -f crates/router/src/error.rs -f crates/router/src/lib.rs --timeout 120
+    cargo mutants --version >/dev/null 2>&1 || cargo install cargo-mutants --locked --version {{CARGO_MUTANTS}}
+    cd {{TOP}} && ANGZARR_PROJECT_PROTO=${ANGZARR_PROJECT_PROTO:-{{TOP}}/angzarr-project/proto} cargo mutants -f crates/router/src/rebuild.rs -f crates/router/src/aggregate.rs -f crates/router/src/projector.rs -f crates/router/src/saga.rs -f crates/router/src/destinations.rs -f crates/router/src/process_manager.rs -f crates/router/src/error.rs -f crates/router/src/lib.rs -f crates/router/src/router.rs -f crates/router/src/upcaster.rs -f crates/router-ffi/src/registry.rs --timeout 120
 
 # Format
 fmt:
@@ -33,10 +90,10 @@ fmt:
 lint:
     cargo clippy --manifest-path {{TOP}}/Cargo.toml --workspace --all-targets -- -D warnings
 
-# Lint the router's own protos (io.angzarr.router.ffi.v1) with buf — the
-# pinned plugins come from this image.
+# Lint the router's own protos (io.angzarr.router.ffi.v1) with buf, in the
+# root workspace so their angzarr-project imports resolve.
 buf-lint:
-    cd {{TOP}}/proto && buf lint
+    cd {{TOP}} && buf lint --path proto/io
 
 # Check proto formatting (no rewrite; fails on drift).
 buf-format:
@@ -54,7 +111,8 @@ buf-format:
 go-binding-gen:
     rm -rf {{TOP}}/bindings/go/gen
     cd {{TOP}} && buf generate --template bindings/go/buf.gen.yaml \
-        --exclude-path angzarr-project/proto/google --exclude-path proto/google
+        --exclude-path angzarr-project/proto/google --exclude-path proto/google \
+        --exclude-path angzarr-project/proto/io/angzarr/examples
 
 # Build the Go binding (cdylib already built + carried forward). Generated
 # protobuf code is never committed (regenerate on need), so gen runs first.
@@ -81,7 +139,7 @@ go-binding-lint: go-binding-gen
 # emits path-based imports (`from io.angzarr.v1 import ...`) which cannot be
 # imported as written (stdlib `io` collision), so fixup_gen_imports.py reroots
 # them under the binding's gen package. Generated code is never committed.
-py-binding-gen:
+py-binding-gen: (_protoc "python" PROTOC_PYTHON)
     rm -rf {{TOP}}/bindings/python/angzarr_router_ffi/gen
     cd {{TOP}} && buf generate --template bindings/python/buf.gen.yaml \
         --exclude-path angzarr-project/proto/google --exclude-path proto/google \
@@ -101,8 +159,8 @@ py-binding-test: py-binding-gen
 
 # Lint + format check the Python binding (ruff; generated code excluded).
 py-binding-lint:
-    cd {{TOP}}/bindings/python && uv run --with ruff ruff check . && \
-        uv run --with ruff ruff format --check .
+    cd {{TOP}}/bindings/python && uv run --with ruff==0.16.9 ruff check . && \
+        uv run --with ruff==0.16.9 ruff format --check .
 
 # --- Java binding (bindings/java) ----------------------------------------
 # Run in the Java image. Panama/FFM loads the router-ffi cdylib, built in the
@@ -113,7 +171,7 @@ py-binding-lint:
 # Regenerate the Java binding's protobuf types + angzarr dispatch wiring.
 # google.* come from protobuf-java + proto-google-common-protos and are
 # excluded. Generated code is never committed (regenerate on need).
-java-binding-gen:
+java-binding-gen: (_protoc "jvm" PROTOC_JVM)
     rm -rf {{TOP}}/bindings/java/build/generated/proto/main/java
     cd {{TOP}} && buf generate --template bindings/java/buf.gen.yaml \
         --exclude-path angzarr-project/proto/google --exclude-path proto/google \
@@ -132,6 +190,10 @@ java-binding-test: java-binding-gen
 java-binding-lint: java-binding-gen
     cd {{TOP}}/bindings/java && gradle --no-daemon --console=plain spotlessCheck
 
+# Auto-format the Java binding (spotless; generated code excluded).
+java-binding-format: java-binding-gen
+    cd {{TOP}}/bindings/java && gradle --no-daemon --console=plain spotlessApply
+
 # --- C# binding (bindings/csharp) ----------------------------------------
 # Run in the C# image. P/Invoke loads the router-ffi cdylib, built in the rust
 # image and carried forward in target/debug (the host `build` step runs first);
@@ -142,7 +204,7 @@ java-binding-lint: java-binding-gen
 # materialize the shared behavioral features into the conformance project
 # (Reqnroll generates code-behind from them; canonical source is
 # conformance/features). google.* are excluded. Generated code is never committed.
-csharp-binding-gen:
+csharp-binding-gen: (_protoc "jvm" PROTOC_JVM)
     rm -rf {{TOP}}/bindings/csharp/gen
     cd {{TOP}} && buf generate --template bindings/csharp/buf.gen.yaml \
         --exclude-path angzarr-project/proto/google --exclude-path proto/google \
@@ -191,7 +253,8 @@ cpp-binding-test: cpp-binding-gen
 # Format check the C++ binding (clang-format; generated tree excluded).
 cpp-binding-lint:
     cd {{TOP}}/bindings/cpp && clang-format --dry-run --Werror \
-        include/angzarr/router/*.h src/*.cpp conformance/*.h conformance/*.cpp
+        include/angzarr/router/*.h src/*.cpp conformance/*.h conformance/*.cpp \
+        tests/*.h tests/*.cpp
 
 # --- TypeScript binding (bindings/typescript) ----------------------------
 # Run in the TypeScript image. The binding loads the router-ffi cdylib (built in
@@ -202,21 +265,22 @@ cpp-binding-lint:
 
 ts-binding-gen:
     rm -rf {{TOP}}/bindings/typescript/gen
+    cd {{TOP}}/bindings/typescript && npm ci
     cd {{TOP}} && buf generate --template bindings/typescript/buf.gen.yaml \
         --exclude-path angzarr-project/proto/io/angzarr/examples
 
 ts-binding-build: ts-binding-gen
-    cd {{TOP}}/bindings/typescript && npm ci
 
 ts-binding-test: ts-binding-gen
-    cd {{TOP}}/bindings/typescript && npm ci
     cd {{TOP}}/bindings/typescript && \
         ANGZARR_ROUTER_LIB={{TOP}}/target/debug/libangzarr_router_ffi.so \
         NODE_OPTIONS="--import tsx" npx cucumber-js
 
-# Format check the TS binding (prettier; generated tree + node_modules excluded).
-ts-binding-lint:
+# Format check (prettier; generated tree + node_modules excluded) and type-check
+# (tsc) the TS binding.
+ts-binding-lint: ts-binding-gen
     cd {{TOP}}/bindings/typescript && prettier --check "src/**/*.ts" "conformance/**/*.ts" "*.mjs"
+    cd {{TOP}}/bindings/typescript && npx tsc --noEmit -p tsconfig.json
 
 # Auto-format the TS binding (prettier).
 ts-binding-format:

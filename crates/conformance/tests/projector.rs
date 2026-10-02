@@ -12,11 +12,13 @@ use cucumber::{given, then, when, World};
 struct ProjectorWorld {
     /// Outcome of the dispatched delivery.
     result: Option<Result<pb::Projection, CodedError>>,
+    /// The projector's declared domains.
+    domains: Vec<&'static str>,
 }
 
 impl ProjectorWorld {
     fn dispatch(&mut self, book: pb::EventBook) {
-        self.result = Some(conf::counter_projector().dispatch(&book));
+        self.result = Some(conf::counter_projector(&self.domains).dispatch(&book));
     }
 
     fn projection(&self) -> &pb::Projection {
@@ -29,8 +31,13 @@ impl ProjectorWorld {
 }
 
 #[given("a counter projection")]
-async fn a_counter_projection(_w: &mut ProjectorWorld) {
-    // Each dispatch builds a fresh projector; nothing to seed.
+async fn a_counter_projection(w: &mut ProjectorWorld) {
+    w.domains = vec!["counter"];
+}
+
+#[given("a counter projection over every domain")]
+async fn a_counter_projection_over_every_domain(w: &mut ProjectorWorld) {
+    w.domains = vec![angzarr_router::WILDCARD_DOMAIN];
 }
 
 #[when(regex = r#"^(\d+) events are delivered in domain "([^"]*)"$"#)]

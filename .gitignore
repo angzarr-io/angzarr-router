@@ -7,6 +7,9 @@ mutants.out*
 # container-overlay cargo home (host-delegation runs)
 /.cargo-container/
 
+# pinned codegen toolchain (protoc releases, the angzarr CLI); justfile.container
+/.tools/
+
 # ctxloom private working state (synced bundles, session/context, project id)
 *.ctxloom.bak
 .agents/

@@ -14,6 +14,9 @@ export const CODE_UNHANDLED_HANDLER_ERROR = "UNHANDLED_HANDLER_ERROR";
 // The code an Any-decode failure carries.
 export const CODE_ANY_DECODE_FAILED = "ANY_DECODE_FAILED";
 
+// The code a dispatch or registration on a closed router fails with.
+export const CODE_ROUTER_CLOSED = "ROUTER_CLOSED";
+
 /**
  * A stable cross-language coded failure. A handler throws one (via
  * {@link reject}) to fail a command with a code like `VALUE_NOT_POSITIVE`; the
@@ -55,6 +58,15 @@ export function anyDecodeError(typeUrl: string, cause: unknown): CodedError {
     `decode Any ${typeUrl}: ${reason}`,
     GrpcCode.InvalidArgument,
     { type_url: typeUrl },
+  );
+}
+
+/** A dispatch or registration on a router whose native router was released. */
+export function routerClosed(): CodedError {
+  return new CodedError(
+    CODE_ROUTER_CLOSED,
+    "router is closed",
+    GrpcCode.FailedPrecondition,
   );
 }
 

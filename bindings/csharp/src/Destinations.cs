@@ -4,51 +4,26 @@ using System.Linq;
 namespace Angzarr.Router;
 
 /// <summary>
-/// The coordinator-supplied next-sequences for command stamping. Sagas and
-/// process managers are translators — they stamp emitted commands, they do not
-/// rebuild destination state to make decisions.
+/// The output domains a saga or process manager declares (its command targets).
+/// Emitted commands are deferred: they carry no destination sequence, and the
+/// router stamps their <c>angzarr_deferred</c> provenance from the triggering
+/// page, so a handler never stamps a command and never needs destination state.
 /// </summary>
 public sealed class Destinations
 {
-    private readonly IReadOnlyDictionary<string, uint> _sequences;
+    private readonly IReadOnlyList<string> _domains;
 
-    /// <summary>Wraps a domain→next-sequence map (null becomes empty).</summary>
-    public Destinations(IReadOnlyDictionary<string, uint>? sequences)
+    /// <summary>The declared output domains, in declaration order (null becomes
+    /// none).</summary>
+    public Destinations(IEnumerable<string>? domains)
     {
-        _sequences = sequences ?? new Dictionary<string, uint>();
+        _domains = domains?.ToList() ?? new List<string>();
     }
 
-    /// <summary>Returns the next sequence for a domain, or null if none exists.</summary>
-    public uint? SequenceFor(string domain) =>
-        _sequences.TryGetValue(domain, out var seq) ? seq : null;
+    /// <summary>Reports whether <paramref name="domain"/> is a declared output
+    /// domain.</summary>
+    public bool Has(string domain) => _domains.Contains(domain);
 
-    /// <summary>Reports whether a sequence exists for the domain.</summary>
-    public bool Has(string domain) => _sequences.ContainsKey(domain);
-
-    /// <summary>Every domain carrying a sequence (unordered).</summary>
-    public IReadOnlyList<string> Domains() => _sequences.Keys.ToList();
-
-    /// <summary>
-    /// Returns a copy of <paramref name="cmd"/> with every page stamped with the
-    /// next sequence for <paramref name="domain"/>. A domain with no supplied
-    /// sequence is the coded <c>MISSING_DESTINATION_SEQUENCE</c>.
-    /// </summary>
-    public CommandBook StampCommand(CommandBook cmd, string domain)
-    {
-        if (!_sequences.TryGetValue(domain, out var seq))
-        {
-            throw new CodedError(
-                "MISSING_DESTINATION_SEQUENCE",
-                "no sequence for destination domain",
-                GrpcCode.InvalidArgument,
-                new Dictionary<string, string> { ["domain"] = domain }
-            );
-        }
-        var book = cmd.Clone();
-        foreach (var page in book.Pages)
-        {
-            page.Header = new PageHeader { Sequence = seq };
-        }
-        return book;
-    }
+    /// <summary>The declared output domains, in declaration order.</summary>
+    public IReadOnlyList<string> Domains() => _domains;
 }

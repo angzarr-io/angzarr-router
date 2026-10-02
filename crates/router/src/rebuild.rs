@@ -5,13 +5,36 @@ use std::collections::HashMap;
 
 use prost_types::Any;
 
-use crate::error::CodedError;
+use crate::error::{codes, extras, map_handler_error, messages, CodedError, HandlerError};
 use crate::pb;
+use crate::PageContext;
 
-/// Folds one event payload into state. Generated/binding thunks unmarshal
-/// to the typed event and call the pure typed applier; decode errors
-/// surface here so the engine can classify them.
-pub type ApplierFn<S> =
+/// Folds one event payload into state, seeing where the event sits.
+/// Generated/binding thunks unmarshal to the typed event and call the pure
+/// typed applier; decode errors surface here so the engine can classify them.
+pub type ApplierFn<S> = Box<
+    dyn for<'a> Fn(
+            &mut S,
+            &Any,
+            &PageContext<'a>,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+        + Send
+        + Sync,
+>;
+
+/// Packs replayed state into the `Any` a `ReplayResponse` carries.
+pub type StatePackFn<S> = Box<dyn Fn(&S) -> Result<Any, HandlerError> + Send + Sync>;
+
+/// Packs a protobuf-message state under its fully-qualified name.
+pub fn pack_message_state<S: prost::Message + prost::Name>(state: &S) -> Result<Any, HandlerError> {
+    Ok(Any {
+        type_url: crate::type_url(&S::full_name()),
+        value: state.encode_to_vec(),
+    })
+}
+
+/// Loads snapshot state into fresh state.
+pub type SnapshotFn<S> =
     Box<dyn Fn(&mut S, &Any) -> Result<(), Box<dyn std::error::Error + Send + Sync>> + Send + Sync>;
 
 /// What the rebuild consumed.
@@ -33,7 +56,7 @@ pub struct RebuildInfo {
 /// applier are skipped: not every event folds into state.
 pub struct Rebuilder<S> {
     factory: Box<dyn Fn() -> S + Send + Sync>,
-    snapshot: Option<ApplierFn<S>>,
+    snapshot: Option<SnapshotFn<S>>,
     appliers: HashMap<String, ApplierFn<S>>,
 }
 
@@ -56,6 +79,27 @@ impl<S> Rebuilder<S> {
             + Sync
             + 'static,
     ) -> Self {
+        self.appliers.insert(
+            full_name.to_string(),
+            Box::new(move |state, any, _ctx| thunk(state, any)),
+        );
+        self
+    }
+
+    /// Registers an applier that also sees the page's context (the book's
+    /// cover and the page's explicit sequence).
+    pub fn apply_with_context(
+        mut self,
+        full_name: &str,
+        thunk: impl for<'a> Fn(
+                &mut S,
+                &Any,
+                &PageContext<'a>,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
         self.appliers.insert(full_name.to_string(), Box::new(thunk));
         self
     }
@@ -72,6 +116,39 @@ impl<S> Rebuilder<S> {
         self
     }
 
+    /// `Replay`: the state after folding the base snapshot (when present)
+    /// and then the events, in order.
+    pub fn replay(&self, req: &pb::ReplayRequest) -> Result<S, CodedError> {
+        let book = pb::EventBook {
+            snapshot: req.base_snapshot.clone(),
+            pages: req.events.clone(),
+            ..Default::default()
+        };
+        Ok(self.rebuild(Some(&book))?.0)
+    }
+
+    /// [`Self::replay`] packed by `packer` into a `ReplayResponse`. A
+    /// component with no packer does not support Replay
+    /// (NO_HANDLER_REGISTERED, with its `domain`).
+    pub fn packed_replay(
+        &self,
+        packer: Option<&StatePackFn<S>>,
+        domain: &str,
+        req: &pb::ReplayRequest,
+    ) -> Result<pb::ReplayResponse, CodedError> {
+        let Some(packer) = packer else {
+            return Err(CodedError::invalid_argument(
+                codes::NO_HANDLER_REGISTERED,
+                messages::REPLAY_UNSUPPORTED,
+                [(extras::DOMAIN.to_string(), domain.to_string())],
+            ));
+        };
+        let state = self.replay(req)?;
+        Ok(pb::ReplayResponse {
+            state: Some(packer(&state).map_err(map_handler_error)?),
+        })
+    }
+
     /// Folds the book into fresh state. An absent book normalizes to an
     /// empty one (fresh state, no prior events) — callers never need
     /// their own guard.
@@ -83,6 +160,11 @@ impl<S> Rebuilder<S> {
         };
         info.had_prior_events = !book.pages.is_empty() || book.snapshot.is_some();
 
+        // Pages a LOADED snapshot already folded must not re-apply — their
+        // effects are in the snapshot state; double-folding corrupts it. A
+        // snapshot that did not load (no loader, no state) covers nothing, and a
+        // page without an explicit sequence is never provably covered.
+        let mut covered_through: Option<u32> = None;
         if let Some(snapshot) = book.snapshot.as_ref() {
             if let (Some(snap_state), Some(loader)) =
                 (snapshot.state.as_ref(), self.snapshot.as_ref())
@@ -90,19 +172,18 @@ impl<S> Rebuilder<S> {
                 if loader(&mut state, snap_state).is_err() {
                     return Err(CodedError::persisted_corrupt(&snap_state.type_url));
                 }
+                covered_through = Some(snapshot.sequence);
             }
         }
-
-        // Pages already folded into the snapshot must not re-apply — their
-        // effects are in the snapshot state; double-folding corrupts it.
-        let covered_through = book.snapshot.as_ref().map_or(0, |s| s.sequence);
 
         for page in &book.pages {
             let Some(event) = crate::page_event(page) else {
                 continue;
             };
-            if covered_through > 0 && crate::page_sequence(page) <= covered_through {
-                continue;
+            if let (Some(covered), Some(seq)) = (covered_through, explicit_sequence(page)) {
+                if seq <= covered {
+                    continue;
+                }
             }
             let Some(thunk) = self
                 .appliers
@@ -110,12 +191,52 @@ impl<S> Rebuilder<S> {
             else {
                 continue;
             };
-            if thunk(&mut state, event).is_err() {
+            let ctx = PageContext {
+                cover: book.cover.as_ref(),
+                sequence: crate::page_sequence(page),
+            };
+            if thunk(&mut state, event, &ctx).is_err() {
                 return Err(CodedError::persisted_corrupt(&event.type_url));
             }
             info.applied_count += 1;
         }
         Ok((state, info))
+    }
+}
+
+impl<S> Rebuilder<S> {
+    /// Folds one page of a book with `cover` into `state` through its applier,
+    /// returning whether an applier ran. A page with no event or an unapplied type is skipped; a
+    /// corrupt payload is PERSISTED_EVENT_CORRUPT.
+    pub fn apply_page(
+        &self,
+        state: &mut S,
+        page: &pb::EventPage,
+        cover: Option<&pb::Cover>,
+    ) -> Result<bool, CodedError> {
+        let Some(event) = crate::page_event(page) else {
+            return Ok(false);
+        };
+        let Some(thunk) = self
+            .appliers
+            .get(crate::type_name_from_url(&event.type_url))
+        else {
+            return Ok(false);
+        };
+        let ctx = PageContext {
+            cover,
+            sequence: crate::page_sequence(page),
+        };
+        thunk(state, event, &ctx).map_err(|_| CodedError::persisted_corrupt(&event.type_url))?;
+        Ok(true)
+    }
+}
+
+/// The page's explicit header sequence, when it carries one.
+fn explicit_sequence(page: &pb::EventPage) -> Option<u32> {
+    match page.header.as_ref()?.sequence_type.as_ref()? {
+        pb::page_header::SequenceType::Sequence(seq) => Some(*seq),
+        _ => None,
     }
 }
 

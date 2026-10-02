@@ -36,7 +36,8 @@ class CounterFixture : public tc::CounterAggregateHandler {
   pb::EventBook FailHard(const tc::FailHard&, tc::CounterState&, const CommandContext&) override {
     throw std::runtime_error("hard failure");
   }
-  void ApplyIncreased(tc::CounterState& state, const tc::Increased&) override {
+  void ApplyIncreased(tc::CounterState& state, const tc::Increased&,
+                      const angzarr::router::PageContext&) override {
     state.set_count(state.count() + 1);
   }
   pb::BusinessResponse OnReserveRejected(const pb::Notification&, const pb::RejectionNotification&,
@@ -74,15 +75,17 @@ struct CounterWorld {
   }
 };
 
-std::string FqFromUrl(const std::string& url) {
-  const auto i = url.rfind('/');
-  return i == std::string::npos ? url : url.substr(i + 1);
-}
-
 void Register(StepRegistry& r, CounterWorld& w) {
   r.On("a new counter", [&w](const StepArgs&) { w.prior.reset(); });
   r.On("a counter that has already recorded {int} increase(s)",
        [&w](const StepArgs& a) { w.prior = PriorIncreases(std::stoi(a[0])); });
+  r.On("a counter that has already recorded {int} increases under the {string} type-URL prefix",
+       [&w](const StepArgs& a) {
+         pb::ContextualCommand carrier;
+         if (auto prior = PriorIncreases(std::stoi(a[0]))) *carrier.mutable_events() = *prior;
+         carrier = WithTypeUrlPrefix(carrier, a[1]);
+         w.prior = carrier.has_events() ? std::optional(carrier.events()) : std::nullopt;
+       });
   r.On("a counter whose history holds a corrupt event",
        [&w](const StepArgs&) { w.prior = CorruptHistory(); });
   r.On("a counter restored from a snapshot of 10 with one newer event",
@@ -92,6 +95,10 @@ void Register(StepRegistry& r, CounterWorld& w) {
        [&w](const StepArgs& a) { w.Dispatch(IncreaseCommand(std::stoi(a[0]))); });
   r.On("the operator increases the counter by {int} on behalf of a parent",
        [&w](const StepArgs& a) { w.Dispatch(IncreaseCommandWithLinkage(std::stoi(a[0]))); });
+  r.On("the operator increases the counter by {int} under the {string} type-URL prefix",
+       [&w](const StepArgs& a) {
+         w.Dispatch(WithTypeUrlPrefix(IncreaseCommand(std::stoi(a[0])), a[1]));
+       });
   r.On("the operator triggers a hard failure",
        [&w](const StepArgs&) { w.Dispatch(FailHardCommand()); });
   r.On("an unhandled command is dispatched",
@@ -135,6 +142,12 @@ void Register(StepRegistry& r, CounterWorld& w) {
     REQUIRE(w.resp.has_value());
     REQUIRE(w.resp->events().cover().ext().SerializeAsString() ==
             ParentLinkage().SerializeAsString());
+  });
+  r.On("the recorded events carry no parent linkage", [&w](const StepArgs&) {
+    REQUIRE_FALSE(w.err.has_value());
+    REQUIRE(w.resp.has_value());
+    REQUIRE(w.resp->events().pages_size() > 0);
+    REQUIRE_FALSE(w.resp->events().cover().has_ext());
   });
   r.On("the compensations run first then second", [&w](const StepArgs&) {
     REQUIRE_FALSE(w.err.has_value());

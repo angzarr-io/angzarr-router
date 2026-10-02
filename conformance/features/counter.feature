@@ -2,8 +2,9 @@ Feature: Counter aggregate dispatch
 
   The CounterAggregate proves the dispatch mechanisms the shared router must
   implement identically in every language: prior events fold into state,
-  commands emit events with historical context, business rules reject, and
-  unclassified or misrouted commands surface as coded errors.
+  commands emit events with historical context and the command's parent
+  linkage (cover.ext, fill-only), business rules reject, and unclassified or
+  misrouted commands surface as coded errors.
 
   Scenario Outline: increasing a new counter records that many events
     Given a new counter
@@ -59,6 +60,11 @@ Feature: Counter aggregate dispatch
     When the operator increases the counter by 1 on behalf of a parent
     Then the recorded events carry the parent linkage
 
+  Scenario: events emitted without a parent carry no linkage
+    Given a new counter
+    When the operator increases the counter by 1
+    Then the recorded events carry no parent linkage
+
   Scenario: a rejected command runs its compensators in registration order
     Given a new counter
     When a Reserve command is rejected
@@ -83,3 +89,14 @@ Feature: Counter aggregate dispatch
     Given a counter restored from a snapshot of 10 with one newer event
     When the operator increases the counter by 1
     Then the handler saw a counter of 11, at next sequence 12
+
+  Scenario Outline: commands and events route by fully-qualified name under any type-URL prefix
+    Given a counter that has already recorded 2 increases under the "<prefix>" type-URL prefix
+    When the operator increases the counter by 1 under the "<prefix>" type-URL prefix
+    Then the handler saw a counter of 2, at next sequence 2
+
+    Examples:
+      | prefix               |
+      | type.googleapis.com/ |
+      | /                    |
+      | example.com/types/   |

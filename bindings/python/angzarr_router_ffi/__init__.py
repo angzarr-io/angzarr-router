@@ -7,17 +7,24 @@ linked cgo) so the ABI is exercised two ways before it freezes (plan §4).
 Public surface (engine-shaped, so the unit-6 generator targets it):
 
     from angzarr_router_ffi import (
-        Router, AggregateDispatch, Rebuilder,
-        CommandContext, CodedError, reject, GrpcCode, abi_version,
+        Router, AggregateDispatch, Rebuilder, ProjectorDispatch,
+        SagaDispatch, ProcessManagerDispatch, Destinations,
+        CommandContext, FactRecord, PageContext, current_cover, current_page,
+        CodedError, reject, GrpcCode, abi_version, AbiVersionError,
+        WILDCARD_DOMAIN,
     )
 """
 
+from ._abi import AbiVersionError
 from ._dispatch import (
+    WILDCARD_DOMAIN,
     AggregateDispatch,
     CodedError,
     CommandContext,
     Destinations,
+    FactRecord,
     GrpcCode,
+    PageContext,
     ProcessManagerDispatch,
     ProjectorDispatch,
     Rebuilder,
@@ -25,16 +32,22 @@ from ._dispatch import (
     SagaDispatch,
     abi_version,
     any_decode_error,
+    current_cover,
+    current_page,
     pack,
     reject,
 )
 
 __all__ = [
+    "WILDCARD_DOMAIN",
+    "AbiVersionError",
     "AggregateDispatch",
     "CodedError",
     "CommandContext",
     "Destinations",
+    "FactRecord",
     "GrpcCode",
+    "PageContext",
     "ProcessManagerDispatch",
     "ProjectorDispatch",
     "Rebuilder",
@@ -42,6 +55,8 @@ __all__ = [
     "SagaDispatch",
     "abi_version",
     "any_decode_error",
+    "current_cover",
+    "current_page",
     "pack",
     "reject",
 ]

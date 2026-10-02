@@ -26,7 +26,6 @@ public class ProjectorSteps {
   @Before
   public void before() {
     router = new Router();
-    CounterProjectorAngzarr.registerCounterProjector(router, new ProjectorFixture());
     proj = null;
     err = null;
   }
@@ -50,7 +49,14 @@ public class ProjectorSteps {
 
   @Given("a counter projection")
   public void aCounterProjection() {
-    // The fixture is registered in @Before.
+    CounterProjectorAngzarr.registerCounterProjector(router, new ProjectorFixture());
+  }
+
+  @Given("a counter projection over every domain")
+  public void aCounterProjectionOverEveryDomain() {
+    router.registerProjector(
+        CounterProjectorAngzarr.newCounterProjectorDispatch(new ProjectorFixture())
+            .forDomains("*"));
   }
 
   @When("{int} events are delivered in domain {string}")

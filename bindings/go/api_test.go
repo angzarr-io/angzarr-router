@@ -2,6 +2,8 @@ package ffirouter
 
 import (
 	"errors"
+	"reflect"
+	"strings"
 	"testing"
 
 	pb "github.com/angzarr-io/angzarr-router/bindings/go/gen/io/angzarr/v1"
@@ -27,5 +29,58 @@ func TestAnyDecodeError_IsInvalidArgumentWithTypeURL(t *testing.T) {
 	}
 	if err.Extras["type_url"] != "/io.angzarr.v1.Notification" {
 		t.Errorf("Extras[type_url] = %q, want the type URL", err.Extras["type_url"])
+	}
+}
+
+func TestCheckAbiVersion_AcceptsTheExpectedVersion(t *testing.T) {
+	if err := checkAbiVersion(ExpectedAbiVersion); err != nil {
+		t.Fatalf("checkAbiVersion(%d) = %v, want nil", ExpectedAbiVersion, err)
+	}
+}
+
+func TestCheckAbiVersion_RefusesADriftedLibraryNamingBothVersions(t *testing.T) {
+	err := checkAbiVersion(ExpectedAbiVersion + 1)
+	if err == nil {
+		t.Fatal("checkAbiVersion accepted a mismatched ABI version")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "expects ABI version 3") || !strings.Contains(msg, "reports ABI version 4") {
+		t.Errorf("error %q does not name expected (3) and actual (4) versions", msg)
+	}
+}
+
+func TestDestinations_AreTheDeclaredOutputDomains(t *testing.T) {
+	d := NewDestinations("inventory", "billing")
+	if !d.Has("inventory") || !d.Has("billing") {
+		t.Errorf("Has(declared) = false; domains %v", d.Domains())
+	}
+	if d.Has("shipping") {
+		t.Error("Has(undeclared shipping) = true, want false")
+	}
+	got := d.Domains()
+	if len(got) != 2 || got[0] != "inventory" || got[1] != "billing" {
+		t.Errorf("Domains() = %v, want [inventory billing] in declaration order", got)
+	}
+}
+
+func TestDestinations_EmptyDeclaresNothing(t *testing.T) {
+	d := NewDestinations()
+	if d.Has("") || len(d.Domains()) != 0 {
+		t.Errorf("empty Destinations = %v, want none", d.Domains())
+	}
+}
+
+// A saga receives no rejections, so its API offers no way to declare a
+// rejection handler (C-0484); compensation belongs to the issuing aggregate
+// or process manager.
+func TestSagaDispatch_CannotDeclareARejectionHandler(t *testing.T) {
+	saga := reflect.TypeOf(&SagaDispatch{})
+	for i := 0; i < saga.NumMethod(); i++ {
+		if name := saga.Method(i).Name; strings.Contains(name, "Reject") {
+			t.Errorf("SagaDispatch.%s declares a rejection handler", name)
+		}
+	}
+	if _, ok := saga.MethodByName("OnEvent"); !ok {
+		t.Fatal("the method listing is not SagaDispatch's")
 	}
 }

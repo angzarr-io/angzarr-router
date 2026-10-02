@@ -16,7 +16,7 @@ public sealed class ProjectorDispatch<TState>
     internal readonly string Name;
     internal readonly Func<TState> Factory;
     internal IReadOnlyList<string> Domains = Array.Empty<string>();
-    internal readonly Dictionary<string, ProjectorEventThunk<TState>> Events = new();
+    internal readonly Dictionary<string, ProjectorPageThunk<TState>> Events = new();
     internal ProjectorFinishThunk<TState>? FinishThunk;
     internal ProjectorUnknownThunk? Unknown;
 
@@ -34,7 +34,12 @@ public sealed class ProjectorDispatch<TState>
     }
 
     /// <summary>Registers the fold thunk for a fully-qualified event type.</summary>
-    public ProjectorDispatch<TState> OnEvent(string fullName, ProjectorEventThunk<TState> thunk)
+    public ProjectorDispatch<TState> OnEvent(string fullName, ProjectorEventThunk<TState> thunk) =>
+        OnEvent(fullName, (projection, ev, _) => thunk(projection, ev));
+
+    /// <summary>Registers the fold thunk for a fully-qualified event type; the
+    /// thunk also reads where each event sits (<see cref="PageContext"/>).</summary>
+    public ProjectorDispatch<TState> OnEvent(string fullName, ProjectorPageThunk<TState> thunk)
     {
         Events[fullName] = thunk;
         return this;

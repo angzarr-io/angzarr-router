@@ -19,23 +19,51 @@ namespace Angzarr.Router;
 /// the generated wiring and handler thunks are statically typed. The one
 /// unavoidable erasing cast — the FFI registry is keyed by an opaque
 /// callback_id, not a type — lives in the invoker adapters below
-/// (<c>(TState)session.EnsureState(...)</c>), guaranteed correct because the same
-/// factory produces the state.</para>
+/// (<c>(TState)session.EnsureState(component, ...)</c>). It is guaranteed correct
+/// because each registration mints its own <see cref="ComponentKey"/> that only
+/// that component's invokers capture, and the session creates the state for a
+/// key from that component's own factory.</para>
 /// </summary>
 public sealed class Router : IDisposable
 {
-    private readonly IntPtr _ptr;
+    private readonly RouterHandle _handle;
     private readonly ConcurrentDictionary<ulong, Invoker> _registry = new();
     private readonly object _lock = new();
     private long _nextId;
 
-    public Router() => _ptr = Ffi.RouterNew();
+    public Router()
+    {
+        _handle = Ffi.RouterNew();
+        if (_handle.IsInvalid)
+        {
+            throw new InvalidOperationException("angzarr_router_new returned null");
+        }
+    }
 
-    /// <summary>The ABI version the loaded cdylib reports (always 1 for a
-    /// compatible lib).</summary>
-    public static int AbiVersion() => 1;
+    /// <summary>The router-ffi ABI version this binding requires; a loaded
+    /// library reporting any other version is refused at load.</summary>
+    public const int ExpectedAbiVersion = (int)Ffi.ExpectedAbiVersion;
 
-    public void Dispose() => Ffi.RouterFree(_ptr);
+    /// <summary>The ABI version the loaded router-ffi library reports.</summary>
+    public static int AbiVersion() => (int)Ffi.AbiVersion();
+
+    /// <summary>True once <see cref="Dispose"/> has released the native
+    /// router.</summary>
+    public bool IsDisposed => _handle.IsClosed;
+
+    /// <summary>Releases the native router. Idempotent; registering or
+    /// dispatching afterwards throws <see cref="ObjectDisposedException"/>. A
+    /// router never disposed is released by its handle's finalizer.</summary>
+    public void Dispose() => _handle.Dispose();
+
+    private RouterHandle Handle()
+    {
+        if (_handle.IsClosed)
+        {
+            throw new ObjectDisposedException(nameof(Router));
+        }
+        return _handle;
+    }
 
     internal Invoker? InvokerFor(ulong callbackId) =>
         _registry.TryGetValue(callbackId, out var inv) ? inv : null;
@@ -54,30 +82,46 @@ public sealed class Router : IDisposable
     {
         lock (_lock)
         {
+            var component = new ComponentKey();
             var factory = d.Rebuilder.Factory;
             var desc = new Abi.AggregateDescriptor { Name = d.Name, Domain = d.Domain };
             foreach (var (key, thunk) in d.Rebuilder.Appliers)
             {
-                desc.Appliers.Add(CallbackEntry(key, Assign(ApplierInvoker(factory, thunk))));
+                desc.Appliers.Add(
+                    CallbackEntry(key, Assign(ApplierInvoker(component, factory, thunk)))
+                );
             }
             if (d.Rebuilder.Snapshot != null)
             {
-                desc.SnapshotCallbackId = Assign(ApplierInvoker(factory, d.Rebuilder.Snapshot));
+                desc.SnapshotCallbackId = Assign(
+                    SnapshotInvoker(component, factory, d.Rebuilder.Snapshot)
+                );
             }
             foreach (var (key, thunk) in d.Commands)
             {
-                desc.Commands.Add(CallbackEntry(key, Assign(CommandInvoker(factory, thunk))));
+                desc.Commands.Add(
+                    CallbackEntry(key, Assign(CommandInvoker(component, factory, thunk)))
+                );
             }
-            foreach (var (cmd, thunks) in d.Rejections)
+            foreach (var (compensates, thunks) in d.Rejections)
             {
-                var entry = new Abi.RejectionEntry { FqCommandType = cmd };
+                var entry = new Abi.RejectionEntry { Compensates = compensates };
                 foreach (var thunk in thunks)
                 {
-                    entry.CallbackIds.Add(Assign(RejectionInvoker(factory, thunk)));
+                    entry.CallbackIds.Add(Assign(RejectionInvoker(component, factory, thunk)));
                 }
                 desc.Rejections.Add(entry);
             }
-            Check(Ffi.RegisterAggregate(_ptr, desc.ToByteArray()));
+            foreach (var (key, thunk) in d.Undoes)
+            {
+                desc.Undoes.Add(CallbackEntry(key, Assign(UndoInvoker(component, factory, thunk))));
+            }
+            foreach (var (key, thunk) in d.Facts)
+            {
+                desc.Facts.Add(CallbackEntry(key, Assign(FactInvoker(component, factory, thunk))));
+            }
+            desc.StateCallbackId = Assign(StateInvoker(component, factory));
+            Check(Ffi.RegisterAggregate(Handle(), desc.ToByteArray()));
         }
     }
 
@@ -86,12 +130,15 @@ public sealed class Router : IDisposable
     {
         lock (_lock)
         {
+            var component = new ComponentKey();
             var factory = d.Factory;
             var desc = new Abi.ProjectorDescriptor { Name = d.Name };
             desc.Domains.AddRange(d.Domains);
             foreach (var (key, thunk) in d.Events)
             {
-                desc.Events.Add(CallbackEntry(key, Assign(ProjectorEventInvoker(factory, thunk))));
+                desc.Events.Add(
+                    CallbackEntry(key, Assign(ProjectorEventInvoker(component, factory, thunk)))
+                );
             }
             if (d.Unknown != null)
             {
@@ -99,9 +146,11 @@ public sealed class Router : IDisposable
             }
             if (d.FinishThunk != null)
             {
-                desc.FinishCallbackId = Assign(ProjectorFinishInvoker(factory, d.FinishThunk));
+                desc.FinishCallbackId = Assign(
+                    ProjectorFinishInvoker(component, factory, d.FinishThunk)
+                );
             }
-            Check(Ffi.RegisterProjector(_ptr, desc.ToByteArray()));
+            Check(Ffi.RegisterProjector(Handle(), desc.ToByteArray()));
         }
     }
 
@@ -111,20 +160,12 @@ public sealed class Router : IDisposable
         {
             var desc = new Abi.SagaDescriptor { Name = d.Name, InputDomain = d.InputDomain };
             desc.TargetDomains.AddRange(d.Targets);
+            var dests = new Destinations(d.Targets);
             foreach (var (key, thunk) in d.Events)
             {
-                desc.Events.Add(CallbackEntry(key, Assign(SagaEventInvoker(thunk))));
+                desc.Events.Add(CallbackEntry(key, Assign(SagaEventInvoker(dests, thunk))));
             }
-            foreach (var (cmd, thunks) in d.Rejections)
-            {
-                var entry = new Abi.RejectionEntry { FqCommandType = cmd };
-                foreach (var thunk in thunks)
-                {
-                    entry.CallbackIds.Add(Assign(SagaRejectionInvoker(thunk)));
-                }
-                desc.Rejections.Add(entry);
-            }
-            Check(Ffi.RegisterSaga(_ptr, desc.ToByteArray()));
+            Check(Ffi.RegisterSaga(Handle(), desc.ToByteArray()));
         }
     }
 
@@ -133,15 +174,22 @@ public sealed class Router : IDisposable
     {
         lock (_lock)
         {
+            var component = new ComponentKey();
             var factory = d.Rebuilder.Factory;
             var desc = new Abi.ProcessManagerDescriptor { Name = d.Name, PmDomain = d.PmDomain };
+            desc.TargetDomains.AddRange(d.Targets);
+            var dests = new Destinations(d.Targets);
             foreach (var (key, thunk) in d.Rebuilder.Appliers)
             {
-                desc.Appliers.Add(CallbackEntry(key, Assign(ApplierInvoker(factory, thunk))));
+                desc.Appliers.Add(
+                    CallbackEntry(key, Assign(ApplierInvoker(component, factory, thunk)))
+                );
             }
             if (d.Rebuilder.Snapshot != null)
             {
-                desc.SnapshotCallbackId = Assign(ApplierInvoker(factory, d.Rebuilder.Snapshot));
+                desc.SnapshotCallbackId = Assign(
+                    SnapshotInvoker(component, factory, d.Rebuilder.Snapshot)
+                );
             }
             foreach (var (sourceDomain, byType) in d.Handlers)
             {
@@ -152,21 +200,22 @@ public sealed class Router : IDisposable
                         {
                             InputDomain = sourceDomain,
                             FqType = fqType,
-                            CallbackId = Assign(PmEventInvoker(factory, thunk)),
+                            CallbackId = Assign(PmEventInvoker(component, factory, dests, thunk)),
                         }
                     );
                 }
             }
-            foreach (var (cmd, thunks) in d.Rejections)
+            foreach (var (compensates, thunks) in d.Rejections)
             {
-                var entry = new Abi.RejectionEntry { FqCommandType = cmd };
+                var entry = new Abi.RejectionEntry { Compensates = compensates };
                 foreach (var thunk in thunks)
                 {
-                    entry.CallbackIds.Add(Assign(PmRejectionInvoker(factory, thunk)));
+                    entry.CallbackIds.Add(Assign(PmRejectionInvoker(component, factory, thunk)));
                 }
                 desc.Rejections.Add(entry);
             }
-            Check(Ffi.RegisterProcessManager(_ptr, desc.ToByteArray()));
+            desc.StateCallbackId = Assign(StateInvoker(component, factory));
+            Check(Ffi.RegisterProcessManager(Handle(), desc.ToByteArray()));
         }
     }
 
@@ -201,15 +250,39 @@ public sealed class Router : IDisposable
             "ProcessManagerHandleResponse"
         );
 
+    /// <summary>Handles a FactRequest through the aggregate claiming the facts'
+    /// cover domain (a sole aggregate claims everything): each fact's handler
+    /// sees the state rebuilt from the prior events and the facts before it,
+    /// and returns the fact to record plus its flagging events. A fact of an
+    /// undeclared type refuses the request with NO_FACT_HANDLER. Returns the
+    /// EventBook of events to record.</summary>
+    public EventBook DispatchFact(FactRequest request) =>
+        Parse(DispatchVia(request, Ffi.DispatchFact), EventBook.Parser, "EventBook");
+
+    /// <summary>Replays a ReplayRequest (base snapshot, then events) through
+    /// the aggregate registered for <paramref name="domain"/>, else the process
+    /// manager whose own domain it is (empty selects a sole registered
+    /// aggregate), and returns its state packed as an Any.</summary>
+    public ReplayResponse DispatchReplay(string domain, ReplayRequest request) =>
+        Parse(
+            DispatchVia(
+                new Abi.ReplayCall { Domain = domain, Request = request },
+                Ffi.DispatchReplay
+            ),
+            ReplayResponse.Parser,
+            "ReplayResponse"
+        );
+
     private Ffi.Dispatched DispatchVia(
         IMessage request,
-        Func<IntPtr, IntPtr, byte[], Ffi.Dispatched> call
+        Func<RouterHandle, IntPtr, byte[], Ffi.Dispatched> call
     )
     {
+        var router = Handle();
         var handle = GCHandle.Alloc(new Session(this));
         try
         {
-            return call(_ptr, GCHandle.ToIntPtr(handle), request.ToByteArray());
+            return call(router, GCHandle.ToIntPtr(handle), request.ToByteArray());
         }
         finally
         {
@@ -239,31 +312,66 @@ public sealed class Router : IDisposable
     private static Any AnyOf(string typeUrl, byte[] payload) =>
         new() { TypeUrl = typeUrl, Value = ByteString.CopyFrom(payload) };
 
-    private static Destinations DestinationsOf(
-        Google.Protobuf.Collections.MapField<string, uint> seqs
-    ) => new(new Dictionary<string, uint>(seqs));
+    private static CommandContext ContextOf(Abi.CommandContextAux? cax) =>
+        cax == null
+            ? new CommandContext(0, false)
+            : new CommandContext(cax.NextSequence, cax.HadPriorEvents, cax.Cover);
 
-    private static Invoker ApplierInvoker<TState>(Func<TState> factory, ApplierThunk<TState> thunk)
+    private static PageContext PageOf(byte[] aux)
+    {
+        var pax = Abi.ProjectorEventAux.Parser.ParseFrom(aux);
+        return new PageContext(pax.Cover, pax.Sequence);
+    }
+
+    private static Invoker ApplierInvoker<TState>(
+        ComponentKey component,
+        Func<TState> factory,
+        ApplierPageThunk<TState> thunk
+    )
         where TState : class, IMessage =>
         (session, typeUrl, payload, aux) =>
         {
-            thunk((TState)session.EnsureState(factory), AnyOf(typeUrl, payload));
+            thunk(
+                (TState)session.EnsureState(component, factory),
+                AnyOf(typeUrl, payload),
+                PageOf(aux)
+            );
             return new InvokerResult(null, Ffi.StatusOk);
         };
 
-    private static Invoker CommandInvoker<TState>(Func<TState> factory, CommandThunk<TState> thunk)
+    private static Invoker SnapshotInvoker<TState>(
+        ComponentKey component,
+        Func<TState> factory,
+        ApplierThunk<TState> thunk
+    )
         where TState : class, IMessage =>
         (session, typeUrl, payload, aux) =>
         {
-            var cax = Abi.CommandContextAux.Parser.ParseFrom(aux);
-            var cctx = new CommandContext(cax.NextSequence, cax.HadPriorEvents);
-            var book = thunk(AnyOf(typeUrl, payload), (TState)session.EnsureState(factory), cctx);
+            thunk((TState)session.EnsureState(component, factory), AnyOf(typeUrl, payload));
+            return new InvokerResult(null, Ffi.StatusOk);
+        };
+
+    private static Invoker CommandInvoker<TState>(
+        ComponentKey component,
+        Func<TState> factory,
+        CommandThunk<TState> thunk
+    )
+        where TState : class, IMessage =>
+        (session, typeUrl, payload, aux) =>
+        {
+            var cctx = ContextOf(Abi.CommandContextAux.Parser.ParseFrom(aux));
+            var book = thunk(
+                AnyOf(typeUrl, payload),
+                (TState)session.EnsureState(component, factory),
+                cctx
+            );
             return book == null
                 ? new InvokerResult(null, Ffi.StatusOkEmpty)
                 : new InvokerResult(book.ToByteArray(), Ffi.StatusOk);
         };
 
     private static Invoker RejectionInvoker<TState>(
+        ComponentKey component,
         Func<TState> factory,
         RejectionThunk<TState> thunk
     )
@@ -273,28 +381,78 @@ public sealed class Router : IDisposable
             var rax = Abi.RejectionAux.Parser.ParseFrom(aux);
             var n = Notification.Parser.ParseFrom(rax.Notification);
             var rej = RejectionNotification.Parser.ParseFrom(rax.Rejection);
-            var cctx =
-                rax.Cctx != null
-                    ? new CommandContext(rax.Cctx.NextSequence, rax.Cctx.HadPriorEvents)
-                    : new CommandContext(0, false);
-            var resp = thunk(n, rej, (TState)session.EnsureState(factory), cctx);
+            var resp = thunk(
+                n,
+                rej,
+                (TState)session.EnsureState(component, factory),
+                ContextOf(rax.Cctx)
+            );
             return resp == null
                 ? new InvokerResult(null, Ffi.StatusOkEmpty)
                 : new InvokerResult(resp.ToByteArray(), Ffi.StatusOk);
         };
 
-    private static Invoker ProjectorEventInvoker<TState>(
+    private static Invoker UndoInvoker<TState>(
+        ComponentKey component,
         Func<TState> factory,
-        ProjectorEventThunk<TState> thunk
+        UndoThunk<TState> thunk
     )
         where TState : class, IMessage =>
         (session, typeUrl, payload, aux) =>
         {
-            thunk((TState)session.EnsureState(factory), AnyOf(typeUrl, payload));
+            var uax = Abi.UndoAux.Parser.ParseFrom(aux);
+            var resp = thunk(
+                Notification.Parser.ParseFrom(uax.Notification),
+                Compensate.Parser.ParseFrom(uax.Compensate),
+                (TState)session.EnsureState(component, factory),
+                ContextOf(uax.Cctx)
+            );
+            return resp == null
+                ? new InvokerResult(null, Ffi.StatusOkEmpty)
+                : new InvokerResult(resp.ToByteArray(), Ffi.StatusOk);
+        };
+
+    private static Invoker FactInvoker<TState>(
+        ComponentKey component,
+        Func<TState> factory,
+        FactThunk<TState> thunk
+    )
+        where TState : class, IMessage =>
+        (session, typeUrl, payload, aux) =>
+        {
+            var recorded =
+                thunk(AnyOf(typeUrl, payload), (TState)session.EnsureState(component, factory))
+                ?? throw new InvalidOperationException("a fact handler must return a FactRecord");
+            var reply = new Abi.FactRecord { Fact = recorded.Fact, Flags = { recorded.Flags } };
+            return new InvokerResult(reply.ToByteArray(), Ffi.StatusOk);
+        };
+
+    private static Invoker StateInvoker<TState>(ComponentKey component, Func<TState> factory)
+        where TState : class, IMessage =>
+        (session, typeUrl, payload, aux) =>
+            new InvokerResult(
+                Pack.Wrap(session.EnsureState(component, factory)).ToByteArray(),
+                Ffi.StatusOk
+            );
+
+    private static Invoker ProjectorEventInvoker<TState>(
+        ComponentKey component,
+        Func<TState> factory,
+        ProjectorPageThunk<TState> thunk
+    )
+        where TState : class, IMessage =>
+        (session, typeUrl, payload, aux) =>
+        {
+            thunk(
+                (TState)session.EnsureState(component, factory),
+                AnyOf(typeUrl, payload),
+                PageOf(aux)
+            );
             return new InvokerResult(null, Ffi.StatusOk);
         };
 
     private static Invoker ProjectorFinishInvoker<TState>(
+        ComponentKey component,
         Func<TState> factory,
         ProjectorFinishThunk<TState> thunk
     )
@@ -302,7 +460,7 @@ public sealed class Router : IDisposable
         (session, typeUrl, payload, aux) =>
         {
             var book = EventBook.Parser.ParseFrom(payload);
-            var proj = thunk((TState)session.EnsureState(factory), book);
+            var proj = thunk((TState)session.EnsureState(component, factory), book);
             return new InvokerResult(proj.ToByteArray(), Ffi.StatusOk);
         };
 
@@ -313,42 +471,41 @@ public sealed class Router : IDisposable
             return new InvokerResult(null, Ffi.StatusOk);
         };
 
-    private static Invoker SagaEventInvoker(SagaEventThunk thunk) =>
+    private static Invoker SagaEventInvoker(Destinations dests, SagaEventPageThunk thunk) =>
         (session, typeUrl, payload, aux) =>
         {
             var sax = Abi.SagaEventAux.Parser.ParseFrom(aux);
-            var dests = DestinationsOf(sax.DestinationSequences);
-            var emission = thunk(AnyOf(typeUrl, payload), dests, sax.SourceCover);
+            var source = new PageContext(sax.SourceCover, sax.SourceSeq);
+            var emission = thunk(AnyOf(typeUrl, payload), dests, source);
             var resp = new SagaResponse();
             resp.Commands.AddRange(emission.Commands);
             resp.Events.AddRange(emission.Events);
             return new InvokerResult(resp.ToByteArray(), Ffi.StatusOk);
         };
 
-    private static Invoker SagaRejectionInvoker(SagaRejectionThunk thunk) =>
-        (session, typeUrl, payload, aux) =>
-        {
-            var rax = Abi.RejectionAux.Parser.ParseFrom(aux);
-            var n = Notification.Parser.ParseFrom(rax.Notification);
-            var rej = RejectionNotification.Parser.ParseFrom(rax.Rejection);
-            var resp = new SagaResponse();
-            resp.Events.AddRange(thunk(n, rej));
-            return new InvokerResult(resp.ToByteArray(), Ffi.StatusOk);
-        };
-
-    private static Invoker PmEventInvoker<TState>(Func<TState> factory, PmEventThunk<TState> thunk)
+    private static Invoker PmEventInvoker<TState>(
+        ComponentKey component,
+        Func<TState> factory,
+        Destinations dests,
+        PmTriggerThunk<TState> thunk
+    )
         where TState : class, IMessage =>
         (session, typeUrl, payload, aux) =>
         {
             var pax = Abi.PmEventAux.Parser.ParseFrom(aux);
-            var dests = DestinationsOf(pax.DestinationSequences);
-            var resp = thunk(AnyOf(typeUrl, payload), (TState)session.EnsureState(factory), dests);
+            var resp = thunk(
+                AnyOf(typeUrl, payload),
+                (TState)session.EnsureState(component, factory),
+                dests,
+                pax.TriggerCover
+            );
             return new InvokerResult(resp.ToByteArray(), Ffi.StatusOk);
         };
 
     private static Invoker PmRejectionInvoker<TState>(
+        ComponentKey component,
         Func<TState> factory,
-        PmRejectionThunk<TState> thunk
+        PmCompensatorThunk<TState> thunk
     )
         where TState : class, IMessage =>
         (session, typeUrl, payload, aux) =>
@@ -356,13 +513,7 @@ public sealed class Router : IDisposable
             var rax = Abi.RejectionAux.Parser.ParseFrom(aux);
             var n = Notification.Parser.ParseFrom(rax.Notification);
             var rej = RejectionNotification.Parser.ParseFrom(rax.Rejection);
-            var r = thunk(n, rej, (TState)session.EnsureState(factory));
-            var resp = new ProcessManagerHandleResponse();
-            resp.ProcessEvents.AddRange(r.ProcessEvents);
-            if (r.Escalation != null)
-            {
-                resp.Notification = r.Escalation;
-            }
+            var resp = thunk(n, rej, (TState)session.EnsureState(component, factory));
             return new InvokerResult(resp.ToByteArray(), Ffi.StatusOk);
         };
 }

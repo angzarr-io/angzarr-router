@@ -16,7 +16,7 @@ internal struct AngzarrBuf
 }
 
 /// <summary>
-/// The raw C-ABI layer over the router-ffi cdylib, via P/Invoke. Holds the 11
+/// The raw C-ABI layer over the router-ffi cdylib, via P/Invoke. Holds the 15
 /// exported downcalls, the <see cref="AngzarrBuf"/> layout, and the single
 /// <c>[UnmanagedCallersOnly]</c> upcall trampoline the core calls for every host
 /// callback.
@@ -57,12 +57,27 @@ internal static unsafe class Ffi
     static Ffi()
     {
         NativeLibrary.SetDllImportResolver(typeof(Ffi).Assembly, Resolve);
-        var v = angzarr_abi_version();
-        if (v != 1)
+        CheckAbiVersion(angzarr_abi_version());
+    }
+
+    /// <summary>The router-ffi ABI version this binding is written against.</summary>
+    internal const uint ExpectedAbiVersion = 3;
+
+    /// <summary>Refuses a router-ffi library whose ABI version differs from
+    /// <see cref="ExpectedAbiVersion"/>.</summary>
+    internal static void CheckAbiVersion(uint actual)
+    {
+        if (actual != ExpectedAbiVersion)
         {
-            throw new InvalidOperationException($"router-ffi ABI version {v} != 1");
+            throw new InvalidOperationException(
+                $"router-ffi ABI version mismatch: expected {ExpectedAbiVersion}, "
+                    + $"loaded library reports {actual}"
+            );
         }
     }
+
+    /// <summary>The ABI version the loaded router-ffi library reports.</summary>
+    internal static uint AbiVersion() => angzarr_abi_version();
 
     private static IntPtr Resolve(
         string libraryName,
@@ -84,7 +99,7 @@ internal static unsafe class Ffi
         return NativeLibrary.Load(path);
     }
 
-    // --- the 11 downcalls ---------------------------------------------------
+    // --- the 15 downcalls ---------------------------------------------------
 
     [DllImport(Lib)]
     private static extern uint angzarr_abi_version();
@@ -96,14 +111,14 @@ internal static unsafe class Ffi
     private static extern void angzarr_buf_release(IntPtr ptr, nuint len);
 
     [DllImport(Lib)]
-    private static extern IntPtr angzarr_router_new();
+    private static extern RouterHandle angzarr_router_new();
 
     [DllImport(Lib)]
-    private static extern void angzarr_router_free(IntPtr r);
+    internal static extern void angzarr_router_free(IntPtr r);
 
     [DllImport(Lib)]
     private static extern int angzarr_router_register_aggregate(
-        IntPtr r,
+        RouterHandle r,
         byte* descriptor,
         nuint len,
         IntPtr cb
@@ -111,7 +126,7 @@ internal static unsafe class Ffi
 
     [DllImport(Lib)]
     private static extern int angzarr_router_register_projector(
-        IntPtr r,
+        RouterHandle r,
         byte* descriptor,
         nuint len,
         IntPtr cb
@@ -119,7 +134,7 @@ internal static unsafe class Ffi
 
     [DllImport(Lib)]
     private static extern int angzarr_router_register_saga(
-        IntPtr r,
+        RouterHandle r,
         byte* descriptor,
         nuint len,
         IntPtr cb
@@ -127,7 +142,7 @@ internal static unsafe class Ffi
 
     [DllImport(Lib)]
     private static extern int angzarr_router_register_process_manager(
-        IntPtr r,
+        RouterHandle r,
         byte* descriptor,
         nuint len,
         IntPtr cb
@@ -135,7 +150,7 @@ internal static unsafe class Ffi
 
     [DllImport(Lib)]
     private static extern int angzarr_router_dispatch(
-        IntPtr r,
+        RouterHandle r,
         IntPtr hostCtx,
         byte* request,
         nuint len,
@@ -144,7 +159,7 @@ internal static unsafe class Ffi
 
     [DllImport(Lib)]
     private static extern int angzarr_router_dispatch_projector(
-        IntPtr r,
+        RouterHandle r,
         IntPtr hostCtx,
         byte* request,
         nuint len,
@@ -153,7 +168,7 @@ internal static unsafe class Ffi
 
     [DllImport(Lib)]
     private static extern int angzarr_router_dispatch_saga(
-        IntPtr r,
+        RouterHandle r,
         IntPtr hostCtx,
         byte* request,
         nuint len,
@@ -162,7 +177,25 @@ internal static unsafe class Ffi
 
     [DllImport(Lib)]
     private static extern int angzarr_router_dispatch_process_manager(
-        IntPtr r,
+        RouterHandle r,
+        IntPtr hostCtx,
+        byte* request,
+        nuint len,
+        AngzarrBuf* outBuf
+    );
+
+    [DllImport(Lib)]
+    private static extern int angzarr_router_dispatch_fact(
+        RouterHandle r,
+        IntPtr hostCtx,
+        byte* request,
+        nuint len,
+        AngzarrBuf* outBuf
+    );
+
+    [DllImport(Lib)]
+    private static extern int angzarr_router_dispatch_replay(
+        RouterHandle r,
         IntPtr hostCtx,
         byte* request,
         nuint len,
@@ -171,13 +204,11 @@ internal static unsafe class Ffi
 
     // --- lifecycle ----------------------------------------------------------
 
-    internal static IntPtr RouterNew() => angzarr_router_new();
-
-    internal static void RouterFree(IntPtr r) => angzarr_router_free(r);
+    internal static RouterHandle RouterNew() => angzarr_router_new();
 
     // --- registration -------------------------------------------------------
 
-    internal static int RegisterAggregate(IntPtr r, byte[] descriptor)
+    internal static int RegisterAggregate(RouterHandle r, byte[] descriptor)
     {
         fixed (byte* p = descriptor)
         {
@@ -185,7 +216,7 @@ internal static unsafe class Ffi
         }
     }
 
-    internal static int RegisterProjector(IntPtr r, byte[] descriptor)
+    internal static int RegisterProjector(RouterHandle r, byte[] descriptor)
     {
         fixed (byte* p = descriptor)
         {
@@ -193,7 +224,7 @@ internal static unsafe class Ffi
         }
     }
 
-    internal static int RegisterSaga(IntPtr r, byte[] descriptor)
+    internal static int RegisterSaga(RouterHandle r, byte[] descriptor)
     {
         fixed (byte* p = descriptor)
         {
@@ -201,7 +232,7 @@ internal static unsafe class Ffi
         }
     }
 
-    internal static int RegisterProcessManager(IntPtr r, byte[] descriptor)
+    internal static int RegisterProcessManager(RouterHandle r, byte[] descriptor)
     {
         fixed (byte* p = descriptor)
         {
@@ -220,7 +251,7 @@ internal static unsafe class Ffi
     /// + status.</summary>
     internal readonly record struct Dispatched(byte[]? Response, int Status);
 
-    internal static Dispatched Dispatch(IntPtr r, IntPtr hostCtx, byte[] request)
+    internal static Dispatched Dispatch(RouterHandle r, IntPtr hostCtx, byte[] request)
     {
         AngzarrBuf outBuf = default;
         int ret;
@@ -231,7 +262,7 @@ internal static unsafe class Ffi
         return new Dispatched(ConsumeOut(&outBuf), ret);
     }
 
-    internal static Dispatched DispatchProjector(IntPtr r, IntPtr hostCtx, byte[] request)
+    internal static Dispatched DispatchProjector(RouterHandle r, IntPtr hostCtx, byte[] request)
     {
         AngzarrBuf outBuf = default;
         int ret;
@@ -242,7 +273,7 @@ internal static unsafe class Ffi
         return new Dispatched(ConsumeOut(&outBuf), ret);
     }
 
-    internal static Dispatched DispatchSaga(IntPtr r, IntPtr hostCtx, byte[] request)
+    internal static Dispatched DispatchSaga(RouterHandle r, IntPtr hostCtx, byte[] request)
     {
         AngzarrBuf outBuf = default;
         int ret;
@@ -253,7 +284,11 @@ internal static unsafe class Ffi
         return new Dispatched(ConsumeOut(&outBuf), ret);
     }
 
-    internal static Dispatched DispatchProcessManager(IntPtr r, IntPtr hostCtx, byte[] request)
+    internal static Dispatched DispatchProcessManager(
+        RouterHandle r,
+        IntPtr hostCtx,
+        byte[] request
+    )
     {
         AngzarrBuf outBuf = default;
         int ret;
@@ -266,6 +301,28 @@ internal static unsafe class Ffi
                 (nuint)request.Length,
                 &outBuf
             );
+        }
+        return new Dispatched(ConsumeOut(&outBuf), ret);
+    }
+
+    internal static Dispatched DispatchFact(RouterHandle r, IntPtr hostCtx, byte[] request)
+    {
+        AngzarrBuf outBuf = default;
+        int ret;
+        fixed (byte* p = request)
+        {
+            ret = angzarr_router_dispatch_fact(r, hostCtx, p, (nuint)request.Length, &outBuf);
+        }
+        return new Dispatched(ConsumeOut(&outBuf), ret);
+    }
+
+    internal static Dispatched DispatchReplay(RouterHandle r, IntPtr hostCtx, byte[] request)
+    {
+        AngzarrBuf outBuf = default;
+        int ret;
+        fixed (byte* p = request)
+        {
+            ret = angzarr_router_dispatch_replay(r, hostCtx, p, (nuint)request.Length, &outBuf);
         }
         return new Dispatched(ConsumeOut(&outBuf), ret);
     }
@@ -381,5 +438,26 @@ internal static unsafe class Ffi
         Marshal.Copy(outBuf->Data, bytes, 0, len);
         angzarr_buf_release(outBuf->Data, outBuf->Len);
         return bytes;
+    }
+}
+
+/// <summary>
+/// Owns one native router: released exactly once through
+/// <c>angzarr_router_free</c>, on <see cref="SafeHandle.Dispose()"/> or, for a
+/// router never disposed, by the runtime's critical finalizer. P/Invoke calls
+/// taking it hold a reference for the call's duration, so the native router is
+/// never freed while a downcall is using it.
+/// </summary>
+internal sealed class RouterHandle : SafeHandle
+{
+    public RouterHandle()
+        : base(IntPtr.Zero, ownsHandle: true) { }
+
+    public override bool IsInvalid => handle == IntPtr.Zero;
+
+    protected override bool ReleaseHandle()
+    {
+        Ffi.angzarr_router_free(handle);
+        return true;
     }
 }

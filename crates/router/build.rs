@@ -30,6 +30,7 @@ fn main() {
                 root.join("io/angzarr/v1/command_handler.proto"),
                 root.join("io/angzarr/v1/saga.proto"),
                 root.join("io/angzarr/v1/process_manager.proto"),
+                root.join("io/angzarr/v1/upcaster.proto"),
             ],
             &[root],
         )

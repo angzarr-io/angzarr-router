@@ -1,12 +1,11 @@
-//! SagaDispatch contracts, transliterated from client-go's engine.go
-//! SagaDispatch.Dispatch + features/saga.go (spec C-0050..C-0053, C-0042):
-//! a stateless translator that walks EVERY source page, emits commands
-//! (stamped from coordinator Destinations) and/or injected fact events for
-//! declared event types, routes Notification pages to ordered compensation
-//! thunks, skips undeclared events/rejections (DelegateToFramework), and
-//! fills the source correlation id onto emitted commands fill-only.
+//! SagaDispatch contracts (spec C-0050..C-0053, C-0177..C-0179): a
+//! stateless translator that walks EVERY source page, emits deferred
+//! commands (angzarr_deferred provenance from the triggering page, never an
+//! explicit sequence) and/or injected fact events for declared event types,
+//! skips undeclared events and Notification pages (sagas receive no
+//! rejections), and fills the source correlation id onto emitted commands
+//! fill-only.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use prost_types::Any;
@@ -15,7 +14,7 @@ use crate::error::{codes, HandlerError};
 use crate::pb;
 use crate::saga::SagaDispatch;
 use crate::test_support::{event_page, notification_page_for};
-use crate::{type_url, NOTIFICATION_TYPE_URL};
+use crate::type_url;
 
 const FQ_ORDER_CREATED: &str = "test.OrderCreated";
 const FQ_STOCK_RESERVED: &str = "test.StockReserved";
@@ -23,11 +22,10 @@ const FQ_RESERVE_STOCK: &str = "test.ReserveStock";
 
 // --- fixtures -------------------------------------------------------------
 
-/// A SagaHandleRequest over an optional source book and a destination map.
-fn request(source: Option<pb::EventBook>, dest: &[(&str, u32)]) -> pb::SagaHandleRequest {
+/// A SagaHandleRequest over an optional source book.
+fn request(source: Option<pb::EventBook>) -> pb::SagaHandleRequest {
     pb::SagaHandleRequest {
         source,
-        destination_sequences: dest.iter().map(|(d, s)| (d.to_string(), *s)).collect(),
         ..Default::default()
     }
 }
@@ -89,11 +87,20 @@ fn cmd_to<'a>(resp: &'a pb::SagaResponse, domain: &str) -> &'a pb::CommandBook {
         .unwrap_or_else(|| panic!("no command targets {domain}"))
 }
 
-fn cmd_page_seq(page: &pb::CommandPage) -> Option<u32> {
+fn cmd_page_deferred(page: &pb::CommandPage) -> Option<&pb::AngzarrDeferredSequence> {
     match page.header.as_ref().and_then(|h| h.sequence_type.as_ref()) {
-        Some(pb::page_header::SequenceType::Sequence(s)) => Some(*s),
+        Some(pb::page_header::SequenceType::AngzarrDeferred(d)) => Some(d),
         _ => None,
     }
+}
+
+fn sequenced_page_of(fq: &str, seq: u32) -> pb::EventPage {
+    let mut page = event_page_of(fq);
+    page.header = Some(pb::PageHeader {
+        sequence_type: Some(pb::page_header::SequenceType::Sequence(seq)),
+        ..Default::default()
+    });
+    page
 }
 
 fn event_domains(resp: &pb::SagaResponse) -> Vec<String> {
@@ -117,10 +124,10 @@ fn declared_event_emits_its_command() {
             Ok((vec![command_to("inventory")], vec![]))
         });
     let resp = saga
-        .dispatch(&request(
-            Some(source_book("order", vec![event_page_of(FQ_ORDER_CREATED)])),
-            &[],
-        ))
+        .dispatch(&request(Some(source_book(
+            "order",
+            vec![event_page_of(FQ_ORDER_CREATED)],
+        ))))
         .expect("dispatch");
     assert_eq!(resp.commands.len(), 1, "one command emitted (C-0050)");
     assert_eq!(
@@ -138,10 +145,10 @@ fn undeclared_event_type_is_skipped() {
             Ok((vec![command_to("inventory")], vec![]))
         });
     let resp = saga
-        .dispatch(&request(
-            Some(source_book("order", vec![event_page_of(FQ_STOCK_RESERVED)])),
-            &[],
-        ))
+        .dispatch(&request(Some(source_book(
+            "order",
+            vec![event_page_of(FQ_STOCK_RESERVED)],
+        ))))
         .expect("dispatch");
     assert!(
         resp.commands.is_empty(),
@@ -159,7 +166,7 @@ fn every_page_is_a_fresh_trigger() {
         });
     let pages = (0..3).map(|_| event_page_of(FQ_ORDER_CREATED)).collect();
     let resp = saga
-        .dispatch(&request(Some(source_book("order", pages)), &[]))
+        .dispatch(&request(Some(source_book("order", pages))))
         .expect("dispatch");
     assert_eq!(resp.commands.len(), 3, "every page triggers the handler");
 }
@@ -171,111 +178,146 @@ fn event_thunk_can_inject_fact_events() {
             Ok((vec![], vec![fact_event("fact")]))
         });
     let resp = saga
-        .dispatch(&request(
-            Some(source_book("order", vec![event_page_of(FQ_ORDER_CREATED)])),
-            &[],
-        ))
+        .dispatch(&request(Some(source_book(
+            "order",
+            vec![event_page_of(FQ_ORDER_CREATED)],
+        ))))
         .expect("dispatch");
     assert!(resp.commands.is_empty());
     assert_eq!(event_domains(&resp), vec!["fact".to_string()]);
 }
 
-// --- destinations (C-0052, C-0053) ---------------------------------------
+// --- deferred emission (C-0053, C-0177..C-0179) --------------------------
 
 #[test]
-fn two_target_fanout_stamps_destination_sequences() {
-    // Handler emits one stamped command per target; the coordinator supplied
-    // inventory=7, fulfillment=3 → each command page carries its sequence.
-    let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory", "fulfillment"])
-        .on_event(FQ_ORDER_CREATED, |_e, dests, _c| {
-            let mut inv = command_to("inventory");
-            dests.stamp_command(&mut inv, "inventory")?;
-            let mut ful = command_to("fulfillment");
-            dests.stamp_command(&mut ful, "fulfillment")?;
-            Ok((vec![inv, ful], vec![]))
-        });
-    let resp = saga
-        .dispatch(&request(
-            Some(source_book("order", vec![event_page_of(FQ_ORDER_CREATED)])),
-            &[("inventory", 7), ("fulfillment", 3)],
-        ))
-        .expect("dispatch");
-    assert_eq!(
-        cmd_page_seq(&cmd_to(&resp, "inventory").pages[0]),
-        Some(7),
-        "C-0053"
+fn emitted_commands_are_deferred_from_their_triggering_page() {
+    let saga = SagaDispatch::new("OrderSplit", "order", ["inventory", "fulfillment"]).on_event(
+        FQ_ORDER_CREATED,
+        |_e, _d, _c| {
+            Ok((
+                vec![command_to("inventory"), command_to("fulfillment")],
+                vec![],
+            ))
+        },
     );
-    assert_eq!(
-        cmd_page_seq(&cmd_to(&resp, "fulfillment").pages[0]),
-        Some(3),
-        "C-0053"
+    let mut src = source_book(
+        "order",
+        vec![
+            sequenced_page_of(FQ_STOCK_RESERVED, 3),
+            sequenced_page_of(FQ_ORDER_CREATED, 4),
+        ],
+    );
+    src.cover.as_mut().unwrap().root = Some(pb::Uuid { value: vec![7] });
+    let resp = saga
+        .dispatch(&request(Some(src.clone())))
+        .expect("dispatch");
+    for (index, domain) in ["inventory", "fulfillment"].iter().enumerate() {
+        let d = cmd_page_deferred(&cmd_to(&resp, domain).pages[0]).expect("deferred header");
+        assert_eq!(
+            d.source, src.cover,
+            "source cover is the triggering book's (C-0177)"
+        );
+        assert_eq!(
+            d.source_seq, 4,
+            "source_seq is the triggering page's (C-0177)"
+        );
+        assert_eq!(
+            d.command_index, index as u32,
+            "indexed in emission order (C-0179)"
+        );
+    }
+}
+
+#[test]
+fn a_handler_set_explicit_sequence_never_survives() {
+    let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory"]).on_event(
+        FQ_ORDER_CREATED,
+        |_e, _d, _c| {
+            let mut cmd = command_to("inventory");
+            cmd.pages[0].header = Some(pb::PageHeader {
+                sequence_type: Some(pb::page_header::SequenceType::Sequence(9)),
+                ..Default::default()
+            });
+            Ok((vec![cmd], vec![]))
+        },
+    );
+    let resp = saga
+        .dispatch(&request(Some(source_book(
+            "order",
+            vec![event_page_of(FQ_ORDER_CREATED)],
+        ))))
+        .expect("dispatch");
+    assert!(
+        cmd_page_deferred(&cmd_to(&resp, "inventory").pages[0]).is_some(),
+        "C-0178: no explicit sequence"
     );
 }
 
 #[test]
-fn handler_observes_destination_sequences() {
-    // The handler reads the coordinator-supplied sequences (C-0052).
-    let observed: Arc<Mutex<HashMap<String, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+fn each_triggering_page_indexes_its_own_commands_from_zero() {
+    let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory"])
+        .on_event(FQ_ORDER_CREATED, |_e, _d, _c| {
+            Ok((vec![command_to("inventory")], vec![]))
+        });
+    let pages = vec![
+        sequenced_page_of(FQ_ORDER_CREATED, 1),
+        sequenced_page_of(FQ_ORDER_CREATED, 2),
+    ];
+    let resp = saga
+        .dispatch(&request(Some(source_book("order", pages))))
+        .expect("dispatch");
+    let stamps: Vec<_> = resp
+        .commands
+        .iter()
+        .map(|c| {
+            let d = cmd_page_deferred(&c.pages[0]).unwrap();
+            (d.source_seq, d.command_index)
+        })
+        .collect();
+    assert_eq!(stamps, vec![(1, 0), (2, 0)]);
+}
+
+#[test]
+fn handler_observes_the_declared_output_domains() {
+    let observed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let cap = observed.clone();
-    let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory"]).on_event(
+    let saga = SagaDispatch::new("OrderSplit", "order", ["inventory", "fulfillment"]).on_event(
         FQ_ORDER_CREATED,
         move |_e, dests, _c| {
-            for d in dests.domains() {
-                if let Some(s) = dests.sequence_for(&d) {
-                    cap.lock().unwrap().insert(d, s);
-                }
-            }
+            *cap.lock().unwrap() = dests.domains().to_vec();
             Ok((vec![], vec![]))
         },
     );
-    saga.dispatch(&request(
-        Some(source_book("order", vec![event_page_of(FQ_ORDER_CREATED)])),
-        &[("inventory", 5)],
-    ))
+    saga.dispatch(&request(Some(source_book(
+        "order",
+        vec![event_page_of(FQ_ORDER_CREATED)],
+    ))))
     .expect("dispatch");
-    assert_eq!(observed.lock().unwrap().get("inventory"), Some(&5));
-}
-
-// --- rejection fan-out (C-0042) ------------------------------------------
-
-#[test]
-fn notification_routes_to_ordered_rejection_thunks() {
-    // Two compensators for the same command run in REGISTRATION order
-    // (C-0042); their fact events merge in that order.
-    let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory"])
-        .on_rejected(FQ_RESERVE_STOCK, |_n, _r| Ok(vec![fact_event("comp-1")]))
-        .on_rejected(FQ_RESERVE_STOCK, |_n, _r| Ok(vec![fact_event("comp-2")]));
-    let resp = saga
-        .dispatch(&request(
-            Some(source_book(
-                "order",
-                vec![notification_page_for(FQ_RESERVE_STOCK)],
-            )),
-            &[],
-        ))
-        .expect("dispatch");
     assert_eq!(
-        event_domains(&resp),
-        vec!["comp-1".to_string(), "comp-2".to_string()]
+        *observed.lock().unwrap(),
+        vec!["inventory".to_string(), "fulfillment".to_string()]
     );
 }
 
 #[test]
-fn undeclared_rejection_yields_empty_response() {
-    // A notification for a command with no registered compensator is the
-    // framework's to handle (DelegateToFramework): empty, not an error.
-    let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory"]);
+fn a_notification_page_is_skipped() {
+    // Sagas receive no rejections: a Notification page is not a declared
+    // event and emits nothing, even alongside a declared one.
+    let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory"])
+        .on_event(FQ_ORDER_CREATED, |_e, _d, _c| {
+            Ok((vec![command_to("inventory")], vec![]))
+        });
     let resp = saga
-        .dispatch(&request(
-            Some(source_book(
-                "order",
-                vec![notification_page_for(FQ_RESERVE_STOCK)],
-            )),
-            &[],
-        ))
+        .dispatch(&request(Some(source_book(
+            "order",
+            vec![
+                notification_page_for(FQ_RESERVE_STOCK),
+                event_page_of(FQ_ORDER_CREATED),
+            ],
+        ))))
         .expect("dispatch");
+    assert_eq!(resp.commands.len(), 1);
     assert!(resp.events.is_empty());
-    assert!(resp.commands.is_empty());
 }
 
 // --- correlation (fill-only) ---------------------------------------------
@@ -293,7 +335,7 @@ fn correlation_fills_only_unset_command_covers() {
         });
     let mut src = source_book("order", vec![event_page_of(FQ_ORDER_CREATED)]);
     src.cover.as_mut().unwrap().correlation_id = "corr-1".to_string();
-    let resp = saga.dispatch(&request(Some(src), &[])).expect("dispatch");
+    let resp = saga.dispatch(&request(Some(src))).expect("dispatch");
     assert_eq!(
         cmd_to(&resp, "inventory")
             .cover
@@ -320,7 +362,7 @@ fn correlation_fills_only_unset_command_covers() {
 fn nil_source_is_missing_saga_source() {
     let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory"]);
     let err = saga
-        .dispatch(&request(None, &[]))
+        .dispatch(&request(None))
         .expect_err("nil source must fail");
     assert_eq!(err.code, codes::MISSING_SAGA_SOURCE);
 }
@@ -329,25 +371,9 @@ fn nil_source_is_missing_saga_source() {
 fn empty_source_is_empty_saga_source() {
     let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory"]);
     let err = saga
-        .dispatch(&request(Some(source_book("order", vec![])), &[]))
+        .dispatch(&request(Some(source_book("order", vec![]))))
         .expect_err("empty source must fail");
     assert_eq!(err.code, codes::EMPTY_SAGA_SOURCE);
-}
-
-#[test]
-fn corrupt_notification_payload_is_coded() {
-    // A page claiming the Notification type but carrying undecodable bytes
-    // fails with NOTIFICATION_DECODE_FAILED.
-    let bad = event_page(Any {
-        type_url: NOTIFICATION_TYPE_URL.to_string(),
-        value: vec![0xFF, 0xFF, 0xFF, 0xFF],
-    });
-    let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory"])
-        .on_rejected(FQ_RESERVE_STOCK, |_n, _r| Ok(vec![]));
-    let err = saga
-        .dispatch(&request(Some(source_book("order", vec![bad])), &[]))
-        .expect_err("corrupt notification must fail");
-    assert_eq!(err.code, codes::NOTIFICATION_DECODE_FAILED);
 }
 
 #[test]
@@ -357,10 +383,10 @@ fn handler_error_propagates_as_unhandled() {
             Err(HandlerError::Other("boom".to_string()))
         });
     let err = saga
-        .dispatch(&request(
-            Some(source_book("order", vec![event_page_of(FQ_ORDER_CREATED)])),
-            &[],
-        ))
+        .dispatch(&request(Some(source_book(
+            "order",
+            vec![event_page_of(FQ_ORDER_CREATED)],
+        ))))
         .expect_err("handler error must fail dispatch");
     assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
 }
@@ -382,4 +408,63 @@ fn accessors_report_name_domains_and_types() {
         saga.subscriptions().get("order"),
         Some(&vec![FQ_ORDER_CREATED.to_string()])
     );
+}
+
+// --- handler context: the triggering page's cover and sequence (X-037) ----
+
+#[test]
+fn a_context_handler_sees_each_triggering_page() {
+    let seen: Arc<Mutex<Vec<(String, u32)>>> = Arc::default();
+    let sink = seen.clone();
+    let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory"]).on_event_with_context(
+        FQ_ORDER_CREATED,
+        move |_e, _d, source| {
+            let domain = source.cover.map(|c| c.domain.clone()).unwrap_or_default();
+            sink.lock().unwrap().push((domain, source.sequence));
+            Ok((vec![command_to("inventory")], vec![]))
+        },
+    );
+    let resp = saga
+        .dispatch(&request(Some(source_book(
+            "order",
+            vec![
+                sequenced_page_of(FQ_ORDER_CREATED, 4),
+                sequenced_page_of(FQ_STOCK_RESERVED, 5),
+                sequenced_page_of(FQ_ORDER_CREATED, 6),
+            ],
+        ))))
+        .expect("dispatch");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![("order".to_string(), 4), ("order".to_string(), 6)]
+    );
+    let source_seqs: Vec<u32> = resp
+        .commands
+        .iter()
+        .map(|c| cmd_page_deferred(&c.pages[0]).expect("deferred").source_seq)
+        .collect();
+    assert_eq!(
+        source_seqs,
+        vec![4, 6],
+        "provenance matches what the handler saw"
+    );
+}
+
+#[test]
+fn a_context_handler_sees_sequence_zero_for_an_unsequenced_page() {
+    let seen: Arc<Mutex<Vec<u32>>> = Arc::default();
+    let sink = seen.clone();
+    let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory"]).on_event_with_context(
+        FQ_ORDER_CREATED,
+        move |_e, _d, source| {
+            sink.lock().unwrap().push(source.sequence);
+            Ok((vec![], vec![]))
+        },
+    );
+    saga.dispatch(&request(Some(source_book(
+        "order",
+        vec![event_page_of(FQ_ORDER_CREATED)],
+    ))))
+    .expect("dispatch");
+    assert_eq!(*seen.lock().unwrap(), vec![0]);
 }

@@ -7,11 +7,10 @@ import com.google.protobuf.Parser;
 import java.util.Map;
 
 /**
- * A stable cross-language coded failure. A handler throws one (via {@link
- * #reject}) to fail a command with a code like {@code VALUE_NOT_POSITIVE}; the
- * binding also produces one when decoding a coded failure the core returned. It
- * crosses the FFI as {@code google.rpc.Status} carrying a {@code
- * google.rpc.ErrorInfo}.
+ * A stable cross-language coded failure. A handler throws one (via {@link #reject}) to fail a
+ * command with a code like {@code VALUE_NOT_POSITIVE}; the binding also produces one when decoding
+ * a coded failure the core returned. It crosses the FFI as {@code google.rpc.Status} carrying a
+ * {@code google.rpc.ErrorInfo}.
  */
 public final class CodedError extends RuntimeException {
 
@@ -34,14 +33,18 @@ public final class CodedError extends RuntimeException {
     this.extras = extras == null ? Map.of() : Map.copyOf(extras);
   }
 
-  /** An invalid-argument business rejection — the common shape a command
-   * handler throws to reject a command with a coded reason. */
+  /**
+   * An invalid-argument business rejection — the common shape a command handler throws to reject a
+   * command with a coded reason.
+   */
   public static CodedError reject(String code, String message) {
     return new CodedError(code, message, GrpcCode.INVALID_ARGUMENT, Map.of());
   }
 
-  /** Reports that a google.protobuf.Any payload failed to unmarshal — a
-   * malformed payload is an invalid argument, not a handler bug. */
+  /**
+   * Reports that a google.protobuf.Any payload failed to unmarshal — a malformed payload is an
+   * invalid argument, not a handler bug.
+   */
   public static CodedError anyDecodeError(String typeUrl, Throwable cause) {
     return new CodedError(
         ANY_DECODE_FAILED,
@@ -56,9 +59,9 @@ public final class CodedError extends RuntimeException {
   }
 
   /**
-   * Parses an Any payload into its typed message, mapping a decode failure to a
-   * coded {@link #anyDecodeError} — the generated dispatch wiring calls this when
-   * unmarshalling a command or event Any.
+   * Parses an Any payload into its typed message, mapping a decode failure to a coded {@link
+   * #anyDecodeError} — the generated dispatch wiring calls this when unmarshalling a command or
+   * event Any.
    */
   public static <T extends Message> T parse(Parser<T> parser, Any any) {
     try {

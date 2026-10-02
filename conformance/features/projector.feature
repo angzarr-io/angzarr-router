@@ -3,7 +3,8 @@ Feature: Counter projector dispatch
   The CounterProjector proves the read-side dispatch mechanisms the shared
   router must implement identically in every language: every delivered event
   folds into one projection instance, a delivery from an undeclared domain
-  folds nothing, and a delivery missing its cover surfaces a coded error.
+  folds nothing (a projector declaring the "*" domain folds every domain), and
+  a delivery missing its cover surfaces a coded error.
 
   Scenario Outline: every delivered event folds into one projection
     Given a counter projection
@@ -20,6 +21,11 @@ Feature: Counter projector dispatch
     Given a counter projection
     When 3 events are delivered in domain "inventory"
     Then the projection records nothing
+
+  Scenario: a projector declaring the "*" domain folds every domain
+    Given a counter projection over every domain
+    When 3 events are delivered in domain "inventory"
+    Then the projection records 3 events
 
   Scenario: a delivery missing its cover is refused
     Given a counter projection

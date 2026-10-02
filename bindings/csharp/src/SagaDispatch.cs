@@ -5,16 +5,16 @@ namespace Angzarr.Router;
 
 /// <summary>
 /// One saga component's registration: its name, the input domain it consumes,
-/// the domains it issues commands to, its event handlers, and ordered rejection
-/// compensators. A saga is stateless — no rebuilder, no state.
+/// the domains it issues commands to, and its event handlers. A saga is a
+/// stateless translator — no rebuilder, no state, and no rejections (only
+/// aggregates and process managers compensate).
 /// </summary>
 public sealed class SagaDispatch
 {
     internal readonly string Name;
     internal readonly string InputDomain;
     internal readonly IReadOnlyList<string> Targets;
-    internal readonly Dictionary<string, SagaEventThunk> Events = new();
-    internal readonly Dictionary<string, List<SagaRejectionThunk>> Rejections = new();
+    internal readonly Dictionary<string, SagaEventPageThunk> Events = new();
 
     /// <summary>Starts a saga registration translating inputDomain events into
     /// commands for targetDomains.</summary>
@@ -26,22 +26,16 @@ public sealed class SagaDispatch
     }
 
     /// <summary>Registers the translation thunk for a fully-qualified event type.</summary>
-    public SagaDispatch OnEvent(string fullName, SagaEventThunk thunk)
+    public SagaDispatch OnEvent(string fullName, SagaEventThunk thunk) =>
+        OnEventWithContext(fullName, (ev, dests, source) => thunk(ev, dests, source.Cover!));
+
+    /// <summary>Registers the translation thunk for a fully-qualified event
+    /// type; the thunk also reads where the triggering event sits
+    /// (<see cref="PageContext"/>: its book's cover and the event's
+    /// sequence).</summary>
+    public SagaDispatch OnEventWithContext(string fullName, SagaEventPageThunk thunk)
     {
         Events[fullName] = thunk;
-        return this;
-    }
-
-    /// <summary>Appends a compensator for one fully-qualified command type;
-    /// repeated calls register an ordered fan-out.</summary>
-    public SagaDispatch OnRejected(string fqCommand, SagaRejectionThunk thunk)
-    {
-        if (!Rejections.TryGetValue(fqCommand, out var list))
-        {
-            list = new List<SagaRejectionThunk>();
-            Rejections[fqCommand] = list;
-        }
-        list.Add(thunk);
         return this;
     }
 }
