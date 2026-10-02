@@ -14,9 +14,9 @@ managed:
     - file_option: go_package_prefix
       value: github.com/angzarr-io/angzarr-router/bindings/cpp/gen
 plugins:
-  # Pinned to match the image's libprotobuf-dev (Debian bookworm = 3.21.12);
+  # The image's protoc (3.21.12) matches its libprotobuf-dev (Debian bookworm);
   # protobuf C++ generated code is version-locked to the runtime.
-  - remote: buf.build/protocolbuffers/cpp:v21.12
+  - protoc_builtin: cpp
     out: bindings/cpp/gen
   # angzarr dispatch wiring for declared components (test.counter). Baked into
   # the base image and invoked as a local plugin. The conformance fixtures

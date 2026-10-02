@@ -1,0 +1,80 @@
+# Thin CI: tool setup, then just recipes. All logic lives in the justfile;
+# every recipe runs in the org's pinned toolchain image. Codegen never touches
+# the Buf Schema Registry: protos come from the angzarr-project submodule, and
+# protoc, protoc-gen-es and the angzarr CLI are pinned (justfile.container).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Toolchains run as container-root so their HOME-based caches work.
+  ANGZARR_CONTAINER_USER: "0:0"
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: extractions/setup-just@v2
+
+      - name: Format
+        run: just fmt-check
+
+      - name: Clippy
+        run: just lint
+
+      - name: Unit tests and conformance (Rust)
+        run: just test
+
+      - name: Lint protos
+        run: just buf-lint
+
+      - name: Proto format
+        run: just buf-format
+
+  binding:
+    name: binding (${{ matrix.lang }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        lang: [go, py, java, csharp, cpp, ts]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: extractions/setup-just@v2
+
+      - name: Log in to ghcr.io (toolchain images)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pinned codegen toolchain cache
+        uses: actions/cache@v4
+        with:
+          path: .tools
+          key: tools-${{ matrix.lang }}-${{ hashFiles('justfile.container') }}
+
+      - name: Conformance
+        run: just ${{ matrix.lang }}-binding-test
+
+      - name: Lint
+        run: just ${{ matrix.lang }}-binding-lint

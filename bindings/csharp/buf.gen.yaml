@@ -22,7 +22,9 @@ managed:
     - file_option: go_package_prefix
       value: github.com/angzarr-io/angzarr-router/bindings/csharp/gen
 plugins:
-  - remote: buf.build/protocolbuffers/csharp:v28.3
+  # protoc's csharp generator, pinned by justfile.container (PROTOC_JVM).
+  - protoc_builtin: csharp
+    protoc_path: .tools/protoc/jvm/bin/protoc
     out: bindings/csharp/gen
   # angzarr dispatch wiring for declared components (test.counter). Baked into
   # the base image and invoked as a local plugin. The conformance fixtures

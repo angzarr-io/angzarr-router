@@ -54,7 +54,10 @@ managed:
     - file_option: go_package_prefix
       value: github.com/angzarr-io/angzarr-router/bindings/go/gen
 plugins:
-  - remote: buf.build/protocolbuffers/python:v35.1
+  # protoc's python generator, pinned by justfile.container (PROTOC_PYTHON) to
+  # the protobuf 7.35.x runtime this binding depends on.
+  - protoc_builtin: python
+    protoc_path: .tools/protoc/python/bin/protoc
     out: bindings/python/angzarr_router_ffi/gen
   # angzarr dispatch wiring for declared components. Baked into the python image
   # (build/images/python) and invoked as a local plugin. The scaffold
