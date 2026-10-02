@@ -68,7 +68,7 @@ func (w *sagaWorld) reset() {
 			if err := event.UnmarshalTo(&increased); err != nil {
 				return nil, nil, err
 			}
-			return orderSaga{}.Increased(&increased, dests, source.Cover)
+			return orderSaga{}.Increased(&increased, dests, source)
 		})
 	if err := w.router.RegisterSaga(saga); err != nil {
 		panic(fmt.Sprintf("register saga fixture: %v", err))
