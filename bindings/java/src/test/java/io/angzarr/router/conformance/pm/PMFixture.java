@@ -17,9 +17,12 @@ import test.counter.OrderProcessManagerAngzarr;
 /**
  * The conformance OrderProcessManager fixture: the newest trigger reacts with a Reserve command
  * (stamped deferred by the router) plus one fact per rebuilt prior-state event; a rejection injects
- * one process event and escalates.
+ * one process event and escalates, recording the rejection's code and message in {@link #seen}.
  */
 final class PMFixture implements OrderProcessManagerAngzarr.OrderProcessManagerHandler {
+
+  /** The (code, rejection_reason) of each rejection the Reserve compensator handled. */
+  final List<List<String>> seen = new ArrayList<>();
 
   @Override
   public ProcessManagerHandleResponse increased(
@@ -43,6 +46,7 @@ final class PMFixture implements OrderProcessManagerAngzarr.OrderProcessManagerH
       Notification n,
       RejectionNotification rejection,
       Counter.OrderProcessManagerState.Builder state) {
+    seen.add(List.of(rejection.getCode(), rejection.getRejectionReason()));
     Notification escalation =
         Notification.newBuilder().setCover(Cover.newBuilder().setDomain("escalated")).build();
     return new PmRejection(List.of(Builders.oneFact()), escalation);

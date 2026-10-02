@@ -31,12 +31,14 @@ public class PMSteps {
   private Router router;
   private ProcessManagerHandleResponse resp;
   private CodedError err;
+  private PMFixture order;
 
   @Before
   public void before() {
     router = new Router();
     resp = null;
     err = null;
+    order = new PMFixture();
   }
 
   @After
@@ -58,12 +60,12 @@ public class PMSteps {
 
   @Given("an order process-manager")
   public void anOrderProcessManager() {
-    OrderProcessManagerAngzarr.registerOrderProcessManager(router, new PMFixture());
+    OrderProcessManagerAngzarr.registerOrderProcessManager(router, order);
   }
 
   @Given("co-resident order and audit process-managers")
   public void coResidentOrderAndAudit() {
-    OrderProcessManagerAngzarr.registerOrderProcessManager(router, new PMFixture());
+    OrderProcessManagerAngzarr.registerOrderProcessManager(router, order);
     AuditProcessManagerAngzarr.registerAuditProcessManager(router, new AuditFixture());
   }
 
@@ -116,6 +118,11 @@ public class PMSteps {
   @When("a rejection of Reserve is dispatched")
   public void rejectionReserve() {
     dispatch(Builders.pmRejection("test.counter.Reserve"));
+  }
+
+  @When("a rejection of Reserve with code {string} and message {string} is dispatched")
+  public void rejectionReserveWithCode(String code, String message) {
+    dispatch(Builders.pmRejectionWith("test.counter.Reserve", code, message));
   }
 
   @When("a rejection of Reserve issued by {string} is dispatched")
@@ -200,6 +207,13 @@ public class PMSteps {
     return resp.getFactsList().stream()
         .filter(f -> AuditFixture.AUDIT_MARK.equals(f.getCover().getDomain()) == audit)
         .count();
+  }
+
+  @Then("the process-manager compensator saw code {string} and message {string}")
+  public void compensatorSawCode(String code, String message) {
+    assertNull(err, () -> "dispatch failed: " + err);
+    assertEquals(
+        List.of(List.of(code, message)), order.seen, "(code, message) the compensator saw");
   }
 
   @Then("the dispatch fails with {word}")

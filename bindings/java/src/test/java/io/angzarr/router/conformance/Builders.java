@@ -460,7 +460,13 @@ public final class Builders {
 
   /** A trigger whose newest page is a rejection Notification for fqCommand. */
   public static ProcessManagerHandleRequest pmRejection(String fqCommand) {
-    return pmRejectionRequest(fqCommand, "counter", PageHeader.getDefaultInstance());
+    return pmRejectionWith(fqCommand, "", "");
+  }
+
+  /** A rejection of fqCommand whose RejectionNotification carries code and message. */
+  public static ProcessManagerHandleRequest pmRejectionWith(
+      String fqCommand, String code, String message) {
+    return pmRejectionRequest(fqCommand, "counter", PageHeader.getDefaultInstance(), code, message);
   }
 
   /**
@@ -476,11 +482,15 @@ public final class Builders {
                 AngzarrDeferredSequence.newBuilder()
                     .setSource(Cover.newBuilder().setDomain(issuerDomain)))
             .build();
-    return pmRejectionRequest(fqCommand, issuerDomain, header);
+    return pmRejectionRequest(fqCommand, issuerDomain, header, "", "");
   }
 
   private static ProcessManagerHandleRequest pmRejectionRequest(
-      String fqCommand, String triggerDomain, PageHeader commandHeader) {
+      String fqCommand,
+      String triggerDomain,
+      PageHeader commandHeader,
+      String code,
+      String message) {
     CommandPage.Builder page =
         CommandPage.newBuilder().setCommand(Any.newBuilder().setTypeUrl(typeUrl(fqCommand)));
     if (!commandHeader.equals(PageHeader.getDefaultInstance())) {
@@ -492,6 +502,8 @@ public final class Builders {
                 CommandBook.newBuilder()
                     .setCover(Cover.newBuilder().setDomain("inventory"))
                     .addPages(page))
+            .setRejectionReason(message)
+            .setCode(code)
             .build();
     Notification notification = Notification.newBuilder().setPayload(Pack.pack(rejection)).build();
     return ProcessManagerHandleRequest.newBuilder()
@@ -535,6 +547,15 @@ public final class Builders {
    */
   public static ContextualCommand rejectionSentTo(
       String command, String targetDomain, Integer nextSequence) {
+    return rejectionWith(command, targetDomain, nextSequence, "", "");
+  }
+
+  /**
+   * {@link #rejectionSentTo} whose RejectionNotification carries code (its machine code) and
+   * message (its rejection_reason).
+   */
+  public static ContextualCommand rejectionWith(
+      String command, String targetDomain, Integer nextSequence, String code, String message) {
     RejectionNotification rejection =
         RejectionNotification.newBuilder()
             .setRejectedCommand(
@@ -544,6 +565,8 @@ public final class Builders {
                         CommandPage.newBuilder()
                             .setCommand(
                                 Any.newBuilder().setTypeUrl(typeUrl("test.counter." + command)))))
+            .setRejectionReason(message)
+            .setCode(code)
             .build();
     return notificationCommand("payment", Pack.pack(rejection), nextSequence);
   }

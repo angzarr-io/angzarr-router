@@ -19,6 +19,7 @@ import io.cucumber.java.Before;
 import io.cucumber.java.en.Given;
 import io.cucumber.java.en.Then;
 import io.cucumber.java.en.When;
+import java.util.ArrayList;
 import java.util.List;
 import test.counter.Counter;
 
@@ -35,11 +36,15 @@ public class CompensationSteps {
   private BusinessResponse resp;
   private CodedError err;
 
+  /** The (code, rejection_reason) of each rejection a payment compensator handled. */
+  private final List<List<String>> seen = new ArrayList<>();
+
   @Before
   public void before() {
     router = new Router();
     resp = null;
     err = null;
+    seen.clear();
   }
 
   @After
@@ -59,14 +64,22 @@ public class CompensationSteps {
     }
   }
 
-  /** The payment aggregate: one compensator per (compensates entry, emitted event) pair. */
+  /**
+   * The payment aggregate: one compensator per (compensates entry, emitted event) pair, each
+   * recording the rejection's code and message.
+   */
   private void payment(String... entryThenEvent) {
     AggregateDispatch agg =
         new AggregateDispatch(
             "Payment", "payment", new Rebuilder(Counter.CounterState::newBuilder));
     for (int i = 0; i < entryThenEvent.length; i += 2) {
       String event = entryThenEvent[i + 1];
-      agg.onRejected(entryThenEvent[i], (n, rejection, state, cctx) -> Builders.oneEvent(event));
+      agg.onRejected(
+          entryThenEvent[i],
+          (n, rejection, state, cctx) -> {
+            seen.add(List.of(rejection.getCode(), rejection.getRejectionReason()));
+            return Builders.oneEvent(event);
+          });
     }
     router.registerAggregate(agg);
   }
@@ -112,6 +125,32 @@ public class CompensationSteps {
           + " ending at sequence {int}")
   public void rejectionOverHistory(String command, String domain, int last) {
     dispatch(Builders.rejectionSentTo(command, domain, last + 1));
+  }
+
+  @When(
+      "a rejection of {word} with code {string} and message {string} is dispatched to the payment"
+          + " aggregate")
+  public void rejectionWithCode(String command, String code, String message) {
+    dispatch(Builders.rejectionWith(command, "inventory", null, code, message));
+  }
+
+  @When(
+      "a rejection of {word} with no code and message {string} is dispatched to the payment"
+          + " aggregate")
+  public void rejectionWithoutCode(String command, String message) {
+    dispatch(Builders.rejectionWith(command, "inventory", null, "", message));
+  }
+
+  @Then("the compensation handler saw code {string} and message {string}")
+  public void sawCode(String code, String message) {
+    assertNull(err, () -> "dispatch failed: " + err);
+    assertEquals(List.of(List.of(code, message)), seen, "(code, message) the compensator saw");
+  }
+
+  @Then("the compensation handler saw an empty code and message {string}")
+  public void sawNoCode(String message) {
+    assertNull(err, () -> "dispatch failed: " + err);
+    assertEquals(List.of(List.of("", message)), seen, "(code, message) the compensator saw");
   }
 
   @When("a Compensate for {word} is dispatched to the inventory aggregate")
