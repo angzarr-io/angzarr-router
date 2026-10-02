@@ -18,7 +18,8 @@ internal sealed class PmFixture : TC.OrderProcessManagerAngzarr.OrderProcessMana
     public ProcessManagerHandleResponse Increased(
         TC.Increased ev,
         TC.OrderProcessManagerState state,
-        Destinations dests
+        Destinations dests,
+        Cover? triggerCover
     )
     {
         var resp = new ProcessManagerHandleResponse();
@@ -30,10 +31,13 @@ internal sealed class PmFixture : TC.OrderProcessManagerAngzarr.OrderProcessMana
         return resp;
     }
 
-    public void ApplyIncreased(TC.OrderProcessManagerState state, TC.Increased ev) =>
-        state.Count += 1;
+    public void ApplyIncreased(
+        TC.OrderProcessManagerState state,
+        TC.Increased ev,
+        PageContext page
+    ) => state.Count += 1;
 
-    public PmRejection OnReserveRejected(
+    public ProcessManagerHandleResponse OnReserveRejected(
         Notification n,
         RejectionNotification rejection,
         TC.OrderProcessManagerState state
@@ -41,6 +45,8 @@ internal sealed class PmFixture : TC.OrderProcessManagerAngzarr.OrderProcessMana
     {
         Seen.Add((rejection.Code, rejection.RejectionReason));
         var escalation = new Notification { Cover = new Cover { Domain = "escalated" } };
-        return new PmRejection(new[] { Builders.OneFact() }, escalation);
+        var resp = new ProcessManagerHandleResponse { Notification = escalation };
+        resp.ProcessEvents.Add(Builders.OneFact());
+        return resp;
     }
 }

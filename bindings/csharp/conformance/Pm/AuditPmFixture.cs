@@ -1,4 +1,3 @@
-using System.Collections.Generic;
 using Angzarr;
 using Angzarr.Router;
 using TC = Test.Counter;
@@ -19,7 +18,8 @@ internal sealed class AuditPmFixture : TC.AuditProcessManagerAngzarr.AuditProces
     public ProcessManagerHandleResponse Increased(
         TC.Increased ev,
         TC.AuditProcessManagerState state,
-        Destinations dests
+        Destinations dests,
+        Cover? triggerCover
     )
     {
         var resp = new ProcessManagerHandleResponse();
@@ -30,14 +30,17 @@ internal sealed class AuditPmFixture : TC.AuditProcessManagerAngzarr.AuditProces
         return resp;
     }
 
-    public void ApplyIncreased(TC.AuditProcessManagerState state, TC.Increased ev) =>
-        state.Seen.Add("Increased");
+    public void ApplyIncreased(
+        TC.AuditProcessManagerState state,
+        TC.Increased ev,
+        PageContext page
+    ) => state.Seen.Add("Increased");
 
-    public PmRejection OnReserveRejected(
+    public ProcessManagerHandleResponse OnReserveRejected(
         Notification n,
         RejectionNotification rejection,
         TC.AuditProcessManagerState state
-    ) => new(new List<EventBook> { AuditBook() }, null);
+    ) => new() { ProcessEvents = { AuditBook() } };
 
     private static EventBook AuditBook() => new() { Cover = new Cover { Domain = Mark } };
 }

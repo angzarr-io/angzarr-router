@@ -45,7 +45,8 @@ internal sealed class CounterFixture : TC.CounterAggregateAngzarr.CounterAggrega
     public EventBook FailHard(TC.FailHard cmd, TC.CounterState state, CommandContext cctx) =>
         throw new Exception("hard failure");
 
-    public void ApplyIncreased(TC.CounterState state, TC.Increased ev) => state.Count += 1;
+    public void ApplyIncreased(TC.CounterState state, TC.Increased ev, PageContext page) =>
+        state.Count += 1;
 
     /// <summary>Appends both ordered markers in one response — the
     /// within-component fan-out collapses to one compensator, preserving the
