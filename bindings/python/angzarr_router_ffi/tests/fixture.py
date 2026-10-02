@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .. import CommandContext, reject
+from .. import CommandContext, PageContext, reject
 from ..gen.io.angzarr.v1 import command_handler_pb2, process_manager_pb2, types_pb2
 from ..gen.test.counter import counter_pb2
 from .builders import FQ_RESERVE, type_url
@@ -49,7 +49,7 @@ class CounterAggregate:
     def fail_hard(self, cmd, state, cctx: CommandContext):
         raise RuntimeError("hard failure")
 
-    def apply_increased(self, state, event) -> None:
+    def apply_increased(self, state, event, ctx: PageContext) -> None:
         state.count += 1
 
     def on_reserve_rejected(self, notification, rejection, state, cctx: CommandContext):
@@ -67,7 +67,7 @@ class CounterAggregate:
 class OrderSaga:
     """Implements order_saga_angzarr.OrderSagaHandler."""
 
-    def increased(self, event, dests, source_cover):
+    def increased(self, event, dests, source: PageContext):
         return [_reserve_command()], []
 
 
@@ -77,7 +77,7 @@ class OrderSaga:
 class CounterProjector:
     """Implements counter_projector_angzarr.CounterProjectorHandler."""
 
-    def increased(self, projection, event) -> None:
+    def increased(self, projection, event, ctx: PageContext) -> None:
         projection.count += 1
 
     def finish(self, projection, events):
@@ -101,21 +101,22 @@ class OrderProcessManager:
     def __init__(self, seen: list[tuple[str, str]] | None = None):
         self.seen = seen if seen is not None else []
 
-    def increased(self, event, state, dests):
+    def increased(self, event, state, dests, trigger_cover):
         resp = process_manager_pb2.ProcessManagerHandleResponse()
         resp.commands.append(_reserve_command())
         for _ in range(state.count):
             resp.facts.add().pages.add()
         return resp
 
-    def apply_increased(self, state, event) -> None:
+    def apply_increased(self, state, event, ctx: PageContext) -> None:
         state.count += 1
 
     def on_reserve_rejected(self, notification, rejection, state):
         self.seen.append((rejection.code, rejection.rejection_reason))
-        escalation = types_pb2.Notification()
-        escalation.cover.domain = "escalated"
-        return [_one_fact()], escalation
+        resp = process_manager_pb2.ProcessManagerHandleResponse()
+        resp.process_events.append(_one_fact())
+        resp.notification.cover.domain = "escalated"
+        return resp
 
 
 # --- AuditProcessManager ---
@@ -132,19 +133,19 @@ class AuditProcessManager:
     "audit" fact per prior state event and no commands, and compensates with
     one "audit" process event and no escalation."""
 
-    def increased(self, event, state, dests):
+    def increased(self, event, state, dests, trigger_cover):
         resp = process_manager_pb2.ProcessManagerHandleResponse()
         for _ in state.seen:
             resp.facts.add().cover.domain = AUDIT_MARK
         return resp
 
-    def apply_increased(self, state, event) -> None:
+    def apply_increased(self, state, event, ctx: PageContext) -> None:
         state.seen.append("Increased")
 
     def on_reserve_rejected(self, notification, rejection, state):
-        book = types_pb2.EventBook()
-        book.cover.domain = AUDIT_MARK
-        return [book], None
+        resp = process_manager_pb2.ProcessManagerHandleResponse()
+        resp.process_events.add().cover.domain = AUDIT_MARK
+        return resp
 
 
 def _reserve_command():
