@@ -22,14 +22,15 @@ TOP := `git rev-parse --show-toplevel`
 # client-go uses. The cdylib is the ABI boundary and is carried forward
 # between the two (built once in rust, linked in go via the shared target/
 # mount), so no single all-languages image is required.
-# Override either with the matching env var to pin a git-SHA tag.
-ROUTER_IMAGE := env_var_or_default("ANGZARR_ROUTER_IMAGE", "ghcr.io/angzarr-io/angzarr-rust:v0.5.1-97-gf28c8f95")
-ROUTER_GO_IMAGE := env_var_or_default("ANGZARR_ROUTER_GO_IMAGE", "ghcr.io/angzarr-io/angzarr-go:latest")
-ROUTER_PYTHON_IMAGE := env_var_or_default("ANGZARR_ROUTER_PYTHON_IMAGE", "ghcr.io/angzarr-io/angzarr-python:latest")
-ROUTER_JAVA_IMAGE := env_var_or_default("ANGZARR_ROUTER_JAVA_IMAGE", "ghcr.io/angzarr-io/angzarr-java:531d91e")
-ROUTER_CSHARP_IMAGE := env_var_or_default("ANGZARR_ROUTER_CSHARP_IMAGE", "ghcr.io/angzarr-io/angzarr-csharp:latest")
-ROUTER_CPP_IMAGE := env_var_or_default("ANGZARR_ROUTER_CPP_IMAGE", "ghcr.io/angzarr-io/angzarr-cpp:latest")
-ROUTER_TYPESCRIPT_IMAGE := env_var_or_default("ANGZARR_ROUTER_TYPESCRIPT_IMAGE", "ghcr.io/angzarr-io/angzarr-typescript:531d91e")
+# Each is pinned by tag and digest (the image actually tested); override with
+# the matching env var.
+ROUTER_IMAGE := env_var_or_default("ANGZARR_ROUTER_IMAGE", "ghcr.io/angzarr-io/angzarr-rust:9e07ae0@sha256:1f70b5de243d50aab989103ce87be393b6282c538ecabccef5f07c15760ac156")
+ROUTER_GO_IMAGE := env_var_or_default("ANGZARR_ROUTER_GO_IMAGE", "ghcr.io/angzarr-io/angzarr-go:latest@sha256:b57cce65c7bc14aaa67845d94d0eb3c7f7bddae43190299ec8f02bb8e92ee6d8")
+ROUTER_PYTHON_IMAGE := env_var_or_default("ANGZARR_ROUTER_PYTHON_IMAGE", "ghcr.io/angzarr-io/angzarr-python:latest@sha256:1d6841f4b10c59bfab9d1896976214105136857bda41b64ece407cf734141032")
+ROUTER_JAVA_IMAGE := env_var_or_default("ANGZARR_ROUTER_JAVA_IMAGE", "ghcr.io/angzarr-io/angzarr-java:531d91e@sha256:3c64d5337aa53c1a5a2c7bf34737b7012464acfdb5c2dc39f55a119f3441e96e")
+ROUTER_CSHARP_IMAGE := env_var_or_default("ANGZARR_ROUTER_CSHARP_IMAGE", "ghcr.io/angzarr-io/angzarr-csharp:latest@sha256:32c482820b2021ec7639a800d8778a51db27e604edbe1359a8a328c6c65b5991")
+ROUTER_CPP_IMAGE := env_var_or_default("ANGZARR_ROUTER_CPP_IMAGE", "ghcr.io/angzarr-io/angzarr-cpp:latest@sha256:3c66dd0ffc7d2dd727c355d1b22c2741abce4d570baea4517c77fd5d40d97bfe")
+ROUTER_TYPESCRIPT_IMAGE := env_var_or_default("ANGZARR_ROUTER_TYPESCRIPT_IMAGE", "ghcr.io/angzarr-io/angzarr-typescript:531d91e@sha256:6121d654662bcbba25162d89b6fe03d41b6d9c364346dd7e6fee394123ef02b3")
 # Container runtime: docker (rootless or rootful). Empty inside a container.
 CONTAINER_CMD := `command -v docker 2>/dev/null || echo ""`
 # `-u $(id -u):$(id -g)` is right for ROOTFUL docker (bind-mount files get the

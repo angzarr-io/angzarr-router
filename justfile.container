@@ -19,6 +19,9 @@ PROTOC_JVM := "28.3"
 # angzarr-io/angzarr-cli at this commit into .tools/bin, which precedes the
 # image's own copy on PATH.
 CLI_REF := "794f457f27508b536cac8fc53adfb518ce1969da"
+# cargo-mutants, installed into the persisted CARGO_HOME when the rust image
+# lacks it (no published image ships it).
+CARGO_MUTANTS := "27.1.0"
 export PATH := TOP + "/.tools/bin:" + env_var("PATH")
 
 default:
@@ -76,6 +79,7 @@ fmt-check:
 # path that survives the copy — ANGZARR_PROJECT_PROTO points build.rs at the
 # real submodule checkout.
 mutation-test:
+    cargo mutants --version >/dev/null 2>&1 || cargo install cargo-mutants --locked --version {{CARGO_MUTANTS}}
     cd {{TOP}} && ANGZARR_PROJECT_PROTO=${ANGZARR_PROJECT_PROTO:-{{TOP}}/angzarr-project/proto} cargo mutants -f crates/router/src/rebuild.rs -f crates/router/src/aggregate.rs -f crates/router/src/projector.rs -f crates/router/src/saga.rs -f crates/router/src/destinations.rs -f crates/router/src/process_manager.rs -f crates/router/src/error.rs -f crates/router/src/lib.rs -f crates/router/src/router.rs -f crates/router/src/upcaster.rs -f crates/router-ffi/src/registry.rs --timeout 120
 
 # Format
