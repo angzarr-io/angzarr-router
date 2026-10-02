@@ -1,6 +1,8 @@
 #include <catch2/catch.hpp>
 #include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "builders.h"
 #include "gherkin.h"
@@ -15,10 +17,14 @@ using angzarr::router::PmRejection;
 
 // The conformance OrderProcessManager fixture: the newest trigger reacts with a
 // Reserve command (deferred: the router stamps its provenance) plus one fact
-// per rebuilt prior-state event; a rejection injects one process event and
-// escalates.
+// per rebuilt prior-state event; a rejection records its code and message in
+// seen, injects one process event and escalates.
 class PmFixture : public tc::OrderProcessManagerHandler {
  public:
+  // The (code, rejection_reason) of each rejection the Reserve compensator
+  // handled.
+  std::vector<std::pair<std::string, std::string>> seen;
+
   pb::ProcessManagerHandleResponse Increased(const tc::Increased&,
                                              tc::OrderProcessManagerState& state,
                                              const Destinations&) override {
@@ -30,8 +36,9 @@ class PmFixture : public tc::OrderProcessManagerHandler {
   void ApplyIncreased(tc::OrderProcessManagerState& state, const tc::Increased&) override {
     state.set_count(state.count() + 1);
   }
-  PmRejection OnReserveRejected(const pb::Notification&, const pb::RejectionNotification&,
+  PmRejection OnReserveRejected(const pb::Notification&, const pb::RejectionNotification& rejection,
                                 tc::OrderProcessManagerState&) override {
+    seen.emplace_back(rejection.code(), rejection.rejection_reason());
     pb::Notification escalation;
     escalation.mutable_cover()->set_domain("escalated");
     return {{OneFact()}, escalation};
@@ -135,6 +142,9 @@ void Register(StepRegistry& r, PmWorld& w) {
     w.Dispatch(angzarr::conformance::PmRejection("test.counter.Reserve"));
   });
 
+  r.On(
+      "a rejection of Reserve with code {string} and message {string} is dispatched",
+      [&w](const StepArgs& a) { w.Dispatch(PmRejectionWith("test.counter.Reserve", a[0], a[1])); });
   r.On("a Compensate for Reserve is dispatched to the order process-manager",
        [&w](const StepArgs&) { w.Dispatch(PmCompensateRequest("Reserve")); });
   r.On("a rejection of Reserve issued by {string} is dispatched",
@@ -178,6 +188,12 @@ void Register(StepRegistry& r, PmWorld& w) {
     REQUIRE(w.resp->process_events(0).cover().domain() == kAuditMark);
     REQUIRE_FALSE(w.resp->has_notification());
   });
+  r.On("the process-manager compensator saw code {string} and message {string}",
+       [&w](const StepArgs& a) {
+         REQUIRE_FALSE(w.err.has_value());
+         const std::vector<std::pair<std::string, std::string>> want{{a[0], a[1]}};
+         REQUIRE(w.fixture.seen == want);
+       });
   r.On("the dispatch fails with {word}", [&w](const StepArgs& a) {
     REQUIRE(w.err.has_value());
     REQUIRE(w.err->code == a[0]);

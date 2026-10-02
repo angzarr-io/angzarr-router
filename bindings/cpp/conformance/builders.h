@@ -100,12 +100,18 @@ inline pb::ContextualCommand EmptyCommand(const std::string& fq) {
 inline pb::ContextualCommand FailHardCommand() { return EmptyCommand("test.counter.FailHard"); }
 inline pb::ContextualCommand UnhandledCommand() { return EmptyCommand("test.counter.Reserve"); }
 
+// A rejection Notification for fq_command sent to domain, carrying code (its
+// machine code) and message (its rejection_reason).
 inline pb::Notification RejectionNotificationFor(const std::string& fq_command,
-                                                 const std::string& domain) {
+                                                 const std::string& domain,
+                                                 const std::string& code = "",
+                                                 const std::string& message = "") {
   pb::RejectionNotification rejection;
   auto* rc = rejection.mutable_rejected_command();
   rc->mutable_cover()->set_domain(domain);
   SetAnyEmpty(rc->add_pages()->mutable_command(), fq_command);
+  rejection.set_rejection_reason(message);
+  rejection.set_code(code);
   pb::Notification n;
   *n.mutable_payload() = angzarr::router::Pack::Wrap(rejection);
   return n;
@@ -296,13 +302,20 @@ inline pb::EventBook PmStateOf(int n) {
   return book;
 }
 
-inline pb::ProcessManagerHandleRequest PmRejection(const std::string& fq_command) {
+// A rejection of fq_command whose RejectionNotification carries code and message.
+inline pb::ProcessManagerHandleRequest PmRejectionWith(const std::string& fq_command,
+                                                       const std::string& code,
+                                                       const std::string& message) {
   pb::ProcessManagerHandleRequest req;
   auto* trigger = req.mutable_trigger();
   trigger->mutable_cover()->set_domain("counter");
   *trigger->add_pages()->mutable_event() =
-      angzarr::router::Pack::Wrap(RejectionNotificationFor(fq_command, "inventory"));
+      angzarr::router::Pack::Wrap(RejectionNotificationFor(fq_command, "inventory", code, message));
   return req;
+}
+
+inline pb::ProcessManagerHandleRequest PmRejection(const std::string& fq_command) {
+  return PmRejectionWith(fq_command, "", "");
 }
 
 // The rejection of fq_command issued by the PM owning issuer_domain: the trigger
