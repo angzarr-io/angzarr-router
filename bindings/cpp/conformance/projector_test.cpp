@@ -15,7 +15,8 @@ using angzarr::router::CodedError;
 // projection; the finisher carries the cover and folded count.
 class ProjectorFixture : public tc::CounterProjectorHandler {
  public:
-  void Increased(tc::CounterProjectorState& projection, const tc::Increased&) override {
+  void Increased(tc::CounterProjectorState& projection, const tc::Increased&,
+                 const angzarr::router::PageContext&) override {
     projection.set_count(projection.count() + 1);
   }
   pb::Projection Finish(tc::CounterProjectorState& projection,

@@ -25,8 +25,8 @@ class Counter : public test::counter::CounterAggregateHandler {
                                       const angzarr::router::CommandContext&) override {
     throw std::runtime_error("hard failure");
   }
-  void ApplyIncreased(test::counter::CounterState& state,
-                      const test::counter::Increased&) override {
+  void ApplyIncreased(test::counter::CounterState& state, const test::counter::Increased&,
+                      const angzarr::router::PageContext&) override {
     state.set_count(state.count() + 1);
   }
   io::angzarr::v1::BusinessResponse OnReserveRejected(

@@ -36,7 +36,8 @@ class CounterFixture : public tc::CounterAggregateHandler {
   pb::EventBook FailHard(const tc::FailHard&, tc::CounterState&, const CommandContext&) override {
     throw std::runtime_error("hard failure");
   }
-  void ApplyIncreased(tc::CounterState& state, const tc::Increased&) override {
+  void ApplyIncreased(tc::CounterState& state, const tc::Increased&,
+                      const angzarr::router::PageContext&) override {
     state.set_count(state.count() + 1);
   }
   pb::BusinessResponse OnReserveRejected(const pb::Notification&, const pb::RejectionNotification&,

@@ -25,7 +25,7 @@ using angzarr::router::SagaEmission;
 // command for "inventory" (deferred: the router stamps its provenance).
 class SagaFixture : public tc::OrderSagaHandler {
  public:
-  SagaEmission Increased(const tc::Increased&, const Destinations&, const pb::Cover&) override {
+  SagaEmission Increased(const tc::Increased&, const Destinations&, const PageContext&) override {
     return {{ReserveCommand()}, {}};
   }
 };
@@ -37,7 +37,7 @@ SagaDispatch::EventWithContextFn RecordingIncreased(SagaFixture& fixture,
   return [&fixture, &seen](const google::protobuf::Any& event_any, const Destinations& dests,
                            const PageContext& source) {
     seen.push_back(source.sequence);
-    return fixture.Increased(CodedError::Parse<tc::Increased>(event_any), dests, source.cover);
+    return fixture.Increased(CodedError::Parse<tc::Increased>(event_any), dests, source);
   };
 }
 
