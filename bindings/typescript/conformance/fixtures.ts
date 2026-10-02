@@ -39,6 +39,9 @@ import {
 } from "../gen/test/counter/counter_pb";
 import { oneFact, reserveCommand } from "./builders";
 
+/** The (code, rejection_reason) of a rejection a compensator handled. */
+export type RejectionSeen = [code: string, message: string];
+
 /** The historical-state evidence a command handler saw — what the suite
  * asserts, since state never crosses the boundary. */
 export interface Observation {
@@ -140,6 +143,10 @@ export class ProjectorFixture implements CounterProjectorHandler {
  * Reserve command (the router stamps it deferred) plus one fact per rebuilt
  * prior-state event; a rejection injects one process event and escalates. */
 export class PmFixture implements OrderProcessManagerHandler {
+  /** `seen` collects the (code, rejection_reason) of each rejection the
+   * fixture compensates. */
+  constructor(readonly seen: RejectionSeen[] = []) {}
+
   increased(
     _ev: Increased,
     state: OrderProcessManagerState,
@@ -157,9 +164,10 @@ export class PmFixture implements OrderProcessManagerHandler {
 
   onReserveRejected(
     _n: Notification,
-    _rejection: RejectionNotification,
+    rejection: RejectionNotification,
     _state: OrderProcessManagerState,
   ): PmRejection {
+    this.seen.push([rejection.code, rejection.rejectionReason]);
     return {
       processEvents: [oneFact()],
       escalation: create(NotificationSchema, {

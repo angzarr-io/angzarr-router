@@ -47,6 +47,7 @@ import {
   AuditPmFixture,
   CounterFixture,
   type Observation,
+  type RejectionSeen,
   PmFixture,
   ProjectorFixture,
   SagaFixture,
@@ -65,6 +66,8 @@ interface Ctx {
   err?: CodedError;
   observed: Observation[];
   sagaSeen: number[];
+  /** The (code, message) of each rejection the order PM compensated. */
+  pmSeen: RejectionSeen[];
   registration?: unknown;
   registered?: boolean;
 }
@@ -72,7 +75,7 @@ interface Ctx {
 let ctx: Ctx;
 
 Before(() => {
-  ctx = { observed: [], sagaSeen: [] };
+  ctx = { observed: [], sagaSeen: [], pmSeen: [] };
 });
 
 After(() => {
@@ -540,13 +543,13 @@ Then("the delivery fails with {word}", failsWith);
 Given("an order process-manager", function () {
   ctx.kind = "pm";
   ctx.router = new Router();
-  registerOrderProcessManager(ctx.router, new PmFixture());
+  registerOrderProcessManager(ctx.router, new PmFixture(ctx.pmSeen));
 });
 
 Given("co-resident order and audit process-managers", function () {
   ctx.kind = "pm";
   ctx.router = new Router();
-  registerOrderProcessManager(ctx.router, new PmFixture());
+  registerOrderProcessManager(ctx.router, new PmFixture(ctx.pmSeen));
   registerAuditProcessManager(ctx.router, new AuditPmFixture());
 });
 
@@ -716,6 +719,21 @@ Then("the process-manager escalates", function () {
 });
 
 // --- shared (saga + pm step text collides) ----------------------------------
+
+When(
+  "a rejection of Reserve with code {string} and message {string} is dispatched",
+  function (code: string, message: string) {
+    dispatchPm(B.pmRejection("test.counter.Reserve", code, message));
+  },
+);
+
+Then(
+  "the process-manager compensator saw code {string} and message {string}",
+  function (code: string, message: string) {
+    assert.equal(ctx.err, undefined, `dispatch failed: ${ctx.err}`);
+    assert.deepEqual(ctx.pmSeen, [[code, message]]);
+  },
+);
 
 When("a rejection of {word} is dispatched", function (cmd: string) {
   const fq = `test.counter.${cmd}`;

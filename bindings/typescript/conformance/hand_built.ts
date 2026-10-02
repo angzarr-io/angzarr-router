@@ -18,14 +18,17 @@ import {
   IncreasedSchema,
 } from "../gen/test/counter/counter_pb";
 import { ledgerLinkage, oneEvent, releaseCommand } from "./builders";
+import { type RejectionSeen } from "./fixtures";
 
 // Components built through the binding's hand-written API (compensation.feature
 // and context.feature), mirroring the Rust reference fixtures.
 
 /** The payment aggregate (domain "payment"): one compensator per
- * (compensates entry, emitted event name) pair. */
+ * (compensates entry, emitted event name) pair, each recording the rejection's
+ * code and message in `seen`. */
 export function paymentAggregate(
   entries: [key: string, event: string][],
+  seen: RejectionSeen[],
 ): AggregateDispatch<object> {
   const agg = new AggregateDispatch<object>(
     "Payment",
@@ -33,7 +36,10 @@ export function paymentAggregate(
     new Rebuilder(() => ({})),
   );
   for (const [key, event] of entries) {
-    agg.onRejected(key, () => oneEvent(event));
+    agg.onRejected(key, (_n, rejection) => {
+      seen.push([rejection.code, rejection.rejectionReason]);
+      return oneEvent(event);
+    });
   }
   return agg;
 }

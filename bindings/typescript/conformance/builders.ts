@@ -235,12 +235,16 @@ export function oneFact(): EventBook {
 function rejectionNotificationFor(
   fqCommand: string,
   domain: string,
+  code = "",
+  message = "",
 ): Notification {
   const rejection = create(RejectionNotificationSchema, {
     rejectedCommand: create(CommandBookSchema, {
       cover: create(CoverSchema, { domain }),
       pages: [singleCommandPage(anyEmpty(fqCommand))],
     }),
+    rejectionReason: message,
+    code,
   });
   return create(NotificationSchema, {
     payload: Pack.wrap(RejectionNotificationSchema, rejection),
@@ -436,7 +440,13 @@ export function pmIssuedRejection(
   });
 }
 
-export function pmRejection(fqCommand: string): ProcessManagerHandleRequest {
+/** A PM request whose trigger's newest page is a rejection Notification for
+ * `fqCommand`, carrying `code` and `message` (its rejection_reason). */
+export function pmRejection(
+  fqCommand: string,
+  code = "",
+  message = "",
+): ProcessManagerHandleRequest {
   return create(ProcessManagerHandleRequestSchema, {
     trigger: create(EventBookSchema, {
       cover: create(CoverSchema, { domain: "counter" }),
@@ -446,7 +456,7 @@ export function pmRejection(fqCommand: string): ProcessManagerHandleRequest {
             case: "event",
             value: Pack.wrap(
               NotificationSchema,
-              rejectionNotificationFor(fqCommand, "inventory"),
+              rejectionNotificationFor(fqCommand, "inventory", code, message),
             ),
           },
         }),
@@ -540,17 +550,22 @@ function notificationCommand(
 }
 
 /** The rejection of a `test.counter.<command>` sent to `targetDomain`,
- * delivered to the payment aggregate. */
+ * carrying `code` and `message` (its rejection_reason), delivered to the
+ * payment aggregate. */
 export function rejectionSentTo(
   command: string,
   targetDomain: string,
   nextSequence?: number,
+  code = "",
+  message = "",
 ): ContextualCommand {
   const rejection = create(RejectionNotificationSchema, {
     rejectedCommand: create(CommandBookSchema, {
       cover: create(CoverSchema, { domain: targetDomain }),
       pages: [singleCommandPage(anyEmpty(`test.counter.${command}`))],
     }),
+    rejectionReason: message,
+    code,
   });
   return notificationCommand(
     "payment",
