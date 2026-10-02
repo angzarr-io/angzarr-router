@@ -2,6 +2,7 @@ package io.angzarr.router.conformance.projector;
 
 import io.angzarr.EventBook;
 import io.angzarr.Projection;
+import io.angzarr.router.PageContext;
 import test.counter.Counter;
 import test.counter.CounterProjectorAngzarr;
 
@@ -12,7 +13,8 @@ import test.counter.CounterProjectorAngzarr;
 final class ProjectorFixture implements CounterProjectorAngzarr.CounterProjectorHandler {
 
   @Override
-  public void increased(Counter.CounterProjectorState.Builder projection, Counter.Increased event) {
+  public void increased(
+      Counter.CounterProjectorState.Builder projection, Counter.Increased event, PageContext ctx) {
     projection.setCount(projection.getCount() + 1);
   }
 

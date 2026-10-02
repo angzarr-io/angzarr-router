@@ -7,7 +7,7 @@ import io.angzarr.Notification;
 import io.angzarr.ProcessManagerHandleResponse;
 import io.angzarr.RejectionNotification;
 import io.angzarr.router.Destinations;
-import io.angzarr.router.Thunks.PmRejection;
+import io.angzarr.router.PageContext;
 import io.angzarr.router.conformance.Builders;
 import java.util.ArrayList;
 import java.util.List;
@@ -26,7 +26,10 @@ final class PMFixture implements OrderProcessManagerAngzarr.OrderProcessManagerH
 
   @Override
   public ProcessManagerHandleResponse increased(
-      Counter.Increased event, Counter.OrderProcessManagerState.Builder state, Destinations dests) {
+      Counter.Increased event,
+      Counter.OrderProcessManagerState.Builder state,
+      Destinations dests,
+      Cover triggerCover) {
     CommandBook cmd = Builders.reserveCommand();
     List<EventBook> facts = new ArrayList<>();
     for (int i = 0; i < state.getCount(); i++) {
@@ -37,18 +40,21 @@ final class PMFixture implements OrderProcessManagerAngzarr.OrderProcessManagerH
 
   @Override
   public void applyIncreased(
-      Counter.OrderProcessManagerState.Builder state, Counter.Increased event) {
+      Counter.OrderProcessManagerState.Builder state, Counter.Increased event, PageContext ctx) {
     state.setCount(state.getCount() + 1);
   }
 
   @Override
-  public PmRejection onReserveRejected(
+  public ProcessManagerHandleResponse onReserveRejected(
       Notification n,
       RejectionNotification rejection,
       Counter.OrderProcessManagerState.Builder state) {
     seen.add(List.of(rejection.getCode(), rejection.getRejectionReason()));
     Notification escalation =
         Notification.newBuilder().setCover(Cover.newBuilder().setDomain("escalated")).build();
-    return new PmRejection(List.of(Builders.oneFact()), escalation);
+    return ProcessManagerHandleResponse.newBuilder()
+        .addProcessEvents(Builders.oneFact())
+        .setNotification(escalation)
+        .build();
   }
 }

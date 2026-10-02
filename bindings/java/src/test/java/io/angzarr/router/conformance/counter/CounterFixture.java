@@ -8,6 +8,7 @@ import io.angzarr.Notification;
 import io.angzarr.RejectionNotification;
 import io.angzarr.router.CodedError;
 import io.angzarr.router.CommandContext;
+import io.angzarr.router.PageContext;
 import io.angzarr.router.conformance.Builders;
 import java.util.ArrayList;
 import java.util.List;
@@ -54,7 +55,8 @@ final class CounterFixture implements CounterAggregateAngzarr.CounterAggregateHa
   }
 
   @Override
-  public void applyIncreased(Counter.CounterState.Builder state, Counter.Increased event) {
+  public void applyIncreased(
+      Counter.CounterState.Builder state, Counter.Increased event, PageContext ctx) {
     state.setCount(state.getCount() + 1);
   }
 
