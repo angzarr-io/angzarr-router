@@ -10,6 +10,7 @@ package conformance
 
 import (
 	"errors"
+	"fmt"
 
 	"google.golang.org/protobuf/types/known/anypb"
 
@@ -111,7 +112,9 @@ func (counterProjector) Finish(p *counter.CounterProjectorState, events *pb.Even
 
 // --- OrderProcessManager ---
 
-type orderPM struct{}
+type orderPM struct {
+	seen *rejectionSink
+}
 
 // Increased emits one Reserve command for "inventory" (stamped deferred by the
 // router) plus one fact per prior state event.
@@ -128,8 +131,29 @@ func (orderPM) ApplyIncreased(state *counter.OrderProcessManagerState, _ *counte
 	state.Count++
 }
 
-func (orderPM) OnReserveRejected(*pb.Notification, *pb.RejectionNotification, *counter.OrderProcessManagerState) ([]*pb.EventBook, *pb.Notification, error) {
+// OnReserveRejected records the rejection's code and message, then
+// compensates with one fact and an escalation.
+func (p orderPM) OnReserveRejected(_ *pb.Notification, r *pb.RejectionNotification, _ *counter.OrderProcessManagerState) ([]*pb.EventBook, *pb.Notification, error) {
+	p.seen.record(r)
 	return []*pb.EventBook{oneFact()}, &pb.Notification{Cover: &pb.Cover{Domain: "escalated"}}, nil
+}
+
+// rejectionSink holds the (code, rejection_reason) of each rejection a
+// compensator handled.
+type rejectionSink [][2]string
+
+func (s *rejectionSink) record(r *pb.RejectionNotification) {
+	*s = append(*s, [2]string{r.GetCode(), r.GetRejectionReason()})
+}
+
+// exactly reports whether exactly one rejection was handled, with code and
+// message.
+func (s *rejectionSink) exactly(code, message string) error {
+	want := [][2]string{{code, message}}
+	if fmt.Sprintf("%q", *s) != fmt.Sprintf("%q", want) {
+		return fmt.Errorf("compensators saw (code, message) %q, want %q", *s, want)
+	}
+	return nil
 }
 
 // --- AuditProcessManager ---

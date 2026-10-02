@@ -36,6 +36,7 @@ func TestProcessManagerConformance(t *testing.T) {
 
 type pmWorld struct {
 	router *Router
+	seen   rejectionSink
 	resp   *pb.ProcessManagerHandleResponse
 	err    error
 }
@@ -45,6 +46,7 @@ func (w *pmWorld) reset() {
 		w.router.Close()
 	}
 	w.router = NewRouter()
+	w.seen = nil
 	w.resp = nil
 	w.err = nil
 }
@@ -52,7 +54,7 @@ func (w *pmWorld) reset() {
 // --- Given ---
 
 func (w *pmWorld) orderPM() error {
-	if err := counter.RegisterOrderProcessManager(w.router, orderPM{}); err != nil {
+	if err := counter.RegisterOrderProcessManager(w.router, orderPM{seen: &w.seen}); err != nil {
 		return fmt.Errorf("register order PM fixture: %w", err)
 	}
 	return nil
@@ -100,6 +102,11 @@ func pmStateOf(n int) *pb.EventBook {
 // pmRejection is a trigger whose newest page is a rejection Notification for
 // fqCommand.
 func pmRejection(fqCommand string) *pb.ProcessManagerHandleRequest {
+	return pmRejectionWith(fqCommand, "", "")
+}
+
+// pmRejectionWith is pmRejection whose rejection carries code and message.
+func pmRejectionWith(fqCommand, code, message string) *pb.ProcessManagerHandleRequest {
 	rejection := &pb.RejectionNotification{
 		RejectedCommand: &pb.CommandBook{
 			Cover: &pb.Cover{Domain: "inventory"},
@@ -107,6 +114,8 @@ func pmRejection(fqCommand string) *pb.ProcessManagerHandleRequest {
 				Command: &anypb.Any{TypeUrl: typeURL(fqCommand)},
 			}}},
 		},
+		RejectionReason: message,
+		Code:            code,
 	}
 	return pmRejectionOf(rejection)
 }
@@ -205,6 +214,17 @@ func (w *pmWorld) increasedOverOwnedState(owner string, n int) {
 	state := pmStateOf(n)
 	state.Cover = &pb.Cover{Domain: owner}
 	w.dispatch(pmTrigger("counter", []string{fqIncreased}, state, nil))
+}
+
+func (w *pmWorld) rejectionWithCode(code, message string) {
+	w.dispatch(pmRejectionWith(fqReserve, code, message))
+}
+
+func (w *pmWorld) compensatorSawCode(code, message string) error {
+	if w.err != nil {
+		return fmt.Errorf("dispatch failed: %w", w.err)
+	}
+	return w.seen.exactly(code, message)
 }
 
 func (w *pmWorld) rejectionIssuedBy(issuer string) {
@@ -397,6 +417,8 @@ func initializeProcessManagerScenario(sc *godog.ScenarioContext) {
 	sc.Step(`^a request with no trigger is dispatched$`, w.noTrigger)
 	sc.Step(`^a trigger with no pages is dispatched$`, w.emptyTrigger)
 	sc.Step(`^a rejection of Reserve is dispatched$`, w.rejectionReserve)
+	sc.Step(`^a rejection of Reserve with code "([^"]*)" and message "([^"]*)" is dispatched$`, w.rejectionWithCode)
+	sc.Step(`^the process-manager compensator saw code "([^"]*)" and message "([^"]*)"$`, w.compensatorSawCode)
 	sc.Step(`^the process-manager emits one command to "([^"]*)"$`, w.emitsOneCommand)
 	sc.Step(`^the command is deferred from source sequence (\d+) at command index (\d+)$`, w.commandIsDeferred)
 	sc.Step(`^the command leaves its source component to the coordinator$`, w.leavesSourceComponent)
