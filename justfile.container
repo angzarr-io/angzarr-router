@@ -55,7 +55,8 @@ buf-format:
 go-binding-gen:
     rm -rf {{TOP}}/bindings/go/gen
     cd {{TOP}} && buf generate --template bindings/go/buf.gen.yaml \
-        --exclude-path angzarr-project/proto/google --exclude-path proto/google
+        --exclude-path angzarr-project/proto/google --exclude-path proto/google \
+        --exclude-path angzarr-project/proto/io/angzarr/examples
 
 # Build the Go binding (cdylib already built + carried forward). Generated
 # protobuf code is never committed (regenerate on need), so gen runs first.

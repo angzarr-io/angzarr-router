@@ -20,10 +20,6 @@ type SagaEventThunk func(event *anypb.Any, dests *Destinations, sourceCover *pb.
 // sequence (0 when the page carries none).
 type SagaEventContextThunk func(event *anypb.Any, dests *Destinations, source PageContext) (commands []*pb.CommandBook, events []*pb.EventBook, err error)
 
-// SagaRejectionThunk is the shape of a saga compensator. Sagas receive no
-// rejections, so the router never invokes one.
-type SagaRejectionThunk func(n *pb.Notification, rejection *pb.RejectionNotification) ([]*pb.EventBook, error)
-
 // SagaDispatch is one saga component's registration: its name, the input
 // domain it consumes, the domains it issues commands to, and its event
 // handlers. A saga is stateless — no rebuilder, no state — and receives no
@@ -57,17 +53,6 @@ func (d *SagaDispatch) OnEvent(fullName string, thunk SagaEventThunk) *SagaDispa
 // event type; the thunk also receives the triggering event's PageContext.
 func (d *SagaDispatch) OnEventWithContext(fullName string, thunk SagaEventContextThunk) *SagaDispatch {
 	d.events[fullName] = thunk
-	return d
-}
-
-// OnRejected accepts a saga compensator and registers nothing: sagas receive
-// no rejections (a rejection Notification in a saga's source emits nothing),
-// so the thunk never runs. Compensation belongs to the aggregate or process
-// manager that issued the command.
-//
-// Deprecated: sagas receive no rejections; declare compensates on the issuing
-// aggregate or process manager instead.
-func (d *SagaDispatch) OnRejected(string, SagaRejectionThunk) *SagaDispatch {
 	return d
 }
 
