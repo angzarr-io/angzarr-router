@@ -93,7 +93,13 @@ class CounterProjector:
 
 
 class OrderProcessManager:
-    """Implements order_process_manager_angzarr.OrderProcessManagerHandler."""
+    """Implements order_process_manager_angzarr.OrderProcessManagerHandler.
+
+    ``seen`` collects the (code, rejection_reason) of each rejection it
+    compensates."""
+
+    def __init__(self, seen: list[tuple[str, str]] | None = None):
+        self.seen = seen if seen is not None else []
 
     def increased(self, event, state, dests):
         resp = process_manager_pb2.ProcessManagerHandleResponse()
@@ -106,6 +112,7 @@ class OrderProcessManager:
         state.count += 1
 
     def on_reserve_rejected(self, notification, rejection, state):
+        self.seen.append((rejection.code, rejection.rejection_reason))
         escalation = types_pb2.Notification()
         escalation.cover.domain = "escalated"
         return [_one_fact()], escalation

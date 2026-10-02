@@ -30,6 +30,7 @@ class _World:
 
     def __init__(self):
         self.router = Router()
+        self.seen: list[tuple[str, str]] = []
         self.resp = None
         self.err: CodedError | None = None
 
@@ -98,11 +99,12 @@ def _state_of(n: int, owner: str | None = None):
     return book
 
 
-def _rejection(fq_command: str, issuer: str | None = None):
-    """A rejection of fq_command delivered as a Notification trigger. With an
-    ``issuer`` the trigger cover is the issuer's domain and the rejected
-    command's angzarr_deferred header names the issuer as its source."""
-    rejection = types_pb2.RejectionNotification()
+def _rejection(fq_command: str, issuer: str | None = None, code: str = "", message: str = ""):
+    """A rejection of fq_command delivered as a Notification trigger, carrying
+    ``code`` and ``message`` (its rejection_reason). With an ``issuer`` the
+    trigger cover is the issuer's domain and the rejected command's
+    angzarr_deferred header names the issuer as its source."""
+    rejection = types_pb2.RejectionNotification(code=code, rejection_reason=message)
     rejection.rejected_command.cover.domain = "inventory"
     page = rejection.rejected_command.pages.add()
     page.command.type_url = type_url(fq_command)
@@ -123,14 +125,14 @@ def _rejection(fq_command: str, issuer: str | None = None):
 @given("an order process-manager")
 def _an_order_pm(world):
     order_process_manager_angzarr.register_order_process_manager(
-        world.router, OrderProcessManager()
+        world.router, OrderProcessManager(world.seen)
     )
 
 
 @given("co-resident order and audit process-managers")
 def _co_resident_pms(world):
     order_process_manager_angzarr.register_order_process_manager(
-        world.router, OrderProcessManager()
+        world.router, OrderProcessManager(world.seen)
     )
     audit_process_manager_angzarr.register_audit_process_manager(
         world.router, AuditProcessManager()
@@ -190,6 +192,27 @@ def _empty_trigger(world):
 @when("a rejection of Reserve is dispatched")
 def _rejection_reserve(world):
     world.dispatch(_rejection(FQ_RESERVE))
+
+
+@when(
+    parsers.re(
+        r'a rejection of Reserve with code "(?P<code>[^"]*)" and message "(?P<message>[^"]*)" '
+        r"is dispatched"
+    )
+)
+def _rejection_reserve_with_code(world, code, message):
+    world.dispatch(_rejection(FQ_RESERVE, code=code, message=message))
+
+
+@then(
+    parsers.re(
+        r'the process-manager compensator saw code "(?P<code>[^"]*)" '
+        r'and message "(?P<message>[^"]*)"'
+    )
+)
+def _compensator_saw_code(world, code, message):
+    assert world.err is None, f"dispatch failed: {world.err}"
+    assert world.seen == [(code, message)]
 
 
 @when(parsers.re(r'a rejection of Reserve issued by "(?P<issuer>[^"]*)" is dispatched'))

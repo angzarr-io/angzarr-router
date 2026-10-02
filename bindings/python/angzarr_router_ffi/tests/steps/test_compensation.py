@@ -31,12 +31,26 @@ def _emitting(name: str):
     return handler
 
 
-def _payment_aggregate(entries: list[tuple[str, str]]) -> AggregateDispatch:
+def _recording(name: str, seen: list[tuple[str, str]]):
+    """A compensation handler that records the rejection's (code,
+    rejection_reason) in ``seen`` and emits ``test.counter.<name>``."""
+
+    def handler(_notification, rejection, _state, _cctx):
+        seen.append((rejection.code, rejection.rejection_reason))
+        return _one_event(name)
+
+    return handler
+
+
+def _payment_aggregate(
+    entries: list[tuple[str, str]], seen: list[tuple[str, str]]
+) -> AggregateDispatch:
     """The payment aggregate (domain "payment"): one compensation handler per
-    (compensates entry, emitted event name) pair."""
+    (compensates entry, emitted event name) pair, each recording the
+    rejection's code and message in ``seen``."""
     dispatch = AggregateDispatch("Payment", "payment", Rebuilder(factory=lambda: None))
     for compensates, event in entries:
-        dispatch.on_rejected(compensates, _emitting(event))
+        dispatch.on_rejected(compensates, _recording(event, seen))
     return dispatch
 
 
@@ -66,8 +80,17 @@ def _notification_command(domain: str, payload, next_sequence: int | None):
     return cc
 
 
-def _rejection_sent_to(command: str, target_domain: str, next_sequence: int | None = None):
-    rejection = types_pb2.RejectionNotification()
+def _rejection_sent_to(
+    command: str,
+    target_domain: str,
+    next_sequence: int | None = None,
+    code: str = "",
+    message: str = "",
+):
+    """The rejection of ``test.counter.<command>`` sent to ``target_domain``,
+    carrying ``code`` and ``message`` (its rejection_reason), delivered to the
+    payment aggregate."""
+    rejection = types_pb2.RejectionNotification(code=code, rejection_reason=message)
     rejection.rejected_command.cover.domain = target_domain
     rejection.rejected_command.pages.add().command.type_url = type_url("test.counter." + command)
     return _notification_command("payment", pack(rejection), next_sequence)
@@ -83,6 +106,7 @@ def _compensate_for(command: str):
 class _World:
     def __init__(self):
         self.router = Router()
+        self.seen: list[tuple[str, str]] = []
         self.resp = None
         self.err: CodedError | None = None
 
@@ -114,7 +138,7 @@ def world():
 
 @given(parsers.re(r"a payment aggregate compensating Reserve from any domain with (?P<event>\w+)"))
 def _payment_unqualified(world, event):
-    world.build(_payment_aggregate([(FQ_RESERVE, event)]))
+    world.build(_payment_aggregate([(FQ_RESERVE, event)], world.seen))
 
 
 @given(
@@ -123,7 +147,7 @@ def _payment_unqualified(world, event):
     )
 )
 def _second_payment(world, event):
-    world.build(_payment_aggregate([(FQ_RESERVE, event)]))
+    world.build(_payment_aggregate([(FQ_RESERVE, event)], world.seen))
 
 
 @given(
@@ -138,7 +162,8 @@ def _payment_qualified(world, first_domain, first_event, second_domain, second_e
             [
                 (f"{first_domain}:{FQ_RESERVE}", first_event),
                 (f"{second_domain}:{FQ_RESERVE}", second_event),
-            ]
+            ],
+            world.seen,
         )
     )
 
@@ -169,6 +194,26 @@ def _rejection_sent(world, command, domain):
 )
 def _rejection_over_history(world, command, domain, last):
     world.dispatch(_rejection_sent_to(command, domain, int(last) + 1))
+
+
+@when(
+    parsers.re(
+        r'a rejection of (?P<command>\w+) with code "(?P<code>[^"]*)" and message '
+        r'"(?P<message>[^"]*)" is dispatched to the payment aggregate'
+    )
+)
+def _rejection_with_code(world, command, code, message):
+    world.dispatch(_rejection_sent_to(command, "inventory", code=code, message=message))
+
+
+@when(
+    parsers.re(
+        r'a rejection of (?P<command>\w+) with no code and message "(?P<message>[^"]*)" '
+        r"is dispatched to the payment aggregate"
+    )
+)
+def _rejection_without_code(world, command, message):
+    world.dispatch(_rejection_sent_to(command, "inventory", code="", message=message))
 
 
 @when(parsers.re(r"a Compensate for (?P<command>\w+) is dispatched to the inventory aggregate"))
@@ -218,3 +263,19 @@ def _fails_unimplemented(world, code):
     assert world.err is not None, f"expected failure {code}, got a success"
     assert world.err.code == code
     assert world.err.grpc == GrpcCode.UNIMPLEMENTED
+
+
+@then(
+    parsers.re(
+        r'the compensation handler saw code "(?P<code>[^"]*)" and message "(?P<message>[^"]*)"'
+    )
+)
+def _saw_code(world, code, message):
+    assert world.err is None, f"dispatch failed: {world.err}"
+    assert world.seen == [(code, message)]
+
+
+@then(parsers.re(r'the compensation handler saw an empty code and message "(?P<message>[^"]*)"'))
+def _saw_no_code(world, message):
+    assert world.err is None, f"dispatch failed: {world.err}"
+    assert world.seen == [("", message)]
