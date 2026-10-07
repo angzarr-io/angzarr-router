@@ -283,9 +283,6 @@ impl Scanner {
         let mut leaves = Vec::new();
         flatten_use(&u.tree, Vec::new(), &mut leaves);
         for (segs, alias) in leaves {
-            if segs.is_empty() {
-                continue;
-            }
             if module_level {
                 if let (Some(alias), Some(info)) = (alias, self.modules.get_mut(&ctx.module)) {
                     info.aliases.insert(alias, segs.clone());
@@ -341,7 +338,6 @@ impl Scanner {
             "crate" => info.root.clone(),
             "self" => module.to_string(),
             "super" => parent_of(module, &info.root),
-            "Self" => return None,
             name if info.children.contains(name) => format!("{module}::{name}"),
             name if info.aliases.contains_key(name) && depth < ALIAS_DEPTH => {
                 let target = self.resolve(module, &info.aliases[name], false, home, depth + 1)?;
@@ -454,6 +450,8 @@ impl Collector {
 
 impl<'ast> Visit<'ast> for Collector {
     fn visit_path(&mut self, p: &'ast syn::Path) {
+        // A bare identifier is a local, a generic or an imported name (whose
+        // `use` is already an edge) — never a module reference on its own.
         if p.segments.len() > 1 || p.leading_colon.is_some() {
             let segs = p.segments.iter().map(|s| s.ident.to_string()).collect();
             let line = p
@@ -469,7 +467,7 @@ impl<'ast> Visit<'ast> for Collector {
         let line = u.use_token.span.start().line;
         let mut leaves = Vec::new();
         flatten_use(&u.tree, Vec::new(), &mut leaves);
-        for (segs, _) in leaves.into_iter().filter(|(s, _)| !s.is_empty()) {
+        for (segs, _) in leaves {
             self.push(segs, u.leading_colon.is_some(), line);
         }
     }
@@ -553,7 +551,6 @@ fn item_attrs(item: &Item) -> &[Attribute] {
     match item {
         Item::Const(i) => &i.attrs,
         Item::Enum(i) => &i.attrs,
-        Item::ExternCrate(i) => &i.attrs,
         Item::Fn(i) => &i.attrs,
         Item::ForeignMod(i) => &i.attrs,
         Item::Impl(i) => &i.attrs,
@@ -562,7 +559,6 @@ fn item_attrs(item: &Item) -> &[Attribute] {
         Item::Static(i) => &i.attrs,
         Item::Struct(i) => &i.attrs,
         Item::Trait(i) => &i.attrs,
-        Item::TraitAlias(i) => &i.attrs,
         Item::Type(i) => &i.attrs,
         Item::Union(i) => &i.attrs,
         Item::Use(i) => &i.attrs,
