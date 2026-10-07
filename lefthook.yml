@@ -1,0 +1,34 @@
+# Lefthook configuration for angzarr-router
+# https://github.com/evilmartians/lefthook
+#
+# Setup: lefthook install
+# Bypass: none — fix the finding instead.
+
+# Plant the in-submodule pre-commit guard in .git/modules/<name>/hooks/
+# (angzarr-project/submodule.just) after checkouts and merges.
+post-checkout:
+  commands:
+    install-submodule-hooks:
+      run: just install-submodule-hooks
+
+post-merge:
+  commands:
+    install-submodule-hooks:
+      run: just install-submodule-hooks
+
+pre-commit:
+  parallel: false
+  commands:
+    # Block the commit if a submodule has uncommitted edits or untracked
+    # files. Pointer-only bumps still pass.
+    check-submodules-clean:
+      run: just check-submodules-clean
+
+    # Refuse commits whose staged files contain secrets (gitleaks).
+    scan-secrets:
+      run: just scan-secrets
+
+    # Module-level layer rules (archlint.toml) over the Rust workspace.
+    archlint:
+      glob: "*.{rs,toml}"
+      run: just archlint

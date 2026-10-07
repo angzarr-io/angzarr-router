@@ -5,7 +5,10 @@
 # delegates here via the container-overlay pattern (same as angzarr core).
 set shell := ["bash", "-c"]
 
-TOP := `git rev-parse --show-toplevel`
+# The checkout root: this file sits at the top (mounted over `justfile` in the
+# container, read in place in a devcontainer). Independent of git, so a git
+# worktree whose .git points outside the mount works too.
+TOP := justfile_directory()
 
 # Pinned codegen toolchain, fetched into .tools/ (gitignored) from GitHub —
 # never from the Buf Schema Registry. Protobuf generated code is version-locked
@@ -72,14 +75,14 @@ test:
 fmt-check:
     cargo fmt --manifest-path {{TOP}}/Cargo.toml --all --check
 
-# Mutation-test the core modules and the FFI registry's routing/claim rules
-# (gate: kill >= 0.95).
+# Mutation-test the core modules, the FFI registry's routing/claim rules and
+# the architecture linter (gate: kill >= 0.95).
 # cargo-mutants copies the source tree, so the proto root must be an absolute
 # path that survives the copy — ANGZARR_PROJECT_PROTO points build.rs at the
 # real submodule checkout.
 mutation-test:
     cargo mutants --version >/dev/null 2>&1 || cargo install cargo-mutants --locked --version {{CARGO_MUTANTS}}
-    cd {{TOP}} && ANGZARR_PROJECT_PROTO=${ANGZARR_PROJECT_PROTO:-{{TOP}}/angzarr-project/proto} cargo mutants -f crates/router/src/rebuild.rs -f crates/router/src/aggregate.rs -f crates/router/src/projector.rs -f crates/router/src/saga.rs -f crates/router/src/destinations.rs -f crates/router/src/process_manager.rs -f crates/router/src/error.rs -f crates/router/src/lib.rs -f crates/router/src/router.rs -f crates/router/src/upcaster.rs -f crates/router-ffi/src/registry.rs --timeout 120
+    cd {{TOP}} && ANGZARR_PROJECT_PROTO=${ANGZARR_PROJECT_PROTO:-{{TOP}}/angzarr-project/proto} cargo mutants -f crates/router/src/rebuild.rs -f crates/router/src/aggregate.rs -f crates/router/src/projector.rs -f crates/router/src/saga.rs -f crates/router/src/destinations.rs -f crates/router/src/process_manager.rs -f crates/router/src/error.rs -f crates/router/src/lib.rs -f crates/router/src/router.rs -f crates/router/src/upcaster.rs -f crates/router-ffi/src/registry.rs -f tools/archlint/src/rules.rs -f tools/archlint/src/scan.rs -f tools/archlint/src/workspace.rs -f tools/archlint/src/model.rs --timeout 120
 
 # Format
 fmt:
@@ -88,6 +91,12 @@ fmt:
 # Lint (clippy, warnings are errors)
 lint:
     cargo clippy --manifest-path {{TOP}}/Cargo.toml --workspace --all-targets -- -D warnings
+
+# Architecture lint: check the workspace's module dependency graph against
+# the layer rules in archlint.toml (tools/archlint). `cargo run -p archlint --
+# --edges` prints the model the rules are checked against.
+archlint:
+    cargo run --manifest-path {{TOP}}/Cargo.toml --quiet -p archlint -- --rules {{TOP}}/archlint.toml --manifest-path {{TOP}}/Cargo.toml
 
 # Lint the router's own protos (io.angzarr.router.ffi.v1) with buf, in the
 # root workspace so their angzarr-project imports resolve.

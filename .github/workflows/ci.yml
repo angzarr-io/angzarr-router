@@ -37,6 +37,9 @@ jobs:
       - name: Clippy
         run: just lint
 
+      - name: Architecture lint
+        run: just archlint
+
       - name: Unit tests and conformance (Rust)
         run: just test
 

@@ -123,5 +123,10 @@ libraries.
   each binding against fixtures implementing the generated handler
   interfaces from `conformance/proto/test/counter/counter.proto`, plus
   binding-local tests.
-- `just mutation-test`: cargo-mutants over the core modules and the FFI
-  registry.
+- `just mutation-test`: cargo-mutants over the core modules, the FFI
+  registry and the architecture linter.
+- `just archlint`: the layering above as checked rules — `archlint.toml`
+  (engine below the C ABI, components independent of each other and of the
+  router, conformance on the public surfaces, bindings as leaves), enforced
+  by `tools/archlint` over every module's `use`/path references and every
+  manifest dependency. Runs in pre-commit and CI.

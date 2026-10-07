@@ -77,8 +77,9 @@ path through that env var so cargo-mutants' copied trees build.
 ```bash
 just build              # cargo build --workspace (also builds the router-ffi cdylib)
 just test               # core + FFI ABI tests + native conformance suite
-just mutation-test      # cargo-mutants over the core modules and the FFI registry
+just mutation-test      # cargo-mutants over the core, the FFI registry and archlint
 just lint               # clippy -D warnings
+just archlint           # module-level layer rules (archlint.toml)
 just <lang>-binding-test  # go | java | csharp | cpp | ts: conformance via that binding
 ```
 
