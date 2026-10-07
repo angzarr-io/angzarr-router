@@ -5,7 +5,10 @@
 # delegates here via the container-overlay pattern (same as angzarr core).
 set shell := ["bash", "-c"]
 
-TOP := `git rev-parse --show-toplevel`
+# The checkout root: this file sits at the top (mounted over `justfile` in the
+# container, read in place in a devcontainer). Independent of git, so a git
+# worktree whose .git points outside the mount works too.
+TOP := justfile_directory()
 
 # Pinned codegen toolchain, fetched into .tools/ (gitignored) from GitHub —
 # never from the Buf Schema Registry. Protobuf generated code is version-locked
