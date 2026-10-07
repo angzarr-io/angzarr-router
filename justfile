@@ -194,6 +194,9 @@ fmt: (_container "fmt")
 # Lint (clippy, warnings are errors)
 lint: (_container "lint")
 
+# Architecture lint: module-level layer rules (archlint.toml)
+archlint: (_container "archlint")
+
 # Lint the router's protos (buf, pinned plugins)
 buf-lint: (_container "buf-lint")
 

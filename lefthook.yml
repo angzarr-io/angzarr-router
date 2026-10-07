@@ -28,3 +28,7 @@ pre-commit:
     scan-secrets:
       run: just scan-secrets
 
+    # Module-level layer rules (archlint.toml) over the Rust workspace.
+    archlint:
+      glob: "*.{rs,toml}"
+      run: just archlint

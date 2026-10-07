@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/router", "crates/router-ffi", "crates/conformance"]
+members = ["crates/router", "crates/router-ffi", "crates/conformance", "tools/archlint"]
 
 [workspace.package]
 version = "0.1.0"

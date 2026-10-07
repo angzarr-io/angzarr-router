@@ -7,6 +7,8 @@
 //! here — do not duplicate them into generated output, bindings, or
 //! component adapters.
 
+#![forbid(unsafe_code)]
+
 pub mod aggregate;
 pub mod destinations;
 pub mod error;
