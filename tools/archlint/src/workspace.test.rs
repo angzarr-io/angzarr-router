@@ -185,4 +185,20 @@ fn build_model_scans_targets_and_manifest_edges() {
 fn metadata_reports_cargo_failures() {
     let err = metadata(std::path::Path::new("/nonexistent/Cargo.toml")).unwrap_err();
     assert!(err.starts_with("cargo metadata:"), "{err}");
+    assert!(
+        err.contains("/nonexistent/Cargo.toml"),
+        "carries cargo's stderr: {err}"
+    );
+}
+
+#[test]
+fn metadata_reads_the_workspace() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let meta = metadata(&manifest).unwrap();
+    let me = meta
+        .packages
+        .iter()
+        .find(|p| p.name == "archlint")
+        .expect("archlint package");
+    assert!(me.targets.iter().any(|t| t.kind == ["bin"]));
 }

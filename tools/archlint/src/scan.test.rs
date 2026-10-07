@@ -416,3 +416,199 @@ fn workspace_crate_names_resolve_without_a_declared_dependency() {
     let (m, _) = s.finish();
     assert!(has(&m, "core_crate", "ffi", Scope::Lib), "{:?}", edges(&m));
 }
+
+#[test]
+fn path_attr_module_children_resolve_beside_its_file() {
+    let (m, warnings) = scan_lib(
+        &[
+            ("src/lib.rs", "#[path = \"impl/c.rs\"] mod c;"),
+            ("src/impl/c.rs", "mod d;"),
+            ("src/impl/d.rs", ""),
+        ],
+        &[],
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(m.modules["app::c::d"], PathBuf::from("src/impl/d.rs"));
+}
+
+#[test]
+fn self_paths_descend_into_child_modules() {
+    let (m, _) = scan_lib(
+        &[
+            ("src/lib.rs", "pub mod a; fn f() { self::a::x(); }"),
+            ("src/a.rs", ""),
+        ],
+        &[],
+    );
+    assert!(has(&m, "app", "app::a", Scope::Lib), "{:?}", edges(&m));
+}
+
+#[test]
+fn imported_module_names_resolve_in_later_paths() {
+    let (m, _) = scan_lib(
+        &[
+            ("src/lib.rs", "pub mod b; pub mod user;"),
+            ("src/b.rs", "pub mod inner {}"),
+            ("src/user.rs", "use crate::b;\nfn f() { b::inner::x(); }"),
+        ],
+        &[],
+    );
+    let e = m
+        .edges
+        .iter()
+        .find(|e| e.from == "app::user" && e.to == "app::b::inner")
+        .expect("alias-resolved edge");
+    assert_eq!(e.line, 2);
+}
+
+#[test]
+fn use_self_imports_the_parent_name() {
+    let (m, _) = scan_lib(
+        &[
+            ("src/lib.rs", "pub mod b; pub mod user;"),
+            ("src/b.rs", "pub mod inner {}"),
+            (
+                "src/user.rs",
+                "use crate::b::{self};\nfn f() { b::inner::x(); }",
+            ),
+        ],
+        &[],
+    );
+    assert!(
+        has(&m, "app::user", "app::b::inner", Scope::Lib),
+        "{:?}",
+        edges(&m)
+    );
+}
+
+#[test]
+fn cyclic_aliases_terminate() {
+    let (m, _) = scan_lib(
+        &[(
+            "src/lib.rs",
+            "pub mod m { pub use self::b as a; pub use self::a as b; }\nfn f() { crate::m::a::x(); m::b::y(); }",
+        )],
+        &[],
+    );
+    assert!(has(&m, "app", "app::m", Scope::Lib), "{:?}", edges(&m));
+}
+
+#[test]
+fn bare_identifiers_are_not_module_references() {
+    let (m, _) = scan_lib(
+        &[
+            ("src/lib.rs", "pub mod saga; fn f(saga: u8) -> u8 { saga }"),
+            ("src/saga.rs", ""),
+        ],
+        &[],
+    );
+    assert!(edges(&m).is_empty(), "{:?}", edges(&m));
+}
+
+#[test]
+fn unscanned_workspace_crates_keep_the_written_path() {
+    let mut s = Scanner::in_memory(
+        PathBuf::from(WS),
+        files(&[("src/lib.rs", "use tool::a::b;")]),
+    );
+    s.add_workspace_crate("app");
+    s.add_workspace_crate("tool");
+    s.add_target(
+        "app",
+        Path::new("/ws/src/lib.rs"),
+        Scope::Lib,
+        &known(&["app"]),
+    )
+    .unwrap();
+    let (m, _) = s.finish();
+    assert!(has(&m, "app", "tool::a::b", Scope::Lib), "{:?}", edges(&m));
+}
+
+#[test]
+fn nested_uses_inside_bodies_are_references() {
+    let (m, _) = scan_lib(
+        &[
+            ("src/lib.rs", "pub mod a; fn f() { use crate::a::X; }"),
+            ("src/a.rs", ""),
+        ],
+        &[],
+    );
+    assert!(has(&m, "app", "app::a", Scope::Lib), "{:?}", edges(&m));
+}
+
+#[test]
+fn cfg_test_on_any_item_kind_is_test_scope() {
+    let (m, _) = scan_lib(
+        &[
+            (
+                "src/lib.rs",
+                "pub mod a;
+                 #[cfg(test)] const C: crate::a::T1 = 0;
+                 #[cfg(test)] enum E { V(crate::a::T2) }
+                 #[cfg(test)] extern \"C\" { fn g(x: crate::a::T3); }
+                 #[cfg(test)] impl crate::a::T4 {}
+                 #[cfg(test)] m!(crate::a::t5());
+                 #[cfg(test)] static S: crate::a::T6 = 0;
+                 #[cfg(test)] struct St(crate::a::T7);
+                 #[cfg(test)] trait Tr: crate::a::T8 {}
+                 #[cfg(test)] type Ty = crate::a::T9;
+                 #[cfg(test)] union U { f: crate::a::T10 }
+                 #[cfg(test)] use crate::a::T11;
+                 #[cfg(test)] fn h() { crate::a::t12(); }
+                 struct I; impl Tr for I {
+                     #[cfg(test)] const K: crate::a::T13 = 0;
+                     #[cfg(test)] type A = crate::a::T14;
+                 }",
+            ),
+            ("src/a.rs", ""),
+        ],
+        &[],
+    );
+    let lib: Vec<_> = m
+        .edges
+        .iter()
+        .filter(|e| e.scope == Scope::Lib && e.to == "app::a")
+        .map(|e| e.via.clone())
+        .collect();
+    assert!(lib.is_empty(), "lib-scope edges: {lib:?}");
+    let test = m
+        .edges
+        .iter()
+        .filter(|e| e.scope == Scope::Test && e.to == "app::a")
+        .count();
+    assert_eq!(test, 14, "{:?}", m.edges);
+}
+
+#[test]
+fn self_referential_use_aliases_terminate() {
+    let (m, _) = scan_lib(
+        &[(
+            "src/lib.rs",
+            "pub mod m { use a as b; use b as a; fn f() { a::x(); } }",
+        )],
+        &[],
+    );
+    assert!(m.modules.contains_key("app::m"));
+}
+
+/// A module whose `fn f` (line 1) reaches `crate::t` through a chain of
+/// `hops` aliases, declared one per following line.
+fn alias_chain(hops: usize) -> Model {
+    let mut src = String::from("pub mod t {}\npub mod m { fn f() { a0::x(); }\n");
+    for i in 0..hops - 1 {
+        src.push_str(&format!("use a{} as a{i};\n", i + 1));
+    }
+    src.push_str(&format!("use crate::t as a{};\n}}", hops - 1));
+    scan_lib(&[("src/lib.rs", src.as_str())], &[]).0
+}
+
+#[test]
+fn alias_chains_resolve_up_to_the_depth_bound() {
+    let reaches = |m: &Model| m.edges.iter().any(|e| e.line == 2 && e.to == "app::t");
+    assert!(
+        reaches(&alias_chain(ALIAS_DEPTH)),
+        "{:?}",
+        alias_chain(ALIAS_DEPTH).edges
+    );
+    assert!(!reaches(&alias_chain(ALIAS_DEPTH + 1)));
+}
