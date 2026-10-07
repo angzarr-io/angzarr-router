@@ -4,6 +4,7 @@ import com.google.protobuf.Any;
 import com.google.protobuf.Message;
 import io.angzarr.BusinessResponse;
 import io.angzarr.CommandBook;
+import io.angzarr.Compensate;
 import io.angzarr.Cover;
 import io.angzarr.EventBook;
 import io.angzarr.Notification;
@@ -13,11 +14,10 @@ import io.angzarr.RejectionNotification;
 import java.util.List;
 
 /**
- * The typed business thunks the dispatch builders hold and the generated wiring
- * provides. State is a {@link Message.Builder} (protobuf-java is immutable;
- * appliers fold events into the builder); the generated lambdas cast it to the
- * concrete builder type. A thunk throws to fail — the trampoline catches and
- * codes it.
+ * The typed business thunks the dispatch builders hold and the generated wiring provides. State is
+ * a {@link Message.Builder} (protobuf-java is immutable; appliers fold events into the builder);
+ * the generated lambdas cast it to the concrete builder type. A thunk throws to fail — the
+ * trampoline catches and codes it.
  */
 public final class Thunks {
   private Thunks() {}
@@ -25,6 +25,12 @@ public final class Thunks {
   @FunctionalInterface
   public interface ApplierThunk {
     void apply(Message.Builder state, Any event) throws Exception;
+  }
+
+  @FunctionalInterface
+  public interface ApplierContextThunk {
+    /** ctx is where the event sits: its book's cover and the page's sequence. */
+    void apply(Message.Builder state, Any event, PageContext ctx) throws Exception;
   }
 
   @FunctionalInterface
@@ -45,8 +51,37 @@ public final class Thunks {
   }
 
   @FunctionalInterface
+  public interface UndoThunk {
+    /**
+     * Undoes an executed command named by the Compensate; returns a BusinessResponse, or null for
+     * nothing.
+     */
+    BusinessResponse undo(
+        Notification notification,
+        Compensate compensate,
+        Message.Builder state,
+        CommandContext cctx)
+        throws Exception;
+  }
+
+  @FunctionalInterface
+  public interface FactThunk {
+    /**
+     * Returns the fact to record (as received, or annotated) and the events that flag it. State is
+     * the aggregate's rebuilt state.
+     */
+    FactRecord handle(Any fact, Message.Builder state) throws Exception;
+  }
+
+  @FunctionalInterface
   public interface ProjectorEventThunk {
     void fold(Message.Builder projection, Any event) throws Exception;
+  }
+
+  @FunctionalInterface
+  public interface ProjectorEventContextThunk {
+    /** ctx is where the event sits: its book's cover and the page's sequence. */
+    void fold(Message.Builder projection, Any event, PageContext ctx) throws Exception;
   }
 
   @FunctionalInterface
@@ -61,15 +96,20 @@ public final class Thunks {
 
   @FunctionalInterface
   public interface SagaEventThunk {
-    /** sourceCover is the source book's cover, so the saga can route emitted
-     * commands by the trigger's identity (root, ext). */
+    /**
+     * sourceCover is the source book's cover, so the saga can route emitted commands by the
+     * trigger's identity (root, ext).
+     */
     SagaEmission translate(Any event, Destinations dests, Cover sourceCover) throws Exception;
   }
 
   @FunctionalInterface
-  public interface SagaRejectionThunk {
-    List<EventBook> compensate(Notification notification, RejectionNotification rejection)
-        throws Exception;
+  public interface SagaEventContextThunk {
+    /**
+     * source is where the triggering event sits: the source book's cover (to route emitted commands
+     * by the trigger's identity) and the event's sequence (0 when the page carries none).
+     */
+    SagaEmission translate(Any event, Destinations dests, PageContext source) throws Exception;
   }
 
   @FunctionalInterface
@@ -79,8 +119,25 @@ public final class Thunks {
   }
 
   @FunctionalInterface
+  public interface PmEventCoverThunk {
+    /** triggerCover is the trigger book's cover. */
+    ProcessManagerHandleResponse handle(
+        Any event, Message.Builder state, Destinations dests, Cover triggerCover) throws Exception;
+  }
+
+  @FunctionalInterface
   public interface PmRejectionThunk {
     PmRejection compensate(
+        Notification notification, RejectionNotification rejection, Message.Builder state)
+        throws Exception;
+  }
+
+  @FunctionalInterface
+  public interface PmCompensatorThunk {
+    /**
+     * Returns the full response (process events, commands, facts, escalation), or null for nothing.
+     */
+    ProcessManagerHandleResponse compensate(
         Notification notification, RejectionNotification rejection, Message.Builder state)
         throws Exception;
   }
@@ -88,7 +145,9 @@ public final class Thunks {
   /** A saga event's emission: commands to issue + fact events to inject. */
   public record SagaEmission(List<CommandBook> commands, List<EventBook> events) {}
 
-  /** A PM rejection's result: process events to fold + an optional escalation
-   * notification (null for none). */
+  /**
+   * A PM rejection's result: process events to fold + an optional escalation notification (null for
+   * none).
+   */
   public record PmRejection(List<EventBook> processEvents, Notification escalation) {}
 }

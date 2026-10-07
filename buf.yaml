@@ -1,5 +1,20 @@
 version: v2
 modules:
   - path: angzarr-project/proto
+  # The router's own ABI protos (io.angzarr.router.ffi.v1) and vendored
+  # google.rpc shapes. buf-lint lints only proto/io: framework protos are
+  # linted in angzarr-project, and upstream Google protos are not ours to
+  # police.
   - path: proto
+    lint:
+      use:
+        - STANDARD
+      except:
+        - RPC_REQUEST_RESPONSE_UNIQUE
+        - RPC_REQUEST_STANDARD_NAME
+        - RPC_RESPONSE_STANDARD_NAME
+        - ENUM_VALUE_PREFIX
+        - ENUM_ZERO_VALUE_SUFFIX
+        - SERVICE_SUFFIX
+        - IMPORT_USED
   - path: conformance/proto

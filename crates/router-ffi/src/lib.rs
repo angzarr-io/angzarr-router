@@ -1,5 +1,10 @@
-//! angzarr-router-ffi — the C ABI over the core. Nothing else: no
-//! semantics in this layer.
+//! angzarr-router-ffi — the C ABI over the core. Dispatch semantics live in
+//! the core; this layer owns the marshaling plus the registry's component
+//! claims: routing a command to its aggregate through the core's
+//! CommandHandlers (by domain and command type; a sole aggregate claims
+//! every domain), one projector per router, sagas by source domain, and
+//! co-resident PMs through the core's selection. Those rules are
+//! mutation-tested with the core.
 //!
 //! # Status codes
 //! Every entry point and host callback returns `i32`:
@@ -24,7 +29,12 @@
 //! Callbacks are invoked synchronously on the dispatching thread — one
 //! callback at a time per dispatch; dispatches on different host_ctx
 //! values may run concurrently. `host_ctx` is opaque to Rust: it is where
-//! the binding parks the per-dispatch state object (state never crosses).
+//! the binding parks the per-dispatch session (state never crosses). One
+//! dispatch may run several components under the same `host_ctx`
+//! (co-resident sagas or process managers), so the host keys any lazily
+//! created state by component (each component's callback ids), never by
+//! session alone. Registration takes the router exclusively: it must not run
+//! concurrently with any other call on the same router.
 //! Every entry point wraps `catch_unwind`; a Rust panic surfaces as a
 //! coded UNHANDLED_HANDLER_ERROR failure — never an abort, never an
 //! unwind across the boundary.
@@ -330,6 +340,80 @@ pub unsafe extern "C" fn angzarr_router_dispatch(
         let router = &*(r as *const FfiRouter);
         let bytes = slice_from(request, request_len);
         router.dispatch(host_ctx, bytes)
+    }));
+    match flatten_panic(result) {
+        Ok(response) => {
+            fill_out(out, &response);
+            0
+        }
+        Err(err) => {
+            let code = err.grpc as i32;
+            fill_out(out, &coded_to_status_bytes(err));
+            -code
+        }
+    }
+}
+
+/// Dispatches `io.angzarr.v1.FactRequest` bytes through the fact handling of the aggregate claiming the facts' cover domain. On success returns 0 and fills `out`
+/// with `io.angzarr.v1.EventBook` bytes; on failure returns the negated gRPC code and fills
+/// `out` with `google.rpc.Status` bytes. Either way the host releases `out`
+/// with `angzarr_buf_release`.
+///
+/// # Safety
+/// `r` must be a live router; `request` must point to `request_len` readable
+/// bytes; `out` must point to a writable `AngzarrBuf`.
+#[no_mangle]
+pub unsafe extern "C" fn angzarr_router_dispatch_fact(
+    r: *mut c_void,
+    host_ctx: *mut c_void,
+    request: *const u8,
+    request_len: usize,
+    out: *mut AngzarrBuf,
+) -> i32 {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if r.is_null() {
+            return Err(invalid_pointer("router"));
+        }
+        let router = &*(r as *const FfiRouter);
+        let bytes = slice_from(request, request_len);
+        router.dispatch_fact(host_ctx, bytes)
+    }));
+    match flatten_panic(result) {
+        Ok(response) => {
+            fill_out(out, &response);
+            0
+        }
+        Err(err) => {
+            let code = err.grpc as i32;
+            fill_out(out, &coded_to_status_bytes(err));
+            -code
+        }
+    }
+}
+
+/// Dispatches `io.angzarr.router.ffi.v1.ReplayCall` bytes through the replay of the first aggregate of its domain, else the process manager owning it. On success returns 0 and fills `out`
+/// with `io.angzarr.v1.ReplayResponse` bytes; on failure returns the negated gRPC code and fills
+/// `out` with `google.rpc.Status` bytes. Either way the host releases `out`
+/// with `angzarr_buf_release`.
+///
+/// # Safety
+/// `r` must be a live router; `request` must point to `request_len` readable
+/// bytes; `out` must point to a writable `AngzarrBuf`.
+#[no_mangle]
+pub unsafe extern "C" fn angzarr_router_dispatch_replay(
+    r: *mut c_void,
+    host_ctx: *mut c_void,
+    request: *const u8,
+    request_len: usize,
+    out: *mut AngzarrBuf,
+) -> i32 {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if r.is_null() {
+            return Err(invalid_pointer("router"));
+        }
+        let router = &*(r as *const FfiRouter);
+        let bytes = slice_from(request, request_len);
+        router.dispatch_replay(host_ctx, bytes)
     }));
     match flatten_panic(result) {
         Ok(response) => {

@@ -8,14 +8,17 @@
 // The dispatch surfaces are generic in the component state message, so the
 // generated wiring and handler thunks are statically typed. The one unavoidable
 // erasing cast — the FFI registry is keyed by an opaque callback_id, not a type
-// — lives in Session::EnsureState<TState>(), guaranteed correct because the same
-// TState's invokers created the state. host_ctx is a Session* directly.
+// — lives in Session::EnsureState<TState>(key): each registration draws a fresh
+// component key that all of that component's invokers capture, so a state entry
+// is only ever created and reached by invokers typed on the same TState.
+// host_ctx is a Session* directly.
 
 #include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 
 #include "angzarr/router/coded_error.h"
@@ -41,12 +44,26 @@ extern "C" inline int32_t AngzarrTrampoline(void* host_ctx, uint64_t callback_id
                                             const uint8_t* aux, size_t aux_len,
                                             ffi::AngzarrBuf* out);
 
+// Refuses a router-ffi library whose ABI version differs from the one this
+// binding is written against, naming both versions.
+inline void CheckAbiVersion(uint32_t actual) {
+  if (actual != ffi::kAbiVersion) {
+    throw std::runtime_error("router-ffi ABI version mismatch: expected " +
+                             std::to_string(ffi::kAbiVersion) + ", got " + std::to_string(actual));
+  }
+}
+
 class Router {
  public:
-  Router() : ptr_(ffi::angzarr_router_new()) {}
+  // Checks the linked router-ffi's ABI version before creating the native
+  // router; a drifted library throws std::runtime_error.
+  Router() : ptr_(NewNative()) {}
   ~Router() { ffi::angzarr_router_free(ptr_); }
   Router(const Router&) = delete;
   Router& operator=(const Router&) = delete;
+
+  // The ABI version the linked router-ffi library reports.
+  static uint32_t AbiVersion() { return ffi::angzarr_abi_version(); }
 
   Invoker* InvokerFor(uint64_t id) {
     std::lock_guard<std::mutex> lock(mu_);
@@ -58,42 +75,58 @@ class Router {
 
   template <class TState>
   void RegisterAggregate(AggregateDispatch<TState> d) {
+    const ComponentKey key = NextComponentKey();
     abi::AggregateDescriptor desc;
     desc.set_name(d.name);
     desc.set_domain(d.domain);
     for (auto& [fq, fn] : d.rebuilder.appliers) {
       auto* e = desc.add_appliers();
       e->set_fq_type(fq);
-      e->set_callback_id(Assign(ApplierInvoker<TState>(fn)));
+      e->set_callback_id(Assign(ApplierInvoker<TState>(key, fn)));
     }
     if (d.rebuilder.snapshot) {
-      desc.set_snapshot_callback_id(Assign(ApplierInvoker<TState>(d.rebuilder.snapshot)));
+      desc.set_snapshot_callback_id(Assign(SnapshotInvoker<TState>(key, d.rebuilder.snapshot)));
     }
     for (auto& [fq, fn] : d.commands) {
       auto* e = desc.add_commands();
       e->set_fq_type(fq);
-      e->set_callback_id(Assign(CommandInvoker<TState>(fn)));
+      e->set_callback_id(Assign(CommandInvoker<TState>(key, fn)));
     }
     for (auto& [fq, fns] : d.rejections) {
       auto* entry = desc.add_rejections();
-      entry->set_fq_command_type(fq);
-      for (auto& fn : fns) entry->add_callback_ids(Assign(RejectionInvoker<TState>(fn)));
+      entry->set_compensates(fq);
+      for (auto& fn : fns) entry->add_callback_ids(Assign(RejectionInvoker<TState>(key, fn)));
     }
+    for (auto& [fq, fn] : d.undoes) {
+      auto* e = desc.add_undoes();
+      e->set_fq_type(fq);
+      e->set_callback_id(Assign(UndoInvoker<TState>(key, fn)));
+    }
+    for (auto& [fq, fn] : d.facts) {
+      auto* e = desc.add_facts();
+      e->set_fq_type(fq);
+      e->set_callback_id(Assign(FactInvoker<TState>(key, fn)));
+    }
+    desc.set_state_callback_id(Assign(StateInvoker<TState>(key)));
     Register(ffi::angzarr_router_register_aggregate, desc);
   }
 
   template <class TState>
   void RegisterProjector(ProjectorDispatch<TState> d) {
+    const ComponentKey key = NextComponentKey();
     abi::ProjectorDescriptor desc;
     desc.set_name(d.name);
     for (auto& dom : d.domains) desc.add_domains(dom);
     for (auto& [fq, fn] : d.events) {
       auto* e = desc.add_events();
       e->set_fq_type(fq);
-      e->set_callback_id(Assign(ApplierInvoker<TState>(fn)));
+      e->set_callback_id(Assign(ProjectorEventInvoker<TState>(key, fn)));
+    }
+    if (d.unknown) {
+      desc.set_unknown_callback_id(Assign(ProjectorUnknownInvoker(d.unknown)));
     }
     if (d.finish) {
-      desc.set_finish_callback_id(Assign(ProjectorFinishInvoker<TState>(d.finish)));
+      desc.set_finish_callback_id(Assign(ProjectorFinishInvoker<TState>(key, d.finish)));
     }
     Register(ffi::angzarr_router_register_projector, desc);
   }
@@ -106,40 +139,38 @@ class Router {
     for (auto& [fq, fn] : d.events) {
       auto* e = desc.add_events();
       e->set_fq_type(fq);
-      e->set_callback_id(Assign(SagaEventInvoker(fn)));
-    }
-    for (auto& [fq, fns] : d.rejections) {
-      auto* entry = desc.add_rejections();
-      entry->set_fq_command_type(fq);
-      for (auto& fn : fns) entry->add_callback_ids(Assign(SagaRejectionInvoker(fn)));
+      e->set_callback_id(Assign(SagaEventInvoker(d.targets, fn)));
     }
     Register(ffi::angzarr_router_register_saga, desc);
   }
 
   template <class TState>
   void RegisterProcessManager(ProcessManagerDispatch<TState> d) {
+    const ComponentKey key = NextComponentKey();
     abi::ProcessManagerDescriptor desc;
     desc.set_name(d.name);
     desc.set_pm_domain(d.pm_domain);
+    for (auto& t : d.targets) desc.add_target_domains(t);
     for (auto& [fq, fn] : d.rebuilder.appliers) {
       auto* e = desc.add_appliers();
       e->set_fq_type(fq);
-      e->set_callback_id(Assign(ApplierInvoker<TState>(fn)));
+      e->set_callback_id(Assign(ApplierInvoker<TState>(key, fn)));
     }
     if (d.rebuilder.snapshot) {
-      desc.set_snapshot_callback_id(Assign(ApplierInvoker<TState>(d.rebuilder.snapshot)));
+      desc.set_snapshot_callback_id(Assign(SnapshotInvoker<TState>(key, d.rebuilder.snapshot)));
     }
     for (auto& h : d.handlers) {
       auto* e = desc.add_events();
       e->set_input_domain(h.source_domain);
       e->set_fq_type(h.full_name);
-      e->set_callback_id(Assign(PmEventInvoker<TState>(h.fn)));
+      e->set_callback_id(Assign(PmEventInvoker<TState>(key, d.targets, h.fn)));
     }
     for (auto& [fq, fns] : d.rejections) {
       auto* entry = desc.add_rejections();
-      entry->set_fq_command_type(fq);
-      for (auto& fn : fns) entry->add_callback_ids(Assign(PmRejectionInvoker<TState>(fn)));
+      entry->set_compensates(fq);
+      for (auto& fn : fns) entry->add_callback_ids(Assign(PmRejectionInvoker<TState>(key, fn)));
     }
+    desc.set_state_callback_id(Assign(StateInvoker<TState>(key)));
     Register(ffi::angzarr_router_register_process_manager, desc);
   }
 
@@ -163,12 +194,36 @@ class Router {
         DispatchVia(request, ffi::angzarr_router_dispatch_process_manager),
         "ProcessManagerHandleResponse");
   }
+  // Handles facts through the aggregate claiming the facts' cover domain;
+  // returns the events to record (each fact and its flags). A fact of an
+  // undeclared type refuses the request with NO_FACT_HANDLER.
+  pb::EventBook DispatchFact(const pb::FactRequest& request) {
+    return ParseResponse<pb::EventBook>(DispatchVia(request, ffi::angzarr_router_dispatch_fact),
+                                        "EventBook");
+  }
+  // Replays history into the state of the aggregate claiming domain, else the
+  // process manager whose own domain it is (empty selects a sole registered
+  // aggregate); returns its packed state.
+  pb::ReplayResponse DispatchReplay(const std::string& domain, const pb::ReplayRequest& request) {
+    abi::ReplayCall call;
+    call.set_domain(domain);
+    *call.mutable_request() = request;
+    return ParseResponse<pb::ReplayResponse>(DispatchVia(call, ffi::angzarr_router_dispatch_replay),
+                                             "ReplayResponse");
+  }
 
  private:
   struct Dispatched {
     std::string response;
     int32_t status;
   };
+
+  static void* NewNative() {
+    CheckAbiVersion(AbiVersion());
+    return ffi::angzarr_router_new();
+  }
+
+  ComponentKey NextComponentKey() { return ++next_component_; }
 
   uint64_t Assign(Invoker invoker) {
     std::lock_guard<std::mutex> lock(mu_);
@@ -212,6 +267,10 @@ class Router {
     return s;
   }
 
+  static CommandContext ContextOf(const abi::CommandContextAux& cax) {
+    return CommandContext{cax.next_sequence(), cax.had_prior_events(), cax.cover()};
+  }
+
   static google::protobuf::Any AnyOf(const std::string& type_url, const std::string& payload) {
     google::protobuf::Any any;
     any.set_type_url(type_url);
@@ -220,65 +279,139 @@ class Router {
   }
 
   // --- invoker adapters (the lone TState cast lives in EnsureState) --------
+  // Each stateful adapter captures its component's key and reaches only that
+  // component's state in the session.
+
+  static PageContext PageOf(const std::string& aux) {
+    abi::ProjectorEventAux pax;
+    pax.ParseFromString(aux);
+    return PageContext{pax.cover(), pax.sequence()};
+  }
 
   template <class TState>
-  static Invoker ApplierInvoker(std::function<void(TState&, const google::protobuf::Any&)> fn) {
-    return [fn](Session& s, const std::string& tu, const std::string& payload, const std::string&) {
-      fn(s.EnsureState<TState>(), AnyOf(tu, payload));
+  static Invoker ApplierInvoker(ComponentKey key,
+                                typename Rebuilder<TState>::ApplierWithContextFn fn) {
+    return [key, fn](Session& s, const std::string& tu, const std::string& payload,
+                     const std::string& aux) {
+      fn(s.EnsureState<TState>(key), AnyOf(tu, payload), PageOf(aux));
       return InvokerResult{"", ffi::kStatusOk, false};
     };
   }
 
   template <class TState>
-  static Invoker CommandInvoker(typename AggregateDispatch<TState>::CommandFn fn) {
-    return [fn](Session& s, const std::string& tu, const std::string& payload,
-                const std::string& aux) {
-      abi::CommandContextAux cax;
-      cax.ParseFromString(aux);
-      CommandContext cctx{cax.next_sequence(), cax.had_prior_events()};
-      auto book = fn(AnyOf(tu, payload), s.EnsureState<TState>(), cctx);
-      return InvokerResult{book.SerializeAsString(), ffi::kStatusOk, true};
+  static Invoker SnapshotInvoker(ComponentKey key, typename Rebuilder<TState>::ApplierFn fn) {
+    return [key, fn](Session& s, const std::string& tu, const std::string& payload,
+                     const std::string&) {
+      fn(s.EnsureState<TState>(key), AnyOf(tu, payload));
+      return InvokerResult{"", ffi::kStatusOk, false};
     };
   }
 
   template <class TState>
-  static Invoker RejectionInvoker(typename AggregateDispatch<TState>::RejectionFn fn) {
-    return [fn](Session& s, const std::string&, const std::string&, const std::string& aux) {
+  static Invoker CommandInvoker(ComponentKey key,
+                                typename AggregateDispatch<TState>::CommandFn fn) {
+    return [key, fn](Session& s, const std::string& tu, const std::string& payload,
+                     const std::string& aux) {
+      abi::CommandContextAux cax;
+      cax.ParseFromString(aux);
+      auto book = fn(AnyOf(tu, payload), s.EnsureState<TState>(key), ContextOf(cax));
+      if (!book) return InvokerResult{"", ffi::kStatusOkEmpty, false};
+      return InvokerResult{book->SerializeAsString(), ffi::kStatusOk, true};
+    };
+  }
+
+  template <class TState>
+  static Invoker RejectionInvoker(ComponentKey key,
+                                  typename AggregateDispatch<TState>::RejectionFn fn) {
+    return [key, fn](Session& s, const std::string&, const std::string&, const std::string& aux) {
       abi::RejectionAux rax;
       rax.ParseFromString(aux);
       pb::Notification n;
       n.ParseFromString(rax.notification());
       pb::RejectionNotification rej;
       rej.ParseFromString(rax.rejection());
-      CommandContext cctx{};
-      if (rax.has_cctx()) {
-        cctx.next_sequence = rax.cctx().next_sequence();
-        cctx.had_prior_events = rax.cctx().had_prior_events();
-      }
-      auto resp = fn(n, rej, s.EnsureState<TState>(), cctx);
-      return InvokerResult{resp.SerializeAsString(), ffi::kStatusOk, true};
+      auto resp = fn(n, rej, s.EnsureState<TState>(key), ContextOf(rax.cctx()));
+      if (!resp) return InvokerResult{"", ffi::kStatusOkEmpty, false};
+      return InvokerResult{resp->SerializeAsString(), ffi::kStatusOk, true};
     };
   }
 
   template <class TState>
-  static Invoker ProjectorFinishInvoker(typename ProjectorDispatch<TState>::FinishFn fn) {
-    return [fn](Session& s, const std::string&, const std::string& payload, const std::string&) {
-      pb::EventBook book;
-      book.ParseFromString(payload);
-      auto proj = fn(s.EnsureState<TState>(), book);
-      return InvokerResult{proj.SerializeAsString(), ffi::kStatusOk, true};
+  static Invoker UndoInvoker(ComponentKey key, typename AggregateDispatch<TState>::UndoFn fn) {
+    return [key, fn](Session& s, const std::string&, const std::string&, const std::string& aux) {
+      abi::UndoAux uax;
+      uax.ParseFromString(aux);
+      pb::Notification n;
+      n.ParseFromString(uax.notification());
+      pb::Compensate compensate;
+      compensate.ParseFromString(uax.compensate());
+      auto resp = fn(n, compensate, s.EnsureState<TState>(key), ContextOf(uax.cctx()));
+      if (!resp) return InvokerResult{"", ffi::kStatusOkEmpty, false};
+      return InvokerResult{resp->SerializeAsString(), ffi::kStatusOk, true};
     };
   }
 
-  static Invoker SagaEventInvoker(SagaDispatch::EventFn fn) {
+  // A fact handler: the fact to record and its flagging events as a serialized
+  // ABI FactRecord.
+  template <class TState>
+  static Invoker FactInvoker(ComponentKey key, typename AggregateDispatch<TState>::FactFn fn) {
+    return [key, fn](Session& s, const std::string& tu, const std::string& payload,
+                     const std::string&) {
+      FactRecord recorded = fn(AnyOf(tu, payload), s.EnsureState<TState>(key));
+      abi::FactRecord reply;
+      *reply.mutable_fact() = std::move(recorded.fact);
+      for (auto& flag : recorded.flags) *reply.add_flags() = std::move(flag);
+      return InvokerResult{reply.SerializeAsString(), ffi::kStatusOk, true};
+    };
+  }
+
+  // Packs the component's current session state as a serialized Any (Replay).
+  template <class TState>
+  static Invoker StateInvoker(ComponentKey key) {
+    return [key](Session& s, const std::string&, const std::string&, const std::string&) {
+      return InvokerResult{Pack::Wrap(s.EnsureState<TState>(key)).SerializeAsString(),
+                           ffi::kStatusOk, true};
+    };
+  }
+
+  template <class TState>
+  static Invoker ProjectorEventInvoker(ComponentKey key,
+                                       typename ProjectorDispatch<TState>::EventWithContextFn fn) {
+    return [key, fn](Session& s, const std::string& tu, const std::string& payload,
+                     const std::string& aux) {
+      fn(s.EnsureState<TState>(key), AnyOf(tu, payload), PageOf(aux));
+      return InvokerResult{"", ffi::kStatusOk, false};
+    };
+  }
+
+  template <class TState>
+  static Invoker ProjectorFinishInvoker(ComponentKey key,
+                                        typename ProjectorDispatch<TState>::FinishFn fn) {
     return
-        [fn](Session&, const std::string& tu, const std::string& payload, const std::string& aux) {
+        [key, fn](Session& s, const std::string&, const std::string& payload, const std::string&) {
+          pb::EventBook book;
+          book.ParseFromString(payload);
+          auto proj = fn(s.EnsureState<TState>(key), book);
+          return InvokerResult{proj.SerializeAsString(), ffi::kStatusOk, true};
+        };
+  }
+
+  static Invoker ProjectorUnknownInvoker(ProjectorUnknownFn fn) {
+    return [fn](Session&, const std::string& tu, const std::string&, const std::string&) {
+      fn(tu);
+      return InvokerResult{"", ffi::kStatusOk, false};
+    };
+  }
+
+  static Invoker SagaEventInvoker(std::vector<std::string> targets,
+                                  SagaDispatch::EventWithContextFn fn) {
+    return
+        [dests = Destinations(std::move(targets)), fn](
+            Session&, const std::string& tu, const std::string& payload, const std::string& aux) {
           abi::SagaEventAux sax;
           sax.ParseFromString(aux);
-          std::map<std::string, uint32_t> seqs;
-          for (const auto& kv : sax.destination_sequences()) seqs[kv.first] = kv.second;
-          Destinations dests(std::move(seqs));
-          auto emission = fn(AnyOf(tu, payload), dests, sax.source_cover());
+          auto emission =
+              fn(AnyOf(tu, payload), dests, PageContext{sax.source_cover(), sax.source_seq()});
           pb::SagaResponse resp;
           for (auto& c : emission.commands) *resp.add_commands() = c;
           for (auto& e : emission.events) *resp.add_events() = e;
@@ -286,47 +419,30 @@ class Router {
         };
   }
 
-  static Invoker SagaRejectionInvoker(SagaDispatch::RejectionFn fn) {
-    return [fn](Session&, const std::string&, const std::string&, const std::string& aux) {
-      abi::RejectionAux rax;
-      rax.ParseFromString(aux);
-      pb::Notification n;
-      n.ParseFromString(rax.notification());
-      pb::RejectionNotification rej;
-      rej.ParseFromString(rax.rejection());
-      pb::SagaResponse resp;
-      for (auto& e : fn(n, rej)) *resp.add_events() = e;
-      return InvokerResult{resp.SerializeAsString(), ffi::kStatusOk, true};
-    };
-  }
-
   template <class TState>
-  static Invoker PmEventInvoker(typename ProcessManagerDispatch<TState>::EventFn fn) {
-    return [fn](Session& s, const std::string& tu, const std::string& payload,
-                const std::string& aux) {
+  static Invoker PmEventInvoker(ComponentKey key, std::vector<std::string> targets,
+                                typename ProcessManagerDispatch<TState>::EventWithCoverFn fn) {
+    return [key, dests = Destinations(std::move(targets)), fn](Session& s, const std::string& tu,
+                                                               const std::string& payload,
+                                                               const std::string& aux) {
       abi::PmEventAux pax;
       pax.ParseFromString(aux);
-      std::map<std::string, uint32_t> seqs;
-      for (const auto& kv : pax.destination_sequences()) seqs[kv.first] = kv.second;
-      Destinations dests(std::move(seqs));
-      auto resp = fn(AnyOf(tu, payload), s.EnsureState<TState>(), dests);
+      auto resp = fn(AnyOf(tu, payload), s.EnsureState<TState>(key), dests, pax.trigger_cover());
       return InvokerResult{resp.SerializeAsString(), ffi::kStatusOk, true};
     };
   }
 
   template <class TState>
-  static Invoker PmRejectionInvoker(typename ProcessManagerDispatch<TState>::RejectionFn fn) {
-    return [fn](Session& s, const std::string&, const std::string&, const std::string& aux) {
+  static Invoker PmRejectionInvoker(
+      ComponentKey key, typename ProcessManagerDispatch<TState>::RejectionResponseFn fn) {
+    return [key, fn](Session& s, const std::string&, const std::string&, const std::string& aux) {
       abi::RejectionAux rax;
       rax.ParseFromString(aux);
       pb::Notification n;
       n.ParseFromString(rax.notification());
       pb::RejectionNotification rej;
       rej.ParseFromString(rax.rejection());
-      auto r = fn(n, rej, s.EnsureState<TState>());
-      pb::ProcessManagerHandleResponse resp;
-      for (auto& e : r.process_events) *resp.add_process_events() = e;
-      if (r.escalation) *resp.mutable_notification() = *r.escalation;
+      auto resp = fn(n, rej, s.EnsureState<TState>(key));
       return InvokerResult{resp.SerializeAsString(), ffi::kStatusOk, true};
     };
   }
@@ -334,8 +450,15 @@ class Router {
   void* ptr_;
   std::map<uint64_t, Invoker> registry_;
   std::atomic<uint64_t> next_id_{0};
+  std::atomic<ComponentKey> next_component_{0};
   std::mutex mu_;
 };
+
+// A coded failure as a callback outcome: the google.rpc.Status bytes and the
+// negated wire gRPC code (never 0, which the core would read as success).
+inline InvokerResult ErrorResult(const CodedError& e) {
+  return InvokerResult{ToStatusBytes(e), -static_cast<int32_t>(WireGrpc(e.grpc)), true};
+}
 
 // The single host-callback gateway. One inline definition; passed by address to
 // every registration. Catches every exception and codes it — never unwinds
@@ -361,7 +484,7 @@ extern "C" inline int32_t AngzarrTrampoline(void* host_ctx, uint64_t callback_id
     o->len = r.response.size();
   };
   auto fail = [&](const CodedError& e) {
-    InvokerResult r{ToStatusBytes(e), -static_cast<int32_t>(e.grpc), true};
+    InvokerResult r = ErrorResult(e);
     write_out(out, r);
     return r.status;
   };
@@ -377,10 +500,9 @@ extern "C" inline int32_t AngzarrTrampoline(void* host_ctx, uint64_t callback_id
       result = (*invoker)(*session, read(type_url, type_url_len), read(payload, payload_len),
                           read(aux, aux_len));
     } catch (const CodedError& e) {
-      result = {ToStatusBytes(e), -static_cast<int32_t>(e.grpc), true};
+      result = ErrorResult(e);
     } catch (const std::exception& e) {
-      CodedError ce = CodedError::Unhandled(e.what());
-      result = {ToStatusBytes(ce), -static_cast<int32_t>(ce.grpc), true};
+      result = ErrorResult(CodedError::Unhandled(e.what()));
     }
     write_out(out, result);
     return result.status;

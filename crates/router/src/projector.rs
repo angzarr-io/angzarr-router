@@ -15,9 +15,12 @@ use prost_types::Any;
 use crate::error::{codes, map_handler_error, messages, CodedError, HandlerError};
 use crate::pb;
 
+pub use crate::PageContext;
+
 /// Folds one delivered event page into the rebuilding projection. Generated
 /// thunks unmarshal to the typed event and call the typed business method.
-pub type EventFn<P> = Box<dyn Fn(&mut P, &Any) -> Result<(), HandlerError> + Send + Sync>;
+pub type EventFn<P> =
+    Box<dyn for<'a> Fn(&mut P, &Any, &PageContext<'a>) -> Result<(), HandlerError> + Send + Sync>;
 
 /// Packs the folded projection instance into the wire Projection. When
 /// absent, dispatch returns a default Projection (cover + projector name).
@@ -50,7 +53,8 @@ impl<P> ProjectorDispatch<P> {
         }
     }
 
-    /// Restricts folding to books whose cover carries one of these domains.
+    /// Restricts folding to books whose cover carries one of these domains;
+    /// [`crate::WILDCARD_DOMAIN`] (`"*"`) among them consumes every domain.
     /// Unset (the default) consumes every domain.
     pub fn for_domains(mut self, domains: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.domains = Some(domains.into_iter().map(Into::into).collect());
@@ -61,7 +65,10 @@ impl<P> ProjectorDispatch<P> {
     pub fn on_event(
         mut self,
         full_name: &str,
-        thunk: impl Fn(&mut P, &Any) -> Result<(), HandlerError> + Send + Sync + 'static,
+        thunk: impl for<'a> Fn(&mut P, &Any, &PageContext<'a>) -> Result<(), HandlerError>
+            + Send
+            + Sync
+            + 'static,
     ) -> Self {
         self.handlers.insert(full_name.to_string(), Box::new(thunk));
         self
@@ -114,7 +121,7 @@ impl<P> ProjectorDispatch<P> {
 
         let mut projection = (self.factory)();
         let consumed = match self.domains.as_ref() {
-            Some(set) => set.contains(&cover.domain),
+            Some(set) => set.contains(crate::WILDCARD_DOMAIN) || set.contains(&cover.domain),
             None => true,
         };
 
@@ -138,7 +145,11 @@ impl<P> ProjectorDispatch<P> {
                     }
                     continue;
                 };
-                thunk(&mut projection, event_any).map_err(map_handler_error)?;
+                let ctx = PageContext {
+                    cover: Some(cover),
+                    sequence: crate::page_sequence(page),
+                };
+                thunk(&mut projection, event_any, &ctx).map_err(map_handler_error)?;
             }
         }
 

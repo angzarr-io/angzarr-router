@@ -1,6 +1,5 @@
 package io.angzarr.router.conformance.counter;
 
-import io.angzarr.router.conformance.Builders;
 import com.google.protobuf.Any;
 import io.angzarr.BusinessResponse;
 import io.angzarr.EventBook;
@@ -9,21 +8,24 @@ import io.angzarr.Notification;
 import io.angzarr.RejectionNotification;
 import io.angzarr.router.CodedError;
 import io.angzarr.router.CommandContext;
+import io.angzarr.router.PageContext;
+import io.angzarr.router.conformance.Builders;
 import java.util.ArrayList;
 import java.util.List;
 import test.counter.Counter;
 import test.counter.CounterAggregateAngzarr;
 
 /**
- * The conformance CounterAggregate fixture, implementing the angzarr-generated
- * handler seam. The behaviour is the contract the shared feature asserts; the
- * wiring is generated, so this fixture is the proof the generated seam is
- * faithful.
+ * The conformance CounterAggregate fixture, implementing the angzarr-generated handler seam. The
+ * behaviour is the contract the shared feature asserts; the wiring is generated, so this fixture is
+ * the proof the generated seam is faithful.
  */
 final class CounterFixture implements CounterAggregateAngzarr.CounterAggregateHandler {
 
-  /** The historical-state evidence a command handler saw — what the suite
-   * asserts, since state never crosses the boundary. */
+  /**
+   * The historical-state evidence a command handler saw — what the suite asserts, since state never
+   * crosses the boundary.
+   */
   record Observation(boolean hadPriorEvents, long nextSequence, long count) {}
 
   private final List<Observation> observed;
@@ -53,13 +55,15 @@ final class CounterFixture implements CounterAggregateAngzarr.CounterAggregateHa
   }
 
   @Override
-  public void applyIncreased(Counter.CounterState.Builder state, Counter.Increased event) {
+  public void applyIncreased(
+      Counter.CounterState.Builder state, Counter.Increased event, PageContext ctx) {
     state.setCount(state.getCount() + 1);
   }
 
-  /** Appends both ordered markers in one response — the within-component
-   * fan-out collapses to one compensator, preserving the observable two-marker
-   * ordering the feature asserts. */
+  /**
+   * Appends both ordered markers in one response — the within-component fan-out collapses to one
+   * compensator, preserving the observable two-marker ordering the feature asserts.
+   */
   @Override
   public BusinessResponse onReserveRejected(
       Notification n,

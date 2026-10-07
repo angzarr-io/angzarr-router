@@ -12,6 +12,7 @@ expands the Any payloads in the skeletons.
 from __future__ import annotations
 
 import pathlib
+import uuid
 
 from google.protobuf import any_pb2, text_format
 
@@ -44,6 +45,58 @@ def type_url(fq: str) -> str:
 def fq_from_url(url: str) -> str:
     """The fully-qualified name from a type URL, prefix-agnostic."""
     return url.rsplit("/", 1)[-1]
+
+
+def root_of(label: str) -> bytes:
+    """The root bytes for a label: UUID v5 in the OID namespace."""
+    return uuid.uuid5(uuid.NAMESPACE_OID, label).bytes
+
+
+def cover_of(domain: str, label: str):
+    """A cover in ``domain`` whose root is :func:`root_of` ``label``."""
+    cover = types_pb2.Cover(domain=domain)
+    cover.root.value = root_of(label)
+    return cover
+
+
+def assert_deferred(command_book, source_domain: str, source_seq: int, index: int) -> None:
+    """Every page of ``command_book`` carries angzarr_deferred provenance from
+    ``source_domain`` at ``source_seq``, emitted at position ``index``, and no
+    explicit sequence."""
+    assert command_book.pages, "the command has no pages"
+    for page in command_book.pages:
+        assert page.header.WhichOneof("sequence_type") == "angzarr_deferred", (
+            f"command page is not deferred: {page.header}"
+        )
+        deferred = page.header.angzarr_deferred
+        assert deferred.source_seq == source_seq, "source_seq is the triggering page's"
+        assert deferred.command_index == index, "command_index is the emission position"
+        assert deferred.source.domain == source_domain, "the source cover is the trigger's"
+
+
+def assert_no_source_component(command_book) -> None:
+    """Every page of ``command_book`` is deferred with an empty
+    source_component: the coordinator stamps the component."""
+    assert command_book.pages, "the command has no pages"
+    for page in command_book.pages:
+        assert page.header.WhichOneof("sequence_type") == "angzarr_deferred", (
+            f"command page is not deferred: {page.header}"
+        )
+        assert page.header.angzarr_deferred.source_component == "", (
+            "the coordinator stamps the component"
+        )
+
+
+def with_type_url_prefix(cc, prefix: str):
+    """Rewrite every Any type URL in ``cc``'s command and prior events to
+    ``prefix`` + the fully-qualified name."""
+    for page in cc.command.pages:
+        if page.HasField("command"):
+            page.command.type_url = prefix + fq_from_url(page.command.type_url)
+    for page in cc.events.pages:
+        if page.HasField("event"):
+            page.event.type_url = prefix + fq_from_url(page.event.type_url)
+    return cc
 
 
 def _load_skeleton(name: str, message):

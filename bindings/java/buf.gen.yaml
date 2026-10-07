@@ -23,11 +23,15 @@ managed:
     - file_option: go_package_prefix
       value: github.com/angzarr-io/angzarr-router/bindings/java/gen
 plugins:
-  - remote: buf.build/protocolbuffers/java:v28.3
+  # protoc's java generator, pinned by justfile.container (PROTOC_JVM) to the
+  # protobuf-java 4.28.3 runtime.
+  - protoc_builtin: java
+    protoc_path: .tools/protoc/jvm/bin/protoc
     out: bindings/java/build/generated/proto/main/java
-  # angzarr dispatch wiring for declared components (test.counter). Baked into
-  # the base image and invoked as a local plugin. The conformance fixtures
-  # hand-implement the generated <Component>Handler interfaces.
+  # angzarr dispatch wiring for declared components (test.counter), from the
+  # angzarr CLI pinned by justfile.container (CLI_REF) and built into .tools/bin.
+  # The conformance fixtures hand-implement the generated <Component>Handler
+  # interfaces.
   - local: ["angzarr", "codegen", "java"]
     out: bindings/java/build/generated/proto/main/java
     opt: paths=source_relative

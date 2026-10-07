@@ -8,7 +8,7 @@ namespace Angzarr.Router.Conformance.Projector;
 /// count.</summary>
 internal sealed class ProjectorFixture : TC.CounterProjectorAngzarr.CounterProjectorHandler
 {
-    public void Increased(TC.CounterProjectorState projection, TC.Increased ev) =>
+    public void Increased(TC.CounterProjectorState projection, TC.Increased ev, PageContext page) =>
         projection.Count += 1;
 
     public Projection Finish(TC.CounterProjectorState projection, EventBook events) =>

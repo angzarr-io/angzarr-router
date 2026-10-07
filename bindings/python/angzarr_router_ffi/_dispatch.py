@@ -14,10 +14,14 @@ from __future__ import annotations
 
 import enum
 import threading
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import TYPE_CHECKING
 
 from google.protobuf import any_pb2
+from google.protobuf.message import DecodeError, Message
 from google.rpc import error_details_pb2, status_pb2
 
 from ._abi import ffi, lib
@@ -28,6 +32,9 @@ from .gen.io.angzarr.v1 import (
     saga_pb2,
     types_pb2,
 )
+
+if TYPE_CHECKING:
+    from typing_extensions import Self
 
 # --- ABI status codes (mirror crates/router-ffi/src/abi.rs) ---
 _STATUS_OK = 0  # success with a payload in `out`
@@ -75,7 +82,7 @@ class CodedError(Exception):
         code: str = "",
         message: str = "",
         grpc: int = GrpcCode.INTERNAL,
-        extras: Optional[dict[str, str]] = None,
+        extras: dict[str, str] | None = None,
     ):
         self.code = code
         self.message = message
@@ -113,23 +120,132 @@ def pack(msg) -> any_pb2.Any:
     )
 
 
+def _as_any(msg) -> any_pb2.Any:
+    """``msg`` itself when it is an Any, otherwise ``msg`` packed."""
+    return msg if isinstance(msg, any_pb2.Any) else pack(msg)
+
+
+@dataclass(frozen=True)
+class FactRecord:
+    """What a fact handler records for one fact: the fact itself (as
+    received, or annotated) followed by the events that flag it. The fact
+    and each flag are a message (packed with the framework type-URL prefix)
+    or an Any. Each flag is recorded with no header and the fact's
+    created_at, and folds into the state the next fact sees."""
+
+    fact: object
+    flags: tuple = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "flags", tuple(self.flags))
+
+    @classmethod
+    def as_received(cls, fact) -> FactRecord:
+        """The record of ``fact`` as received, with no flags."""
+        return cls(fact)
+
+    def to_abi(self) -> abi_pb2.FactRecord:
+        """The ABI FactRecord the fact callback replies with."""
+        return abi_pb2.FactRecord(
+            fact=_as_any(self.fact), flags=[_as_any(flag) for flag in self.flags]
+        )
+
+
 @dataclass
 class CommandContext:
-    """The historical-state evidence a handler sees. Host state never
-    crosses the FFI, so the core reconstructs this from the prior-events book
-    and hands it back."""
+    """The historical-state evidence a handler sees, and the cover it is
+    handling. Host state never crosses the FFI, so the core reconstructs this
+    from the prior-events book and hands it back. ``cover`` is the command's
+    (or notification delivery's) cover: the aggregate's own domain and root,
+    None when the command carried none."""
 
     next_sequence: int = 0
     had_prior_events: bool = False
+    cover: types_pb2.Cover | None = None
+
+
+@dataclass(frozen=True)
+class PageContext:
+    """Where the event or command a handler is handling sits: the cover of
+    its book (None when the book carries none) and the page's explicit
+    sequence (0 when the page carries none, and for commands and
+    process-manager triggers, whose callbacks carry no page sequence).
+    Projector folds and aggregate / process-manager appliers see the
+    folded event's own book cover and page sequence; a saga handler sees the
+    source book's cover and the triggering event's sequence."""
+
+    cover: types_pb2.Cover | None = None
+    sequence: int = 0
+
+
+_CURRENT_PAGE: ContextVar[PageContext | None] = ContextVar(
+    "angzarr_router_ffi_current_page", default=None
+)
+
+
+@contextmanager
+def _handling(ctx: PageContext) -> Iterator[None]:
+    """Make ``ctx`` the current page context while the block runs."""
+    token = _CURRENT_PAGE.set(ctx)
+    try:
+        yield
+    finally:
+        _CURRENT_PAGE.reset(token)
+
+
+def _cover_of(msg, name: str) -> types_pb2.Cover | None:
+    """``msg``'s cover field ``name``, or None when it is unset."""
+    return getattr(msg, name) if msg.HasField(name) else None
+
+
+def current_page() -> PageContext:
+    """The page context of the handler running on this thread. A dispatch
+    sets it for every callback it makes: an aggregate command, compensation
+    or undo handler sees its command's cover, a fact handler the facts'
+    cover, a saga handler the source cover and the triggering event's
+    sequence, a process-manager handler the
+    trigger cover, a projector fold or an aggregate / process-manager applier
+    its event's book cover and page sequence.
+    Raises RuntimeError outside a dispatch."""
+    ctx = _CURRENT_PAGE.get()
+    if ctx is None:
+        raise RuntimeError("no angzarr dispatch is being handled on this thread")
+    return ctx
+
+
+def current_cover() -> types_pb2.Cover:
+    """The cover of the book the running handler is handling (see
+    :func:`current_page`). Raises RuntimeError outside a dispatch or when that
+    book carries no cover."""
+    cover = current_page().cover
+    if cover is None:
+        raise RuntimeError("the book being handled carries no cover")
+    return cover
+
+
+def _command_context(cax) -> CommandContext:
+    """The CommandContext a CommandContextAux stands for."""
+    return CommandContext(
+        next_sequence=cax.next_sequence,
+        had_prior_events=cax.had_prior_events,
+        cover=_cover_of(cax, "cover"),
+    )
 
 
 # Thunk shapes (host-supplied business logic):
 #   applier:   (state, payload: Any) -> None            (folds; raises on corrupt)
+#   context applier: (state, payload: Any, ctx: PageContext) -> None
 #   command:   (cmd: Any, state, cctx) -> EventBook|None (raises CodedError to reject)
 #   rejection: (notification, rejection, state, cctx) -> BusinessResponse|None
+#   undo:      (notification, compensate, state, cctx) -> BusinessResponse|None
+#   fact:      (fact: Any, state) -> FactRecord          (the fact to record
+#                                                         and its flags)
 ApplierThunk = Callable[[object, any_pb2.Any], None]
-CommandThunk = Callable[[any_pb2.Any, object, CommandContext], Optional[object]]
-RejectionThunk = Callable[[object, object, object, CommandContext], Optional[object]]
+ApplierContextThunk = Callable[[object, any_pb2.Any, PageContext], None]
+CommandThunk = Callable[[any_pb2.Any, object, CommandContext], object | None]
+RejectionThunk = Callable[[object, object, object, CommandContext], object | None]
+UndoThunk = Callable[[object, object, object, CommandContext], object | None]
+FactThunk = Callable[[any_pb2.Any, object], "FactRecord"]
 
 
 @dataclass
@@ -139,14 +255,25 @@ class Rebuilder:
 
     factory: Callable[[], object]
     appliers: dict[str, ApplierThunk] = field(default_factory=dict)
-    snapshot: Optional[ApplierThunk] = None
+    snapshot: ApplierThunk | None = None
 
-    def apply(self, full_name: str, thunk: ApplierThunk) -> "Rebuilder":
+    def apply(self, full_name: str, thunk: ApplierThunk) -> Rebuilder:
         """Register an applier for one fully-qualified event type."""
         self.appliers[full_name] = thunk
         return self
 
-    def with_snapshot(self, thunk: ApplierThunk) -> "Rebuilder":
+    def apply_with_context(self, full_name: str, thunk: ApplierContextThunk) -> Rebuilder:
+        """Register an applier for one fully-qualified event type that also
+        receives the event's :class:`PageContext` (its book's cover and the
+        page's sequence)."""
+
+        def fold(state, event):
+            thunk(state, event, current_page())
+
+        self.appliers[full_name] = fold
+        return self
+
+    def with_snapshot(self, thunk: ApplierThunk) -> Rebuilder:
         """Register the snapshot loader that seeds state before pages."""
         self.snapshot = thunk
         return self
@@ -155,31 +282,64 @@ class Rebuilder:
 @dataclass
 class AggregateDispatch:
     """One aggregate component's registration: name, domain, rebuilder,
-    command handlers, and ordered rejection compensators."""
+    command handlers, ordered rejection compensators, undo handlers and fact
+    handlers. An aggregate whose state (the rebuilder factory's product) is a
+    protobuf message also supports Replay: the router packs its rebuilt
+    state."""
 
     name: str
     domain: str
     rebuilder: Rebuilder
     commands: dict[str, CommandThunk] = field(default_factory=dict)
     rejections: dict[str, list[RejectionThunk]] = field(default_factory=dict)
+    undoes: dict[str, UndoThunk] = field(default_factory=dict)
+    facts: dict[str, FactThunk] = field(default_factory=dict)
 
-    def on_command(self, full_name: str, thunk: CommandThunk) -> "AggregateDispatch":
+    def on_command(self, full_name: str, thunk: CommandThunk) -> AggregateDispatch:
         """Register a handler for one fully-qualified command type."""
         self.commands[full_name] = thunk
         return self
 
-    def on_rejected(self, fq_command: str, thunk: RejectionThunk) -> "AggregateDispatch":
-        """Append a compensator for one fully-qualified command type; repeated
+    def on_rejected(self, compensates: str, thunk: RejectionThunk) -> AggregateDispatch:
+        """Append a compensator under a ``compensates`` entry: the rejected
+        command's fully-qualified type (``"fq.Type"``, sent to any domain) or
+        ``"domain:fq.Type"`` (only when it was sent to that domain). Repeated
         calls register an ordered fan-out."""
-        self.rejections.setdefault(fq_command, []).append(thunk)
+        self.rejections.setdefault(compensates, []).append(thunk)
         return self
+
+    def on_undo(self, fq_command: str, thunk: UndoThunk) -> AggregateDispatch:
+        """Register the undo handler for a Compensate whose ``command_type``
+        is ``fq_command`` (the fully-qualified type of the executed command to
+        undo). The handler receives (notification, compensate, state, cctx)
+        and returns a BusinessResponse, or None to record nothing. A
+        Compensate with no undo handler fails NO_UNDO_HANDLER
+        (UNIMPLEMENTED)."""
+        self.undoes[fq_command] = thunk
+        return self
+
+    def on_fact(self, fq_fact: str, thunk: FactThunk) -> AggregateDispatch:
+        """Register the fact handler for a fully-qualified fact (event) type.
+        The handler receives (fact Any, rebuilt state) and returns the
+        :class:`FactRecord` to record (``FactRecord.as_received(fact)`` keeps
+        the fact as received, with no flags). A fact cannot be refused; the
+        core refuses a fact of an undeclared type with NO_FACT_HANDLER
+        (INVALID_ARGUMENT) before any handler runs."""
+        self.facts[fq_fact] = thunk
+        return self
+
+
+# A projector domain that consumes every domain.
+WILDCARD_DOMAIN = "*"
 
 
 # Projector thunk shapes:
 #   event:   (state, event: Any) -> None             (folds; raises on corrupt)
+#   context event: (state, event: Any, ctx: PageContext) -> None
 #   finish:  (state, events: EventBook) -> Projection (packs the folded state)
 #   unknown: (type_url: str) -> None                  (observes an unhandled type)
 ProjectorEventThunk = Callable[[object, any_pb2.Any], None]
+ProjectorContextThunk = Callable[[object, any_pb2.Any, PageContext], None]
 ProjectorFinishThunk = Callable[[object, object], object]
 ProjectorUnknownThunk = Callable[[str], None]
 
@@ -195,26 +355,40 @@ class ProjectorDispatch:
     factory: Callable[[], object]
     domains: list[str] = field(default_factory=list)
     events: dict[str, ProjectorEventThunk] = field(default_factory=dict)
-    unknown: Optional[ProjectorUnknownThunk] = None
-    finisher: Optional[ProjectorFinishThunk] = None
+    unknown: ProjectorUnknownThunk | None = None
+    finisher: ProjectorFinishThunk | None = None
 
-    def for_domains(self, *domains: str) -> "ProjectorDispatch":
+    def for_domains(self, *domains: str) -> ProjectorDispatch:
         """Restrict folding to books whose cover carries one of these domains.
-        Unset (the default) consumes every domain."""
+        Unset (the default) or :data:`WILDCARD_DOMAIN` consumes every
+        domain."""
         self.domains = list(domains)
         return self
 
-    def on_event(self, full_name: str, thunk: ProjectorEventThunk) -> "ProjectorDispatch":
+    def on_event(self, full_name: str, thunk: ProjectorEventThunk) -> ProjectorDispatch:
         """Register the fold thunk for a fully-qualified event type name."""
         self.events[full_name] = thunk
         return self
 
-    def on_unknown(self, thunk: ProjectorUnknownThunk) -> "ProjectorDispatch":
+    def on_event_with_context(
+        self, full_name: str, thunk: ProjectorContextThunk
+    ) -> ProjectorDispatch:
+        """Register a fold thunk for a fully-qualified event type that also
+        receives the event's :class:`PageContext` (its book's cover and the
+        page's sequence)."""
+
+        def fold(state, event):
+            thunk(state, event, current_page())
+
+        self.events[full_name] = fold
+        return self
+
+    def on_unknown(self, thunk: ProjectorUnknownThunk) -> ProjectorDispatch:
         """Register a catch-all for events with no fold thunk."""
         self.unknown = thunk
         return self
 
-    def finish(self, thunk: ProjectorFinishThunk) -> "ProjectorDispatch":
+    def finish(self, thunk: ProjectorFinishThunk) -> ProjectorDispatch:
         """Register the finisher that packs the folded instance into the wire
         Projection."""
         self.finisher = thunk
@@ -222,115 +396,133 @@ class ProjectorDispatch:
 
 
 class Destinations:
-    """Coordinator-supplied next-sequences for command stamping. Sagas and
-    process managers are translators — they stamp emitted commands, they do
-    not rebuild destination state to make decisions."""
+    """The declared output domains of one saga or process manager (its command
+    targets), in declaration order. Emitted commands carry no destination
+    sequence: the router stamps their ``angzarr_deferred`` provenance from the
+    triggering page, so a handler returns its commands as built."""
 
-    __slots__ = ("_sequences",)
+    __slots__ = ("_domains",)
 
-    def __init__(self, sequences: Optional[dict[str, int]] = None):
-        self._sequences = dict(sequences) if sequences else {}
-
-    def sequence_for(self, domain: str) -> Optional[int]:
-        """The next sequence for a domain, or None when none was supplied."""
-        return self._sequences.get(domain)
+    def __init__(self, domains: Iterable[str] | None = None):
+        self._domains = list(domains) if domains else []
 
     def has(self, domain: str) -> bool:
-        """Whether a sequence exists for the domain."""
-        return domain in self._sequences
+        """Whether ``domain`` is a declared output domain."""
+        return domain in self._domains
 
     def domains(self) -> list[str]:
-        """Every domain carrying a sequence (unordered)."""
-        return list(self._sequences.keys())
-
-    def stamp_command(self, command_book, domain: str) -> None:
-        """Stamp every page of ``command_book`` with the next sequence for
-        ``domain``. A domain with no supplied sequence raises the coded
-        MISSING_DESTINATION_SEQUENCE (check output_domains config)."""
-        seq = self._sequences.get(domain)
-        if seq is None:
-            raise CodedError(
-                code="MISSING_DESTINATION_SEQUENCE",
-                message="no sequence for destination domain",
-                grpc=GrpcCode.INVALID_ARGUMENT,
-                extras={"domain": domain},
-            )
-        for page in command_book.pages:
-            page.header.sequence = seq
+        """The declared output domains, in declaration order."""
+        return list(self._domains)
 
 
 # Saga thunk shapes (a saga is stateless — no state argument):
-#   event:     (event: Any, dests: Destinations, source_cover: Cover) -> (commands, events)
-#   rejection: (notification, rejection) -> events
-# source_cover is the source book's cover passed through whole (Rust owns the
-# deserialization) so the saga can route emitted commands by the trigger's identity.
+#   event: (event: Any, dests: Destinations, source_cover: Cover) -> (commands, events)
+#   context event: (event: Any, dests: Destinations, source: PageContext) ->
+#                  (commands, events)
+# dests are the saga's declared targets; source_cover is the source book's
+# cover passed through whole so the saga can route emitted commands by the
+# trigger's identity; source adds the triggering event's sequence. The router
+# stamps the commands deferred. Sagas receive no rejections.
 SagaEventThunk = Callable[[any_pb2.Any, Destinations, object], tuple[list, list]]
-SagaRejectionThunk = Callable[[object, object], list]
+SagaContextThunk = Callable[[any_pb2.Any, Destinations, PageContext], tuple[list, list]]
 
 
 @dataclass
 class SagaDispatch:
     """One saga component's registration: name, the input domain it consumes,
-    the domains it issues commands to, event handlers, and ordered rejection
-    compensators. A saga is stateless — no rebuilder, no state. Shaped like the
-    core/Go API so the unit-6 emitter targets it with minimal changes."""
+    the domains it issues commands to (its declared output domains), and event
+    handlers. A saga is stateless — no rebuilder, no state — and receives no
+    rejections. Shaped like the core/Go API."""
 
     name: str
     input_domain: str
     targets: list[str] = field(default_factory=list)
     events: dict[str, SagaEventThunk] = field(default_factory=dict)
-    rejections: dict[str, list[SagaRejectionThunk]] = field(default_factory=dict)
 
-    def on_event(self, full_name: str, thunk: SagaEventThunk) -> "SagaDispatch":
+    def on_event(self, full_name: str, thunk: SagaEventThunk) -> SagaDispatch:
         """Register the translation thunk for a fully-qualified event type."""
         self.events[full_name] = thunk
         return self
 
-    def on_rejected(self, fq_command: str, thunk: SagaRejectionThunk) -> "SagaDispatch":
-        """Append a compensator for one fully-qualified command type; repeated
-        calls register an ordered fan-out (C-0042)."""
-        self.rejections.setdefault(fq_command, []).append(thunk)
+    def on_event_with_context(self, full_name: str, thunk: SagaContextThunk) -> SagaDispatch:
+        """Register a translation thunk for a fully-qualified event type that
+        receives the triggering event's :class:`PageContext` (the source
+        book's cover and the event's sequence) in place of the source
+        cover."""
+
+        def translate(event, dests, _source_cover):
+            return thunk(event, dests, current_page())
+
+        self.events[full_name] = translate
         return self
 
 
 # Process-manager thunk shapes (a PM is stateful — it sees rebuilt state):
 #   event:     (event: Any, state, dests) -> ProcessManagerHandleResponse
-#   rejection: (notification, rejection, state) -> (process_events, escalation|None)
-PMEventThunk = Callable[[any_pb2.Any, object, "Destinations"], object]
-PMRejectionThunk = Callable[[object, object, object], tuple[list, Optional[object]]]
+#   cover event: (event: Any, state, dests, trigger_cover: Cover | None) ->
+#                ProcessManagerHandleResponse
+#   rejection: (notification, rejection, state) ->
+#                ProcessManagerHandleResponse            (process events, commands,
+#                                                         facts, escalation)
+#              | (process_events, escalation | None)
+#              | None                                    (nothing)
+# dests are the PM's declared targets. The router stamps every command the
+# PM returns (from an event handler or a compensator) deferred.
+PMEventThunk = Callable[[any_pb2.Any, object, Destinations], object]
+PMCoverEventThunk = Callable[[any_pb2.Any, object, Destinations, object], object]
+PMRejectionThunk = Callable[[object, object, object], object]
 
 
 @dataclass
 class ProcessManagerDispatch:
     """One process-manager component's registration: name, its own domain, the
-    rebuilder for its event-sourced state, event handlers keyed by (input
-    domain, FQ event type), and ordered rejection compensators. Shaped like the
-    core/Go API so the unit-6 emitter targets it with minimal changes."""
+    rebuilder for its event-sourced state, its declared output domains
+    (``targets``, its command targets), event handlers keyed by (input domain,
+    FQ event type), and ordered rejection compensators keyed by ``compensates``
+    entry. Shaped like the core/Go API."""
 
     name: str
     pm_domain: str
     rebuilder: Rebuilder
+    targets: list[str] = field(default_factory=list)
     handlers: dict[str, dict[str, PMEventThunk]] = field(default_factory=dict)
     rejections: dict[str, list[PMRejectionThunk]] = field(default_factory=dict)
 
     def on_event(
         self, input_domain: str, full_name: str, thunk: PMEventThunk
-    ) -> "ProcessManagerDispatch":
+    ) -> ProcessManagerDispatch:
         """Register the thunk for (input domain, fully-qualified event type)."""
         self.handlers.setdefault(input_domain, {})[full_name] = thunk
         return self
 
-    def on_rejected(self, fq_command: str, thunk: PMRejectionThunk) -> "ProcessManagerDispatch":
-        """Append a compensator for one fully-qualified command type; repeated
-        calls register an ordered fan-out (C-0042)."""
-        self.rejections.setdefault(fq_command, []).append(thunk)
+    def on_event_with_cover(
+        self, input_domain: str, full_name: str, thunk: PMCoverEventThunk
+    ) -> ProcessManagerDispatch:
+        """Register a thunk for (input domain, fully-qualified event type)
+        that also receives the trigger book's cover (None when it carries
+        none)."""
+
+        def handle(event, state, dests):
+            return thunk(event, state, dests, current_page().cover)
+
+        self.handlers.setdefault(input_domain, {})[full_name] = handle
+        return self
+
+    def on_rejected(self, compensates: str, thunk: PMRejectionThunk) -> ProcessManagerDispatch:
+        """Append a compensator under a ``compensates`` entry: the rejected
+        command's fully-qualified type (``"fq.Type"``, sent to any domain) or
+        ``"domain:fq.Type"`` (only when it was sent to that domain). Repeated
+        calls register an ordered fan-out (C-0042). The compensator may return
+        a full ProcessManagerHandleResponse (its commands are kept and stamped
+        deferred) or the ``(process_events, escalation)`` pair."""
+        self.rejections.setdefault(compensates, []).append(thunk)
         return self
 
 
 # --- error model: CodedError <-> google.rpc.Status bytes ---
 
 
-def _build_status_bytes(grpc: int, message: str, code: str, extras: Optional[dict]) -> bytes:
+def _build_status_bytes(grpc: int, message: str, code: str, extras: dict | None) -> bytes:
     """Serialize a coded failure as google.rpc.Status bytes carrying an
     ErrorInfo detail — the exact shape the core decodes (and gRPC puts on the
     wire). ErrorInfo Any uses the type.googleapis.com prefix the ABI pins."""
@@ -354,7 +546,7 @@ def _error_status(exc: BaseException) -> tuple[bytes, int]:
     )
 
 
-def _decode_status(data: Optional[bytes], ret: int) -> CodedError:
+def _decode_status(data: bytes | None, ret: int) -> CodedError:
     """Turn google.rpc.Status bytes (with an ErrorInfo detail) back into a
     CodedError. ``ret`` (the negative callback/dispatch return) is the gRPC
     fallback when the bytes are absent or undecodable."""
@@ -366,7 +558,7 @@ def _decode_status(data: Optional[bytes], ret: int) -> CodedError:
         status = status_pb2.Status()
         try:
             status.ParseFromString(data)
-        except Exception:
+        except DecodeError:
             return CodedError(grpc=grpc)
         message = status.message
         if status.code != 0:
@@ -385,49 +577,64 @@ def _decode_status(data: Optional[bytes], ret: int) -> CodedError:
 
 
 class _Session:
-    """One dispatch's host-side state object, reached from callbacks via the
-    host_ctx handle. State never crosses to Rust; it lives here and is
-    created lazily by the first callback (all callbacks in one dispatch belong
-    to the same aggregate, so the factory is consistent)."""
+    """One dispatch's host-side state, reached from callbacks via the host_ctx
+    handle. State never crosses to Rust; it lives here, created lazily per
+    component. One dispatch may run several components (co-resident process
+    managers subscribed to the same trigger), so each component's state is
+    keyed by the component key assigned at registration and is never shared
+    with another component."""
 
-    __slots__ = ("router", "_state", "_has_state")
+    __slots__ = ("_states", "router")
 
-    def __init__(self, router: "Router"):
+    def __init__(self, router: Router):
         self.router = router
-        self._state: object = None
-        self._has_state = False
+        self._states: dict[int, object] = {}
 
-    def ensure_state(self, factory: Callable[[], object]) -> object:
-        if not self._has_state:
-            self._state = factory()
-            self._has_state = True
-        return self._state
+    def ensure_state(self, key: int, factory: Callable[[], object]) -> object:
+        """The state for component ``key``, created by ``factory`` on first
+        use within this dispatch."""
+        if key not in self._states:
+            self._states[key] = factory()
+        return self._states[key]
 
 
 # An invoker bridges a callback_id to a registered typed thunk: it receives
 # the live session and the marshaled inputs and returns (out_bytes, status).
 # Thunk exceptions are NOT caught here — the trampoline catches them once.
-Invoker = Callable[["_Session", str, bytes, bytes], tuple[Optional[bytes], int]]
+Invoker = Callable[[_Session, str, bytes, bytes], tuple[bytes | None, int]]
 
 
-def _applier_invoker(factory, thunk: ApplierThunk) -> Invoker:
+def _applier_invoker(key: int, factory, thunk: ApplierThunk) -> Invoker:
+    # The applier aux is a ProjectorEventAux: the folded event's book cover
+    # and page sequence, current while the applier runs.
+    def inv(session, type_url, payload, aux):
+        pax = abi_pb2.ProjectorEventAux()
+        pax.ParseFromString(aux)
+        state = session.ensure_state(key, factory)
+        with _handling(PageContext(cover=_cover_of(pax, "cover"), sequence=pax.sequence)):
+            thunk(state, any_pb2.Any(type_url=type_url, value=payload))
+        return None, _STATUS_OK
+
+    return inv
+
+
+def _snapshot_invoker(key: int, factory, thunk: ApplierThunk) -> Invoker:
     def inv(session, type_url, payload, _aux):
-        state = session.ensure_state(factory)
+        state = session.ensure_state(key, factory)
         thunk(state, any_pb2.Any(type_url=type_url, value=payload))
         return None, _STATUS_OK
 
     return inv
 
 
-def _command_invoker(factory, thunk: CommandThunk) -> Invoker:
+def _command_invoker(key: int, factory, thunk: CommandThunk) -> Invoker:
     def inv(session, type_url, payload, aux):
         cax = abi_pb2.CommandContextAux()
         cax.ParseFromString(aux)
-        cctx = CommandContext(
-            next_sequence=cax.next_sequence, had_prior_events=cax.had_prior_events
-        )
-        state = session.ensure_state(factory)
-        book = thunk(any_pb2.Any(type_url=type_url, value=payload), state, cctx)
+        cctx = _command_context(cax)
+        state = session.ensure_state(key, factory)
+        with _handling(PageContext(cover=cctx.cover)):
+            book = thunk(any_pb2.Any(type_url=type_url, value=payload), state, cctx)
         if book is None:
             return None, _STATUS_OK_EMPTY
         return book.SerializeToString(), _STATUS_OK
@@ -435,7 +642,7 @@ def _command_invoker(factory, thunk: CommandThunk) -> Invoker:
     return inv
 
 
-def _rejection_invoker(factory, thunk: RejectionThunk) -> Invoker:
+def _rejection_invoker(key: int, factory, thunk: RejectionThunk) -> Invoker:
     def inv(session, _type_url, _payload, aux):
         rax = abi_pb2.RejectionAux()
         rax.ParseFromString(aux)
@@ -443,11 +650,10 @@ def _rejection_invoker(factory, thunk: RejectionThunk) -> Invoker:
         notification.ParseFromString(rax.notification)
         rejection = types_pb2.RejectionNotification()
         rejection.ParseFromString(rax.rejection)
-        cctx = CommandContext(
-            next_sequence=rax.cctx.next_sequence, had_prior_events=rax.cctx.had_prior_events
-        )
-        state = session.ensure_state(factory)
-        resp = thunk(notification, rejection, state, cctx)
+        cctx = _command_context(rax.cctx)
+        state = session.ensure_state(key, factory)
+        with _handling(PageContext(cover=cctx.cover)):
+            resp = thunk(notification, rejection, state, cctx)
         if resp is None:
             return None, _STATUS_OK_EMPTY
         return resp.SerializeToString(), _STATUS_OK
@@ -455,23 +661,68 @@ def _rejection_invoker(factory, thunk: RejectionThunk) -> Invoker:
     return inv
 
 
-def _projector_event_invoker(factory, thunk: ProjectorEventThunk) -> Invoker:
+def _undo_invoker(key: int, factory, thunk: UndoThunk) -> Invoker:
+    def inv(session, _type_url, _payload, aux):
+        uax = abi_pb2.UndoAux()
+        uax.ParseFromString(aux)
+        notification = types_pb2.Notification()
+        notification.ParseFromString(uax.notification)
+        compensate = types_pb2.Compensate()
+        compensate.ParseFromString(uax.compensate)
+        cctx = _command_context(uax.cctx)
+        state = session.ensure_state(key, factory)
+        with _handling(PageContext(cover=cctx.cover)):
+            resp = thunk(notification, compensate, state, cctx)
+        if resp is None:
+            return None, _STATUS_OK_EMPTY
+        return resp.SerializeToString(), _STATUS_OK
+
+    return inv
+
+
+def _fact_invoker(key: int, factory, thunk: FactThunk) -> Invoker:
+    # The facts' cover is the dispatch-level page context Router.dispatch_fact
+    # sets; the fact callback carries no aux.
     def inv(session, type_url, payload, _aux):
-        state = session.ensure_state(factory)
-        thunk(state, any_pb2.Any(type_url=type_url, value=payload))
+        state = session.ensure_state(key, factory)
+        record = thunk(any_pb2.Any(type_url=type_url, value=payload), state)
+        if not isinstance(record, FactRecord):
+            raise TypeError(
+                f"fact handler for {type_url!r} returned {type(record).__name__}, not a FactRecord"
+            )
+        return record.to_abi().SerializeToString(), _STATUS_OK
+
+    return inv
+
+
+def _state_invoker(key: int, factory) -> Invoker:
+    # Packs the component's rebuilt state for Replay.
+    def inv(session, _type_url, _payload, _aux):
+        return pack(session.ensure_state(key, factory)).SerializeToString(), _STATUS_OK
+
+    return inv
+
+
+def _projector_event_invoker(key: int, factory, thunk: ProjectorEventThunk) -> Invoker:
+    def inv(session, type_url, payload, aux):
+        pax = abi_pb2.ProjectorEventAux()
+        pax.ParseFromString(aux)
+        state = session.ensure_state(key, factory)
+        with _handling(PageContext(cover=_cover_of(pax, "cover"), sequence=pax.sequence)):
+            thunk(state, any_pb2.Any(type_url=type_url, value=payload))
         return None, _STATUS_OK
 
     return inv
 
 
-def _projector_finish_invoker(factory, thunk: ProjectorFinishThunk) -> Invoker:
+def _projector_finish_invoker(key: int, factory, thunk: ProjectorFinishThunk) -> Invoker:
     def inv(session, _type_url, payload, _aux):
         # The core hands the EventBook over as the callback payload so the
         # finisher can carry its cover onto the Projection.
         book = types_pb2.EventBook()
         if payload:
             book.ParseFromString(payload)
-        state = session.ensure_state(factory)
+        state = session.ensure_state(key, factory)
         projection = thunk(state, book)
         if projection is None:
             return None, _STATUS_OK_EMPTY
@@ -488,53 +739,58 @@ def _projector_unknown_invoker(thunk: ProjectorUnknownThunk) -> Invoker:
     return inv
 
 
-def _saga_event_invoker(thunk: SagaEventThunk) -> Invoker:
+def _saga_event_invoker(targets: list[str], thunk: SagaEventThunk) -> Invoker:
     # Saga is stateless — the session's host state is untouched. The event
-    # thunk rebuilds Destinations from the aux and returns a SagaResponse.
+    # thunk sees the saga's declared targets and returns a SagaResponse.
     def inv(_session, type_url, payload, aux):
         sax = abi_pb2.SagaEventAux()
         sax.ParseFromString(aux)
-        dests = Destinations(dict(sax.destination_sequences))
-        commands, events = thunk(
-            any_pb2.Any(type_url=type_url, value=payload), dests, sax.source_cover
-        )
+        source = PageContext(cover=_cover_of(sax, "source_cover"), sequence=sax.source_seq)
+        with _handling(source):
+            commands, events = thunk(
+                any_pb2.Any(type_url=type_url, value=payload),
+                Destinations(targets),
+                sax.source_cover,
+            )
         resp = saga_pb2.SagaResponse(commands=commands, events=events)
         return resp.SerializeToString(), _STATUS_OK
 
     return inv
 
 
-def _saga_rejection_invoker(thunk: SagaRejectionThunk) -> Invoker:
-    def inv(_session, _type_url, _payload, aux):
-        rax = abi_pb2.RejectionAux()
-        rax.ParseFromString(aux)
-        notification = types_pb2.Notification()
-        notification.ParseFromString(rax.notification)
-        rejection = types_pb2.RejectionNotification()
-        rejection.ParseFromString(rax.rejection)
-        events = thunk(notification, rejection)
-        resp = saga_pb2.SagaResponse(events=events)
-        return resp.SerializeToString(), _STATUS_OK
-
-    return inv
-
-
-def _pm_event_invoker(factory, thunk: PMEventThunk) -> Invoker:
+def _pm_event_invoker(key: int, factory, targets: list[str], thunk: PMEventThunk) -> Invoker:
     # The PM is stateful: the appliers fold process_state into the session's
     # state first, then this handler reads it. The host returns a full
-    # ProcessManagerHandleResponse.
+    # ProcessManagerHandleResponse; the trigger cover is its page context.
     def inv(session, type_url, payload, aux):
         pax = abi_pb2.PmEventAux()
         pax.ParseFromString(aux)
-        dests = Destinations(dict(pax.destination_sequences))
-        state = session.ensure_state(factory)
-        resp = thunk(any_pb2.Any(type_url=type_url, value=payload), state, dests)
+        state = session.ensure_state(key, factory)
+        with _handling(PageContext(cover=_cover_of(pax, "trigger_cover"))):
+            resp = thunk(
+                any_pb2.Any(type_url=type_url, value=payload), state, Destinations(targets)
+            )
+        if resp is None:
+            return None, _STATUS_OK_EMPTY
         return resp.SerializeToString(), _STATUS_OK
 
     return inv
 
 
-def _pm_rejection_invoker(factory, thunk: PMRejectionThunk) -> Invoker:
+def _pm_compensation_response(result) -> object | None:
+    """The ProcessManagerHandleResponse a PM compensator's result stands for:
+    a full response as returned, the ``(process_events, escalation)`` pair
+    folded into one, or None for nothing."""
+    if result is None or isinstance(result, process_manager_pb2.ProcessManagerHandleResponse):
+        return result
+    process_events, escalation = result
+    resp = process_manager_pb2.ProcessManagerHandleResponse(process_events=process_events)
+    if escalation is not None:
+        resp.notification.CopyFrom(escalation)
+    return resp
+
+
+def _pm_rejection_invoker(key: int, factory, thunk: PMRejectionThunk) -> Invoker:
     def inv(session, _type_url, _payload, aux):
         rax = abi_pb2.RejectionAux()
         rax.ParseFromString(aux)
@@ -542,11 +798,10 @@ def _pm_rejection_invoker(factory, thunk: PMRejectionThunk) -> Invoker:
         notification.ParseFromString(rax.notification)
         rejection = types_pb2.RejectionNotification()
         rejection.ParseFromString(rax.rejection)
-        state = session.ensure_state(factory)
-        process_events, escalation = thunk(notification, rejection, state)
-        resp = process_manager_pb2.ProcessManagerHandleResponse(process_events=process_events)
-        if escalation is not None:
-            resp.notification.CopyFrom(escalation)
+        state = session.ensure_state(key, factory)
+        resp = _pm_compensation_response(thunk(notification, rejection, state))
+        if resp is None:
+            return None, _STATUS_OK_EMPTY
         return resp.SerializeToString(), _STATUS_OK
 
     return inv
@@ -563,7 +818,7 @@ def _c_bytes(ptr, n) -> bytes:
     return bytes(ffi.buffer(ptr, n))
 
 
-def _write_out(out, data: Optional[bytes]) -> None:
+def _write_out(out, data: bytes | None) -> None:
     """Fill a router-allocated out buffer (host allocates via
     angzarr_buf_alloc; the router consumes and frees it). Empty leaves
     out null/zero."""
@@ -579,15 +834,20 @@ def _write_out(out, data: Optional[bytes]) -> None:
     out.len = len(data)
 
 
-@ffi.callback("angzarr_cb")
+# What cffi returns if the trampoline itself fails to return a value: an
+# INTERNAL status, never STATUS_OK with `out` unset.
+_TRAMPOLINE_ERROR = -int(GrpcCode.INTERNAL)
+
+
+@ffi.callback("angzarr_cb", error=_TRAMPOLINE_ERROR)
 def _trampoline(
     host_ctx, callback_id, type_url, type_url_len, payload, payload_len, aux, aux_len, out
 ):
     """The single C-visible gateway the core calls for every host callback.
     Recovers the dispatch session from host_ctx, routes by callback_id to the
-    registered invoker, and writes the response into out. A Python exception
-    is caught and surfaced as a coded failure — it must never unwind across
-    the boundary into Rust."""
+    registered invoker, and writes the response into out. Any raised
+    BaseException is caught and surfaced as a coded failure — nothing unwinds
+    across the boundary into Rust."""
     try:
         session = ffi.from_handle(host_ctx)
         inv = session.router._registry.get(int(callback_id))
@@ -609,7 +869,7 @@ def _trampoline(
         )
         _write_out(out, data)
         return status
-    except Exception as exc:  # noqa: BLE001 — boundary guard: nothing crosses into Rust
+    except BaseException as exc:  # noqa: BLE001 — boundary guard: nothing crosses into Rust
         data, code = _error_status(exc)
         _write_out(out, data)
         return code
@@ -645,6 +905,7 @@ class Router:
         self._ptr = lib.angzarr_router_new()
         self._registry: dict[int, Invoker] = {}
         self._next_id = 0
+        self._next_component = 0
         self._lock = threading.Lock()
 
     def close(self) -> None:
@@ -653,11 +914,31 @@ class Router:
             lib.angzarr_router_free(self._ptr)
             self._ptr = None
 
-    def __enter__(self) -> "Router":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *_exc) -> None:
         self.close()
+
+    def _component_key(self) -> int:
+        """A fresh key identifying one registered component's host state."""
+        self._next_component += 1
+        return self._next_component
+
+    def _call(self, fn, request: bytes, page: PageContext) -> tuple[int, bytes]:
+        """Run one dispatch entry point over ``request`` bytes with a fresh
+        session and ``page`` as the dispatch-level page context (callbacks
+        whose aux carries a cover narrow it). Returns the dispatch's return
+        code and its consumed out bytes."""
+        # The session is reached from callbacks via this handle; the core holds
+        # it only for the duration of this synchronous call. `handle` must stay
+        # referenced until dispatch returns.
+        session = _Session(self)
+        handle = ffi.new_handle(session)
+        out = ffi.new("angzarr_buf*")
+        with _handling(page):
+            ret = fn(self._ptr, handle, _as_u8(request), len(request), out)
+        return ret, _consume_out(out)
 
     def _assign(self, inv: Invoker) -> int:
         self._next_id += 1
@@ -670,23 +951,32 @@ class Router:
         the shared trampoline."""
         with self._lock:
             factory = dispatch.rebuilder.factory
+            key = self._component_key()
             desc = abi_pb2.AggregateDescriptor(name=dispatch.name, domain=dispatch.domain)
 
             for fq, thunk in dispatch.rebuilder.appliers.items():
-                cid = self._assign(_applier_invoker(factory, thunk))
+                cid = self._assign(_applier_invoker(key, factory, thunk))
                 desc.appliers.append(abi_pb2.CallbackEntry(fq_type=fq, callback_id=cid))
             if dispatch.rebuilder.snapshot is not None:
                 desc.snapshot_callback_id = self._assign(
-                    _applier_invoker(factory, dispatch.rebuilder.snapshot)
+                    _snapshot_invoker(key, factory, dispatch.rebuilder.snapshot)
                 )
             for fq, thunk in dispatch.commands.items():
-                cid = self._assign(_command_invoker(factory, thunk))
+                cid = self._assign(_command_invoker(key, factory, thunk))
                 desc.commands.append(abi_pb2.CallbackEntry(fq_type=fq, callback_id=cid))
-            for fq, thunks in dispatch.rejections.items():
-                entry = abi_pb2.RejectionEntry(fq_command_type=fq)
+            for compensates, thunks in dispatch.rejections.items():
+                entry = abi_pb2.RejectionEntry(compensates=compensates)
                 for thunk in thunks:
-                    entry.callback_ids.append(self._assign(_rejection_invoker(factory, thunk)))
+                    entry.callback_ids.append(self._assign(_rejection_invoker(key, factory, thunk)))
                 desc.rejections.append(entry)
+            for fq, thunk in dispatch.undoes.items():
+                cid = self._assign(_undo_invoker(key, factory, thunk))
+                desc.undoes.append(abi_pb2.CallbackEntry(fq_type=fq, callback_id=cid))
+            for fq, thunk in dispatch.facts.items():
+                cid = self._assign(_fact_invoker(key, factory, thunk))
+                desc.facts.append(abi_pb2.CallbackEntry(fq_type=fq, callback_id=cid))
+            if isinstance(factory(), Message):
+                desc.state_callback_id = self._assign(_state_invoker(key, factory))
 
             desc_bytes = desc.SerializeToString()
             ret = lib.angzarr_router_register_aggregate(
@@ -699,17 +989,50 @@ class Router:
         """Run one ContextualCommand through the core and return the
         BusinessResponse, or raise a CodedError decoded from the core's
         failure."""
-        req = contextual_command.SerializeToString()
-        # The session is reached from callbacks via this handle; the core holds
-        # it only for the duration of this synchronous call. `handle` must stay
-        # referenced until dispatch returns.
-        session = _Session(self)
-        handle = ffi.new_handle(session)
-        out = ffi.new("angzarr_buf*")
-        ret = lib.angzarr_router_dispatch(self._ptr, handle, _as_u8(req), len(req), out)
-        resp_bytes = _consume_out(out)
+        ret, resp_bytes = self._call(
+            lib.angzarr_router_dispatch,
+            contextual_command.SerializeToString(),
+            PageContext(cover=_cover_of(contextual_command.command, "cover")),
+        )
         if ret == 0:
             resp = command_handler_pb2.BusinessResponse()
+            if resp_bytes:
+                resp.ParseFromString(resp_bytes)
+            return resp
+        raise _decode_status(resp_bytes, ret)
+
+    def dispatch_fact(self, fact_request) -> object:
+        """Run one FactRequest through the aggregate claiming the facts' cover
+        domain: rebuild its state from the prior events, run each fact through
+        its fact handler, and return the EventBook of facts to record. Raises a
+        CodedError decoded from the core's failure."""
+        ret, resp_bytes = self._call(
+            lib.angzarr_router_dispatch_fact,
+            fact_request.SerializeToString(),
+            PageContext(cover=_cover_of(fact_request.facts, "cover")),
+        )
+        if ret == 0:
+            book = types_pb2.EventBook()
+            if resp_bytes:
+                book.ParseFromString(resp_bytes)
+            return book
+        raise _decode_status(resp_bytes, ret)
+
+    def dispatch_replay(self, domain: str, replay_request) -> object:
+        """Replay a ReplayRequest (a base snapshot, then events) through the
+        aggregate registered for ``domain`` (empty selects a sole registered
+        aggregate), or the process manager whose own domain it is when no
+        aggregate claims it, and return the ReplayResponse carrying its
+        rebuilt state, packed. A component whose state is not a protobuf
+        message does not support Replay (NO_HANDLER_REGISTERED). Raises a CodedError decoded
+        from the core's failure."""
+        call = abi_pb2.ReplayCall(domain=domain)
+        call.request.CopyFrom(replay_request)
+        ret, resp_bytes = self._call(
+            lib.angzarr_router_dispatch_replay, call.SerializeToString(), PageContext()
+        )
+        if ret == 0:
+            resp = command_handler_pb2.ReplayResponse()
             if resp_bytes:
                 resp.ParseFromString(resp_bytes)
             return resp
@@ -721,10 +1044,11 @@ class Router:
         it to the core with the shared trampoline."""
         with self._lock:
             factory = dispatch.factory
+            key = self._component_key()
             desc = abi_pb2.ProjectorDescriptor(name=dispatch.name)
             desc.domains.extend(dispatch.domains)
             for fq, thunk in dispatch.events.items():
-                cid = self._assign(_projector_event_invoker(factory, thunk))
+                cid = self._assign(_projector_event_invoker(key, factory, thunk))
                 desc.events.append(abi_pb2.CallbackEntry(fq_type=fq, callback_id=cid))
             if dispatch.unknown is not None:
                 desc.unknown_callback_id = self._assign(
@@ -732,7 +1056,7 @@ class Router:
                 )
             if dispatch.finisher is not None:
                 desc.finish_callback_id = self._assign(
-                    _projector_finish_invoker(factory, dispatch.finisher)
+                    _projector_finish_invoker(key, factory, dispatch.finisher)
                 )
 
             desc_bytes = desc.SerializeToString()
@@ -745,12 +1069,11 @@ class Router:
     def dispatch_projector(self, event_book) -> object:
         """Fold one EventBook through the registered projector and return the
         Projection, or raise a CodedError decoded from the core's failure."""
-        req = event_book.SerializeToString()
-        session = _Session(self)
-        handle = ffi.new_handle(session)
-        out = ffi.new("angzarr_buf*")
-        ret = lib.angzarr_router_dispatch_projector(self._ptr, handle, _as_u8(req), len(req), out)
-        resp_bytes = _consume_out(out)
+        ret, resp_bytes = self._call(
+            lib.angzarr_router_dispatch_projector,
+            event_book.SerializeToString(),
+            PageContext(cover=_cover_of(event_book, "cover")),
+        )
         if ret == 0:
             proj = types_pb2.Projection()
             if resp_bytes:
@@ -759,37 +1082,44 @@ class Router:
         raise _decode_status(resp_bytes, ret)
 
     def register_saga(self, dispatch: SagaDispatch) -> None:
-        """Register one saga component: assign callback ids to every
-        event/rejection thunk, serialize the SagaDescriptor, and hand it to the
-        core with the shared trampoline."""
+        """Register one saga component: assign callback ids to every event
+        thunk, serialize the SagaDescriptor, and hand it to the core with the
+        shared trampoline."""
         with self._lock:
+            targets = list(dispatch.targets)
             desc = abi_pb2.SagaDescriptor(name=dispatch.name, input_domain=dispatch.input_domain)
-            desc.target_domains.extend(dispatch.targets)
+            desc.target_domains.extend(targets)
             for fq, thunk in dispatch.events.items():
-                cid = self._assign(_saga_event_invoker(thunk))
+                cid = self._assign(_saga_event_invoker(targets, thunk))
                 desc.events.append(abi_pb2.CallbackEntry(fq_type=fq, callback_id=cid))
-            for fq, thunks in dispatch.rejections.items():
-                entry = abi_pb2.RejectionEntry(fq_command_type=fq)
-                for thunk in thunks:
-                    entry.callback_ids.append(self._assign(_saga_rejection_invoker(thunk)))
-                desc.rejections.append(entry)
+            self._register_saga_bytes(desc.SerializeToString())
 
-            desc_bytes = desc.SerializeToString()
-            ret = lib.angzarr_router_register_saga(
-                self._ptr, _as_u8(desc_bytes), len(desc_bytes), _trampoline
-            )
-            if ret != 0:
-                raise _decode_status(None, ret)
+    def register_saga_descriptor(self, descriptor) -> None:
+        """The low-level saga registration entry point: hand an already-built
+        ABI ``SagaDescriptor`` to the core as-is, with the shared trampoline.
+        Every callback id it names must already be assigned on this router;
+        :meth:`register_saga` is the typed path that assigns them. The core
+        validates the descriptor (a saga declaring rejections is refused with
+        SAGA_COMPENSATES), and a refusal raises a CodedError."""
+        with self._lock:
+            self._register_saga_bytes(descriptor.SerializeToString())
+
+    def _register_saga_bytes(self, desc_bytes: bytes) -> None:
+        # The caller holds self._lock.
+        ret = lib.angzarr_router_register_saga(
+            self._ptr, _as_u8(desc_bytes), len(desc_bytes), _trampoline
+        )
+        if ret != 0:
+            raise _decode_status(None, ret)
 
     def dispatch_saga(self, saga_request) -> object:
         """Run one SagaHandleRequest through the registered saga and return the
         SagaResponse, or raise a CodedError decoded from the core's failure."""
-        req = saga_request.SerializeToString()
-        session = _Session(self)
-        handle = ffi.new_handle(session)
-        out = ffi.new("angzarr_buf*")
-        ret = lib.angzarr_router_dispatch_saga(self._ptr, handle, _as_u8(req), len(req), out)
-        resp_bytes = _consume_out(out)
+        ret, resp_bytes = self._call(
+            lib.angzarr_router_dispatch_saga,
+            saga_request.SerializeToString(),
+            PageContext(cover=_cover_of(saga_request.source, "cover")),
+        )
         if ret == 0:
             resp = saga_pb2.SagaResponse()
             if resp_bytes:
@@ -799,32 +1129,39 @@ class Router:
 
     def register_process_manager(self, dispatch: ProcessManagerDispatch) -> None:
         """Register one process-manager component: assign callback ids to every
-        applier/snapshot/event/rejection thunk, serialize the
+        applier/snapshot/event/rejection thunk (plus a state packer for Replay
+        when the state is a protobuf message), serialize the
         ProcessManagerDescriptor, and hand it to the core with the shared
         trampoline."""
         with self._lock:
             factory = dispatch.rebuilder.factory
+            key = self._component_key()
+            targets = list(dispatch.targets)
             desc = abi_pb2.ProcessManagerDescriptor(
                 name=dispatch.name, pm_domain=dispatch.pm_domain
             )
+            desc.target_domains.extend(targets)
             for fq, thunk in dispatch.rebuilder.appliers.items():
-                cid = self._assign(_applier_invoker(factory, thunk))
+                cid = self._assign(_applier_invoker(key, factory, thunk))
                 desc.appliers.append(abi_pb2.CallbackEntry(fq_type=fq, callback_id=cid))
             if dispatch.rebuilder.snapshot is not None:
                 desc.snapshot_callback_id = self._assign(
-                    _applier_invoker(factory, dispatch.rebuilder.snapshot)
+                    _snapshot_invoker(key, factory, dispatch.rebuilder.snapshot)
                 )
             for input_domain, by_type in dispatch.handlers.items():
                 for fq, thunk in by_type.items():
-                    cid = self._assign(_pm_event_invoker(factory, thunk))
+                    cid = self._assign(_pm_event_invoker(key, factory, targets, thunk))
                     desc.events.append(
                         abi_pb2.PmEventEntry(input_domain=input_domain, fq_type=fq, callback_id=cid)
                     )
-            for fq, thunks in dispatch.rejections.items():
-                entry = abi_pb2.RejectionEntry(fq_command_type=fq)
+            for compensates, thunks in dispatch.rejections.items():
+                entry = abi_pb2.RejectionEntry(compensates=compensates)
                 for thunk in thunks:
-                    entry.callback_ids.append(self._assign(_pm_rejection_invoker(factory, thunk)))
+                    cid = self._assign(_pm_rejection_invoker(key, factory, thunk))
+                    entry.callback_ids.append(cid)
                 desc.rejections.append(entry)
+            if isinstance(factory(), Message):
+                desc.state_callback_id = self._assign(_state_invoker(key, factory))
 
             desc_bytes = desc.SerializeToString()
             ret = lib.angzarr_router_register_process_manager(
@@ -837,14 +1174,11 @@ class Router:
         """Run one ProcessManagerHandleRequest through the registered PM and
         return the ProcessManagerHandleResponse, or raise a CodedError decoded
         from the core's failure."""
-        req = pm_request.SerializeToString()
-        session = _Session(self)
-        handle = ffi.new_handle(session)
-        out = ffi.new("angzarr_buf*")
-        ret = lib.angzarr_router_dispatch_process_manager(
-            self._ptr, handle, _as_u8(req), len(req), out
+        ret, resp_bytes = self._call(
+            lib.angzarr_router_dispatch_process_manager,
+            pm_request.SerializeToString(),
+            PageContext(cover=_cover_of(pm_request.trigger, "cover")),
         )
-        resp_bytes = _consume_out(out)
         if ret == 0:
             resp = process_manager_pb2.ProcessManagerHandleResponse()
             if resp_bytes:

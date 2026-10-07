@@ -41,8 +41,19 @@ int32_t angzarr_router_dispatch_saga(void* r, void* host_ctx, const uint8_t* req
                                      AngzarrBuf* out);
 int32_t angzarr_router_dispatch_process_manager(void* r, void* host_ctx, const uint8_t* request,
                                                 size_t len, AngzarrBuf* out);
+// FactRequest bytes in, EventBook bytes (the facts to record) out; routed to
+// the aggregate claiming the facts' cover domain.
+int32_t angzarr_router_dispatch_fact(void* r, void* host_ctx, const uint8_t* request, size_t len,
+                                     AngzarrBuf* out);
+// io.angzarr.router.ffi.v1.ReplayCall bytes in, ReplayResponse bytes out;
+// routed to the aggregate claiming ReplayCall.domain.
+int32_t angzarr_router_dispatch_replay(void* r, void* host_ctx, const uint8_t* request, size_t len,
+                                       AngzarrBuf* out);
 
 }  // extern "C"
+
+// The router-ffi ABI version this binding is written against.
+inline constexpr uint32_t kAbiVersion = 3;
 
 inline constexpr int32_t kStatusOk = 0;
 inline constexpr int32_t kStatusOkEmpty = 1;

@@ -19,6 +19,12 @@ namespace angzarr::router {
 inline constexpr char kErrorInfoDomain[] = "angzarr.io";
 inline constexpr char kErrorInfoTypeUrl[] = "type.googleapis.com/google.rpc.ErrorInfo";
 
+// The gRPC code a coded failure crosses the FFI with. A failure is never OK, so
+// a CodedError carrying code 0 is reported as INVALID_ARGUMENT.
+inline GrpcCode WireGrpc(GrpcCode grpc) {
+  return static_cast<int32_t>(grpc) == 0 ? GrpcCode::kInvalidArgument : grpc;
+}
+
 inline std::string ToStatusBytes(const CodedError& err) {
   google::rpc::ErrorInfo info;
   info.set_reason(err.code);
@@ -27,7 +33,7 @@ inline std::string ToStatusBytes(const CodedError& err) {
     (*info.mutable_metadata())[k] = v;
   }
   google::rpc::Status status;
-  status.set_code(static_cast<int32_t>(err.grpc));
+  status.set_code(static_cast<int32_t>(WireGrpc(err.grpc)));
   status.set_message(err.what());
   auto* detail = status.add_details();
   detail->set_type_url(kErrorInfoTypeUrl);

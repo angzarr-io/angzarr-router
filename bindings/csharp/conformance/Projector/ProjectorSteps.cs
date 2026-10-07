@@ -20,7 +20,6 @@ public sealed class ProjectorSteps
     public void Before()
     {
         _router = new Router();
-        TC.CounterProjectorAngzarr.RegisterCounterProjector(_router, new ProjectorFixture());
         _proj = null;
         _err = null;
     }
@@ -43,10 +42,15 @@ public sealed class ProjectorSteps
     }
 
     [Given("a counter projection")]
-    public void ACounterProjection()
-    {
-        // The fixture is registered in Before.
-    }
+    public void ACounterProjection() =>
+        TC.CounterProjectorAngzarr.RegisterCounterProjector(_router, new ProjectorFixture());
+
+    [Given("a counter projection over every domain")]
+    public void ACounterProjectionOverEveryDomain() =>
+        _router.RegisterProjector(
+            TC.CounterProjectorAngzarr.NewCounterProjectorDispatch(new ProjectorFixture())
+                .ForDomains("*")
+        );
 
     [When("{int} events are delivered in domain {string}")]
     public void EventsDelivered(int n, string domain) => Dispatch(Builders.DeliveryBook(domain, n));

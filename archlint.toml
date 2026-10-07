@@ -1,0 +1,128 @@
+# Architecture rules for angzarr-router, checked by `just archlint`
+# (tools/archlint; pattern syntax and rule semantics in
+# tools/archlint/src/rules.rs). `cargo run -p archlint -- --edges` prints the
+# module graph these rules are checked against.
+#
+# Crate layers, bottom to top:
+#   angzarr_router              the engine: dispatch, component model, rebuild
+#   angzarr_router_ffi          the C ABI over the engine (marshaling, registry)
+#   bindings/<lang>             out-of-tree leaves that link the cdylib
+#   angzarr_router_conformance  the harness: drives the engine's public API
+#                               (its tests also drive the exported C ABI)
+#   archlint                    tooling; no product crate depends on it
+#
+# `allow` lists the ONLY workspace targets a module may reference (external
+# crates are constrained by `deny` alone); `self::**` is the module's own
+# subtree.
+
+# ---- crate layers ----------------------------------------------------------
+
+[[rule]]
+name = "engine-is-the-bottom"
+why = "the engine never depends on the C ABI layer, the conformance harness, tooling, or C FFI types"
+from = ["angzarr_router::**"]
+allow = ["angzarr_router::**"]
+deny = ["std::ffi::**", "core::ffi::**", "std::os::raw::**", "libc::**"]
+
+[[rule]]
+name = "ffi-sits-on-the-engine"
+why = "the C ABI layer marshals over the engine; it never reaches the harness or tooling"
+from = ["angzarr_router_ffi::**"]
+allow = ["angzarr_router_ffi::**", "angzarr_router::**"]
+
+[[rule]]
+name = "conformance-drives-the-public-engine"
+why = "the harness library exercises the engine's public API and the conformance fixtures, never the C ABI"
+from = ["angzarr_router_conformance::**"]
+scope = "lib"
+allow = ["angzarr_router_conformance::**", "angzarr_router::**", "path:conformance/fixtures/**"]
+
+[[rule]]
+name = "conformance-tests-use-public-surfaces"
+why = "conformance tests drive the engine API and the C ABI's exported entry points, never FFI internals"
+from = ["angzarr_router_conformance::**"]
+scope = "test"
+allow = [
+    "angzarr_router_conformance::**",
+    "angzarr_router::**",
+    "angzarr_router_ffi",
+    "path:conformance/**",
+]
+
+[[rule]]
+name = "bindings-are-leaves"
+why = "language bindings link the C ABI from outside the workspace; no Rust crate reads or depends on them"
+from = ["angzarr_router::**", "angzarr_router_ffi::**", "angzarr_router_conformance::**"]
+deny = ["path:bindings/**"]
+
+# ---- engine internals (library code) ----------------------------------------
+
+[[rule]]
+name = "engine-proto-is-a-leaf"
+why = "generated proto types reference nothing else in the engine"
+from = ["angzarr_router::proto::**"]
+scope = "lib"
+allow = ["angzarr_router::proto::**"]
+
+[[rule]]
+name = "engine-error-is-a-leaf"
+why = "the coded-error vocabulary references nothing else in the engine"
+from = ["angzarr_router::error::**"]
+scope = "lib"
+allow = ["angzarr_router::error::**"]
+
+[[rule]]
+name = "engine-kernel-below-components"
+why = "the shared kernel (crate-root helpers, destinations, rebuild) sits below the component dispatchers and the router"
+from = ["angzarr_router", "angzarr_router::destinations::**", "angzarr_router::rebuild::**"]
+scope = "lib"
+allow = [
+    "angzarr_router",
+    "angzarr_router::proto::**",
+    "angzarr_router::error::**",
+    "angzarr_router::destinations::**",
+    "angzarr_router::rebuild::**",
+]
+
+[[rule]]
+name = "engine-components-are-independent"
+why = "each component dispatcher builds on the kernel only, never on another component or the router that composes them"
+from = [
+    "angzarr_router::aggregate::**",
+    "angzarr_router::saga::**",
+    "angzarr_router::process_manager::**",
+    "angzarr_router::projector::**",
+    "angzarr_router::upcaster::**",
+]
+scope = "lib"
+allow = [
+    "self::**",
+    "angzarr_router",
+    "angzarr_router::proto::**",
+    "angzarr_router::error::**",
+    "angzarr_router::destinations::**",
+    "angzarr_router::rebuild::**",
+]
+
+# ---- C ABI internals (library code) -----------------------------------------
+
+[[rule]]
+name = "ffi-proto-is-a-leaf"
+why = "the ABI's generated proto types reference nothing else"
+from = ["angzarr_router_ffi::proto::**"]
+scope = "lib"
+allow = ["angzarr_router_ffi::proto::**"]
+
+[[rule]]
+name = "ffi-abi-below-registry"
+why = "buffer/status marshaling sits below the registry and the exported entry points"
+from = ["angzarr_router_ffi::abi::**"]
+scope = "lib"
+allow = ["self::**", "angzarr_router_ffi::proto::**", "angzarr_router::**"]
+
+[[rule]]
+name = "ffi-registry-below-entry-points"
+why = "the registry adapts host callbacks to engine components; the extern \"C\" entry points sit above it"
+from = ["angzarr_router_ffi::registry::**"]
+scope = "lib"
+allow = ["self::**", "angzarr_router_ffi::abi::**", "angzarr_router_ffi::proto::**", "angzarr_router::**"]

@@ -53,6 +53,15 @@ func (w *projectorWorld) reset() {
 	}
 }
 
+// overEveryDomain replaces the registered projector with one declaring the
+// wildcard domain.
+func (w *projectorWorld) overEveryDomain() error {
+	w.router.Close()
+	w.router = NewRouter()
+	d := counter.NewCounterProjectorDispatch(counterProjector{}).ForDomains(WildcardDomain)
+	return RegisterProjector(w.router, d)
+}
+
 func (w *projectorWorld) dispatch(book *pb.EventBook) {
 	w.proj, w.err = w.router.DispatchProjector(book)
 }
@@ -117,6 +126,7 @@ func initializeProjectorScenario(sc *godog.ScenarioContext) {
 	})
 
 	sc.Step(`^a counter projection$`, func() {})
+	sc.Step(`^a counter projection over every domain$`, w.overEveryDomain)
 	sc.Step(`^(\d+) events are delivered in domain "([^"]*)"$`, w.eventsDelivered)
 	sc.Step(`^a delivery arrives with no cover$`, w.deliveryNoCover)
 	sc.Step(`^the projection records (\d+) events?$`, w.recordsCount)

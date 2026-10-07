@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/router", "crates/router-ffi", "crates/conformance"]
+members = ["crates/router", "crates/router-ffi", "crates/conformance", "tools/archlint"]
 
 [workspace.package]
 version = "0.1.0"
@@ -8,7 +8,7 @@ edition = "2021"
 license = "BSD-3-Clause"
 
 [workspace.dependencies]
-prost = "0.13"
-prost-types = "0.13"
-prost-build = "0.13"
+prost = "0.14"
+prost-types = "0.14"
+prost-build = "0.14"
 tracing = "0.1"

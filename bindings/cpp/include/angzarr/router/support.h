@@ -1,12 +1,14 @@
 #pragma once
 
 // The host-side value types the dispatch surfaces and Router use: the command
-// context, destination stamping, Any packing, the saga/PM emission results, the
-// per-dispatch Session (host_ctx), the type-erased Invoker, and the Rebuilder.
+// context, declared output destinations, Any packing, the saga/PM emission
+// results, the per-dispatch Session (host_ctx), the type-erased Invoker, and the
+// Rebuilder.
 
 #include <google/protobuf/any.pb.h>
 #include <google/protobuf/message.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -24,39 +26,41 @@ namespace angzarr::router {
 
 class Router;  // defined in router.h
 
-// The historical-state evidence a command handler sees. Host state never crosses
-// the FFI, so the core reconstructs this from the prior-events book.
+// The historical-state evidence a command handler (or compensator, or undo
+// handler) sees. Host state never crosses the FFI, so the core reconstructs
+// this from the prior-events book.
 struct CommandContext {
   uint32_t next_sequence = 0;
   bool had_prior_events = false;
+  // The cover of the command (or notification delivery) being handled: the
+  // aggregate's own domain and root.
+  io::angzarr::v1::Cover cover;
 };
 
-// The coordinator-supplied next-sequences for command stamping. Sagas and PMs
-// are translators — they stamp emitted commands, they do not rebuild state.
+// Where a folded event sits (a projector fold or an applier): its book's cover
+// and the page's explicit sequence (0 when absent).
+struct PageContext {
+  io::angzarr::v1::Cover cover;
+  uint32_t sequence = 0;
+};
+
+// The declared output domains of one saga or process manager (its command
+// targets), in declaration order. Emitted commands are deferred: the router
+// stamps their angzarr_deferred provenance, so handlers never stamp sequences.
 class Destinations {
  public:
-  explicit Destinations(std::map<std::string, uint32_t> sequences)
-      : sequences_(std::move(sequences)) {}
+  explicit Destinations(std::vector<std::string> domains) : domains_(std::move(domains)) {}
 
-  bool Has(const std::string& domain) const { return sequences_.count(domain) > 0; }
-
-  // Returns a copy of cmd with every page stamped with the next sequence for
-  // domain; a domain with no supplied sequence is MISSING_DESTINATION_SEQUENCE.
-  io::angzarr::v1::CommandBook StampCommand(io::angzarr::v1::CommandBook cmd,
-                                            const std::string& domain) const {
-    auto it = sequences_.find(domain);
-    if (it == sequences_.end()) {
-      throw CodedError("MISSING_DESTINATION_SEQUENCE", "no sequence for destination domain",
-                       GrpcCode::kInvalidArgument, {{"domain", domain}});
-    }
-    for (auto& page : *cmd.mutable_pages()) {
-      page.mutable_header()->set_sequence(it->second);
-    }
-    return cmd;
+  // True when domain is a declared output domain.
+  bool Has(const std::string& domain) const {
+    return std::find(domains_.begin(), domains_.end(), domain) != domains_.end();
   }
 
+  // The declared output domains, in declaration order.
+  const std::vector<std::string>& Domains() const { return domains_; }
+
  private:
-  std::map<std::string, uint32_t> sequences_;
+  std::vector<std::string> domains_;
 };
 
 // Wraps a message in a google.protobuf.Any using the framework's bare-"/"
@@ -82,11 +86,18 @@ struct PmRejection {
   std::optional<io::angzarr::v1::Notification> escalation;
 };
 
-// One dispatch's host-side state object, reached from callbacks via host_ctx.
-// The rebuilt state is created lazily by the first stateful callback. State is a
-// mutable protobuf message held as the base type; EnsureState<T> performs the
-// single erasing cast — guaranteed correct because the same TState's invokers
-// created it.
+// Identifies one registered component (aggregate, projector or process
+// manager) within a Router. Every invoker registered for a component captures
+// its key, so callbacks reach that component's state and no other.
+using ComponentKey = uint64_t;
+
+// One dispatch's host-side state, reached from callbacks via host_ctx. A single
+// dispatch may run several components (co-resident process managers subscribed
+// to one domain), so state is held per component key, each created lazily by
+// that component's first stateful callback. State is a mutable protobuf message
+// held as the base type; EnsureState<T> performs the single erasing cast —
+// correct because only the invokers of the component that owns the key (all
+// typed on that component's TState) create or reach its entry.
 class Session {
  public:
   explicit Session(Router& router) : router_(router) {}
@@ -94,16 +105,17 @@ class Session {
   Router& router() { return router_; }
 
   template <class TState>
-  TState& EnsureState() {
-    if (!state_) {
-      state_ = std::make_unique<TState>();
+  TState& EnsureState(ComponentKey key) {
+    auto& slot = states_[key];
+    if (!slot) {
+      slot = std::make_unique<TState>();
     }
-    return static_cast<TState&>(*state_);
+    return static_cast<TState&>(*slot);
   }
 
  private:
   Router& router_;
-  std::unique_ptr<google::protobuf::Message> state_;
+  std::map<ComponentKey, std::unique_ptr<google::protobuf::Message>> states_;
 };
 
 // A callback's outcome: response bytes (when has_response) and the ABI status.
@@ -124,6 +136,10 @@ template <class TState>
 class Rebuilder {
  public:
   using ApplierFn = std::function<void(TState&, const google::protobuf::Any&)>;
+  // An applier that also reads where the event sits (its book's cover and the
+  // page's sequence).
+  using ApplierWithContextFn =
+      std::function<void(TState&, const google::protobuf::Any&, const PageContext&)>;
 
   Rebuilder& WithSnapshot(ApplierFn fn) {
     snapshot = std::move(fn);
@@ -131,12 +147,18 @@ class Rebuilder {
   }
 
   Rebuilder& Apply(std::string full_name, ApplierFn fn) {
+    return ApplyWithContext(std::move(full_name),
+                            [fn = std::move(fn)](TState& state, const google::protobuf::Any& event,
+                                                 const PageContext&) { fn(state, event); });
+  }
+
+  Rebuilder& ApplyWithContext(std::string full_name, ApplierWithContextFn fn) {
     appliers.emplace_back(std::move(full_name), std::move(fn));
     return *this;
   }
 
   ApplierFn snapshot;
-  std::vector<std::pair<std::string, ApplierFn>> appliers;
+  std::vector<std::pair<std::string, ApplierWithContextFn>> appliers;
 };
 
 }  // namespace angzarr::router

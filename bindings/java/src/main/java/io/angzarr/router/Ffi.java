@@ -16,15 +16,14 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * The raw C-ABI layer over the router-ffi cdylib, via Panama/FFM. Holds the
- * downcall handles for the 11 exported functions, the {@code AngzarrBuf} layout,
- * and the single upcall trampoline the core calls for every host callback.
+ * The raw C-ABI layer over the router-ffi cdylib, via Panama/FFM. Holds the downcall handles for
+ * the 15 exported functions, the {@code AngzarrBuf} layout, and the single upcall trampoline the
+ * core calls for every host callback.
  *
- * <p>Memory ownership is symmetric, copy-at-the-boundary: a callback fills the
- * router-allocated {@code out} (via {@code angzarr_buf_alloc}); a dispatch
- * response is router-allocated and released here ({@code angzarr_buf_release}).
- * The trampoline catches every throwable and codes it — an exception never
- * unwinds across the boundary.
+ * <p>Memory ownership is symmetric, copy-at-the-boundary: a callback fills the router-allocated
+ * {@code out} (via {@code angzarr_buf_alloc}); a dispatch response is router-allocated and released
+ * here ({@code angzarr_buf_release}). The trampoline catches every throwable and codes it — an
+ * exception never unwinds across the boundary.
  */
 final class Ffi {
   private Ffi() {}
@@ -38,32 +37,63 @@ final class Ffi {
   private static final Linker LINKER = Linker.nativeLinker();
   private static final SymbolLookup LIB = loadLibrary();
 
-  // AngzarrBuf { *mut u8 data; usize len } — data at 0, len at 8 (64-bit).
-  private static final MemoryLayout ANGZARR_BUF =
-      MemoryLayout.structLayout(ValueLayout.ADDRESS.withName("data"), ValueLayout.JAVA_LONG.withName("len"));
-  private static final long BUF_LEN_OFFSET = 8;
+  // The platform's C size_t (Rust usize): every length crossing the ABI.
+  static final ValueLayout SIZE_T = (ValueLayout) LINKER.canonicalLayouts().get("size_t");
 
-  private static final MethodHandle ABI_VERSION = down("angzarr_abi_version", FunctionDescriptor.of(ValueLayout.JAVA_INT));
-  private static final MethodHandle BUF_ALLOC = down("angzarr_buf_alloc", FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.JAVA_LONG));
-  private static final MethodHandle BUF_RELEASE = down("angzarr_buf_release", FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.JAVA_LONG));
-  private static final MethodHandle ROUTER_NEW = down("angzarr_router_new", FunctionDescriptor.of(ValueLayout.ADDRESS));
-  private static final MethodHandle ROUTER_FREE = down("angzarr_router_free", FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));
+  // AngzarrBuf { *mut u8 data; usize len }.
+  static final MemoryLayout ANGZARR_BUF =
+      MemoryLayout.structLayout(ValueLayout.ADDRESS.withName("data"), SIZE_T.withName("len"));
+  static final long BUF_LEN_OFFSET =
+      ANGZARR_BUF.byteOffset(MemoryLayout.PathElement.groupElement("len"));
+
+  private static final MethodHandle ABI_VERSION =
+      down("angzarr_abi_version", FunctionDescriptor.of(ValueLayout.JAVA_INT));
+  private static final MethodHandle BUF_ALLOC =
+      down("angzarr_buf_alloc", FunctionDescriptor.of(ValueLayout.ADDRESS, SIZE_T));
+  private static final MethodHandle BUF_RELEASE =
+      down("angzarr_buf_release", FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, SIZE_T));
+  private static final MethodHandle ROUTER_NEW =
+      down("angzarr_router_new", FunctionDescriptor.of(ValueLayout.ADDRESS));
+  private static final MethodHandle ROUTER_FREE =
+      down("angzarr_router_free", FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));
 
   // register: (router, descriptor, descriptor_len, cb) -> i32
   private static final FunctionDescriptor REGISTER_DESC =
-      FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG, ValueLayout.ADDRESS);
-  private static final MethodHandle REGISTER_AGGREGATE = down("angzarr_router_register_aggregate", REGISTER_DESC);
-  private static final MethodHandle REGISTER_PROJECTOR = down("angzarr_router_register_projector", REGISTER_DESC);
-  private static final MethodHandle REGISTER_SAGA = down("angzarr_router_register_saga", REGISTER_DESC);
-  private static final MethodHandle REGISTER_PROCESS_MANAGER = down("angzarr_router_register_process_manager", REGISTER_DESC);
+      FunctionDescriptor.of(
+          ValueLayout.JAVA_INT,
+          ValueLayout.ADDRESS,
+          ValueLayout.ADDRESS,
+          SIZE_T,
+          ValueLayout.ADDRESS);
+  private static final MethodHandle REGISTER_AGGREGATE =
+      down("angzarr_router_register_aggregate", REGISTER_DESC);
+  private static final MethodHandle REGISTER_PROJECTOR =
+      down("angzarr_router_register_projector", REGISTER_DESC);
+  private static final MethodHandle REGISTER_SAGA =
+      down("angzarr_router_register_saga", REGISTER_DESC);
+  private static final MethodHandle REGISTER_PROCESS_MANAGER =
+      down("angzarr_router_register_process_manager", REGISTER_DESC);
 
   // dispatch: (router, host_ctx, request, request_len, out) -> i32
   private static final FunctionDescriptor DISPATCH_DESC =
-      FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG, ValueLayout.ADDRESS);
+      FunctionDescriptor.of(
+          ValueLayout.JAVA_INT,
+          ValueLayout.ADDRESS,
+          ValueLayout.ADDRESS,
+          ValueLayout.ADDRESS,
+          SIZE_T,
+          ValueLayout.ADDRESS);
   private static final MethodHandle DISPATCH = down("angzarr_router_dispatch", DISPATCH_DESC);
-  private static final MethodHandle DISPATCH_PROJECTOR = down("angzarr_router_dispatch_projector", DISPATCH_DESC);
-  private static final MethodHandle DISPATCH_SAGA = down("angzarr_router_dispatch_saga", DISPATCH_DESC);
-  private static final MethodHandle DISPATCH_PROCESS_MANAGER = down("angzarr_router_dispatch_process_manager", DISPATCH_DESC);
+  private static final MethodHandle DISPATCH_PROJECTOR =
+      down("angzarr_router_dispatch_projector", DISPATCH_DESC);
+  private static final MethodHandle DISPATCH_SAGA =
+      down("angzarr_router_dispatch_saga", DISPATCH_DESC);
+  private static final MethodHandle DISPATCH_PROCESS_MANAGER =
+      down("angzarr_router_dispatch_process_manager", DISPATCH_DESC);
+  private static final MethodHandle DISPATCH_FACT =
+      down("angzarr_router_dispatch_fact", DISPATCH_DESC);
+  private static final MethodHandle DISPATCH_REPLAY =
+      down("angzarr_router_dispatch_replay", DISPATCH_DESC);
 
   // The single host-callback gateway, shared across every registration. It is
   // stateless: it reaches the session via host_ctx and the registry via the
@@ -75,15 +105,31 @@ final class Ffi {
   private static final ConcurrentHashMap<Long, Session> SESSIONS = new ConcurrentHashMap<>();
   private static final AtomicLong NEXT_SESSION = new AtomicLong(1);
 
+  /** The router-ffi ABI version this binding is built against. */
+  static final int EXPECTED_ABI_VERSION = 3;
+
   static {
-    int v;
+    checkAbiVersion(abiVersion());
+  }
+
+  /** The ABI version the loaded router-ffi library reports. */
+  static int abiVersion() {
     try {
-      v = (int) ABI_VERSION.invokeExact();
+      return (int) ABI_VERSION.invokeExact();
     } catch (Throwable t) {
-      throw new ExceptionInInitializerError(t);
+      throw rethrow(t);
     }
-    if (v != 1) {
-      throw new IllegalStateException("router-ffi ABI version " + v + " != 1");
+  }
+
+  /** Refuses a router-ffi library whose ABI version is not the one this binding expects. */
+  static void checkAbiVersion(int actual) {
+    if (actual != EXPECTED_ABI_VERSION) {
+      throw new IllegalStateException(
+          "router-ffi ABI version mismatch: expected "
+              + EXPECTED_ABI_VERSION
+              + ", got "
+              + actual
+              + " — rebuild the binding against the loaded library");
     }
   }
 
@@ -102,7 +148,36 @@ final class Ffi {
   private static MethodHandle down(String name, FunctionDescriptor desc) {
     MemorySegment sym =
         LIB.find(name).orElseThrow(() -> new IllegalStateException("missing FFI symbol: " + name));
-    return LINKER.downcallHandle(sym, desc);
+    MethodHandle handle = LINKER.downcallHandle(sym, desc);
+    return MethodHandles.explicitCastArguments(handle, widened(desc));
+  }
+
+  /**
+   * The descriptor's Java type with every size_t carried as {@code long}, so call sites pass
+   * lengths as {@code long} whatever the platform's size_t width.
+   */
+  private static MethodType widened(FunctionDescriptor desc) {
+    MethodType type = desc.toMethodType();
+    for (int i = 0; i < desc.argumentLayouts().size(); i++) {
+      if (desc.argumentLayouts().get(i).equals(SIZE_T)) {
+        type = type.changeParameterType(i, long.class);
+      }
+    }
+    return type;
+  }
+
+  private static long getSize(MemorySegment seg, long offset) {
+    return SIZE_T.byteSize() == Long.BYTES
+        ? seg.get(ValueLayout.JAVA_LONG, offset)
+        : Integer.toUnsignedLong(seg.get(ValueLayout.JAVA_INT, offset));
+  }
+
+  private static void setSize(MemorySegment seg, long offset, long value) {
+    if (SIZE_T.byteSize() == Long.BYTES) {
+      seg.set(ValueLayout.JAVA_LONG, offset, value);
+    } else {
+      seg.set(ValueLayout.JAVA_INT, offset, Math.toIntExact(value));
+    }
   }
 
   private static MemorySegment upcallStub() {
@@ -126,16 +201,17 @@ final class Ffi {
       FunctionDescriptor desc =
           FunctionDescriptor.of(
               ValueLayout.JAVA_INT,
+              ValueLayout.ADDRESS, // host_ctx
+              ValueLayout.JAVA_LONG, // callback_id (u64)
               ValueLayout.ADDRESS,
-              ValueLayout.JAVA_LONG,
+              SIZE_T,
               ValueLayout.ADDRESS,
-              ValueLayout.JAVA_LONG,
+              SIZE_T,
               ValueLayout.ADDRESS,
-              ValueLayout.JAVA_LONG,
-              ValueLayout.ADDRESS,
-              ValueLayout.JAVA_LONG,
+              SIZE_T,
               ValueLayout.ADDRESS);
-      return LINKER.upcallStub(handle, desc, Arena.global());
+      MethodHandle adapted = MethodHandles.explicitCastArguments(handle, desc.toMethodType());
+      return LINKER.upcallStub(adapted, desc, Arena.global());
     } catch (NoSuchMethodException | IllegalAccessException e) {
       throw new ExceptionInInitializerError(e);
     }
@@ -215,6 +291,14 @@ final class Ffi {
     return dispatch(DISPATCH_PROCESS_MANAGER, router, sessionId, request);
   }
 
+  static Dispatched dispatchFact(MemorySegment router, long sessionId, byte[] request) {
+    return dispatch(DISPATCH_FACT, router, sessionId, request);
+  }
+
+  static Dispatched dispatchReplay(MemorySegment router, long sessionId, byte[] request) {
+    return dispatch(DISPATCH_REPLAY, router, sessionId, request);
+  }
+
   private static Dispatched dispatch(
       MethodHandle handle, MemorySegment router, long sessionId, byte[] request) {
     try (Arena arena = Arena.ofConfined()) {
@@ -244,9 +328,7 @@ final class Ffi {
       Session session = SESSIONS.get(hostCtx.address());
       Invoker invoker = session == null ? null : session.router.invokerFor(callbackId);
       if (invoker == null) {
-        return fail(
-            out,
-            CodedError.unhandled("no host callback registered for id " + callbackId));
+        return fail(out, CodedError.unhandled("no host callback registered for id " + callbackId));
       }
       Invoker.Result result;
       try {
@@ -294,9 +376,10 @@ final class Ffi {
     return new String(readBytes(seg, len), StandardCharsets.UTF_8);
   }
 
-  /** Writes host bytes into a router-allocated out buffer (the host fills out
-   * via the router's allocator; the router consumes and frees it). An empty
-   * payload leaves out null/zero. */
+  /**
+   * Writes host bytes into a router-allocated out buffer (the host fills out via the router's
+   * allocator; the router consumes and frees it). An empty payload leaves out null/zero.
+   */
   private static void writeOut(MemorySegment out, byte[] bytes) {
     if (out.address() == 0) {
       return;
@@ -304,7 +387,7 @@ final class Ffi {
     MemorySegment buf = out.reinterpret(ANGZARR_BUF.byteSize());
     if (bytes == null || bytes.length == 0) {
       buf.set(ValueLayout.ADDRESS, 0, MemorySegment.NULL);
-      buf.set(ValueLayout.JAVA_LONG, BUF_LEN_OFFSET, 0L);
+      setSize(buf, BUF_LEN_OFFSET, 0L);
       return;
     }
     MemorySegment data;
@@ -313,16 +396,19 @@ final class Ffi {
     } catch (Throwable t) {
       throw rethrow(t);
     }
-    MemorySegment.copy(bytes, 0, data.reinterpret(bytes.length), ValueLayout.JAVA_BYTE, 0, bytes.length);
+    MemorySegment.copy(
+        bytes, 0, data.reinterpret(bytes.length), ValueLayout.JAVA_BYTE, 0, bytes.length);
     buf.set(ValueLayout.ADDRESS, 0, data);
-    buf.set(ValueLayout.JAVA_LONG, BUF_LEN_OFFSET, (long) bytes.length);
+    setSize(buf, BUF_LEN_OFFSET, bytes.length);
   }
 
-  /** Copies a router-allocated out buffer into Java memory and releases it (the
-   * dispatch out is router-owned). */
+  /**
+   * Copies a router-allocated out buffer into Java memory and releases it (the dispatch out is
+   * router-owned).
+   */
   private static byte[] consumeOut(MemorySegment out) {
     MemorySegment data = out.get(ValueLayout.ADDRESS, 0);
-    long len = out.get(ValueLayout.JAVA_LONG, BUF_LEN_OFFSET);
+    long len = getSize(out, BUF_LEN_OFFSET);
     if (data.address() == 0 || len == 0) {
       return new byte[0];
     }
