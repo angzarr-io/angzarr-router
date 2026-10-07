@@ -26,7 +26,6 @@ TOP := `git rev-parse --show-toplevel`
 # the matching env var.
 ROUTER_IMAGE := env_var_or_default("ANGZARR_ROUTER_IMAGE", "ghcr.io/angzarr-io/angzarr-rust:9e07ae0@sha256:1f70b5de243d50aab989103ce87be393b6282c538ecabccef5f07c15760ac156")
 ROUTER_GO_IMAGE := env_var_or_default("ANGZARR_ROUTER_GO_IMAGE", "ghcr.io/angzarr-io/angzarr-go:latest@sha256:b57cce65c7bc14aaa67845d94d0eb3c7f7bddae43190299ec8f02bb8e92ee6d8")
-ROUTER_PYTHON_IMAGE := env_var_or_default("ANGZARR_ROUTER_PYTHON_IMAGE", "ghcr.io/angzarr-io/angzarr-python:latest@sha256:1d6841f4b10c59bfab9d1896976214105136857bda41b64ece407cf734141032")
 ROUTER_JAVA_IMAGE := env_var_or_default("ANGZARR_ROUTER_JAVA_IMAGE", "ghcr.io/angzarr-io/angzarr-java:531d91e@sha256:3c64d5337aa53c1a5a2c7bf34737b7012464acfdb5c2dc39f55a119f3441e96e")
 ROUTER_CSHARP_IMAGE := env_var_or_default("ANGZARR_ROUTER_CSHARP_IMAGE", "ghcr.io/angzarr-io/angzarr-csharp:latest@sha256:32c482820b2021ec7639a800d8778a51db27e604edbe1359a8a328c6c65b5991")
 ROUTER_CPP_IMAGE := env_var_or_default("ANGZARR_ROUTER_CPP_IMAGE", "ghcr.io/angzarr-io/angzarr-cpp:latest@sha256:3c66dd0ffc7d2dd727c355d1b22c2741abce4d570baea4517c77fd5d40d97bfe")
@@ -37,7 +36,7 @@ CONTAINER_CMD := `command -v docker 2>/dev/null || echo ""`
 # host UID). With ROOTLESS docker that is WRONG: the userns maps
 # container-root → host UID, so -u $(id -u) remaps onto an unowned subuid and
 # breaks bind-mount writes. Force -u 0:0 instead of relying on the image's
-# default user — images that set a non-root USER (the python image runs as
+# default user — images that set a non-root USER (e.g. one running as
 # `angzarr`) otherwise land on a subuid that cannot write the mount (and trips
 # git's dubious-ownership guard). Running as container-root maps to the host UID.
 # ANGZARR_CONTAINER_USER overrides it (CI runs the toolchains as container-root
@@ -81,24 +80,6 @@ _go_container +ARGS:
             -w /workspace \
             -e ANGZARR_PROJECT_PROTO=/workspace/angzarr-project/proto \
             "{{ROUTER_GO_IMAGE}}" just {{ARGS}}
-    fi
-
-# Same delegation, into the Python toolchain image (python + uv + buf +
-# grpcio-tools). The router-ffi cdylib the binding dlopens is built first in
-# the rust image and carried forward via the shared target/ mount.
-[private]
-_py_container +ARGS:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [ "${DEVCONTAINER:-}" = "true" ]; then
-        just --justfile "{{TOP}}/justfile.container" {{ARGS}}
-    else
-        {{CONTAINER_RUN}} --network=host \
-            -v "{{TOP}}:/workspace:Z" \
-            -v "{{TOP}}/justfile.container:/workspace/justfile:ro" \
-            -w /workspace \
-            -e ANGZARR_PROJECT_PROTO=/workspace/angzarr-project/proto \
-            "{{ROUTER_PYTHON_IMAGE}}" just {{ARGS}}
     fi
 
 # Same delegation, into the Java toolchain image (JDK 25 + Gradle + buf +
@@ -220,25 +201,6 @@ go-binding-test: build cli (_go_container "go-binding-test")
 
 # Format check + vet the Go binding
 go-binding-lint: cli (_go_container "go-binding-lint")
-
-# --- Python binding (bindings/python) -----------------------------------
-# Runs in the Python image (like client-python); the router-ffi cdylib is
-# built in the rust image (`build`) and carried forward via the shared
-# target/ mount — dlopen'd by cffi. The ABI is exercised a second way (cffi
-# vs cgo) before it freezes (§4). Generated protobuf code is never committed
-# (regenerate on need), so build/test regenerate first.
-
-# Regenerate the Python binding's protobuf types (buf + import fixup)
-py-binding-gen: cli (_py_container "py-binding-gen")
-
-# Build the Python binding env (cdylib in the rust image, then uv sync)
-py-binding-build: build cli (_py_container "py-binding-build")
-
-# Run the Python binding's conformance suite (pytest-bdd) + property sweep
-py-binding-test: build cli (_py_container "py-binding-test")
-
-# Lint + format check the Python binding (ruff)
-py-binding-lint: (_py_container "py-binding-lint")
 
 # --- Java binding (bindings/java) ----------------------------------------
 # Runs in the Java image; the router-ffi cdylib is built in the rust image

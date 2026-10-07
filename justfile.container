@@ -12,11 +12,10 @@ TOP := justfile_directory()
 
 # Pinned codegen toolchain, fetched into .tools/ (gitignored) from GitHub —
 # never from the Buf Schema Registry. Protobuf generated code is version-locked
-# to each binding's runtime: Python's protobuf 7.35.x takes protoc 35.1; Java's
-# protobuf-java 4.28.3 and C#'s Google.Protobuf take protoc 28.3. C++ uses the
-# image's protoc (3.21.12, matching its libprotobuf); TypeScript uses the
-# binding's pinned @bufbuild/protoc-gen-es.
-PROTOC_PYTHON := "35.1"
+# to each binding's runtime: Java's protobuf-java 4.28.3 and C#'s
+# Google.Protobuf take protoc 28.3. C++ uses the image's protoc (3.21.12,
+# matching its libprotobuf); TypeScript uses the binding's pinned
+# @bufbuild/protoc-gen-es.
 PROTOC_JVM := "28.3"
 # The angzarr CLI (the `angzarr codegen <lang>` buf plugin) built from
 # angzarr-io/angzarr-cli at this commit into .tools/bin, which precedes the
@@ -135,41 +134,6 @@ go-binding-test: go-binding-gen
 # Format check + vet the Go binding (regenerate first; gen is not committed).
 go-binding-lint: go-binding-gen
     cd {{TOP}}/bindings/go && test -z "$(gofmt -l .)" && go vet -tags ffirouter ./...
-
-# --- Python binding (bindings/python) -----------------------------------
-# Run in the Python image. cffi dlopens the router-ffi cdylib, which is built
-# in the rust image and carried forward in target/debug (the host `build`
-# step runs first); _abi.py resolves it from the shared tree (or
-# ANGZARR_ROUTER_LIB). These recipes deliberately do NOT depend on `build` —
-# there is no cargo in the Python image.
-
-# Regenerate the Python binding's protobuf types. google.* come from the
-# protobuf runtime + googleapis-common-protos and are excluded; the plugin
-# emits path-based imports (`from io.angzarr.v1 import ...`) which cannot be
-# imported as written (stdlib `io` collision), so fixup_gen_imports.py reroots
-# them under the binding's gen package. Generated code is never committed.
-py-binding-gen: (_protoc "python" PROTOC_PYTHON)
-    rm -rf {{TOP}}/bindings/python/angzarr_router_ffi/gen
-    cd {{TOP}} && buf generate --template bindings/python/buf.gen.yaml \
-        --exclude-path angzarr-project/proto/google --exclude-path proto/google \
-        --exclude-path angzarr-project/proto/io/angzarr/examples
-    cd {{TOP}} && python3 bindings/python/scripts/fixup_gen_imports.py \
-        bindings/python/angzarr_router_ffi/gen
-
-# Sync the Python binding's dependency env (cdylib already built + carried
-# forward); regenerate protobuf types first.
-py-binding-build: py-binding-gen
-    cd {{TOP}}/bindings/python && uv sync
-
-# Run the Python binding's conformance suite (pytest-bdd) + property sweep +
-# GIL-threaded concurrency. `uv run` syncs deps as needed.
-py-binding-test: py-binding-gen
-    cd {{TOP}}/bindings/python && uv run pytest -q
-
-# Lint + format check the Python binding (ruff; generated code excluded).
-py-binding-lint:
-    cd {{TOP}}/bindings/python && uv run --with ruff==0.16.9 ruff check . && \
-        uv run --with ruff==0.16.9 ruff format --check .
 
 # --- Java binding (bindings/java) ----------------------------------------
 # Run in the Java image. Panama/FFM loads the router-ffi cdylib, built in the

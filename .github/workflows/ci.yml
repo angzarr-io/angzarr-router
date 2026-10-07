@@ -55,7 +55,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lang: [go, py, java, csharp, cpp, ts]
+        lang: [go, java, csharp, cpp, ts]
     steps:
       - uses: actions/checkout@v4
         with:
