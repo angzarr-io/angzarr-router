@@ -44,6 +44,7 @@ pub mod codes {
     pub const CONFLICT_OVERLAP: &str = "CONFLICT_OVERLAP";
     pub const CONFLICT_RESOLUTION_UNSUPPORTED: &str = "CONFLICT_RESOLUTION_UNSUPPORTED";
     pub const MISSING_RULES_VERSION: &str = "MISSING_RULES_VERSION";
+    pub const MISSING_STATE_TYPE: &str = "MISSING_STATE_TYPE";
 }
 
 /// Canonical static message text (byte-equal across languages).
@@ -67,7 +68,10 @@ pub mod messages {
     pub const CONFLICT_RESOLUTION_UNSUPPORTED: &str =
         "the component does not support COMMUTATIVE conflict resolution";
     pub const MISSING_RULES_VERSION: &str = "a component registers with its rules version";
+    pub const MISSING_STATE_TYPE: &str =
+        "a stateful component registers with its state type (Rebuilder::of_message)";
     pub const FOLD_FAILED: &str = "the state fold failed on an event it had accepted";
+    pub const FOLD_FAILED_EMITTED: &str = "the state fold failed on an event this command emitted";
 }
 
 /// Cross-language detail-key constants.
@@ -81,6 +85,17 @@ pub mod extras {
     pub const SEQUENCE: &str = "sequence";
     pub const STATE_TYPE_URL: &str = "state_type_url";
     pub const COMPONENT: &str = "component";
+    pub const FIRST_SEQUENCE: &str = "first_sequence";
+    pub const LAST_SEQUENCE: &str = "last_sequence";
+    pub const FOLD_MESSAGE: &str = "fold_message";
+}
+
+/// Where a failing fold failed: the page, when known, else the batch's
+/// sequence range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldAt<'a> {
+    Page { sequence: u64, type_url: &'a str },
+    Range { first: u64, last: u64 },
 }
 
 /// A coded business/framework error: the form every failure takes before
@@ -197,22 +212,39 @@ impl CodedError {
         )
     }
 
-    /// A state fold that failed on a persisted event (INTERNAL): the event
-    /// was accepted by the same apply logic, so the failure is a handler
-    /// regression, never corrupt data. Names the event's sequence and type
-    /// URL and the state's type URL.
-    pub fn fold_failed(sequence: u64, type_url: &str, state_type_url: &str) -> Self {
-        Self::coded(
-            codes::UNHANDLED_HANDLER_ERROR,
-            messages::FOLD_FAILED,
-            [
+    /// A fold of events that failed (INTERNAL): those events were accepted
+    /// by the same apply logic (or, for [`messages::FOLD_FAILED_EMITTED`],
+    /// emitted by the command), so the failure is a handler regression,
+    /// never corrupt data. `message` says which; `at` names the failing page
+    /// or, when it is unknown, the batch's range; `fold_message` is the
+    /// fold's own text (omitted when empty).
+    pub fn fold_failed(
+        message: &str,
+        at: FoldAt<'_>,
+        state_type_url: &str,
+        fold_message: &str,
+    ) -> Self {
+        let mut details = match at {
+            FoldAt::Page { sequence, type_url } => vec![
                 (extras::SEQUENCE.to_string(), sequence.to_string()),
                 (extras::TYPE_URL.to_string(), type_url.to_string()),
-                (
-                    extras::STATE_TYPE_URL.to_string(),
-                    state_type_url.to_string(),
-                ),
             ],
+            FoldAt::Range { first, last } => vec![
+                (extras::FIRST_SEQUENCE.to_string(), first.to_string()),
+                (extras::LAST_SEQUENCE.to_string(), last.to_string()),
+            ],
+        };
+        details.push((
+            extras::STATE_TYPE_URL.to_string(),
+            state_type_url.to_string(),
+        ));
+        if !fold_message.is_empty() {
+            details.push((extras::FOLD_MESSAGE.to_string(), fold_message.to_string()));
+        }
+        Self::coded(
+            codes::UNHANDLED_HANDLER_ERROR,
+            message,
+            details,
             GrpcCode::Internal,
         )
     }

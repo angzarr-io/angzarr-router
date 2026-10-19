@@ -68,10 +68,8 @@ const CB_CHANGED_NONE: u64 = 30;
 /// Upcasts IncreaseByV1 to IncreaseBy (payload unchanged).
 const CB_UPCAST_V1: u64 = 31;
 
-/// A fold that fails whenever it is handed more than one page.
-const CB_FOLD_BATCH_FAILS: u64 = 32;
-/// A counting fold that fails on any page that would take the count past 2.
-const CB_FOLD_CAPPED: u64 = 33;
+/// A fold failing with a FoldFailure whose index is outside every batch.
+const CB_FOLD_OUT_OF_RANGE: u64 = 32;
 
 const FQ_INCREASE_BY_V1: &str = "test.counter.IncreaseByV1";
 
@@ -207,24 +205,33 @@ unsafe extern "C" fn host_cb(
         CB_FOLD => {
             // Stateless: fold every Increased page into the state handed in.
             let call = abi_pb::FoldCall::decode(payload).expect("FoldCall");
+            observe(|s| {
+                s.fold_calls
+                    .push(call.pages.iter().map(|p| p.sequence).collect())
+            });
             let mut value = state_value(call.state.as_ref());
-            for page in &call.pages {
+            for (index, page) in call.pages.iter().enumerate() {
                 let Some(event) = page.payload.as_ref() else {
                     continue;
                 };
                 if !event.type_url.ends_with(FQ_INCREASED) {
                     continue;
                 }
-                if Increased::decode(event.value.as_slice()).is_err() {
-                    return -3;
+                if let Err(err) = Increased::decode(event.value.as_slice()) {
+                    // The host's fold loop names the page it failed on.
+                    host_fill(
+                        out,
+                        &abi_pb::FoldFailure {
+                            page_index: Some(index as u32),
+                            message: err.to_string(),
+                        }
+                        .encode_to_vec(),
+                    );
+                    return -13;
                 }
                 value += 1;
                 observe(|s| s.applied_pages.push((call.cover.clone(), page.sequence)));
             }
-            observe(|s| {
-                s.fold_calls
-                    .push(call.pages.iter().map(|p| p.sequence).collect())
-            });
             host_fill(out, &state_any(value).encode_to_vec());
             STATUS_OK
         }
@@ -294,9 +301,14 @@ unsafe extern "C" fn host_cb(
             STATUS_OK
         }
         CB_PROJ_FOLD_REJECTS => {
+            // Fails on the batch's first page.
             host_fill(
                 out,
-                &rejection_status(9, "PROJECTION_STALE", "projection is stale"),
+                &abi_pb::FoldFailure {
+                    page_index: Some(0),
+                    message: "projection is stale".to_string(),
+                }
+                .encode_to_vec(),
             );
             -9
         }
@@ -403,23 +415,17 @@ unsafe extern "C" fn host_cb(
             host_fill(out, &[0xFF, 0xFF, 0xFF]);
             STATUS_OK
         }
-        CB_FOLD_CAPPED => {
-            let call = abi_pb::FoldCall::decode(payload).expect("FoldCall");
-            let value = state_value(call.state.as_ref()) + call.pages.len() as u32;
-            if value > 2 {
-                return -13;
-            }
-            host_fill(out, &state_any(value).encode_to_vec());
-            STATUS_OK
-        }
-        CB_FOLD_BATCH_FAILS => {
-            let call = abi_pb::FoldCall::decode(payload).expect("FoldCall");
-            if call.pages.len() > 1 {
-                return -13;
-            }
-            let value = state_value(call.state.as_ref()) + call.pages.len() as u32;
-            host_fill(out, &state_any(value).encode_to_vec());
-            STATUS_OK
+        CB_FOLD_OUT_OF_RANGE => {
+            observe(|s| s.fold_calls.push(Vec::new()));
+            host_fill(
+                out,
+                &abi_pb::FoldFailure {
+                    page_index: Some(99),
+                    message: "lost track".to_string(),
+                }
+                .encode_to_vec(),
+            );
+            -13
         }
         CB_OK_ZERO => STATUS_OK,
         CB_OK_EMPTY => STATUS_OK_EMPTY,
@@ -730,20 +736,40 @@ fn error_info(bytes: &[u8]) -> (String, std::collections::HashMap<String, String
     (info.reason, info.metadata.into_iter().collect())
 }
 
-/// Asserts a fold failure answered INTERNAL as a handler bug, naming the
-/// failing event's sequence and type URL and the state type URL.
-fn assert_fold_failed(ret: i32, bytes: &[u8], sequence: u64, type_url: &str) {
+/// Asserts a fold failure answered INTERNAL as a handler bug, with the
+/// `located` metadata and the state type URL, returning the metadata.
+fn assert_fold_failed_at(
+    ret: i32,
+    bytes: &[u8],
+    located: &[(&str, &str)],
+) -> std::collections::HashMap<String, String> {
     assert_eq!(ret, -13, "a failing fold is a handler bug (INTERNAL)");
     let (reason, metadata) = error_info(bytes);
     assert_eq!(
         reason,
         angzarr_router::error::codes::UNHANDLED_HANDLER_ERROR
     );
-    assert_eq!(metadata.get("sequence"), Some(&sequence.to_string()));
-    assert_eq!(metadata.get("type_url").map(String::as_str), Some(type_url));
+    for (key, value) in located {
+        assert_eq!(
+            metadata.get(*key).map(String::as_str),
+            Some(*value),
+            "{key}"
+        );
+    }
     assert_eq!(
         metadata.get("state_type_url"),
         Some(&format!("/{STATE_TYPE}"))
+    );
+    metadata
+}
+
+/// [`assert_fold_failed_at`] naming the page at `sequence`, of `type_url`.
+fn assert_fold_failed(ret: i32, bytes: &[u8], sequence: u64, type_url: &str) {
+    let sequence = sequence.to_string();
+    assert_fold_failed_at(
+        ret,
+        bytes,
+        &[("sequence", sequence.as_str()), ("type_url", type_url)],
     );
 }
 
@@ -752,6 +778,7 @@ fn assert_fold_failed(ret: i32, bytes: &[u8], sequence: u64, type_url: &str) {
 #[test]
 fn a_fold_failing_on_a_persisted_event_is_internal_naming_it() {
     let router = Router::with_counter();
+    reset_observations();
     let mut history = increased_history(3, 3);
     history.pages[1].payload.as_mut().unwrap().value = vec![0xFF, 0xFF, 0xFF];
     let (ret, bytes) = router.dispatch(&increase_one(Some(history)));
@@ -761,18 +788,30 @@ fn a_fold_failing_on_a_persisted_event_is_internal_naming_it() {
         1,
         &format!("type.googleapis.com/{FQ_INCREASED}"),
     );
+    let (_, metadata) = error_info(&bytes);
+    assert!(
+        metadata.contains_key("fold_message"),
+        "the host's own text rides along"
+    );
+    assert_eq!(
+        observations().fold_calls,
+        vec![vec![0, 1, 2]],
+        "one batched call; the fold is never re-run"
+    );
 }
 
 #[test]
-fn a_fold_failing_only_as_a_batch_names_the_batchs_last_event() {
-    let router = counter_with(CB_FOLD_BATCH_FAILS);
+fn a_fold_failure_indexing_outside_its_batch_names_the_batchs_range() {
+    let router = counter_with(CB_FOLD_OUT_OF_RANGE);
+    reset_observations();
     let (ret, bytes) = router.dispatch(&increase_one(Some(increased_history(3, 3))));
-    assert_fold_failed(
+    let metadata = assert_fold_failed_at(
         ret,
         &bytes,
-        2,
-        &format!("type.googleapis.com/{FQ_INCREASED}"),
+        &[("first_sequence", "0"), ("last_sequence", "2")],
     );
+    assert!(!metadata.contains_key("sequence"));
+    assert_eq!(observations().fold_calls.len(), 1, "never re-run");
 }
 
 #[test]
@@ -1376,7 +1415,7 @@ fn second_projector_is_refused_at_registration() {
 }
 
 #[test]
-fn projector_fold_failure_keeps_the_host_status() {
+fn projector_fold_failure_is_a_handler_bug_naming_its_page() {
     let r = angzarr_router_new();
     let desc = abi_pb::ProjectorDescriptor {
         name: "Rejecting".to_string(),
@@ -1391,10 +1430,12 @@ fn projector_fold_failure_keeps_the_host_status() {
         0
     );
     let router = Router(r);
-    let (ret, bytes) = router.dispatch_projector(&book_in_domain("counter", 1));
-    assert_eq!(ret, -9, "the host's gRPC code survives");
-    let (_, reason) = decode_status(&bytes);
-    assert_eq!(reason, "PROJECTION_STALE");
+    let (ret, bytes) = router.dispatch_projector(&book_in_domain("counter", 2));
+    let metadata = assert_fold_failed_at(ret, &bytes, &[("sequence", "0")]);
+    assert_eq!(
+        metadata.get("fold_message").map(String::as_str),
+        Some("projection is stale")
+    );
 }
 
 // --- host return-code boundaries across every callback kind
@@ -1452,26 +1493,13 @@ fn a_fold_returning_status_ok_empty_keeps_the_state() {
 }
 
 #[test]
-fn locating_a_fold_failure_carries_the_state_page_to_page() {
-    let router = counter_with(CB_FOLD_CAPPED);
-    let (ret, bytes) = router.dispatch(&increase_one(Some(increased_history(4, 4))));
-    assert_fold_failed(
-        ret,
-        &bytes,
-        2,
-        &format!("type.googleapis.com/{FQ_INCREASED}"),
-    );
-}
-
-#[test]
-fn a_failing_fold_is_internal_naming_the_first_event_it_fails_on() {
+fn a_fold_failing_without_a_fold_failure_names_the_batchs_range() {
     let router = counter_with(CB_FAILS);
     let (ret, bytes) = router.dispatch(&increase_one(Some(increased_history(2, 2))));
-    assert_fold_failed(
+    assert_fold_failed_at(
         ret,
         &bytes,
-        0,
-        &format!("type.googleapis.com/{FQ_INCREASED}"),
+        &[("first_sequence", "0"), ("last_sequence", "1")],
     );
 }
 
@@ -1595,12 +1623,14 @@ fn pm_fold_and_handler_succeed_on_either_ok_status() {
 
 #[test]
 fn failing_pm_fold_is_internal_naming_the_event() {
-    let router = pm_with(CB_FAILS, CB_OK_EMPTY);
-    let (ret, bytes) = router.dispatch_process_manager(&pm_over_state(increased_book(1)));
+    let router = pm_with(CB_FOLD, CB_OK_EMPTY);
+    let mut state = increased_book(2);
+    state.pages[1].payload.as_mut().unwrap().value = vec![0xFF, 0xFF, 0xFF];
+    let (ret, bytes) = router.dispatch_process_manager(&pm_over_state(state));
     assert_fold_failed(
         ret,
         &bytes,
-        0,
+        1,
         &format!("type.googleapis.com/{FQ_INCREASED}"),
     );
 }
@@ -2344,4 +2374,20 @@ fn a_refused_registration_has_no_registration_hello() {
         .map(|d| d.name)
         .collect();
     assert_eq!(names, vec!["Counter".to_string()]);
+}
+
+#[test]
+fn an_aggregate_registered_without_a_state_type_refuses_its_hello() {
+    let r = angzarr_router_new();
+    let mut counter = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
+    counter.rules_version = "1".to_string();
+    counter.state_type_url = String::new();
+    assert_eq!(register_aggregate_desc(r, counter), 0);
+    let router = Router(r);
+    let (ret, bytes) = component_descriptors(router.0);
+    assert_eq!(ret, -3);
+    assert_eq!(
+        decode_status(&bytes).1,
+        angzarr_router::error::codes::MISSING_STATE_TYPE
+    );
 }

@@ -9,8 +9,9 @@ use std::sync::Arc;
 
 use prost::Message;
 
-use crate::error::codes;
+use crate::error::{codes, extras, messages};
 use crate::pb;
+use crate::rebuild::{FoldFailure, PageOrigin, Rebuilder};
 use crate::test_support::*;
 
 #[test]
@@ -39,17 +40,71 @@ fn absent_book_normalizes_to_fresh_state() {
     );
 }
 
+// Owner ruling 2026-10-19: the events were accepted by the same apply
+// logic, so an applier failing on one is a handler bug (INTERNAL), named by
+// the failing page, the state type and the applier's own text.
 #[test]
-fn corrupt_payload_fails_with_coded_error() {
-    let r = cover_applier(fresh_rebuilder());
+fn an_applier_failing_on_a_persisted_event_is_a_handler_bug_naming_it() {
+    let r = cover_applier(fresh_rebuilder().with_state_type("test.Ledger"));
     let book = pb::EventBook {
-        pages: vec![event_page(corrupt_cover_any())],
+        pages: vec![
+            sequenced_event_page(4, cover_any("a")),
+            sequenced_event_page(5, corrupt_cover_any()),
+        ],
         ..Default::default()
     };
 
     let err = r
         .rebuild(Some(&book))
-        .expect_err("corrupt payload must fail the rebuild, not yield factory-default state");
+        .expect_err("a failing applier must fail the rebuild, not yield factory-default state");
+    let type_url = crate::type_url(&cover_full_name());
+    assert_fold_failed(
+        &err,
+        messages::FOLD_FAILED,
+        &[
+            (extras::SEQUENCE, "5"),
+            (extras::TYPE_URL, type_url.as_str()),
+        ],
+        "/test.Ledger",
+    );
+    assert!(
+        !err.extras[extras::FOLD_MESSAGE].is_empty(),
+        "the applier's own text rides along"
+    );
+}
+
+#[test]
+fn a_rebuilder_declares_no_state_type_unless_told() {
+    assert_eq!(fresh_rebuilder().state_type_url(), "");
+    assert_eq!(fresh_rebuilder().with_state_type("").state_type_url(), "");
+    let err = cover_applier(fresh_rebuilder())
+        .rebuild(Some(&pb::EventBook {
+            pages: vec![event_page(corrupt_cover_any())],
+            ..Default::default()
+        }))
+        .expect_err("failed");
+    assert_eq!(err.extras[extras::STATE_TYPE_URL], "");
+}
+
+#[test]
+fn of_message_takes_the_state_type_from_the_prost_name() {
+    let r: Rebuilder<LedgerState> = Rebuilder::of_message();
+    assert_eq!(r.state_type_url(), "/test.ledger.LedgerState");
+    let (state, _) = r.rebuild(None).expect("fresh");
+    assert_eq!(state, LedgerState::default());
+}
+
+#[test]
+fn a_snapshot_the_loader_cannot_load_is_persisted_event_corrupt() {
+    let r = fresh_rebuilder().with_snapshot(|_s, _any| Err("bad snapshot".into()));
+    let book = pb::EventBook {
+        snapshot: Some(pb::Snapshot {
+            state: Some(cover_any("snap")),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let err = r.rebuild(Some(&book)).expect_err("unloadable");
     assert_eq!(err.code, codes::PERSISTED_EVENT_CORRUPT);
 }
 
@@ -432,15 +487,114 @@ fn a_batched_fold_is_not_called_without_pages() {
     assert!(calls.lock().unwrap().is_empty());
 }
 
+/// A rebuilder over "/test.State" whose batched fold fails with `failure`,
+/// counting its calls.
+fn failing_fold(failure: FoldFailure, calls: Arc<AtomicUsize>) -> Rebuilder<TestState> {
+    fresh_rebuilder().with_state_type("test.State").with_fold(
+        move |_s: &mut TestState, _pages, _cover| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(failure.clone())
+        },
+    )
+}
+
+/// Three Cover pages at sequences 4, 5 and 6.
+fn three_pages() -> pb::EventBook {
+    let mut book = book_of_covers(&["a", "b", "c"]);
+    for (page, seq) in book.pages.iter_mut().zip(4..) {
+        page.sequence = seq;
+    }
+    book
+}
+
 #[test]
-fn a_batched_fold_failure_fails_the_rebuild_with_its_code() {
-    let r = fresh_rebuilder().with_fold(|_s: &mut TestState, _pages, _cover| {
-        Err(crate::error::CodedError::persisted_corrupt("/test.Bad"))
-    });
+fn a_batched_fold_failure_names_the_page_it_indexes() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let r = failing_fold(
+        FoldFailure {
+            page_index: Some(1),
+            message: "no".to_string(),
+        },
+        calls.clone(),
+    );
     let err = r
-        .rebuild(Some(&book_of_covers(&["a"])))
+        .rebuild(Some(&three_pages()))
         .expect_err("the fold failed");
-    assert_eq!(err.code, codes::PERSISTED_EVENT_CORRUPT);
+    let type_url = crate::type_url(&cover_full_name());
+    assert_fold_failed(
+        &err,
+        messages::FOLD_FAILED,
+        &[
+            (extras::SEQUENCE, "5"),
+            (extras::TYPE_URL, type_url.as_str()),
+            (extras::FOLD_MESSAGE, "no"),
+        ],
+        "/test.State",
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the fold is never re-run");
+}
+
+#[test]
+fn an_unlocated_or_out_of_range_fold_failure_names_the_batchs_range() {
+    for page_index in [None, Some(3)] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let r = failing_fold(
+            FoldFailure {
+                page_index,
+                message: String::new(),
+            },
+            calls.clone(),
+        );
+        let err = r
+            .rebuild(Some(&three_pages()))
+            .expect_err("the fold failed");
+        assert_fold_failed(
+            &err,
+            messages::FOLD_FAILED,
+            &[(extras::FIRST_SEQUENCE, "4"), (extras::LAST_SEQUENCE, "6")],
+            "/test.State",
+        );
+        assert!(!err.extras.contains_key(extras::SEQUENCE));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the fold is never re-run");
+    }
+}
+
+#[test]
+fn folding_emitted_pages_says_the_command_emitted_them() {
+    let r = failing_fold(
+        FoldFailure {
+            page_index: Some(0),
+            message: String::new(),
+        },
+        Arc::default(),
+    );
+    let mut state = TestState::default();
+    let book = three_pages();
+    let err = r
+        .apply_pages(&mut state, &book.pages, None, PageOrigin::Emitted)
+        .expect_err("failed");
+    assert_fold_failed(
+        &err,
+        messages::FOLD_FAILED_EMITTED,
+        &[(extras::SEQUENCE, "4")],
+        "/test.State",
+    );
+    let err = r
+        .apply_pages(&mut state, &book.pages, None, PageOrigin::Persisted)
+        .expect_err("failed");
+    assert_eq!(err.message, messages::FOLD_FAILED);
+
+    // Per-page appliers say the same.
+    let r = cover_applier(fresh_rebuilder());
+    let err = r
+        .apply_pages(
+            &mut state,
+            &[event_page(corrupt_cover_any())],
+            None,
+            PageOrigin::Emitted,
+        )
+        .expect_err("failed");
+    assert_eq!(err.message, messages::FOLD_FAILED_EMITTED);
 }
 
 #[test]
@@ -449,16 +603,16 @@ fn apply_pages_folds_a_batch_in_one_call() {
     let r = batch_rebuilder(calls.clone());
     let mut state = TestState::default();
     let book = book_of_covers(&["a", "b"]);
-    r.apply_pages(&mut state, &book.pages, None)
+    r.apply_pages(&mut state, &book.pages, None, PageOrigin::Persisted)
         .expect("folded");
-    r.apply_pages(&mut state, &[], None)
+    r.apply_pages(&mut state, &[], None, PageOrigin::Persisted)
         .expect("nothing to fold");
     assert_eq!(*calls.lock().unwrap(), vec![(vec![0, 1], String::new())]);
 
     // Without a batched fold, apply_pages applies each page through its applier.
     let r = cover_applier(fresh_rebuilder());
     let mut state = TestState::default();
-    r.apply_pages(&mut state, &book.pages, None)
+    r.apply_pages(&mut state, &book.pages, None, PageOrigin::Persisted)
         .expect("applied");
     assert_eq!(state.applied, vec!["a", "b"]);
 }

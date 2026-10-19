@@ -4,7 +4,7 @@
 //! trigger page against rebuilt PM state, keys handlers by (input domain, FQ
 //! type), treats out-of-sources / undeclared triggers as empty (not error),
 //! and surfaces MISSING/EMPTY_PM_TRIGGER, MISSING_PM_EVENT_PAYLOAD and
-//! PERSISTED_EVENT_CORRUPT (from rebuild).
+//! UNHANDLED_HANDLER_ERROR (a failing rebuild fold).
 
 use prost_types::Any;
 
@@ -310,7 +310,7 @@ fn trigger_last_page_without_payload_is_coded() {
 }
 
 #[test]
-fn corrupt_process_state_is_data_loss() {
+fn corrupt_process_state_is_a_handler_bug() {
     // A corrupt prior PM-state event fails the rebuild before the handler runs.
     let state = pb::EventBook {
         pages: vec![event_page(corrupt_cover_any())],
@@ -323,7 +323,8 @@ fn corrupt_process_state_is_data_loss() {
             Some(state),
         ))
         .expect_err("corrupt state must fail");
-    assert_eq!(err.code, codes::PERSISTED_EVENT_CORRUPT);
+    assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
+    assert_eq!(err.message, crate::error::messages::FOLD_FAILED);
 }
 
 #[test]

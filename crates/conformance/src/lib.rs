@@ -95,12 +95,13 @@ where
 
 /// Build the CounterAggregate dispatch table (appliers and handlers).
 pub fn counter_aggregate(observed: ObservedSink) -> AggregateDispatch<CounterState> {
-    let rebuilder = Rebuilder::new(CounterState::default)
+    let rebuilder = Rebuilder::of_message()
         .apply(
             "test.counter.Increased",
             |state: &mut CounterState, event| {
                 // Decode the payload so a corrupt persisted event fails the fold
-                // (PERSISTED_EVENT_CORRUPT). Increased is empty, so every
+                // (UNHANDLED_HANDLER_ERROR: a failing fold is a handler bug).
+                // Increased is empty, so every
                 // well-formed event decodes and simply increments.
                 counter::Increased::decode(event.value.as_slice())?;
                 state.count += 1;
@@ -553,7 +554,8 @@ pub fn prior_history(n: u32) -> Option<pb::EventBook> {
 
 /// Prior history whose single Increased event carries undecodable payload
 /// bytes (a truncated varint) → the applier fails the fold, surfacing
-/// PERSISTED_EVENT_CORRUPT when a known command rebuilds over it.
+/// UNHANDLED_HANDLER_ERROR (a handler bug) when a known command rebuilds
+/// over it.
 pub fn corrupt_prior_history() -> Option<pb::EventBook> {
     let mut page: pb::EventPage = parse_txtpb(EVENT_PAGE, SKEL_INCREASED_EVENT);
     if let Some(any) = page.payload.as_mut() {
@@ -668,7 +670,7 @@ fn increased_page(seq: u64) -> pb::EventPage {
 /// Increased; the only fact, Increased, is recorded as received and flagged
 /// by a CounterState carrying the count it brings the ledger to.
 pub fn ledger_aggregate(seen: CoverSink, applied: SequenceSink) -> AggregateDispatch<CounterState> {
-    let rebuilder = Rebuilder::new(CounterState::default)
+    let rebuilder = Rebuilder::of_message()
         .apply_with_context(
             "test.counter.Increased",
             move |state: &mut CounterState, _, ctx| {
@@ -768,13 +770,10 @@ pub fn reserving_pm(seen: CoverSink) -> ProcessManagerDispatch<CounterState> {
         "Reserving",
         "reserving-pm",
         ["inventory"],
-        Rebuilder::new(CounterState::default).apply(
-            "test.counter.Increased",
-            |state: &mut CounterState, _| {
-                state.count += 1;
-                Ok(())
-            },
-        ),
+        Rebuilder::of_message().apply("test.counter.Increased", |state: &mut CounterState, _| {
+            state.count += 1;
+            Ok(())
+        }),
     )
     .on_event("counter", "test.counter.Increased", move |_e, _s, cover| {
         seen.lock().unwrap().push(cover.cloned());
@@ -920,7 +919,7 @@ pub fn order_aggregate(
     settle: Settle,
     seen: OrderSink,
 ) -> AggregateDispatch<orders::v1::OrderState> {
-    let rebuilder = Rebuilder::new(orders::v1::OrderState::default)
+    let rebuilder = Rebuilder::of_message()
         .apply(
             "orders.v1.ItemAdded",
             |state: &mut orders::v1::OrderState, event| {
@@ -1113,7 +1112,7 @@ pub fn fulfillment_pm(rules_version: &str) -> ProcessManagerDispatch<orders::v1:
         "Fulfillment",
         "fulfillment",
         ["shipping"],
-        Rebuilder::new(orders::v1::FulfillmentState::default),
+        Rebuilder::of_message(),
     )
     .with_rules_version(rules_version)
     .on_event("order", "orders.v1.OrderPlaced", |_e, _s, _c| {

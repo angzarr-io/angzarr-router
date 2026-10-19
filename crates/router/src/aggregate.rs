@@ -14,7 +14,7 @@ use prost_types::Any;
 
 use crate::error::{codes, extras, map_handler_error, messages, CodedError, HandlerError};
 use crate::pb;
-use crate::rebuild::Rebuilder;
+use crate::rebuild::{PageOrigin, Rebuilder};
 
 /// Per-dispatch facts the business method may need beyond its typed
 /// command and rebuilt state.
@@ -229,31 +229,19 @@ impl<S> AggregateDispatch<S> {
 
     /// The registration hello (types.proto, ComponentDescriptor): kind
     /// AGGREGATE, no inputs (an aggregate consumes commands, not events), and
-    /// the state named by `S`'s prost name. Refused MISSING_RULES_VERSION
-    /// without a rules version.
-    pub fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError>
-    where
-        S: prost::Name,
-    {
-        self.component_descriptor_with_state(&S::full_name())
-    }
-
-    /// [`Self::component_descriptor`] for state held as something other
-    /// than its own message (an `Any` across the C ABI): `state_full_name`
-    /// is the state message's fully-qualified name.
-    pub fn component_descriptor_with_state(
-        &self,
-        state_full_name: &str,
-    ) -> Result<pb::ComponentDescriptor, CodedError> {
+    /// the state type its rebuilder declares. Refused MISSING_RULES_VERSION
+    /// without a rules version, MISSING_STATE_TYPE without a state type.
+    pub fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError> {
         crate::descriptor::component_descriptor(
             &self.name,
             pb::ComponentKind::Aggregate,
             [],
             &self.rules_version,
             Some(crate::descriptor::state_descriptor(
-                state_full_name,
+                &self.name,
+                self.rebuilder.state_type_url(),
                 self.commutative.is_some(),
-            )),
+            )?),
         )
     }
 
@@ -529,17 +517,14 @@ impl<S> AggregateDispatch<S> {
                 let (mut state, _) = self.rebuilder.rebuild(Some(&prefix))?;
                 let resolved = resolver.resolve(
                     &mut state,
-                    &mut |state| self.rebuilder.apply_pages(state, &window, cover),
+                    &mut |state| {
+                        self.rebuilder
+                            .apply_pages(state, &window, cover, PageOrigin::Persisted)
+                    },
                     &mut |state| run(state, context(had_prior_events, None)),
                     &mut |state, book| {
                         self.rebuilder
-                            .apply_pages(state, &book.pages, cover)
-                            .map_err(|e| {
-                                CodedError::unhandled(&format!(
-                                    "an emitted event does not fold into state: {}",
-                                    e.message
-                                ))
-                            })
+                            .apply_pages(state, &book.pages, cover, PageOrigin::Emitted)
                     },
                 )?;
                 if crate::conflict::overlap(&resolved.window, &resolved.mine) {

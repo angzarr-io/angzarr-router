@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use prost_types::Any;
 
-use crate::error::CodedError;
+use crate::error::{messages, CodedError, FoldAt};
 use crate::pb;
 use crate::PageContext;
 
@@ -39,22 +39,101 @@ pub struct RebuildInfo {
 
 /// Reconstructs state of type S from an EventBook.
 ///
-/// Error semantics: a persisted payload that fails to decode FAILS the
-/// rebuild with PERSISTED_EVENT_CORRUPT — commands must never validate
-/// against silently-truncated state. Event types with no registered
-/// applier are skipped: not every event folds into state.
+/// Error semantics: a page that fails to fold FAILS the rebuild —
+/// commands must never validate against silently-truncated state. The
+/// events were accepted by the same apply logic, so the failure is a handler
+/// bug (UNHANDLED_HANDLER_ERROR, INTERNAL; [`fold_error`]). A snapshot the
+/// loader cannot load is PERSISTED_EVENT_CORRUPT. Event types with no
+/// registered applier are skipped: not every event folds into state.
 pub struct Rebuilder<S> {
     factory: Box<dyn Fn() -> S + Send + Sync>,
     snapshot: Option<SnapshotFn<S>>,
     appliers: HashMap<String, ApplierFn<S>>,
     fold: Option<FoldFn<S>>,
+    /// The state message's type URL ("" when undeclared).
+    state_type_url: String,
+}
+
+/// How a batched fold failed: the index of the failing page within the
+/// batch it was handed, when it knows, and its own text.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FoldFailure {
+    pub page_index: Option<usize>,
+    pub message: String,
+}
+
+/// Where the pages a fold failed on came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageOrigin {
+    /// Persisted events: a rebuild, or a conflict window.
+    Persisted,
+    /// The events the command being handled emitted, not yet persisted.
+    Emitted,
+}
+
+impl PageOrigin {
+    fn message(self) -> &'static str {
+        match self {
+            PageOrigin::Persisted => messages::FOLD_FAILED,
+            PageOrigin::Emitted => messages::FOLD_FAILED_EMITTED,
+        }
+    }
+}
+
+/// The error for a fold of `pages` (from `origin`) into state of
+/// `state_type_url` that failed with `failure`: names the page
+/// `failure.page_index` indexes, or the batch's sequence range when the
+/// index is missing or outside the batch.
+pub fn fold_error(
+    origin: PageOrigin,
+    pages: &[pb::EventPage],
+    failure: &FoldFailure,
+    state_type_url: &str,
+) -> CodedError {
+    let at = match failure.page_index.and_then(|index| pages.get(index)) {
+        Some(page) => return page_fold_error(origin, page, state_type_url, &failure.message),
+        None => FoldAt::Range {
+            first: pages.first().map_or(0, |p| p.sequence),
+            last: pages.last().map_or(0, |p| p.sequence),
+        },
+    };
+    CodedError::fold_failed(origin.message(), at, state_type_url, &failure.message)
+}
+
+/// The type URL a component declares for the message `full_name`: "" (none
+/// declared) for an empty name.
+pub fn declared_type_url(full_name: &str) -> String {
+    if full_name.is_empty() {
+        String::new()
+    } else {
+        crate::type_url(full_name)
+    }
+}
+
+/// The error for a fold that failed on `page`.
+pub fn page_fold_error(
+    origin: PageOrigin,
+    page: &pb::EventPage,
+    state_type_url: &str,
+    fold_message: &str,
+) -> CodedError {
+    let type_url = crate::page_event(page).map_or("", |e| e.type_url.as_str());
+    CodedError::fold_failed(
+        origin.message(),
+        FoldAt::Page {
+            sequence: page.sequence,
+            type_url,
+        },
+        state_type_url,
+        fold_message,
+    )
 }
 
 /// Folds a batch of event pages (with their book's cover) into state in one
 /// call: the batched alternative to per-type appliers, for state the router
 /// holds on a host's behalf (router-owned state across the C ABI).
 pub type FoldFn<S> = Box<
-    dyn Fn(&mut S, &[pb::EventPage], Option<&pb::Cover>) -> Result<(), CodedError> + Send + Sync,
+    dyn Fn(&mut S, &[pb::EventPage], Option<&pb::Cover>) -> Result<(), FoldFailure> + Send + Sync,
 >;
 
 impl<S> Rebuilder<S> {
@@ -65,7 +144,30 @@ impl<S> Rebuilder<S> {
             snapshot: None,
             appliers: HashMap::new(),
             fold: None,
+            state_type_url: String::new(),
         }
+    }
+
+    /// A Rebuilder starting from `S::default()` whose state type comes from
+    /// `S`'s prost name: nobody declares the string by hand.
+    pub fn of_message() -> Self
+    where
+        S: prost::Name + Default + 'static,
+    {
+        Rebuilder::new(S::default).with_state_type(&S::full_name())
+    }
+
+    /// Declares the state message's fully-qualified name, for state held as
+    /// something other than its own message (an `Any` across the C ABI).
+    /// An empty name declares none.
+    pub fn with_state_type(mut self, full_name: &str) -> Self {
+        self.state_type_url = declared_type_url(full_name);
+        self
+    }
+
+    /// The declared state type URL ("" when undeclared).
+    pub fn state_type_url(&self) -> &str {
+        &self.state_type_url
     }
 
     /// Registers the applier for a fully-qualified event type name.
@@ -104,11 +206,12 @@ impl<S> Rebuilder<S> {
 
     /// Folds pages through one batched `fold` instead of the per-type
     /// appliers: a rebuild hands it every uncovered page (and the book's
-    /// cover) in a single call, and none when there are none. Its error
-    /// fails the rebuild as returned.
+    /// cover) in a single call, and none when there are none. Its failure
+    /// fails the rebuild as a handler bug ([`fold_error`]); it is never
+    /// called again for the same pages.
     pub fn with_fold(
         mut self,
-        fold: impl Fn(&mut S, &[pb::EventPage], Option<&pb::Cover>) -> Result<(), CodedError>
+        fold: impl Fn(&mut S, &[pb::EventPage], Option<&pb::Cover>) -> Result<(), FoldFailure>
             + Send
             + Sync
             + 'static,
@@ -164,7 +267,14 @@ impl<S> Rebuilder<S> {
                 .cloned()
                 .collect();
             if !uncovered.is_empty() {
-                fold(&mut state, &uncovered, book.cover.as_ref())?;
+                fold(&mut state, &uncovered, book.cover.as_ref()).map_err(|failure| {
+                    fold_error(
+                        PageOrigin::Persisted,
+                        &uncovered,
+                        &failure,
+                        &self.state_type_url,
+                    )
+                })?;
                 info.applied_count = uncovered.len();
             }
             return Ok((state, info));
@@ -187,8 +297,13 @@ impl<S> Rebuilder<S> {
                 cover: book.cover.as_ref(),
                 sequence: page.sequence,
             };
-            if thunk(&mut state, event, &ctx).is_err() {
-                return Err(CodedError::persisted_corrupt(&event.type_url));
+            if let Err(err) = thunk(&mut state, event, &ctx) {
+                return Err(page_fold_error(
+                    PageOrigin::Persisted,
+                    page,
+                    &self.state_type_url,
+                    &err.to_string(),
+                ));
             }
             info.applied_count += 1;
         }
@@ -197,39 +312,55 @@ impl<S> Rebuilder<S> {
 }
 
 impl<S> Rebuilder<S> {
-    /// Folds `pages` of a book with `cover` into `state`: through the
-    /// batched fold in one call when one is registered (none for no pages),
-    /// otherwise page by page through the appliers ([`Self::apply_page`]).
+    /// Folds `pages` (from `origin`) of a book with `cover` into `state`:
+    /// through the batched fold in one call when one is registered (none for
+    /// no pages), otherwise page by page through the appliers. A failure is
+    /// a handler bug ([`fold_error`]) whose message says where the pages
+    /// came from.
     pub fn apply_pages(
         &self,
         state: &mut S,
         pages: &[pb::EventPage],
         cover: Option<&pb::Cover>,
+        origin: PageOrigin,
     ) -> Result<(), CodedError> {
         if let Some(fold) = self.fold.as_ref() {
             if pages.is_empty() {
                 return Ok(());
             }
-            return fold(state, pages, cover);
+            return fold(state, pages, cover)
+                .map_err(|failure| fold_error(origin, pages, &failure, &self.state_type_url));
         }
         for page in pages {
-            self.apply_page(state, page, cover)?;
+            self.fold_page(state, page, cover, origin)?;
         }
         Ok(())
     }
 
-    /// Folds one page of a book with `cover` into `state` through the batched
-    /// fold when one is registered, else its applier, returning whether
-    /// anything ran. A page with no event or an unapplied type is skipped; a
-    /// corrupt payload is PERSISTED_EVENT_CORRUPT.
+    /// Folds one persisted page of a book with `cover` into `state` through
+    /// the batched fold when one is registered, else its applier, returning
+    /// whether anything ran. A page with no event or an unapplied type is
+    /// skipped; a failing fold is a handler bug ([`page_fold_error`]).
     pub fn apply_page(
         &self,
         state: &mut S,
         page: &pb::EventPage,
         cover: Option<&pb::Cover>,
     ) -> Result<bool, CodedError> {
+        self.fold_page(state, page, cover, PageOrigin::Persisted)
+    }
+
+    fn fold_page(
+        &self,
+        state: &mut S,
+        page: &pb::EventPage,
+        cover: Option<&pb::Cover>,
+        origin: PageOrigin,
+    ) -> Result<bool, CodedError> {
         if let Some(fold) = self.fold.as_ref() {
-            fold(state, std::slice::from_ref(page), cover)?;
+            let pages = std::slice::from_ref(page);
+            fold(state, pages, cover)
+                .map_err(|failure| fold_error(origin, pages, &failure, &self.state_type_url))?;
             return Ok(true);
         }
         let Some(event) = crate::page_event(page) else {
@@ -245,7 +376,8 @@ impl<S> Rebuilder<S> {
             cover,
             sequence: page.sequence,
         };
-        thunk(state, event, &ctx).map_err(|_| CodedError::persisted_corrupt(&event.type_url))?;
+        thunk(state, event, &ctx)
+            .map_err(|err| page_fold_error(origin, page, &self.state_type_url, &err.to_string()))?;
         Ok(true)
     }
 }

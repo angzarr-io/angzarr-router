@@ -125,29 +125,20 @@ impl<S> ProcessManagerDispatch<S> {
     }
 
     /// The registration hello (types.proto, ComponentDescriptor): kind
-    /// PROCESS_MANAGER, its source domains as inputs, and the state named by
-    /// `S`'s prost name. Refused MISSING_RULES_VERSION without a rules
-    /// version.
-    pub fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError>
-    where
-        S: prost::Name,
-    {
-        self.component_descriptor_with_state(&S::full_name())
-    }
-
-    /// [`Self::component_descriptor`] for state held as something other
-    /// than its own message (an `Any` across the C ABI): `state_full_name`
-    /// is the state message's fully-qualified name.
-    pub fn component_descriptor_with_state(
-        &self,
-        state_full_name: &str,
-    ) -> Result<pb::ComponentDescriptor, CodedError> {
+    /// PROCESS_MANAGER, its source domains as inputs, and the state type its
+    /// rebuilder declares. Refused MISSING_RULES_VERSION without a rules
+    /// version, MISSING_STATE_TYPE without a state type.
+    pub fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError> {
         crate::descriptor::component_descriptor(
             &self.name,
             pb::ComponentKind::ProcessManager,
             self.sources(),
             &self.rules_version,
-            Some(crate::descriptor::state_descriptor(state_full_name, false)),
+            Some(crate::descriptor::state_descriptor(
+                &self.name,
+                self.rebuilder.state_type_url(),
+                false,
+            )?),
         )
     }
 

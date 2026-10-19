@@ -23,7 +23,15 @@ fn persisted_corrupt_is_data_loss() {
 // handler bug, named by the event and the state it folded into.
 #[test]
 fn fold_failed_is_internal_naming_the_event_and_state() {
-    let err = CodedError::fold_failed(7, "/test.Evt", "/test.State");
+    let err = CodedError::fold_failed(
+        messages::FOLD_FAILED,
+        FoldAt::Page {
+            sequence: 7,
+            type_url: "/test.Evt",
+        },
+        "/test.State",
+        "bad varint",
+    );
     assert_eq!(err.grpc, GrpcCode::Internal);
     assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
     assert_eq!(err.message, messages::FOLD_FAILED);
@@ -31,6 +39,26 @@ fn fold_failed_is_internal_naming_the_event_and_state() {
     assert_eq!(extra(extras::SEQUENCE), Some("7"));
     assert_eq!(extra(extras::TYPE_URL), Some("/test.Evt"));
     assert_eq!(extra(extras::STATE_TYPE_URL), Some("/test.State"));
+    assert_eq!(extra(extras::FOLD_MESSAGE), Some("bad varint"));
+    assert_eq!(extra(extras::FIRST_SEQUENCE), None);
+}
+
+#[test]
+fn an_unlocated_fold_failure_names_the_batchs_range() {
+    let err = CodedError::fold_failed(
+        messages::FOLD_FAILED_EMITTED,
+        FoldAt::Range { first: 3, last: 5 },
+        "",
+        "",
+    );
+    assert_eq!(err.grpc, GrpcCode::Internal);
+    assert_eq!(err.message, messages::FOLD_FAILED_EMITTED);
+    let extra = |key: &str| err.extras.get(key).map(String::as_str);
+    assert_eq!(extra(extras::FIRST_SEQUENCE), Some("3"));
+    assert_eq!(extra(extras::LAST_SEQUENCE), Some("5"));
+    assert_eq!(extra(extras::SEQUENCE), None);
+    assert_eq!(extra(extras::STATE_TYPE_URL), Some(""));
+    assert_eq!(extra(extras::FOLD_MESSAGE), None, "no text, no key");
 }
 
 #[test]

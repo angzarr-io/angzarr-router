@@ -56,10 +56,10 @@ Feature: Counter aggregate dispatch
     When a command whose page carries no payload is dispatched
     Then the command fails with MISSING_COMMAND_PAYLOAD
 
-  Scenario: a corrupt persisted event fails the command on rebuild
+  Scenario: a persisted event the fold cannot fold fails the command as a handler bug
     Given a counter whose history holds a corrupt event
     When the operator increases the counter by 1
-    Then the command fails with PERSISTED_EVENT_CORRUPT
+    Then the command fails with UNHANDLED_HANDLER_ERROR
 
   Scenario: a fresh counter supplies no prior-history evidence to the handler
     Given a new counter

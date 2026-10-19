@@ -129,9 +129,10 @@ fn corrupt_prior_event_fails_command() {
     let err = d.dispatch(&cmd).expect_err("corrupt prior event must fail");
     assert_eq!(
         err.code,
-        codes::PERSISTED_EVENT_CORRUPT,
-        "never validate against truncated state"
+        codes::UNHANDLED_HANDLER_ERROR,
+        "never validate against truncated state; a failing fold is a handler bug"
     );
+    assert_eq!(err.grpc, crate::error::GrpcCode::Internal);
 }
 
 #[test]
@@ -328,7 +329,8 @@ fn a_corrupt_prior_event_fails_the_fact() {
     let err = fact_aggregate()
         .dispatch(&req)
         .expect_err("corrupt history");
-    assert_eq!(err.code, codes::PERSISTED_EVENT_CORRUPT);
+    assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
+    assert_eq!(err.message, crate::error::messages::FOLD_FAILED);
 }
 
 #[test]

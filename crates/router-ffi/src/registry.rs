@@ -12,7 +12,7 @@ use angzarr_router::process_manager::{
     merge_response, select_process_managers, ProcessManagerDispatch, ProcessManagerRoute,
 };
 use angzarr_router::projector::ProjectorDispatch;
-use angzarr_router::rebuild::Rebuilder;
+use angzarr_router::rebuild::{FoldFailure, Rebuilder};
 use angzarr_router::router::{CommandHandler, CommandHandlers};
 use angzarr_router::saga::SagaDispatch;
 use angzarr_router::upcaster::UpcasterDispatch;
@@ -73,25 +73,19 @@ fn host_error(ret: i32, bytes: Option<Vec<u8>>) -> HandlerError {
     HandlerError::Coded(status_to_coded(bytes.as_deref(), ret))
 }
 
-/// What one host fold call answered.
-enum FoldAnswer {
-    /// The folded state.
-    State(Any),
-    /// STATUS_OK_EMPTY: the state is unchanged.
-    Kept,
-    /// Any failure status.
-    Failed,
-}
-
-/// Calls the host fold over `pages` from `state`. An undecodable answer is
-/// a host bug (INTERNAL).
-fn fold_call(
+/// Calls the host fold over `pages` from `state` (cover optional), folding
+/// its answer into `state`: STATUS_OK carries the new state, STATUS_OK_EMPTY
+/// keeps it. A failure carries the host's FoldFailure (abi.proto), read
+/// from the one call; missing or undecodable failure output, or an
+/// undecodable answer, is a failure at no known page. The caller turns it
+/// into the coded error; the fold is never called again.
+fn host_fold(
     cb: AngzarrCb,
     id: u64,
-    state: &Any,
+    state: &mut Any,
     pages: &[pb::EventPage],
     cover: Option<&pb::Cover>,
-) -> Result<FoldAnswer, CodedError> {
+) -> Result<(), FoldFailure> {
     let call = abi_pb::FoldCall {
         state: Some(state.clone()),
         pages: pages.to_vec(),
@@ -100,80 +94,45 @@ fn fold_call(
     .encode_to_vec();
     let (ret, bytes) = invoke(cb, id, "", &call, &[]);
     match ret {
-        STATUS_OK => Any::decode(bytes.unwrap_or_default().as_slice())
-            .map(FoldAnswer::State)
-            .map_err(|_| CodedError::unhandled("host fold returned undecodable Any bytes")),
-        STATUS_OK_EMPTY => Ok(FoldAnswer::Kept),
-        _ => Ok(FoldAnswer::Failed),
-    }
-}
-
-/// The error for a batched fold that failed: refolds the batch one page at a
-/// time from the same starting state (the fold is stateless, so this is
-/// safe) and names the first page that fails alone. A batch whose pages all
-/// fold alone names its last page.
-fn locate_fold_failure(
-    cb: AngzarrCb,
-    id: u64,
-    state: &Any,
-    pages: &[pb::EventPage],
-    cover: Option<&pb::Cover>,
-    state_type_url: &str,
-) -> CodedError {
-    let failed = |page: &pb::EventPage| {
-        let type_url = angzarr_router::page_event(page).map_or("", |e| e.type_url.as_str());
-        CodedError::fold_failed(page.sequence, type_url, state_type_url)
-    };
-    let mut probe = state.clone();
-    if pages.len() > 1 {
-        for page in pages {
-            match fold_call(cb, id, &probe, std::slice::from_ref(page), cover) {
-                Ok(FoldAnswer::State(next)) => probe = next,
-                Ok(FoldAnswer::Kept) => {}
-                Ok(FoldAnswer::Failed) => return failed(page),
-                Err(err) => return err,
-            }
+        STATUS_OK => {
+            *state =
+                Any::decode(bytes.unwrap_or_default().as_slice()).map_err(|_| FoldFailure {
+                    page_index: None,
+                    message: "host fold returned undecodable Any bytes".to_string(),
+                })?;
+            Ok(())
         }
+        STATUS_OK_EMPTY => Ok(()),
+        _ => Err(bytes
+            .and_then(|out| abi_pb::FoldFailure::decode(out.as_slice()).ok())
+            .map(|failure| FoldFailure {
+                page_index: failure.page_index.map(|index| index as usize),
+                message: failure.message,
+            })
+            .unwrap_or_default()),
     }
-    pages
-        .last()
-        .map_or_else(|| CodedError::fold_failed(0, "", state_type_url), failed)
 }
 
 /// A rebuilder over router-owned state: a serialized `Any` of
 /// `state_type_url`, starting from the message's default (empty bytes) or a
 /// delivered snapshot's state, folded through the host's stateless fold
 /// callback in one batched call per rebuild (abi.proto, FoldCall). A failed
-/// fold is a handler bug (INTERNAL) naming the event it failed on
-/// ([`locate_fold_failure`]); an undecodable answer is a host bug too.
+/// fold is a handler bug (INTERNAL) naming the page the host's FoldFailure
+/// indexes, or the batch's range.
 fn state_rebuilder(state_type_url: &str, fold: Option<u64>, cb: AngzarrCb) -> Rebuilder<Any> {
-    let state_type_url = angzarr_router::type_url(state_type_url);
     let initial = Any {
-        type_url: state_type_url.clone(),
+        type_url: angzarr_router::type_url(state_type_url),
         value: Vec::new(),
     };
-    let mut rebuilder = Rebuilder::new(move || initial.clone()).with_snapshot(|state, snapshot| {
-        *state = snapshot.clone();
-        Ok(())
-    });
-    if let Some(id) = fold {
-        rebuilder = rebuilder.with_fold(move |state: &mut Any, pages, cover| {
-            match fold_call(cb, id, state, pages, cover)? {
-                FoldAnswer::State(next) => *state = next,
-                FoldAnswer::Kept => {}
-                FoldAnswer::Failed => {
-                    return Err(locate_fold_failure(
-                        cb,
-                        id,
-                        state,
-                        pages,
-                        cover,
-                        &state_type_url,
-                    ))
-                }
-            }
+    let mut rebuilder = Rebuilder::new(move || initial.clone())
+        .with_state_type(state_type_url)
+        .with_snapshot(|state, snapshot| {
+            *state = snapshot.clone();
             Ok(())
         });
+    if let Some(id) = fold {
+        rebuilder = rebuilder
+            .with_fold(move |state: &mut Any, pages, cover| host_fold(cb, id, state, pages, cover));
     }
     rebuilder
 }
@@ -339,7 +298,7 @@ impl FfiRouter {
                 }
             });
         }
-        let hello = dispatch.component_descriptor_with_state(&desc.state_type_url);
+        let hello = dispatch.component_descriptor();
         // Refuses a second claim of one (domain, command type) (C-0010,
         // C-0064).
         self.aggregates.push(Box::new(dispatch))?;
@@ -377,33 +336,14 @@ impl FfiRouter {
             value: Vec::new(),
         };
         let mut dispatch = ProjectorDispatch::new(desc.name.clone(), move || initial.clone())
-            .with_rules_version(desc.rules_version.clone());
+            .with_rules_version(desc.rules_version.clone())
+            .with_projection_type(&desc.projection_type_url);
         if !desc.domains.is_empty() {
             dispatch = dispatch.for_domains(desc.domains.clone());
         }
         if let Some(id) = desc.fold_callback_id {
             dispatch = dispatch.with_fold(move |projection: &mut Any, pages, cover| {
-                let call = abi_pb::FoldCall {
-                    state: Some(projection.clone()),
-                    pages: pages.to_vec(),
-                    cover: Some(cover.clone()),
-                }
-                .encode_to_vec();
-                let (ret, bytes) = invoke(cb, id, "", &call, &[]);
-                match ret {
-                    STATUS_OK => {
-                        *projection =
-                            Any::decode(bytes.unwrap_or_default().as_slice()).map_err(|_| {
-                                HandlerError::Other(
-                                    "host projector fold returned undecodable Any bytes"
-                                        .to_string(),
-                                )
-                            })?;
-                        Ok(())
-                    }
-                    STATUS_OK_EMPTY => Ok(()),
-                    _ => Err(host_error(ret, bytes)),
-                }
+                host_fold(cb, id, projection, pages, Some(cover))
             });
         }
         // The router answers the Projection itself (types.proto, Projection):
@@ -641,8 +581,7 @@ impl FfiRouter {
             );
         }
 
-        self.hellos
-            .push(dispatch.component_descriptor_with_state(&desc.state_type_url));
+        self.hellos.push(dispatch.component_descriptor());
         self.process_managers.push((desc.name, dispatch));
         Ok(())
     }

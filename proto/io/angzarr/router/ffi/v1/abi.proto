@@ -71,8 +71,8 @@ message AggregateDescriptor {
   // The fold: payload a serialized FoldCall (the state, every uncovered page
   // of the rebuild, the book's cover); STATUS_OK answers the new state as a
   // serialized google.protobuf.Any, STATUS_OK_EMPTY leaves it unchanged. A
-  // failure is PERSISTED_EVENT_CORRUPT (DATA_LOSS). Absent: events never
-  // change the state.
+  // failure fills `out` with a FoldFailure and is a handler bug (INTERNAL;
+  // see FoldFailure). Absent: events never change the state.
   optional uint64 fold_callback_id = 12;
   // COMMUTATIVE conflict resolution (options.proto, the conflict_units
   // region): the state's generated changed(before, after), payload a
@@ -104,6 +104,19 @@ message FoldCall {
   io.angzarr.v1.Cover cover = 3;
 }
 
+// Failure output of a fold callback (aggregate, process manager, projector):
+// a failing fold fills `out` with it, from the one batched call. page_index
+// is the failing page's index within the FoldCall's pages, filled by the
+// host's fold loop; it is optional so that index 0 is distinguishable from
+// no index. The router names that page's sequence and type URL in an
+// INTERNAL error (a failing fold of accepted events is a handler bug); with
+// no FoldFailure, or an index outside the batch, it names the batch's
+// first..last sequence range instead. The router never calls the fold again.
+message FoldFailure {
+  optional uint32 page_index = 1;
+  string message = 2;
+}
+
 // Payload of a changed callback: two states.
 message ChangedCall {
   google.protobuf.Any before = 1;
@@ -130,8 +143,8 @@ message FactRecord {
 // book from a declared domain (empty `domains`: every domain) is folded
 // through ONE stateless fold call (payload a FoldCall whose `state` is the
 // projection; STATUS_OK answers the new projection as a serialized
-// google.protobuf.Any, STATUS_OK_EMPTY leaves it unchanged; a failure keeps
-// the host's status). The router answers the Projection itself: the book's
+// google.protobuf.Any, STATUS_OK_EMPTY leaves it unchanged; a failure fills
+// `out` with a FoldFailure and is a handler bug, as an aggregate's). The router answers the Projection itself: the book's
 // cover, the projector's name, the folded projection, and next_sequence =
 // the last page's sequence + 1 (the book's next_sequence when it has no
 // pages).

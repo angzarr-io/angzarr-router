@@ -205,16 +205,55 @@ fn accessors_report_name_and_registered_types() {
     assert_eq!(d.event_types(), vec![cover_full_name()]);
 }
 
+// Owner ruling 2026-10-19: any fold of accepted events that fails is a
+// handler bug, named by its page and the projection type.
 #[test]
-fn handler_error_propagates_as_unhandled() {
+fn a_failing_fold_is_a_handler_bug_naming_its_page() {
+    for failure in [
+        HandlerError::Other("boom".to_string()),
+        HandlerError::Coded(crate::error::CodedError::invalid_argument(
+            "SOME_CODE",
+            "coded",
+            [],
+        )),
+    ] {
+        let failure = std::sync::Mutex::new(Some(failure));
+        let d = ProjectorDispatch::new("write-model", Folded::default)
+            .with_projection_type("test.Board")
+            .on_event(&cover_full_name(), move |_p, _any, ctx| {
+                if ctx.sequence == 1 {
+                    return Err(failure.lock().unwrap().take().expect("one failure"));
+                }
+                Ok(())
+            });
+        let mut events = book("order", cover_pages("order", 2));
+        events.pages[1].sequence = 1;
+        let err = d
+            .dispatch(&events)
+            .expect_err("handler error must fail dispatch");
+        let type_url = crate::type_url(&cover_full_name());
+        assert_fold_failed(
+            &err,
+            crate::error::messages::FOLD_FAILED,
+            &[
+                (crate::error::extras::SEQUENCE, "1"),
+                (crate::error::extras::TYPE_URL, type_url.as_str()),
+            ],
+            "/test.Board",
+        );
+        assert!(!err.extras[crate::error::extras::FOLD_MESSAGE].is_empty());
+    }
+}
+
+#[test]
+fn a_finish_failure_is_not_a_fold_failure() {
     let d = ProjectorDispatch::new("write-model", Folded::default)
-        .on_event(&cover_full_name(), |_p, _any, _ctx| {
-            Err(HandlerError::Other("boom".to_string()))
-        });
+        .finish(|_p, _events| Err(HandlerError::Other("boom".to_string())));
     let err = d
         .dispatch(&book("order", cover_pages("order", 1)))
-        .expect_err("handler error must fail dispatch");
+        .expect_err("finish failed");
     assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
+    assert_ne!(err.message, crate::error::messages::FOLD_FAILED);
 }
 
 // Each fold sees its page's place: the book's cover (root) and the page's
@@ -300,11 +339,40 @@ fn a_batched_fold_is_not_called_for_an_undeclared_domain_or_no_pages() {
 }
 
 #[test]
-fn a_batched_fold_failure_fails_the_delivery() {
-    let d = ProjectorDispatch::new("write-model", Folded::default)
-        .with_fold(|_p, _pages, _c| Err(HandlerError::Other("boom".to_string())));
-    let err = d
-        .dispatch(&book("order", cover_pages("order", 1)))
+fn a_batched_fold_failure_names_its_page_or_the_batchs_range() {
+    let mut events = book("order", cover_pages("order", 3));
+    for (page, seq) in events.pages.iter_mut().zip(4..) {
+        page.sequence = seq;
+    }
+    let failing = |page_index: Option<usize>| {
+        ProjectorDispatch::new("write-model", Folded::default)
+            .with_projection_type("test.Board")
+            .with_fold(move |_p, _pages, _c| {
+                Err(crate::rebuild::FoldFailure {
+                    page_index,
+                    message: "boom".to_string(),
+                })
+            })
+    };
+    let err = failing(Some(2))
+        .dispatch(&events)
         .expect_err("the fold failed");
-    assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
+    assert_fold_failed(
+        &err,
+        crate::error::messages::FOLD_FAILED,
+        &[(crate::error::extras::SEQUENCE, "6")],
+        "/test.Board",
+    );
+    let err = failing(Some(9))
+        .dispatch(&events)
+        .expect_err("the fold failed");
+    assert_fold_failed(
+        &err,
+        crate::error::messages::FOLD_FAILED,
+        &[
+            (crate::error::extras::FIRST_SEQUENCE, "4"),
+            (crate::error::extras::LAST_SEQUENCE, "6"),
+        ],
+        "/test.Board",
+    );
 }

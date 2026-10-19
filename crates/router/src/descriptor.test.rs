@@ -9,22 +9,10 @@ use crate::process_manager::ProcessManagerDispatch;
 use crate::projector::ProjectorDispatch;
 use crate::rebuild::Rebuilder;
 use crate::saga::SagaDispatch;
-
-/// A native state message: its type URL comes from its prost name.
-#[derive(Clone, PartialEq, prost::Message)]
-struct LedgerState {
-    #[prost(uint32, tag = "1")]
-    balance: u32,
-}
-
-impl prost::Name for LedgerState {
-    const NAME: &'static str = "LedgerState";
-    const PACKAGE: &'static str = "test.ledger";
-}
+use crate::test_support::LedgerState;
 
 fn ledger(version: &str) -> AggregateDispatch<LedgerState> {
-    AggregateDispatch::new("Ledger", "ledger", Rebuilder::new(LedgerState::default))
-        .with_rules_version(version)
+    AggregateDispatch::new("Ledger", "ledger", Rebuilder::of_message()).with_rules_version(version)
 }
 
 fn resolutions(descriptor: &pb::ComponentDescriptor) -> Vec<pb::ConflictResolution> {
@@ -105,13 +93,14 @@ fn a_commutative_aggregate_lists_commutative_first() {
 }
 
 #[test]
-fn an_aggregate_over_any_state_takes_its_state_type_by_name() {
-    let dispatch: AggregateDispatch<prost_types::Any> =
-        AggregateDispatch::new("Counter", "counter", Rebuilder::new(Default::default))
-            .with_rules_version("2");
-    let descriptor = dispatch
-        .component_descriptor_with_state("test.counter.CounterState")
-        .expect("descriptor");
+fn an_aggregate_over_any_state_takes_the_state_type_its_rebuilder_declares() {
+    let dispatch: AggregateDispatch<prost_types::Any> = AggregateDispatch::new(
+        "Counter",
+        "counter",
+        Rebuilder::new(Default::default).with_state_type("test.counter.CounterState"),
+    )
+    .with_rules_version("2");
+    let descriptor = dispatch.component_descriptor().expect("descriptor");
     assert_eq!(
         descriptor.state.expect("state").type_url,
         "/test.counter.CounterState"
@@ -119,9 +108,30 @@ fn an_aggregate_over_any_state_takes_its_state_type_by_name() {
 }
 
 #[test]
+fn a_stateful_component_whose_rebuilder_declares_no_state_type_is_refused() {
+    let aggregate: AggregateDispatch<LedgerState> =
+        AggregateDispatch::new("Ledger", "ledger", Rebuilder::new(LedgerState::default))
+            .with_rules_version("1");
+    let pm: ProcessManagerDispatch<LedgerState> = ProcessManagerDispatch::new(
+        "Fulfillment",
+        "fulfillment",
+        ["shipping"],
+        Rebuilder::new(LedgerState::default),
+    )
+    .with_rules_version("1");
+    for err in [
+        aggregate.component_descriptor().expect_err("no state type"),
+        pm.component_descriptor().expect_err("no state type"),
+    ] {
+        assert_eq!(err.code, codes::MISSING_STATE_TYPE);
+        assert_eq!(err.grpc, GrpcCode::InvalidArgument);
+        assert!(err.extras.contains_key(crate::error::extras::COMPONENT));
+    }
+}
+
+#[test]
 fn an_aggregate_without_a_rules_version_is_refused() {
     assert_missing_rules_version(ledger("").component_descriptor());
-    assert_missing_rules_version(ledger("").component_descriptor_with_state("x.Y"));
 }
 
 fn fulfillment(version: &str) -> ProcessManagerDispatch<LedgerState> {
@@ -132,7 +142,7 @@ fn fulfillment(version: &str) -> ProcessManagerDispatch<LedgerState> {
         "Fulfillment",
         "fulfillment",
         ["shipping"],
-        Rebuilder::new(LedgerState::default),
+        Rebuilder::of_message(),
     )
     .on_event("order", "test.OrderPlaced", noop)
     .on_event("payment", "test.PaymentTaken", noop)
@@ -160,16 +170,11 @@ fn a_process_manager_announces_its_sources_and_state() {
             pb::ConflictResolution::AggregateHandles
         ]
     );
-    let with_state = fulfillment("2.0.1")
-        .component_descriptor_with_state("test.pm.State")
-        .expect("descriptor");
-    assert_eq!(with_state.state.expect("state").type_url, "/test.pm.State");
 }
 
 #[test]
 fn a_process_manager_without_a_rules_version_is_refused() {
     assert_missing_rules_version(fulfillment("").component_descriptor());
-    assert_missing_rules_version(fulfillment("").component_descriptor_with_state("x.Y"));
 }
 
 fn notifier(version: &str) -> SagaDispatch {

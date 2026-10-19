@@ -39,23 +39,36 @@ pub(crate) fn component_descriptor(
     })
 }
 
-/// The StateDescriptor of the state message named `full_name`: its type URL
-/// and the full resolved list of supported resolutions, in enum-number
-/// order. The base is STRICT and AGGREGATE_HANDLES; COMMUTATIVE (number 1)
-/// leads when the state has a `changed()`.
-pub(crate) fn state_descriptor(full_name: &str, commutative: bool) -> pb::StateDescriptor {
+/// The StateDescriptor of `component`'s state, of type URL `type_url`: the
+/// type URL and the full resolved list of supported resolutions, in
+/// enum-number order. The base is STRICT and AGGREGATE_HANDLES; COMMUTATIVE
+/// (number 1) leads when the state has a `changed()`. An undeclared state
+/// type (empty `type_url`) is refused MISSING_STATE_TYPE (INVALID_ARGUMENT),
+/// naming the component.
+pub(crate) fn state_descriptor(
+    component: &str,
+    type_url: &str,
+    commutative: bool,
+) -> Result<pb::StateDescriptor, CodedError> {
+    if type_url.is_empty() {
+        return Err(CodedError::invalid_argument(
+            codes::MISSING_STATE_TYPE,
+            messages::MISSING_STATE_TYPE,
+            [(extras::COMPONENT.to_string(), component.to_string())],
+        ));
+    }
     let mut resolutions = Vec::new();
     if commutative {
         resolutions.push(pb::ConflictResolution::Commutative as i32);
     }
     resolutions.push(pb::ConflictResolution::Strict as i32);
     resolutions.push(pb::ConflictResolution::AggregateHandles as i32);
-    pb::StateDescriptor {
-        type_url: crate::type_url(full_name),
+    Ok(pb::StateDescriptor {
+        type_url: type_url.to_string(),
         options: Some(pb::StateOptions {
             conflict_resolutions: resolutions,
         }),
-    }
+    })
 }
 
 #[cfg(test)]

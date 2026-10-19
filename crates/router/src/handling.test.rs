@@ -285,6 +285,56 @@ fn commutative_fails_stale_on_overlap() {
     assert_eq!(err.grpc, GrpcCode::Aborted);
 }
 
+// Owner ruling 2026-10-19: a fold of the command's own new events (not yet
+// persisted) that fails is still a handler bug, said differently.
+#[test]
+fn commutative_folding_an_emitted_event_that_fails_says_the_command_emitted_it() {
+    let emits_corrupt = AggregateDispatch::new("list", "list", list_rebuilder())
+        .on_command("test.Bump", |_cmd, _state, _cctx| {
+            Ok(Some(pb::EventBook {
+                pages: vec![sequenced_event_page(9, corrupt_cover_any())],
+                ..Default::default()
+            }))
+        })
+        .with_commutative(changed);
+    let err = emits_corrupt
+        .dispatch(&delivery(
+            "a",
+            &["b"],
+            0,
+            pb::ConflictResolution::Commutative,
+            b"n",
+        ))
+        .expect_err("the emitted event does not fold");
+    let type_url = type_url(&cover_full_name());
+    assert_fold_failed(
+        &err,
+        crate::error::messages::FOLD_FAILED_EMITTED,
+        &[
+            (crate::error::extras::SEQUENCE, "9"),
+            (crate::error::extras::TYPE_URL, type_url.as_str()),
+        ],
+        "",
+    );
+}
+
+#[test]
+fn commutative_folding_a_window_event_that_fails_says_it_was_accepted() {
+    let mut req = delivery(
+        "a",
+        &["b", "b"],
+        0,
+        pb::ConflictResolution::Commutative,
+        b"n",
+    );
+    req.events.as_mut().unwrap().pages[1].payload = Some(corrupt_cover_any());
+    let err = commutative(Arc::default())
+        .dispatch(&req)
+        .expect_err("the window does not fold");
+    assert_eq!(err.message, crate::error::messages::FOLD_FAILED);
+    assert_eq!(err.extras[crate::error::extras::SEQUENCE], "1");
+}
+
 #[test]
 fn commutative_only_counts_events_from_the_expected_sequence() {
     // items[b] changed at sequence 0, which the command saw (expected 1).

@@ -13,6 +13,7 @@ use prost_types::Any;
 
 use crate::error::{codes, map_handler_error, messages, CodedError, HandlerError};
 use crate::pb;
+use crate::rebuild::{fold_error, page_fold_error, FoldFailure, PageOrigin};
 
 pub use crate::PageContext;
 
@@ -30,7 +31,7 @@ pub type FinishFn<P> =
 /// batched alternative to per-type folds, for a projection the router holds
 /// on a host's behalf (router-owned projections across the C ABI).
 pub type BatchFoldFn<P> =
-    Box<dyn Fn(&mut P, &[pb::EventPage], &pb::Cover) -> Result<(), HandlerError> + Send + Sync>;
+    Box<dyn Fn(&mut P, &[pb::EventPage], &pb::Cover) -> Result<(), FoldFailure> + Send + Sync>;
 
 /// The dispatch table for one projector component.
 pub struct ProjectorDispatch<P> {
@@ -41,6 +42,8 @@ pub struct ProjectorDispatch<P> {
     fold: Option<BatchFoldFn<P>>,
     finish: Option<FinishFn<P>>,
     rules_version: String,
+    /// The projection message's type URL ("" when undeclared).
+    projection_type_url: String,
 }
 
 impl<P> ProjectorDispatch<P> {
@@ -54,6 +57,7 @@ impl<P> ProjectorDispatch<P> {
             fold: None,
             finish: None,
             rules_version: String::new(),
+            projection_type_url: String::new(),
         }
     }
 
@@ -62,12 +66,19 @@ impl<P> ProjectorDispatch<P> {
     /// the book's cover) in a single call, and none when there are none.
     pub fn with_fold(
         mut self,
-        fold: impl Fn(&mut P, &[pb::EventPage], &pb::Cover) -> Result<(), HandlerError>
+        fold: impl Fn(&mut P, &[pb::EventPage], &pb::Cover) -> Result<(), FoldFailure>
             + Send
             + Sync
             + 'static,
     ) -> Self {
         self.fold = Some(Box::new(fold));
+        self
+    }
+
+    /// Declares the projection message's fully-qualified name, named by a
+    /// failing fold's error (`state_type_url`). An empty name declares none.
+    pub fn with_projection_type(mut self, full_name: &str) -> Self {
+        self.projection_type_url = crate::rebuild::declared_type_url(full_name);
         self
     }
 
@@ -162,7 +173,14 @@ impl<P> ProjectorDispatch<P> {
 
         if let (true, Some(fold)) = (consumed, self.fold.as_ref()) {
             if !events.pages.is_empty() {
-                fold(&mut projection, &events.pages, cover).map_err(map_handler_error)?;
+                fold(&mut projection, &events.pages, cover).map_err(|failure| {
+                    fold_error(
+                        PageOrigin::Persisted,
+                        &events.pages,
+                        &failure,
+                        &self.projection_type_url,
+                    )
+                })?;
             }
         } else if consumed {
             for page in &events.pages {
@@ -185,7 +203,14 @@ impl<P> ProjectorDispatch<P> {
                     cover: Some(cover),
                     sequence: page.sequence,
                 };
-                thunk(&mut projection, event_any, &ctx).map_err(map_handler_error)?;
+                thunk(&mut projection, event_any, &ctx).map_err(|err| {
+                    page_fold_error(
+                        PageOrigin::Persisted,
+                        page,
+                        &self.projection_type_url,
+                        &handler_error_text(&err),
+                    )
+                })?;
             }
         }
 
@@ -197,6 +222,14 @@ impl<P> ProjectorDispatch<P> {
                 ..Default::default()
             }),
         }
+    }
+}
+
+/// A handler error's text, for a failing fold's `fold_message`.
+fn handler_error_text(err: &HandlerError) -> String {
+    match err {
+        HandlerError::Coded(coded) => format!("{}: {}", coded.code, coded.message),
+        HandlerError::Other(text) => text.clone(),
     }
 }
 
