@@ -587,7 +587,9 @@ fn every_process_manager_response_reports_the_rules_version() {
 }
 
 #[test]
-fn a_process_manager_with_no_declared_rules_version_keeps_its_handlers() {
+// Owner ruling: the router always sets the declared version, overwriting a
+// handler's.
+fn a_process_manager_handlers_rules_version_is_overwritten() {
     let pm = ProcessManagerDispatch::new("pm", "pm", ["inventory"], fresh_rebuilder()).on_event(
         "orders",
         "test.Shipped",
@@ -602,6 +604,38 @@ fn a_process_manager_with_no_declared_rules_version_keeps_its_handlers() {
         pm.dispatch(&shipped("orders"))
             .expect("handled")
             .rules_version,
-        "from-the-handler"
+        "",
+        "none declared: the declared (empty) version still wins"
+    );
+    let pm = pm.with_rules_version(RULES);
+    assert_eq!(pm.rules_version(), RULES);
+    assert_eq!(
+        pm.dispatch(&shipped("orders"))
+            .expect("handled")
+            .rules_version,
+        RULES
+    );
+}
+
+// Co-hosted PMs share one binary and so one version: a router reports it
+// even when no PM consumed the trigger.
+#[test]
+fn a_router_of_process_managers_reports_the_version_with_no_pm_selected() {
+    let router = crate::router::RouterBuilder::new()
+        .process_manager(
+            ProcessManagerDispatch::new("pm", "pm", ["inventory"], fresh_rebuilder())
+                .with_rules_version(RULES)
+                .on_event("orders", "test.Shipped", |_e, _s, _c| {
+                    Ok(pb::ProcessManagerHandleResponse::default())
+                }),
+        )
+        .build()
+        .expect("build");
+    assert_eq!(
+        router
+            .dispatch_process_manager(&shipped("billing"))
+            .expect("no PM consumes billing")
+            .rules_version,
+        RULES
     );
 }

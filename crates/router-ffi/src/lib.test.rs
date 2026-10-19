@@ -2043,6 +2043,18 @@ fn every_response_reports_the_registered_rules_version_through_the_abi() {
             .rules_version,
         "2.0.0"
     );
+    let (ret, bytes) = router.dispatch_process_manager(
+        next_session(),
+        &pm_request("billing", vec![event_page_of(FQ_ORDER_SHIPPED)]),
+    );
+    assert_eq!(ret, 0);
+    assert_eq!(
+        pb::ProcessManagerHandleResponse::decode(bytes.as_slice())
+            .unwrap()
+            .rules_version,
+        "2.0.0",
+        "reported even when no PM consumed the trigger"
+    );
 }
 
 // Registration carries the upcasters' source types, claimed like command

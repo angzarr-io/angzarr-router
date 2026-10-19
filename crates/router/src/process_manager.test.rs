@@ -493,7 +493,10 @@ fn merge_concatenates_in_order() {
         .map(|c| c.cover.as_ref().unwrap().domain.clone())
         .collect();
     assert_eq!(cmd_domains, vec!["c1", "c2"]);
-    assert_eq!(acc.rules_version, "v2", "the first reported rules version");
+    assert_eq!(
+        acc.rules_version, "v3",
+        "co-hosted PMs share one version: the last stands"
+    );
 }
 
 // The handler reads the trigger's cover (e.g. to address the trigger's root).

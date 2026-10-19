@@ -97,6 +97,11 @@ impl<S> CommandHandler for AggregateDispatch<S> {
 
 /// A process manager as the router sees it, whatever its state type.
 pub trait ProcessManagerHandler: ProcessManagerRoute + Send + Sync {
+    /// The declared rules version (empty by default), reported on every
+    /// response.
+    fn rules_version(&self) -> &str {
+        ""
+    }
     /// `ProcessManagerService.Handle`.
     fn dispatch(
         &self,
@@ -117,6 +122,9 @@ impl<T: ProcessManagerRoute + ?Sized> ProcessManagerRoute for Box<T> {
 }
 
 impl<T: ProcessManagerHandler + ?Sized> ProcessManagerHandler for Box<T> {
+    fn rules_version(&self) -> &str {
+        (**self).rules_version()
+    }
     fn dispatch(
         &self,
         req: &pb::ProcessManagerHandleRequest,
@@ -126,6 +134,9 @@ impl<T: ProcessManagerHandler + ?Sized> ProcessManagerHandler for Box<T> {
 }
 
 impl<S> ProcessManagerHandler for ProcessManagerDispatch<S> {
+    fn rules_version(&self) -> &str {
+        ProcessManagerDispatch::rules_version(self)
+    }
     fn dispatch(
         &self,
         req: &pb::ProcessManagerHandleRequest,
@@ -463,7 +474,15 @@ impl Router {
             .iter()
             .map(|pm| pm.as_ref() as &dyn ProcessManagerRoute)
             .collect();
-        let mut merged = pb::ProcessManagerHandleResponse::default();
+        // Co-hosted PMs share one binary, so one rules version: reported even
+        // when no PM consumed the trigger.
+        let mut merged = pb::ProcessManagerHandleResponse {
+            rules_version: pms
+                .first()
+                .map(|pm| pm.rules_version().to_string())
+                .unwrap_or_default(),
+            ..Default::default()
+        };
         for index in select_process_managers(&routes, req) {
             merge_response(&mut merged, pms[index].dispatch(req)?);
         }

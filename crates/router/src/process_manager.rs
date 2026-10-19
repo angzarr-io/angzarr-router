@@ -124,17 +124,19 @@ impl<S> ProcessManagerDispatch<S> {
         self
     }
 
-    /// Handles a trigger book against rebuilt PM state, reporting the
-    /// declared rules version on every response (a handler's own value stands
-    /// when none is declared).
+    /// The declared rules version.
+    pub fn rules_version(&self) -> &str {
+        &self.rules_version
+    }
+
+    /// Handles a trigger book against rebuilt PM state, setting the declared
+    /// rules version on every response, over anything the handler set.
     pub fn dispatch(
         &self,
         req: &pb::ProcessManagerHandleRequest,
     ) -> Result<pb::ProcessManagerHandleResponse, CodedError> {
         let mut resp = self.handle(req)?;
-        if !self.rules_version.is_empty() {
-            resp.rules_version = self.rules_version.clone();
-        }
+        resp.rules_version = self.rules_version.clone();
         Ok(resp)
     }
 
@@ -254,17 +256,15 @@ pub fn select_process_managers(
 }
 
 /// Folds one co-resident PM's response into the merged response: process
-/// events and commands concatenate in dispatch order; the first non-empty
-/// rules version is kept.
+/// events and commands concatenate in dispatch order. Co-hosted PMs share one
+/// binary and so one rules version: the merged response carries it.
 pub fn merge_response(
     acc: &mut pb::ProcessManagerHandleResponse,
     resp: pb::ProcessManagerHandleResponse,
 ) {
     acc.process_events.extend(resp.process_events);
     acc.commands.extend(resp.commands);
-    if acc.rules_version.is_empty() {
-        acc.rules_version = resp.rules_version;
-    }
+    acc.rules_version = resp.rules_version;
 }
 
 #[cfg(test)]

@@ -658,7 +658,15 @@ impl FfiRouter {
             .collect();
         let selected = select_process_managers(&routes, &req);
         let _guard = HostCtxGuard::set(host_ctx);
-        let mut merged = pb::ProcessManagerHandleResponse::default();
+        // Co-hosted PMs share one binary, so one rules version.
+        let mut merged = pb::ProcessManagerHandleResponse {
+            rules_version: self
+                .process_managers
+                .first()
+                .map(|(_, pm)| pm.rules_version().to_string())
+                .unwrap_or_default(),
+            ..Default::default()
+        };
         for index in selected {
             merge_response(&mut merged, self.process_managers[index].1.dispatch(&req)?);
         }
