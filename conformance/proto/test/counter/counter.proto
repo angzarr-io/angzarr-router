@@ -143,34 +143,3 @@ message AuditProcessManagerState {
   };
   repeated string seen = 1;
 }
-
-// --- list aggregate (handling.feature) ---
-//
-// Plain messages, no component options: the harness builds the list
-// aggregate by hand. Bump(key) records Bumped(key); BumpV1 is Bump's old
-// name; BumpOld upcasts to BumpLost, which nothing handles. ListState keeps
-// one counter per item key: its conflict unit is items[<key>].
-
-message Bump {
-  string key = 1;
-}
-
-message BumpV1 {
-  string key = 1;
-}
-
-message BumpOld {
-  string key = 1;
-}
-
-message BumpLost {
-  string key = 1;
-}
-
-message Bumped {
-  string key = 1;
-}
-
-message ListState {
-  map<string, uint32> items = 1;
-}

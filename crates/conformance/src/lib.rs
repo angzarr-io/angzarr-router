@@ -20,6 +20,14 @@ pub mod counter {
     include!(concat!(env!("OUT_DIR"), "/test.counter.rs"));
 }
 
+/// Generated `orders.v1` fixture messages: the handler-contract tier's
+/// order vocabulary.
+pub mod orders {
+    pub mod v1 {
+        include!(concat!(env!("OUT_DIR"), "/orders.v1.rs"));
+    }
+}
+
 /// Re-export the router's framework types under `pb`.
 pub use angzarr_router::pb;
 pub use counter::CounterState;
@@ -816,15 +824,16 @@ pub fn tracked_book(label: &str, sequences: &[u64]) -> pb::EventBook {
 }
 
 // ---------------------------------------------------------------------------
-// The list aggregate: conflict resolution and command upcasting
-// (handling.feature).
+// The order aggregate and the Fulfillment process manager: the
+// handler-contract tier (angzarr-project
+// features/handler-contract/handling.feature, C-0533..C-0550).
 // ---------------------------------------------------------------------------
 
-/// How the list aggregate's Bump handler answers a conflict window under
+/// How the order aggregate's AddItem handler settles a conflict window under
 /// AGGREGATE_HANDLES.
 #[derive(Debug, Clone, Default)]
-pub enum Ack {
-    /// resolve_conflicts with the delivered nonce.
+pub enum Settle {
+    /// resolve_conflicts with the nonce it was given.
     #[default]
     Delivered,
     /// Never call resolve_conflicts.
@@ -833,32 +842,53 @@ pub enum Ack {
     With(Vec<u8>),
 }
 
-/// What the Bump handler saw.
+/// What business code saw when it ran.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ListObserved {
-    /// The fully-qualified type the handler received (after upcasting).
-    pub command: String,
+pub struct OrderObserved {
+    /// The fully-qualified type business code received (after upcasting).
+    pub handled: String,
+    pub item: String,
     pub expected_sequence: u64,
     pub conflict_resolution: pb::ConflictResolution,
-    /// The conflict window's sequences, when the handler got a conflict.
+    /// The conflict window's sequences, when business code got a conflict.
     pub window: Option<Vec<u64>>,
+    /// The nonce, when business code got a conflict.
+    pub nonce: Option<Vec<u8>>,
     /// The item keys of the state it decided on, sorted.
     pub items: Vec<String>,
 }
 
-/// Sink the harness passes into the list aggregate.
-pub type ListSink = Arc<Mutex<Vec<ListObserved>>>;
+/// Sink the harness passes into the order fixtures.
+pub type OrderSink = Arc<Mutex<Vec<OrderObserved>>>;
 
-/// The generated `changed(before, after)` for `ListState` with
-/// `map<string, uint32> items = 1 [(conflict) = {}]` (backlog CR-1): one
-/// unit per item key that differs.
-pub fn list_changed(before: &counter::ListState, after: &counter::ListState) -> Vec<String> {
+/// The generated `changed(before, after)` for `OrderState` (backlog CR-1):
+/// `items[<item>]` per item, `shipping_address`, and the wildcard `*notes`
+/// for the unmarked notes.
+pub fn order_changed(
+    before: &orders::v1::OrderState,
+    after: &orders::v1::OrderState,
+) -> Vec<String> {
     let keys: std::collections::BTreeSet<&String> =
         before.items.keys().chain(after.items.keys()).collect();
-    keys.into_iter()
+    let mut units: Vec<String> = keys
+        .into_iter()
         .filter(|k| before.items.get(*k) != after.items.get(*k))
         .map(|k| format!("items[{k}]"))
-        .collect()
+        .collect();
+    if before.shipping_address != after.shipping_address {
+        units.push("shipping_address".to_string());
+    }
+    if before.notes != after.notes {
+        units.push("*notes".to_string());
+    }
+    units
+}
+
+fn orders_any<M: prost::Message + prost::Name>(msg: &M) -> prost_types::Any {
+    prost_types::Any {
+        type_url: angzarr_router::type_url(&M::full_name()),
+        value: msg.encode_to_vec(),
+    }
 }
 
 fn rename(
@@ -872,86 +902,127 @@ fn rename(
     }
 }
 
-/// The list aggregate (domain "list") over `ListState` at `rules_version`:
-/// Bumped(key) folds items[key] += 1; Bump(key) records what it saw in
-/// `seen`, answers a conflict per `ack`, and records Bumped(key); its
-/// upcaster chain renames BumpV1 to Bump and BumpOld to BumpLost (nothing
-/// handles BumpLost); COMMUTATIVE runs through [`list_changed`].
-pub fn list_aggregate(
+fn sorted_items(state: &orders::v1::OrderState) -> Vec<String> {
+    let mut items: Vec<String> = state.items.keys().cloned().collect();
+    items.sort();
+    items
+}
+
+/// The order aggregate (domain "order") at `rules_version`: ItemAdded bumps
+/// an item, OrderNoteAdded sets the notes, a snapshot loads OrderState;
+/// AddItem records what business code saw in `seen`, settles per `settle`
+/// and records ItemAdded; the fact ItemDelivered is recorded as received;
+/// the upcaster chain renames AddItemV1 to AddItem, ItemDeliveredV1 to
+/// ItemDelivered and AddLine to AddLineItem (which nothing handles);
+/// COMMUTATIVE runs through [`order_changed`].
+pub fn order_aggregate(
     rules_version: &str,
-    ack: Ack,
-    seen: ListSink,
-) -> AggregateDispatch<counter::ListState> {
-    let rebuilder = Rebuilder::new(counter::ListState::default).apply(
-        "test.counter.Bumped",
-        |state: &mut counter::ListState, event| {
-            let key = counter::Bumped::decode(event.value.as_slice())?.key;
-            *state.items.entry(key).or_default() += 1;
+    settle: Settle,
+    seen: OrderSink,
+) -> AggregateDispatch<orders::v1::OrderState> {
+    let rebuilder = Rebuilder::new(orders::v1::OrderState::default)
+        .apply(
+            "orders.v1.ItemAdded",
+            |state: &mut orders::v1::OrderState, event| {
+                let item = orders::v1::ItemAdded::decode(event.value.as_slice())?.item;
+                *state.items.entry(item).or_default() += 1;
+                Ok(())
+            },
+        )
+        .apply(
+            "orders.v1.OrderNoteAdded",
+            |state: &mut orders::v1::OrderState, event| {
+                state.notes = orders::v1::OrderNoteAdded::decode(event.value.as_slice())?.note;
+                Ok(())
+            },
+        )
+        .with_snapshot(|state: &mut orders::v1::OrderState, any| {
+            *state = orders::v1::OrderState::decode(any.value.as_slice())?;
             Ok(())
-        },
-    );
-    let upcaster = angzarr_router::upcaster::UpcasterDispatch::new("list-commands", "list")
-        .on_event("test.counter.BumpV1", rename("test.counter.Bump"))
-        .on_event("test.counter.BumpOld", rename("test.counter.BumpLost"));
-    AggregateDispatch::new("List", "list", rebuilder)
+        });
+    let upcaster = angzarr_router::upcaster::UpcasterDispatch::new("order-payloads", "order")
+        .on_event("orders.v1.AddItemV1", rename("orders.v1.AddItem"))
+        .on_event(
+            "orders.v1.ItemDeliveredV1",
+            rename("orders.v1.ItemDelivered"),
+        )
+        .on_event("orders.v1.AddLine", rename("orders.v1.AddLineItem"));
+    let facts = seen.clone();
+    AggregateDispatch::new("Order", "order", rebuilder)
         .with_rules_version(rules_version)
-        .with_commutative(list_changed)
+        .with_commutative(order_changed)
         .with_command_upcaster(upcaster)
-        .on_command("test.counter.Bump", move |cmd, state, cctx| {
-            let key = counter::Bump::decode(cmd.value.as_slice())
-                .map_err(|e| HandlerError::Other(format!("decode Bump: {e}")))?
-                .key;
-            seen.lock().unwrap().push(ListObserved {
-                command: angzarr_router::type_name_from_url(&cmd.type_url).to_string(),
+        .on_command("orders.v1.AddItem", move |cmd, state, cctx| {
+            let item = orders::v1::AddItem::decode(cmd.value.as_slice())
+                .map_err(|e| HandlerError::Other(format!("decode AddItem: {e}")))?
+                .item;
+            seen.lock().unwrap().push(OrderObserved {
+                handled: angzarr_router::type_name_from_url(&cmd.type_url).to_string(),
+                item: item.clone(),
                 expected_sequence: cctx.expected_sequence,
                 conflict_resolution: cctx.conflict_resolution,
                 window: cctx
                     .conflict
                     .as_ref()
                     .map(|c| c.window().iter().map(|p| p.sequence).collect()),
-                items: {
-                    let mut keys: Vec<String> = state.items.keys().cloned().collect();
-                    keys.sort();
-                    keys
-                },
+                nonce: cctx.conflict.as_ref().map(|c| c.nonce().to_vec()),
+                items: sorted_items(state),
             });
             if let Some(conflict) = cctx.conflict.as_ref() {
-                match &ack {
-                    Ack::Delivered => {
+                match &settle {
+                    Settle::Delivered => {
                         conflict.resolve_conflicts(conflict.window(), conflict.nonce())
                     }
-                    Ack::Never => {}
-                    Ack::With(value) => conflict.resolve_conflicts(conflict.window(), value),
+                    Settle::Never => {}
+                    Settle::With(value) => conflict.resolve_conflicts(conflict.window(), value),
                 }
             }
             Ok(Some(pb::EventBook {
                 pages: vec![pb::EventPage {
-                    payload: Some(bumped(&key)),
+                    payload: Some(orders_any(&orders::v1::ItemAdded { item })),
                     ..Default::default()
                 }],
                 ..Default::default()
             }))
         })
+        .on_fact("orders.v1.ItemDelivered", move |fact, state| {
+            let item = orders::v1::ItemDelivered::decode(fact.value.as_slice())
+                .map_err(|e| HandlerError::Other(format!("decode ItemDelivered: {e}")))?
+                .item;
+            facts.lock().unwrap().push(OrderObserved {
+                handled: angzarr_router::type_name_from_url(&fact.type_url).to_string(),
+                item,
+                expected_sequence: 0,
+                conflict_resolution: pb::ConflictResolution::Unspecified,
+                window: None,
+                nonce: None,
+                items: sorted_items(state),
+            });
+            Ok(FactRecord::from(fact.clone()))
+        })
 }
 
-fn bumped(key: &str) -> prost_types::Any {
-    prost_types::Any {
-        type_url: angzarr_router::type_url("test.counter.Bumped"),
-        value: counter::Bumped {
-            key: key.to_string(),
-        }
-        .encode_to_vec(),
+fn order_event(kind: &str, value: &str) -> prost_types::Any {
+    match kind {
+        "ItemAdded" => orders_any(&orders::v1::ItemAdded {
+            item: value.to_string(),
+        }),
+        "OrderNoteAdded" => orders_any(&orders::v1::OrderNoteAdded {
+            note: value.to_string(),
+        }),
+        other => panic!("no order event {other}"),
     }
 }
 
-/// A `test.counter.<command>` command for item `key` to the list aggregate,
-/// over Bumped events of `history` at sequences 0.., resolved to
-/// `(expected_sequence, resolution, nonce)` when given.
-pub fn list_command(
+/// An `orders.v1.<command>` command for `item` to the order aggregate, over
+/// `history` ((event kind, value) at sequences 0..) and an optional delivered
+/// snapshot, resolved to `(expected_sequence, resolution, nonce)` when given.
+pub fn order_command(
     command: &str,
-    key: &str,
-    history: &[String],
+    item: &str,
+    history: &[(String, String)],
     handling: Option<(u64, pb::ConflictResolution, Vec<u8>)>,
+    snapshot: Option<pb::Snapshot>,
 ) -> pb::ContextualCommand {
     let (handling, nonce) = match handling {
         Some((expected, resolution, nonce)) => (
@@ -966,16 +1037,16 @@ pub fn list_command(
     pb::ContextualCommand {
         command: Some(pb::CommandBook {
             cover: Some(pb::Cover {
-                domain: "list".to_string(),
+                domain: "order".to_string(),
                 ..Default::default()
             }),
             page: Some(pb::CommandPage {
                 body: Some(pb::command_page::Body::Command(pb::Command {
                     payload: Some(prost_types::Any {
-                        type_url: angzarr_router::type_url(&format!("test.counter.{command}")),
-                        // Bump, BumpV1 and BumpOld share the key field.
-                        value: counter::Bump {
-                            key: key.to_string(),
+                        type_url: angzarr_router::type_url(&format!("orders.v1.{command}")),
+                        // Every orders.v1 command carries its item in field 1.
+                        value: orders::v1::AddItem {
+                            item: item.to_string(),
                         }
                         .encode_to_vec(),
                     }),
@@ -985,11 +1056,12 @@ pub fn list_command(
             handling,
         }),
         events: Some(pb::EventBook {
+            snapshot,
             pages: history
                 .iter()
                 .zip(0u64..)
-                .map(|(k, sequence)| pb::EventPage {
-                    payload: Some(bumped(k)),
+                .map(|((kind, value), sequence)| pb::EventPage {
+                    payload: Some(order_event(kind, value)),
                     sequence,
                     ..Default::default()
                 })
@@ -998,6 +1070,72 @@ pub fn list_command(
             ..Default::default()
         }),
         conflict_nonce: nonce.into(),
+    }
+}
+
+/// An `orders.v1.<fact>` fact for `item`, delivered in the Fact arm.
+pub fn order_fact(fact: &str, item: &str) -> pb::ContextualCommand {
+    let mut cc = order_command("AddItem", item, &[], None, None);
+    let page = cc
+        .command
+        .as_mut()
+        .and_then(|b| b.page.as_mut())
+        .expect("command page");
+    page.body = Some(pb::command_page::Body::Fact(pb::Fact {
+        payload: Some(prost_types::Any {
+            type_url: angzarr_router::type_url(&format!("orders.v1.{fact}")),
+            value: orders::v1::ItemDelivered {
+                item: item.to_string(),
+            }
+            .encode_to_vec(),
+        }),
+    }));
+    cc
+}
+
+/// A delivered snapshot of OrderState holding `items`, recorded under
+/// `rules_version` (which the router never judges: decision 14.1).
+pub fn order_snapshot(items: &[&str], rules_version: &str) -> pb::Snapshot {
+    pb::Snapshot {
+        sequence: 0,
+        state: Some(orders_any(&orders::v1::OrderState {
+            items: items.iter().map(|i| (i.to_string(), 1)).collect(),
+            ..Default::default()
+        })),
+        rules_version: rules_version.to_string(),
+    }
+}
+
+/// The Fulfillment process manager at `rules_version`: it reacts to
+/// OrderPlaced from "order" with nothing.
+pub fn fulfillment_pm(rules_version: &str) -> ProcessManagerDispatch<orders::v1::FulfillmentState> {
+    ProcessManagerDispatch::new(
+        "Fulfillment",
+        "fulfillment",
+        ["shipping"],
+        Rebuilder::new(orders::v1::FulfillmentState::default),
+    )
+    .with_rules_version(rules_version)
+    .on_event("order", "orders.v1.OrderPlaced", |_e, _s, _c| {
+        Ok(pb::ProcessManagerHandleResponse::default())
+    })
+}
+
+/// An OrderPlaced trigger from "order".
+pub fn order_placed_trigger() -> pb::ProcessManagerHandleRequest {
+    pb::ProcessManagerHandleRequest {
+        trigger: Some(pb::EventBook {
+            cover: Some(pb::Cover {
+                domain: "order".to_string(),
+                ..Default::default()
+            }),
+            pages: vec![pb::EventPage {
+                payload: Some(orders_any(&orders::v1::OrderPlaced {})),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        process_state: None,
     }
 }
 

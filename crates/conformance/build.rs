@@ -15,6 +15,7 @@ fn main() {
     let framework_proto = top.join("angzarr-project/proto");
     let conformance_proto = top.join("conformance/proto");
     let counter = conformance_proto.join("test/counter/counter.proto");
+    let order = conformance_proto.join("orders/v1/order.proto");
     // The fixture pool parses framework envelopes (ContextualCommand, EventPage)
     // from the .txtpb fixtures. The message-annotation counter.proto no longer
     // imports these, so the harness names them explicitly — its descriptor
@@ -35,7 +36,7 @@ fn main() {
         .extern_path(".sererr.v1", "::angzarr_router::proto::sererr::v1")
         .file_descriptor_set_path(&fds_path)
         .compile_protos(
-            &[counter, types, command_handler],
+            &[counter, order, types, command_handler],
             &[framework_proto, conformance_proto],
         )
         .expect("prost: compile conformance protos");

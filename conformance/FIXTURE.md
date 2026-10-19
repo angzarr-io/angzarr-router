@@ -61,14 +61,16 @@ historical-state evidence the framework supplies.
   prove each PM rebuilds only its own state and that a process state
   reaches only the PM that owns it.
 
-## The list aggregate (handling.feature)
+## The order aggregate and the Fulfillment process manager (handler-contract)
 
-Built by hand in the harness (no component options; the messages are at the
-end of `counter.proto`): `ListState` keeps one counter per item key, with
-the conflict unit `items[<key>]` (its `changed()` is hand-written to what the
-generator would emit). `Bump(key)` records `Bumped(key)`; the upcaster chain
-renames `BumpV1` to `Bump` and `BumpOld` to `BumpLost`, which nothing
-handles. It exercises the rules version on every response, the conflict
-window and nonce under AGGREGATE_HANDLES, the COMMUTATIVE resolver, and
-command upcasting.
-
+`crates/conformance/tests/handling.rs` binds angzarr-project's
+handler-contract tier (`features/handler-contract/handling.feature`,
+C-0533..C-0550) straight from the submodule; C-0535 (registration) is not
+bound yet. The fixtures are built by hand over the plain messages of
+`conformance/proto/orders/v1/order.proto`: `OrderState` keeps a quantity per
+item (conflict unit `items[<item>]`), a shipping address (its own unit) and
+unmarked notes (the wildcard `*notes`), with `changed()` hand-written to what
+the generator would emit. `AddItem(item)` records `ItemAdded(item)`; the
+upcaster chain renames `AddItemV1` to `AddItem`, `ItemDeliveredV1` to
+`ItemDelivered` (a fact) and `AddLine` to `AddLineItem`, which nothing
+handles. The Fulfillment process manager reacts to `OrderPlaced`.

@@ -117,7 +117,7 @@ libraries.
 
 - `just test`: the core unit bank, the FFI's raw-pointer ABI consumer test
   (`crates/router-ffi/src/lib.test.rs`), and the conformance features
-  driven natively by cucumber-rs (`crates/conformance`).
+  driven natively by cucumber-rs (`crates/conformance`), including angzarr-project's handler-contract tier (`features/handler-contract/handling.feature`, bound by scenario id from the submodule).
 - `just <lang>-binding-test` (parked at ABI 3, not run in CI): the same `conformance/features` run through
   each binding against fixtures implementing the generated handler
   interfaces from `conformance/proto/test/counter/counter.proto`, plus

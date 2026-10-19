@@ -1,0 +1,58 @@
+syntax = "proto3";
+
+package orders.v1;
+
+// The handler-contract tier's order vocabulary
+// (angzarr-project features/handler-contract/handling.feature,
+// C-0533..C-0550). Plain messages: the harness builds the order aggregate
+// and the Fulfillment process manager by hand.
+
+// Commands. AddItemV1 is AddItem's old name; AddLine upcasts to
+// AddLineItem, which nothing handles; RemoveEverything is neither handled
+// nor upcast.
+message AddItem {
+  string item = 1;
+}
+message AddItemV1 {
+  string item = 1;
+}
+message AddLine {
+  string item = 1;
+}
+message AddLineItem {
+  string item = 1;
+}
+message RemoveEverything {
+  string item = 1;
+}
+
+// Events.
+message ItemAdded {
+  string item = 1;
+}
+message OrderNoteAdded {
+  string note = 1;
+}
+message OrderPlaced {}
+
+// Facts. ItemDeliveredV1 is ItemDelivered's old name.
+message ItemDelivered {
+  string item = 1;
+}
+message ItemDeliveredV1 {
+  string item = 1;
+}
+
+// The order state: a quantity per item (one conflict unit per item, items[<item>]),
+// a shipping address (its own unit) and free-form notes (unmarked: a change
+// conflicts with everything, reported as the wildcard *notes).
+message OrderState {
+  map<string, uint32> items = 1;
+  string shipping_address = 2;
+  string notes = 3;
+}
+
+// The Fulfillment process manager's state.
+message FulfillmentState {
+  uint32 placed = 1;
+}
