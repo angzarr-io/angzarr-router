@@ -12,10 +12,8 @@ The `angzarr-client-*` libraries (including client-rust) still carry
 their own engines today; none of them links this router yet. client-rust
 is planned to adopt `crates/router`'s Rust-native API directly (no FFI). See
 [docs/architecture.md](docs/architecture.md) for where the router sits,
-its layers, and the engine semantics it guarantees. The decision record
-and bootstrap plan are [docs/decision-shared-rust-router.md](docs/decision-shared-rust-router.md)
-and [docs/plan-shared-router-bootstrap.md](docs/plan-shared-router-bootstrap.md);
-the org-wide decision is `docs/adr/0001-shared-rust-router-via-ffi.md` in
+its layers, and the engine semantics it guarantees. The decision is
+recorded as `docs/adr/0001-shared-rust-router-via-ffi.md` in
 [angzarr-project](https://github.com/angzarr-io/angzarr-project).
 
 ## Why this exists: code size & complexity
