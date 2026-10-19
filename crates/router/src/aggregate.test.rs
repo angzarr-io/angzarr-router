@@ -378,7 +378,6 @@ fn the_emitted_book_passes_through_unstamped() {
     let resp = d.dispatch(&req).expect("dispatch");
     assert_eq!(resp.events, Some(emitted));
     assert_eq!(resp.rules_version, "");
-    assert!(!resp.snapshot_refused);
 }
 
 #[test]

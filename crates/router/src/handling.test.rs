@@ -7,9 +7,6 @@
 //!   command_handler.proto CommandHandlerResponse.rules_version,
 //!   process_manager.proto ProcessManagerHandleResponse.rules_version;
 //!   decision 12.6; backlog RV-2.
-//! - snapshot refusal: types.proto Snapshot (Validity),
-//!   command_handler.proto CommandHandlerService.Handle step 1; decision
-//!   12.6; backlog RV-3.
 //! - conflict delivery: types.proto Handling, ConflictResolution,
 //!   ContextualCommand.conflict_nonce; decision 12.7; backlog HD-5, NC-1.
 //! - COMMUTATIVE resolver and overlap: options.proto conflict_units region
@@ -17,9 +14,11 @@
 //! - command upcasting: upcaster.proto, command_handler.proto Handle step 2;
 //!   decision 12.11; backlog VC-1.
 //!
-//! The angzarr-project features carry no scenario ids for these yet: the
-//! coordinator-contract merge_strategy.feature (C-0149..C-0176) still
-//! describes the superseded MergeStrategy and coordinator-side Replay diff.
+//! The behaviour-level scenarios are angzarr-project's handler-contract
+//! tier (features/handler-contract/handling.feature, C-0533..C-0550), bound
+//! by crates/conformance/tests/handling.rs. Snapshot selection is the
+//! coordinator's (decision 14.1): the router folds a delivered snapshot
+//! unchecked.
 
 use std::sync::{Arc, Mutex};
 

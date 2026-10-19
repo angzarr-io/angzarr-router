@@ -397,7 +397,6 @@ impl<S> AggregateDispatch<S> {
         Ok(pb::CommandHandlerResponse {
             events: Some(events),
             rules_version: self.rules_version.clone(),
-            snapshot_refused: false,
         })
     }
 

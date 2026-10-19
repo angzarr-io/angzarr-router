@@ -477,7 +477,6 @@ fn merge_concatenates_in_order() {
             process_events: vec![tagged_book("p2")],
             commands: vec![command_to("c2")],
             rules_version: "v2".to_string(),
-            snapshot_refused: true,
         },
     );
     merge_response(
@@ -495,7 +494,6 @@ fn merge_concatenates_in_order() {
         .collect();
     assert_eq!(cmd_domains, vec!["c1", "c2"]);
     assert_eq!(acc.rules_version, "v2", "the first reported rules version");
-    assert!(acc.snapshot_refused, "any refusal marks the merge");
 }
 
 // The handler reads the trigger's cover (e.g. to address the trigger's root).

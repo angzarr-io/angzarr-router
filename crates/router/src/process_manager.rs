@@ -255,8 +255,7 @@ pub fn select_process_managers(
 
 /// Folds one co-resident PM's response into the merged response: process
 /// events and commands concatenate in dispatch order; the first non-empty
-/// rules version is kept, and a refused snapshot anywhere marks the merge
-/// refused.
+/// rules version is kept.
 pub fn merge_response(
     acc: &mut pb::ProcessManagerHandleResponse,
     resp: pb::ProcessManagerHandleResponse,
@@ -266,7 +265,6 @@ pub fn merge_response(
     if acc.rules_version.is_empty() {
         acc.rules_version = resp.rules_version;
     }
-    acc.snapshot_refused |= resp.snapshot_refused;
 }
 
 #[cfg(test)]
