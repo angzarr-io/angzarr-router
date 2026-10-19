@@ -1,8 +1,7 @@
 //! AggregateDispatch contracts, transliterated from client-go's
 //! engine_test.go + engine_boundaries_test.go aggregate subset:
 //! validate-before-rebuild, exact envelope guard codes, CommandContext
-//! evidence, FQ-keyed rejection routing with ordered fan-out, and
-//! fill-only ext/sequence stamping.
+//! evidence, and fill-only ext/sequence stamping.
 
 use std::sync::{Arc, Mutex};
 
@@ -12,9 +11,7 @@ use crate::aggregate::{AggregateDispatch, CommandContext};
 use crate::error::codes;
 use crate::pb;
 use crate::test_support::*;
-use crate::{page_event, TYPE_URL_PREFIX};
-
-const FQ_RESERVE: &str = "io.angzarr.examples.v1.ReserveStock";
+use crate::TYPE_URL_PREFIX;
 
 fn test_agg_dispatch() -> (
     AggregateDispatch<TestState>,
@@ -163,151 +160,6 @@ fn command_types_exact() {
             Ok(Some(pb::EventBook::default()))
         });
     assert_eq!(d.command_types(), vec!["test.CreateOrder".to_string()]);
-}
-
-fn notification_command_for(fq_command: &str) -> Any {
-    page_event(&notification_page_for(fq_command))
-        .expect("notification page carries an event")
-        .clone()
-}
-
-#[test]
-fn rejection_routes_by_fq_with_state() {
-    let saw_state = Arc::new(Mutex::new(None));
-    let seen = saw_state.clone();
-    let d = AggregateDispatch::new("agg-test", "order", cover_applier(fresh_rebuilder()))
-        .on_rejected(FQ_RESERVE, move |_, _, state: &mut TestState, _| {
-            *seen.lock().unwrap() = Some(state.applied.clone());
-            Ok(pb::BusinessResponse::default())
-        });
-
-    let cmd = pb::ContextualCommand {
-        command: Some(pb::CommandBook {
-            pages: vec![pb::CommandPage {
-                payload: Some(pb::command_page::Payload::Command(
-                    notification_command_for(FQ_RESERVE),
-                )),
-                ..Default::default()
-            }],
-            ..Default::default()
-        }),
-        events: Some(book_of_covers(&["prior"])),
-    };
-
-    d.dispatch(&cmd).expect("dispatch");
-    let saw = saw_state.lock().unwrap().clone();
-    assert_eq!(
-        saw,
-        Some(vec!["prior".to_string()]),
-        "rejection handler must receive rebuilt prior state"
-    );
-}
-
-// Multiple compensators for the same rejection ALL run, in registration
-// order — distinct undoings (release funds AND notify) are independently
-// registered. Their compensation events merge into one response.
-#[test]
-fn multiple_compensators_all_run_in_order() {
-    let order = Arc::new(Mutex::new(Vec::new()));
-    fn one_page_events() -> Result<pb::BusinessResponse, crate::error::HandlerError> {
-        Ok(pb::BusinessResponse {
-            result: Some(pb::business_response::Result::Events(pb::EventBook {
-                pages: vec![pb::EventPage::default()],
-                ..Default::default()
-            })),
-        })
-    }
-    let first = order.clone();
-    let second = order.clone();
-    let d = AggregateDispatch::new("agg-test", "payment", fresh_rebuilder())
-        .on_rejected(FQ_RESERVE, move |_, _, _: &mut TestState, _| {
-            first.lock().unwrap().push("first");
-            one_page_events()
-        })
-        .on_rejected(FQ_RESERVE, move |_, _, _: &mut TestState, _| {
-            second.lock().unwrap().push("second");
-            one_page_events()
-        });
-
-    let resp = d
-        .dispatch(&command_for(notification_command_for(FQ_RESERVE)))
-        .expect("dispatch");
-    assert_eq!(*order.lock().unwrap(), vec!["first", "second"]);
-    assert_eq!(
-        events_of(&resp).map(|b| b.pages.len()),
-        Some(2),
-        "merged compensation events"
-    );
-}
-
-// Compensation events append after prior history — the rejection thunk
-// needs the aggregate's next_sequence to stamp them.
-#[test]
-fn rejection_receives_command_context() {
-    let saw = Arc::new(Mutex::new(CommandContext::default()));
-    let seen = saw.clone();
-    let d = AggregateDispatch::new("agg-test", "payment", fresh_rebuilder()).on_rejected(
-        FQ_RESERVE,
-        move |_, _, _: &mut TestState, cctx| {
-            *seen.lock().unwrap() = cctx;
-            Ok(pb::BusinessResponse::default())
-        },
-    );
-
-    let cmd = pb::ContextualCommand {
-        command: Some(pb::CommandBook {
-            pages: vec![pb::CommandPage {
-                payload: Some(pb::command_page::Payload::Command(
-                    notification_command_for(FQ_RESERVE),
-                )),
-                ..Default::default()
-            }],
-            ..Default::default()
-        }),
-        events: Some(pb::EventBook {
-            next_sequence: 7,
-            pages: vec![pb::EventPage::default()],
-            ..Default::default()
-        }),
-    };
-    d.dispatch(&cmd).expect("dispatch");
-    let cctx = *saw.lock().unwrap();
-    assert_eq!(
-        cctx.next_sequence, 7,
-        "compensation stamping needs next_sequence"
-    );
-    assert!(cctx.had_prior_events, "had_prior_events with prior history");
-}
-
-// An undeclared rejection is the framework's to handle
-// (DelegateToFramework) and yields an empty response, by declaration
-// rather than by accident.
-#[test]
-fn undeclared_rejection_delegates_to_framework() {
-    let d: AggregateDispatch<TestState> =
-        AggregateDispatch::new("agg-test", "order", fresh_rebuilder());
-    let resp = d
-        .dispatch(&command_for(notification_command_for(
-            "io.angzarr.examples.v1.SomethingElse",
-        )))
-        .expect("undeclared rejection must not error (framework default)");
-    assert!(
-        resp.result.is_none(),
-        "undeclared rejection yields an empty response"
-    );
-}
-
-#[test]
-fn corrupt_notification_coded() {
-    let d: AggregateDispatch<TestState> =
-        AggregateDispatch::new("agg-test", "order", fresh_rebuilder());
-    let err = d
-        .dispatch(&command_for(Any {
-            type_url: crate::NOTIFICATION_TYPE_URL.to_string(),
-            value: vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
-        }))
-        .expect_err("corrupt Notification must error");
-    assert_eq!(err.code, codes::NOTIFICATION_DECODE_FAILED);
 }
 
 // The dispatch path stamps the command's cover.ext onto the emitted

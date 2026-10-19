@@ -8,17 +8,14 @@
 //! the NEWEST page fires, so history never re-triggers. Handlers are keyed by
 //! (input domain, fully-qualified event type). A trigger from a domain outside
 //! the PM's sources, or an undeclared event type, yields an empty response
-//! (spec C-0022), not an error. A Notification trigger routes to the FQ-keyed
-//! compensators (ordered, C-0042); their process events merge and the FIRST
-//! escalation Notification wins (response field 4).
+//! (spec C-0022), not an error. There is no compensation input.
 
 use std::collections::HashMap;
 
-use prost::Message;
 use prost_types::Any;
 
 use crate::destinations::Destinations;
-use crate::error::{codes, extras, map_handler_error, messages, CodedError, HandlerError};
+use crate::error::{codes, map_handler_error, messages, CodedError, HandlerError};
 use crate::pb;
 use crate::rebuild::Rebuilder;
 
@@ -32,19 +29,6 @@ pub type EventFn<S> = Box<
         + Sync,
 >;
 
-/// Compensates a rejected PM-issued command against rebuilt state, returning
-/// process events and an optional escalation Notification (rides field 4 of
-/// the response).
-pub type RejectionFn<S> = Box<
-    dyn Fn(
-            &pb::Notification,
-            &pb::RejectionNotification,
-            &mut S,
-        ) -> Result<(Vec<pb::EventBook>, Option<pb::Notification>), HandlerError>
-        + Send
-        + Sync,
->;
-
 /// The dispatch table for one process-manager component.
 pub struct ProcessManagerDispatch<S> {
     name: String,
@@ -52,7 +36,6 @@ pub struct ProcessManagerDispatch<S> {
     rebuilder: Rebuilder<S>,
     /// input domain → fully-qualified event type → thunk.
     handlers: HashMap<String, HashMap<String, EventFn<S>>>,
-    rejections: HashMap<String, Vec<RejectionFn<S>>>,
 }
 
 impl<S> ProcessManagerDispatch<S> {
@@ -68,7 +51,6 @@ impl<S> ProcessManagerDispatch<S> {
             pm_domain: pm_domain.into(),
             rebuilder,
             handlers: HashMap::new(),
-            rejections: HashMap::new(),
         }
     }
 
@@ -90,28 +72,6 @@ impl<S> ProcessManagerDispatch<S> {
             .entry(input_domain.to_string())
             .or_default()
             .insert(full_name.to_string(), Box::new(thunk));
-        self
-    }
-
-    /// Registers a compensation thunk keyed by the fully-qualified rejected
-    /// command type. Repeated registration for one command appends, preserving
-    /// order (C-0042).
-    pub fn on_rejected(
-        mut self,
-        fq_command_type: &str,
-        thunk: impl Fn(
-                &pb::Notification,
-                &pb::RejectionNotification,
-                &mut S,
-            ) -> Result<(Vec<pb::EventBook>, Option<pb::Notification>), HandlerError>
-            + Send
-            + Sync
-            + 'static,
-    ) -> Self {
-        self.rejections
-            .entry(fq_command_type.to_string())
-            .or_default()
-            .push(Box::new(thunk));
         self
     }
 
@@ -140,8 +100,7 @@ impl<S> ProcessManagerDispatch<S> {
 
     /// Handles a trigger book against rebuilt PM state. Only the NEWEST page
     /// of the trigger fires; a trigger outside the PM's sources or of an
-    /// undeclared type yields an empty response (C-0022). A Notification page
-    /// routes to the compensation path.
+    /// undeclared type yields an empty response (C-0022).
     pub fn dispatch(
         &self,
         req: &pb::ProcessManagerHandleRequest,
@@ -168,11 +127,6 @@ impl<S> ProcessManagerDispatch<S> {
             ));
         };
 
-        // Exact type-URL match only — suffix matching misroutes user types.
-        if crate::is_notification_type_url(&event_any.type_url) {
-            return self.dispatch_rejection(event_any, req.process_state.as_ref());
-        }
-
         let trigger_domain = trigger
             .cover
             .as_ref()
@@ -188,54 +142,6 @@ impl<S> ProcessManagerDispatch<S> {
         let (mut state, _info) = self.rebuilder.rebuild(req.process_state.as_ref())?;
         let dests = Destinations::new(req.destination_sequences.clone());
         thunk(event_any, &mut state, &dests).map_err(map_handler_error)
-    }
-
-    /// Routes a Notification trigger to the FQ-keyed compensators (ordered,
-    /// C-0042); process events merge and the first escalation wins. An
-    /// undeclared rejection is the framework's to handle (DelegateToFramework)
-    /// and yields an empty response.
-    fn dispatch_rejection(
-        &self,
-        event_any: &Any,
-        process_state: Option<&pb::EventBook>,
-    ) -> Result<pb::ProcessManagerHandleResponse, CodedError> {
-        let notification = pb::Notification::decode(event_any.value.as_slice()).map_err(|_| {
-            CodedError::invalid_argument(
-                codes::NOTIFICATION_DECODE_FAILED,
-                messages::NOTIFICATION_DECODE_FAILED,
-                [(extras::TYPE_URL.to_string(), event_any.type_url.clone())],
-            )
-        })?;
-
-        let rejection = match notification.payload.as_ref() {
-            Some(payload) => {
-                pb::RejectionNotification::decode(payload.value.as_slice()).map_err(|_| {
-                    CodedError::invalid_argument(
-                        codes::REJECTION_NOTIFICATION_DECODE_FAILED,
-                        messages::REJECTION_NOTIFICATION_DECODE_FAILED,
-                        [],
-                    )
-                })?
-            }
-            None => pb::RejectionNotification::default(),
-        };
-
-        let (_domain, fq_command) = crate::extract_rejection_key(&rejection);
-        let Some(thunks) = self.rejections.get(&fq_command) else {
-            return Ok(pb::ProcessManagerHandleResponse::default()); // DelegateToFramework
-        };
-
-        let (mut state, _info) = self.rebuilder.rebuild(process_state)?;
-        let mut out = pb::ProcessManagerHandleResponse::default();
-        for thunk in thunks {
-            let (process_events, escalation) =
-                thunk(&notification, &rejection, &mut state).map_err(map_handler_error)?;
-            out.process_events.extend(process_events);
-            if out.notification.is_none() {
-                out.notification = escalation;
-            }
-        }
-        Ok(out)
     }
 }
 

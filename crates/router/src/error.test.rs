@@ -36,8 +36,6 @@ fn other_coded_client_errors_are_invalid_argument() {
         codes::MISSING_COMMAND_BOOK,
         codes::MISSING_COMMAND_PAGE,
         codes::MISSING_COMMAND_PAYLOAD,
-        codes::NOTIFICATION_DECODE_FAILED,
-        codes::REJECTION_NOTIFICATION_DECODE_FAILED,
     ] {
         let err = CodedError::invalid_argument(code, "x", []);
         assert_eq!(err.grpc, GrpcCode::InvalidArgument, "code {code}");

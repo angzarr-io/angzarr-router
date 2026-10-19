@@ -28,8 +28,6 @@ pub mod codes {
     pub const MISSING_COMMAND_BOOK: &str = "MISSING_COMMAND_BOOK";
     pub const MISSING_COMMAND_PAGE: &str = "MISSING_COMMAND_PAGE";
     pub const MISSING_COMMAND_PAYLOAD: &str = "MISSING_COMMAND_PAYLOAD";
-    pub const NOTIFICATION_DECODE_FAILED: &str = "NOTIFICATION_DECODE_FAILED";
-    pub const REJECTION_NOTIFICATION_DECODE_FAILED: &str = "REJECTION_NOTIFICATION_DECODE_FAILED";
     pub const PERSISTED_EVENT_CORRUPT: &str = "PERSISTED_EVENT_CORRUPT";
     pub const UNHANDLED_HANDLER_ERROR: &str = "UNHANDLED_HANDLER_ERROR";
     pub const MISSING_EVENT_BOOK_COVER: &str = "MISSING_EVENT_BOOK_COVER";
@@ -45,9 +43,6 @@ pub mod codes {
 pub mod messages {
     pub const UNKNOWN_COMMAND: &str = "Unknown command type";
     pub const NO_COMMAND_PAGES: &str = "No command pages";
-    pub const NOTIFICATION_DECODE_FAILED: &str = "failed to decode Notification payload";
-    pub const REJECTION_NOTIFICATION_DECODE_FAILED: &str =
-        "failed to decode RejectionNotification payload";
     pub const PERSISTED_EVENT_CORRUPT: &str = "persisted event payload corrupt";
     pub const MISSING_EVENT_BOOK_COVER: &str = "missing event book cover";
     pub const MISSING_SAGA_SOURCE: &str = "missing saga source";

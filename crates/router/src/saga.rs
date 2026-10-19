@@ -4,18 +4,16 @@
 //! `features/saga.go`. A saga holds NO state and rebuilds nothing: every
 //! page of the source book is a fresh trigger. Declared event types emit
 //! commands (stamped from the coordinator-supplied Destinations) and/or
-//! injected fact events; a Notification page routes to the FQ-keyed
-//! compensation thunks (ordered, C-0042); an undeclared event type or
-//! undeclared rejection is silently skipped (DelegateToFramework), not an
-//! error. Emitted commands inherit the source correlation id FILL-ONLY.
+//! injected fact events; an undeclared event type is silently skipped
+//! (DelegateToFramework), not an error. There is no compensation input.
+//! Emitted commands inherit the source correlation id FILL-ONLY.
 
 use std::collections::HashMap;
 
-use prost::Message;
 use prost_types::Any;
 
 use crate::destinations::Destinations;
-use crate::error::{codes, extras, map_handler_error, messages, CodedError, HandlerError};
+use crate::error::{codes, map_handler_error, messages, CodedError, HandlerError};
 use crate::pb;
 
 /// Translates one source event into commands and/or injected fact events.
@@ -31,25 +29,12 @@ pub type EventFn = Box<
         + Sync,
 >;
 
-/// Compensates a rejected command, returning fact events to inject. Keyed
-/// by fully-qualified command type; multiple thunks for one command run in
-/// registration order (C-0042).
-pub type RejectionFn = Box<
-    dyn Fn(
-            &pb::Notification,
-            &pb::RejectionNotification,
-        ) -> Result<Vec<pb::EventBook>, HandlerError>
-        + Send
-        + Sync,
->;
-
 /// The dispatch table for one saga component.
 pub struct SagaDispatch {
     name: String,
     input_domain: String,
     targets: Vec<String>,
     handlers: HashMap<String, EventFn>,
-    rejections: HashMap<String, Vec<RejectionFn>>,
 }
 
 impl SagaDispatch {
@@ -65,7 +50,6 @@ impl SagaDispatch {
             input_domain: input_domain.into(),
             targets: target_domains.into_iter().map(Into::into).collect(),
             handlers: HashMap::new(),
-            rejections: HashMap::new(),
         }
     }
 
@@ -83,27 +67,6 @@ impl SagaDispatch {
             + 'static,
     ) -> Self {
         self.handlers.insert(full_name.to_string(), Box::new(thunk));
-        self
-    }
-
-    /// Registers a compensation thunk for a fully-qualified command type.
-    /// Repeated registration for one command appends, preserving order
-    /// (C-0042).
-    pub fn on_rejected(
-        mut self,
-        fq_command: &str,
-        thunk: impl Fn(
-                &pb::Notification,
-                &pb::RejectionNotification,
-            ) -> Result<Vec<pb::EventBook>, HandlerError>
-            + Send
-            + Sync
-            + 'static,
-    ) -> Self {
-        self.rejections
-            .entry(fq_command.to_string())
-            .or_default()
-            .push(Box::new(thunk));
         self
     }
 
@@ -134,11 +97,10 @@ impl SagaDispatch {
         m
     }
 
-    /// Walks EVERY page of the source book: notification pages route to the
-    /// FQ-keyed compensation thunks; declared event types emit; undeclared
-    /// types are skipped. Emitted commands inherit the source correlation id
-    /// fill-only. A nil source is MISSING_SAGA_SOURCE; a source with no
-    /// pages is EMPTY_SAGA_SOURCE.
+    /// Walks EVERY page of the source book: declared event types emit;
+    /// undeclared types are skipped. Emitted commands inherit the source
+    /// correlation id fill-only. A nil source is MISSING_SAGA_SOURCE; a
+    /// source with no pages is EMPTY_SAGA_SOURCE.
     pub fn dispatch(&self, req: &pb::SagaHandleRequest) -> Result<pb::SagaResponse, CodedError> {
         let Some(source) = req.source.as_ref() else {
             return Err(CodedError::invalid_argument(
@@ -162,12 +124,6 @@ impl SagaDispatch {
             let Some(event_any) = crate::page_event(page) else {
                 continue;
             };
-
-            // Exact type-URL match only — suffix matching misroutes user types.
-            if crate::is_notification_type_url(&event_any.type_url) {
-                resp.events.extend(self.dispatch_rejection(event_any)?);
-                continue;
-            }
 
             let Some(thunk) = self
                 .handlers
@@ -198,43 +154,6 @@ impl SagaDispatch {
             }
         }
         Ok(resp)
-    }
-
-    /// Decodes a Notification page and routes it to the FQ-keyed
-    /// compensation thunks (ordered, C-0042). An undeclared rejection is the
-    /// framework's to handle (DelegateToFramework) and yields no events.
-    fn dispatch_rejection(&self, event_any: &Any) -> Result<Vec<pb::EventBook>, CodedError> {
-        let notification = pb::Notification::decode(event_any.value.as_slice()).map_err(|_| {
-            CodedError::invalid_argument(
-                codes::NOTIFICATION_DECODE_FAILED,
-                messages::NOTIFICATION_DECODE_FAILED,
-                [(extras::TYPE_URL.to_string(), event_any.type_url.clone())],
-            )
-        })?;
-
-        let rejection = match notification.payload.as_ref() {
-            Some(payload) => {
-                pb::RejectionNotification::decode(payload.value.as_slice()).map_err(|_| {
-                    CodedError::invalid_argument(
-                        codes::REJECTION_NOTIFICATION_DECODE_FAILED,
-                        messages::REJECTION_NOTIFICATION_DECODE_FAILED,
-                        [],
-                    )
-                })?
-            }
-            None => pb::RejectionNotification::default(),
-        };
-
-        let (_domain, fq_command) = crate::extract_rejection_key(&rejection);
-        let Some(thunks) = self.rejections.get(&fq_command) else {
-            return Ok(Vec::new()); // undeclared: DelegateToFramework
-        };
-
-        let mut events = Vec::new();
-        for thunk in thunks {
-            events.extend(thunk(&notification, &rejection).map_err(map_handler_error)?);
-        }
-        Ok(events)
     }
 }
 

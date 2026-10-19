@@ -24,22 +24,6 @@ use prost_types::Any;
 /// segment after it is the fully-qualified proto name — no resolver host.
 pub const TYPE_URL_PREFIX: &str = "/";
 
-/// Fully-qualified proto name of the cross-domain rejection Notification.
-pub const NOTIFICATION_FULL_NAME: &str = "io.angzarr.v1.Notification";
-
-/// Canonical wire type_url angzarr PRODUCES for rejection notifications
-/// (bare form). Other-language bindings stamp the same message with their
-/// `Any.Pack()` default (`type.googleapis.com/...`); recognition therefore
-/// matches the full FQN regardless of prefix — see [`is_notification_type_url`].
-pub const NOTIFICATION_TYPE_URL: &str = "/io.angzarr.v1.Notification";
-
-/// True iff `type_url` carries the Notification message, regardless of its
-/// resolver prefix. Matches the FULL FQN (an absolute name), not a partial
-/// suffix — so a user-defined `*.FooNotification` never misroutes.
-pub fn is_notification_type_url(type_url: &str) -> bool {
-    type_name_from_url(type_url) == NOTIFICATION_FULL_NAME
-}
-
 /// Constructs a canonical (bare) type URL from a fully-qualified type name.
 pub fn type_url(full_name: &str) -> String {
     format!("{TYPE_URL_PREFIX}{full_name}")
@@ -84,26 +68,6 @@ pub fn command_payload(page: &pb::CommandPage) -> Option<&Any> {
         Some(pb::command_page::Payload::Command(any)) => Some(any),
         _ => None,
     }
-}
-
-/// Extracts the source domain and FULLY-QUALIFIED command type name from
-/// a RejectionNotification (FQ keys; short names never match).
-pub fn extract_rejection_key(rejection: &pb::RejectionNotification) -> (String, String) {
-    let Some(rejected) = rejection.rejected_command.as_ref() else {
-        return (String::new(), String::new());
-    };
-    let domain = rejected
-        .cover
-        .as_ref()
-        .map(|c| c.domain.clone())
-        .unwrap_or_default();
-    let cmd_type = rejected
-        .pages
-        .first()
-        .and_then(command_payload)
-        .map(|cmd| type_name_from_url(&cmd.type_url).to_string())
-        .unwrap_or_default();
-    (domain, cmd_type)
 }
 
 #[cfg(test)]

@@ -3,9 +3,8 @@
 //! (spec C-0022, C-0042): a STATEFUL translator that fires only the newest
 //! trigger page against rebuilt PM state, keys handlers by (input domain, FQ
 //! type), treats out-of-sources / undeclared triggers as empty (not error),
-//! routes Notification triggers to ordered compensators (first escalation
-//! wins), and surfaces MISSING/EMPTY_PM_TRIGGER, MISSING_PM_EVENT_PAYLOAD,
-//! NOTIFICATION_DECODE_FAILED, and PERSISTED_EVENT_CORRUPT (from rebuild).
+//! and surfaces MISSING/EMPTY_PM_TRIGGER, MISSING_PM_EVENT_PAYLOAD, and
+//! PERSISTED_EVENT_CORRUPT (from rebuild).
 
 use prost_types::Any;
 
@@ -14,15 +13,13 @@ use crate::pb;
 use crate::process_manager::ProcessManagerDispatch;
 use crate::rebuild::Rebuilder;
 use crate::test_support::{
-    book_of_covers, corrupt_cover_any, cover_applier, event_page, fresh_rebuilder,
-    notification_page_for, TestState,
+    book_of_covers, corrupt_cover_any, cover_applier, event_page, fresh_rebuilder, TestState,
 };
 use crate::type_url;
 
 const IN_DOMAIN: &str = "orders";
 const FQ_SHIPPED: &str = "test.OrderShipped";
 const FQ_OTHER: &str = "test.OrderCancelled";
-const FQ_RESERVE: &str = "test.ReserveStock";
 
 // --- fixtures -------------------------------------------------------------
 
@@ -80,17 +77,6 @@ fn command_to(domain: &str) -> pb::CommandBook {
 /// A process-event / fact EventBook tagged with `label` in its cover domain.
 fn tagged_book(label: &str) -> pb::EventBook {
     pb::EventBook {
-        cover: Some(pb::Cover {
-            domain: label.to_string(),
-            ..Default::default()
-        }),
-        ..Default::default()
-    }
-}
-
-/// An escalation Notification tagged with `label` in its cover domain.
-fn escalation(label: &str) -> pb::Notification {
-    pb::Notification {
         cover: Some(pb::Cover {
             domain: label.to_string(),
             ..Default::default()
@@ -286,75 +272,6 @@ fn handler_can_emit_process_events_and_facts() {
     assert_eq!(book_domains(&resp.facts), vec!["fact".to_string()]);
 }
 
-// --- rejection fan-out (C-0042) + escalation ------------------------------
-
-#[test]
-fn notification_routes_to_ordered_compensators() {
-    let d = ProcessManagerDispatch::new(
-        "fulfillment-pm",
-        "fulfillment",
-        cover_applier(fresh_rebuilder()),
-    )
-    .on_rejected(FQ_RESERVE, |_n, _r, _s| {
-        Ok((vec![tagged_book("comp-1")], None))
-    })
-    .on_rejected(FQ_RESERVE, |_n, _r, _s| {
-        Ok((vec![tagged_book("comp-2")], None))
-    });
-    let resp = d
-        .dispatch(&request(
-            Some(trigger(IN_DOMAIN, vec![notification_page_for(FQ_RESERVE)])),
-            None,
-            &[],
-        ))
-        .expect("dispatch");
-    assert_eq!(
-        book_domains(&resp.process_events),
-        vec!["comp-1".to_string(), "comp-2".to_string()]
-    );
-}
-
-#[test]
-fn first_escalation_wins() {
-    let d = ProcessManagerDispatch::new(
-        "fulfillment-pm",
-        "fulfillment",
-        cover_applier(fresh_rebuilder()),
-    )
-    .on_rejected(FQ_RESERVE, |_n, _r, _s| {
-        Ok((vec![], Some(escalation("esc-1"))))
-    })
-    .on_rejected(FQ_RESERVE, |_n, _r, _s| {
-        Ok((vec![], Some(escalation("esc-2"))))
-    });
-    let resp = d
-        .dispatch(&request(
-            Some(trigger(IN_DOMAIN, vec![notification_page_for(FQ_RESERVE)])),
-            None,
-            &[],
-        ))
-        .expect("dispatch");
-    assert_eq!(
-        resp.notification.expect("escalation").cover.unwrap().domain,
-        "esc-1",
-        "first escalation wins"
-    );
-}
-
-#[test]
-fn undeclared_rejection_yields_empty_response() {
-    let d = pm_emitting_one(); // no compensators registered
-    let resp = d
-        .dispatch(&request(
-            Some(trigger(IN_DOMAIN, vec![notification_page_for(FQ_RESERVE)])),
-            None,
-            &[],
-        ))
-        .expect("dispatch");
-    assert!(resp.process_events.is_empty());
-    assert!(resp.notification.is_none());
-}
-
 // --- envelope + error guards ----------------------------------------------
 
 #[test]
@@ -386,24 +303,6 @@ fn trigger_last_page_without_payload_is_coded() {
         ))
         .expect_err("payload-less trigger must fail");
     assert_eq!(err.code, codes::MISSING_PM_EVENT_PAYLOAD);
-}
-
-#[test]
-fn corrupt_notification_payload_is_coded() {
-    let bad = event_page(Any {
-        type_url: crate::NOTIFICATION_TYPE_URL.to_string(),
-        value: vec![0xFF, 0xFF, 0xFF, 0xFF],
-    });
-    let d = ProcessManagerDispatch::new(
-        "fulfillment-pm",
-        "fulfillment",
-        cover_applier(fresh_rebuilder()),
-    )
-    .on_rejected(FQ_RESERVE, |_n, _r, _s| Ok((vec![], None)));
-    let err = d
-        .dispatch(&request(Some(trigger(IN_DOMAIN, vec![bad])), None, &[]))
-        .expect_err("corrupt notification must fail");
-    assert_eq!(err.code, codes::NOTIFICATION_DECODE_FAILED);
 }
 
 #[test]

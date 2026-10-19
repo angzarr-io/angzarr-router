@@ -2,8 +2,7 @@
 //! SagaDispatch.Dispatch + features/saga.go (spec C-0050..C-0053, C-0042):
 //! a stateless translator that walks EVERY source page, emits commands
 //! (stamped from coordinator Destinations) and/or injected fact events for
-//! declared event types, routes Notification pages to ordered compensation
-//! thunks, skips undeclared events/rejections (DelegateToFramework), and
+//! declared event types, skips undeclared events (DelegateToFramework), and
 //! fills the source correlation id onto emitted commands fill-only.
 
 use std::collections::HashMap;
@@ -14,12 +13,11 @@ use prost_types::Any;
 use crate::error::{codes, HandlerError};
 use crate::pb;
 use crate::saga::SagaDispatch;
-use crate::test_support::{event_page, notification_page_for};
-use crate::{type_url, NOTIFICATION_TYPE_URL};
+use crate::test_support::event_page;
+use crate::type_url;
 
 const FQ_ORDER_CREATED: &str = "test.OrderCreated";
 const FQ_STOCK_RESERVED: &str = "test.StockReserved";
-const FQ_RESERVE_STOCK: &str = "test.ReserveStock";
 
 // --- fixtures -------------------------------------------------------------
 
@@ -236,48 +234,6 @@ fn handler_observes_destination_sequences() {
     assert_eq!(observed.lock().unwrap().get("inventory"), Some(&5));
 }
 
-// --- rejection fan-out (C-0042) ------------------------------------------
-
-#[test]
-fn notification_routes_to_ordered_rejection_thunks() {
-    // Two compensators for the same command run in REGISTRATION order
-    // (C-0042); their fact events merge in that order.
-    let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory"])
-        .on_rejected(FQ_RESERVE_STOCK, |_n, _r| Ok(vec![fact_event("comp-1")]))
-        .on_rejected(FQ_RESERVE_STOCK, |_n, _r| Ok(vec![fact_event("comp-2")]));
-    let resp = saga
-        .dispatch(&request(
-            Some(source_book(
-                "order",
-                vec![notification_page_for(FQ_RESERVE_STOCK)],
-            )),
-            &[],
-        ))
-        .expect("dispatch");
-    assert_eq!(
-        event_domains(&resp),
-        vec!["comp-1".to_string(), "comp-2".to_string()]
-    );
-}
-
-#[test]
-fn undeclared_rejection_yields_empty_response() {
-    // A notification for a command with no registered compensator is the
-    // framework's to handle (DelegateToFramework): empty, not an error.
-    let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory"]);
-    let resp = saga
-        .dispatch(&request(
-            Some(source_book(
-                "order",
-                vec![notification_page_for(FQ_RESERVE_STOCK)],
-            )),
-            &[],
-        ))
-        .expect("dispatch");
-    assert!(resp.events.is_empty());
-    assert!(resp.commands.is_empty());
-}
-
 // --- correlation (fill-only) ---------------------------------------------
 
 #[test]
@@ -332,22 +288,6 @@ fn empty_source_is_empty_saga_source() {
         .dispatch(&request(Some(source_book("order", vec![])), &[]))
         .expect_err("empty source must fail");
     assert_eq!(err.code, codes::EMPTY_SAGA_SOURCE);
-}
-
-#[test]
-fn corrupt_notification_payload_is_coded() {
-    // A page claiming the Notification type but carrying undecodable bytes
-    // fails with NOTIFICATION_DECODE_FAILED.
-    let bad = event_page(Any {
-        type_url: NOTIFICATION_TYPE_URL.to_string(),
-        value: vec![0xFF, 0xFF, 0xFF, 0xFF],
-    });
-    let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory"])
-        .on_rejected(FQ_RESERVE_STOCK, |_n, _r| Ok(vec![]));
-    let err = saga
-        .dispatch(&request(Some(source_book("order", vec![bad])), &[]))
-        .expect_err("corrupt notification must fail");
-    assert_eq!(err.code, codes::NOTIFICATION_DECODE_FAILED);
 }
 
 #[test]

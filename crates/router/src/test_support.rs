@@ -83,32 +83,6 @@ pub fn fresh_rebuilder() -> Rebuilder<TestState> {
     Rebuilder::new(TestState::default)
 }
 
-/// A Notification event page carrying a RejectionNotification for the
-/// given fully-qualified command type (rejected by domain "inventory").
-pub fn notification_page_for(fq_command: &str) -> pb::EventPage {
-    let rejection = pb::RejectionNotification {
-        rejected_command: Some(pb::CommandBook {
-            cover: Some(pb::Cover {
-                domain: "inventory".to_string(),
-                ..Default::default()
-            }),
-            pages: vec![pb::CommandPage {
-                payload: Some(pb::command_page::Payload::Command(Any {
-                    type_url: format!("{TYPE_URL_PREFIX}{fq_command}"),
-                    value: Vec::new(),
-                })),
-                ..Default::default()
-            }],
-        }),
-        ..Default::default()
-    };
-    let notification = pb::Notification {
-        payload: Some(any_of(&rejection)),
-        ..Default::default()
-    };
-    event_page(any_of(&notification))
-}
-
 /// Wraps a command Any as the first page of a ContextualCommand.
 pub fn command_for(command: Any) -> pb::ContextualCommand {
     pb::ContextualCommand {

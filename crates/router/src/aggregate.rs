@@ -2,13 +2,11 @@
 //!
 //! Envelope and command type validate BEFORE state is rebuilt (an unknown
 //! command must report NO_HANDLER_REGISTERED, not whatever the rebuild
-//! would surface); rejection routing keys on FULLY-QUALIFIED command type
-//! names; multiple compensators all run, in registration order, merging
-//! their compensation events into one response.
+//! would surface). There is no compensation input: a command whose type
+//! has no registered handler reports NO_HANDLER_REGISTERED.
 
 use std::collections::HashMap;
 
-use prost::Message;
 use prost_types::Any;
 
 use crate::error::{codes, extras, map_handler_error, messages, CodedError, HandlerError};
@@ -38,28 +36,12 @@ pub type CommandFn<S> = Box<
         + Sync,
 >;
 
-/// Compensates a rejected command against rebuilt state, returning a full
-/// BusinessResponse (events, or an escalation Notification).
-/// CommandContext supplies next_sequence so compensation events append
-/// after prior history.
-pub type RejectionFn<S> = Box<
-    dyn Fn(
-            &pb::Notification,
-            &pb::RejectionNotification,
-            &mut S,
-            CommandContext,
-        ) -> Result<pb::BusinessResponse, HandlerError>
-        + Send
-        + Sync,
->;
-
 /// The dispatch table for one aggregate component.
 pub struct AggregateDispatch<S> {
     name: String,
     domain: String,
     rebuilder: Rebuilder<S>,
     handlers: HashMap<String, CommandFn<S>>,
-    rejections: HashMap<String, Vec<RejectionFn<S>>>,
 }
 
 impl<S> AggregateDispatch<S> {
@@ -74,7 +56,6 @@ impl<S> AggregateDispatch<S> {
             domain: domain.into(),
             rebuilder,
             handlers: HashMap::new(),
-            rejections: HashMap::new(),
         }
     }
 
@@ -88,30 +69,6 @@ impl<S> AggregateDispatch<S> {
             + 'static,
     ) -> Self {
         self.handlers.insert(full_name.to_string(), Box::new(thunk));
-        self
-    }
-
-    /// Registers a compensation thunk keyed by the FULLY-QUALIFIED
-    /// rejected-command type name. Multiple registrations for the same
-    /// command all run, in registration order; their compensation events
-    /// merge into one response.
-    pub fn on_rejected(
-        mut self,
-        fq_command_type: &str,
-        thunk: impl Fn(
-                &pb::Notification,
-                &pb::RejectionNotification,
-                &mut S,
-                CommandContext,
-            ) -> Result<pb::BusinessResponse, HandlerError>
-            + Send
-            + Sync
-            + 'static,
-    ) -> Self {
-        self.rejections
-            .entry(fq_command_type.to_string())
-            .or_default()
-            .push(Box::new(thunk));
         self
     }
 
@@ -133,8 +90,7 @@ impl<S> AggregateDispatch<S> {
     /// Routes a ContextualCommand: envelope guards with their exact codes,
     /// validate-before-rebuild, rebuild (corrupt persisted event fails the
     /// command), thunk with rebuilt state and CommandContext, fill-only
-    /// stamping on the emitted book. A Notification command page routes to
-    /// the FQ-keyed compensation path instead.
+    /// stamping on the emitted book.
     pub fn dispatch(
         &self,
         req: &pb::ContextualCommand,
@@ -163,11 +119,6 @@ impl<S> AggregateDispatch<S> {
                 ));
             }
         };
-
-        // Exact type-URL match only — suffix matching misroutes user types.
-        if crate::is_notification_type_url(&command_any.type_url) {
-            return self.dispatch_rejection(command_any, req.events.as_ref());
-        }
 
         let Some(thunk) = self
             .handlers
@@ -200,62 +151,6 @@ impl<S> AggregateDispatch<S> {
             result: Some(pb::business_response::Result::Events(
                 events.unwrap_or_default(),
             )),
-        })
-    }
-
-    /// Decodes a Notification command page and routes it to the FQ-keyed
-    /// compensation entry with rebuilt state.
-    fn dispatch_rejection(
-        &self,
-        command_any: &Any,
-        events: Option<&pb::EventBook>,
-    ) -> Result<pb::BusinessResponse, CodedError> {
-        let notification =
-            pb::Notification::decode(command_any.value.as_slice()).map_err(|_| {
-                CodedError::invalid_argument(
-                    codes::NOTIFICATION_DECODE_FAILED,
-                    messages::NOTIFICATION_DECODE_FAILED,
-                    [(extras::TYPE_URL.to_string(), command_any.type_url.clone())],
-                )
-            })?;
-        let rejection = match notification.payload.as_ref() {
-            Some(payload) => {
-                pb::RejectionNotification::decode(payload.value.as_slice()).map_err(|_| {
-                    CodedError::invalid_argument(
-                        codes::REJECTION_NOTIFICATION_DECODE_FAILED,
-                        messages::REJECTION_NOTIFICATION_DECODE_FAILED,
-                        [],
-                    )
-                })?
-            }
-            None => pb::RejectionNotification::default(),
-        };
-
-        let (_, fq_command) = crate::extract_rejection_key(&rejection);
-        let Some(thunks) = self.rejections.get(&fq_command) else {
-            // Undeclared: DelegateToFramework (by declaration, not accident).
-            return Ok(pb::BusinessResponse::default());
-        };
-        let (mut state, info) = self.rebuilder.rebuild(events)?;
-        let cctx = CommandContext {
-            next_sequence: crate::next_sequence(events),
-            had_prior_events: info.had_prior_events,
-        };
-        if let [thunk] = thunks.as_slice() {
-            return thunk(&notification, &rejection, &mut state, cctx).map_err(map_handler_error);
-        }
-        // Fan-out: run every compensator in registration order, merging
-        // their compensation events into one response.
-        let mut merged = pb::EventBook::default();
-        for thunk in thunks {
-            let resp =
-                thunk(&notification, &rejection, &mut state, cctx).map_err(map_handler_error)?;
-            if let Some(pb::business_response::Result::Events(out)) = resp.result {
-                merged.pages.extend(out.pages);
-            }
-        }
-        Ok(pb::BusinessResponse {
-            result: Some(pb::business_response::Result::Events(merged)),
         })
     }
 }
