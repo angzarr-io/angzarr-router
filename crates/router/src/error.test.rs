@@ -19,6 +19,20 @@ fn persisted_corrupt_is_data_loss() {
     );
 }
 
+// Owner ruling 2026-10-19: a fold failing on an accepted event is a
+// handler bug, named by the event and the state it folded into.
+#[test]
+fn fold_failed_is_internal_naming_the_event_and_state() {
+    let err = CodedError::fold_failed(7, "/test.Evt", "/test.State");
+    assert_eq!(err.grpc, GrpcCode::Internal);
+    assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
+    assert_eq!(err.message, messages::FOLD_FAILED);
+    let extra = |key: &str| err.extras.get(key).map(String::as_str);
+    assert_eq!(extra(extras::SEQUENCE), Some("7"));
+    assert_eq!(extra(extras::TYPE_URL), Some("/test.Evt"));
+    assert_eq!(extra(extras::STATE_TYPE_URL), Some("/test.State"));
+}
+
 #[test]
 fn no_handler_registered_is_unimplemented() {
     let err =

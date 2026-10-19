@@ -16,7 +16,7 @@ at 4.
 
 ## Spec
 
-Source: angzarr-project `spec/20261019-draft` (b412af8).
+Source: angzarr-project `spec/20261019-draft` (619933c).
 
 - **Protos:**
   - `command_handler.proto`: `CommandHandlerService.Handle`,
@@ -103,7 +103,15 @@ message, and its type URL is registered. Every host callback is stateless.
   - Output: the new state, as a serialized `Any`.
   - The router sends one call per rebuild, carrying every uncovered page.
   - `STATUS_OK_EMPTY` means the state is unchanged.
-  - A failure is `PERSISTED_EVENT_CORRUPT` (DATA_LOSS).
+  - A failure is a handler bug: `UNHANDLED_HANDLER_ERROR` (INTERNAL), never
+    `PERSISTED_EVENT_CORRUPT`, because the same apply logic accepted those
+    events (owner ruling, 2026-10-19). The ErrorInfo metadata names the
+    failing event's `sequence` and `type_url` and the `state_type_url`. To
+    find the event, the router refolds the failed batch one page at a time
+    from the same starting state (the fold is stateless, so this is safe);
+    the first page that fails alone is named, or the batch's last page when
+    every page folds alone.
+  - An undecodable answer is INTERNAL too.
 - **decide** (one callback per command type): the payload is the command; the
   aux is `CommandContextAux`, which now carries `state = 8`. The callback
   returns `CommandOutput { events, resolved_nonce }` and no state.
@@ -164,13 +172,15 @@ aggregates or PMs. Projectors are unchanged; see Open.
 - **Accepted:**
   - envelope guards run before upcasting;
   - an empty `resolved_nonce` means unresolved;
-  - a COMMUTATIVE fold failure is INTERNAL.
+  - a COMMUTATIVE fold failure is INTERNAL;
+  - any host fold failure is INTERNAL, naming the failing event (above).
 - **State across the C ABI:** router-owned.
 - **Snapshot selection:** the coordinator's (decision 14.1).
 
 ## Registration and projectors
 
-These follow the owner rulings on the two open items, against spec b412af8.
+These follow the owner rulings on the two open items, against spec b412af8 (now pinned at 619933c, which changes nothing the
+router does).
 
 ### Registration hello: `component_descriptor()`
 

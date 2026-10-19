@@ -73,14 +73,83 @@ fn host_error(ret: i32, bytes: Option<Vec<u8>>) -> HandlerError {
     HandlerError::Coded(status_to_coded(bytes.as_deref(), ret))
 }
 
+/// What one host fold call answered.
+enum FoldAnswer {
+    /// The folded state.
+    State(Any),
+    /// STATUS_OK_EMPTY: the state is unchanged.
+    Kept,
+    /// Any failure status.
+    Failed,
+}
+
+/// Calls the host fold over `pages` from `state`. An undecodable answer is
+/// a host bug (INTERNAL).
+fn fold_call(
+    cb: AngzarrCb,
+    id: u64,
+    state: &Any,
+    pages: &[pb::EventPage],
+    cover: Option<&pb::Cover>,
+) -> Result<FoldAnswer, CodedError> {
+    let call = abi_pb::FoldCall {
+        state: Some(state.clone()),
+        pages: pages.to_vec(),
+        cover: cover.cloned(),
+    }
+    .encode_to_vec();
+    let (ret, bytes) = invoke(cb, id, "", &call, &[]);
+    match ret {
+        STATUS_OK => Any::decode(bytes.unwrap_or_default().as_slice())
+            .map(FoldAnswer::State)
+            .map_err(|_| CodedError::unhandled("host fold returned undecodable Any bytes")),
+        STATUS_OK_EMPTY => Ok(FoldAnswer::Kept),
+        _ => Ok(FoldAnswer::Failed),
+    }
+}
+
+/// The error for a batched fold that failed: refolds the batch one page at a
+/// time from the same starting state (the fold is stateless, so this is
+/// safe) and names the first page that fails alone. A batch whose pages all
+/// fold alone names its last page.
+fn locate_fold_failure(
+    cb: AngzarrCb,
+    id: u64,
+    state: &Any,
+    pages: &[pb::EventPage],
+    cover: Option<&pb::Cover>,
+    state_type_url: &str,
+) -> CodedError {
+    let failed = |page: &pb::EventPage| {
+        let type_url = angzarr_router::page_event(page).map_or("", |e| e.type_url.as_str());
+        CodedError::fold_failed(page.sequence, type_url, state_type_url)
+    };
+    let mut probe = state.clone();
+    if pages.len() > 1 {
+        for page in pages {
+            match fold_call(cb, id, &probe, std::slice::from_ref(page), cover) {
+                Ok(FoldAnswer::State(next)) => probe = next,
+                Ok(FoldAnswer::Kept) => {}
+                Ok(FoldAnswer::Failed) => return failed(page),
+                Err(err) => return err,
+            }
+        }
+    }
+    pages
+        .last()
+        .map_or_else(|| CodedError::fold_failed(0, "", state_type_url), failed)
+}
+
 /// A rebuilder over router-owned state: a serialized `Any` of
 /// `state_type_url`, starting from the message's default (empty bytes) or a
 /// delivered snapshot's state, folded through the host's stateless fold
 /// callback in one batched call per rebuild (abi.proto, FoldCall). A failed
-/// fold is PERSISTED_EVENT_CORRUPT; an undecodable answer a host bug.
+/// fold is a handler bug (INTERNAL) naming the event it failed on
+/// ([`locate_fold_failure`]); an undecodable answer is a host bug too.
 fn state_rebuilder(state_type_url: &str, fold: Option<u64>, cb: AngzarrCb) -> Rebuilder<Any> {
+    let state_type_url = angzarr_router::type_url(state_type_url);
     let initial = Any {
-        type_url: angzarr_router::type_url(state_type_url),
+        type_url: state_type_url.clone(),
         value: Vec::new(),
     };
     let mut rebuilder = Rebuilder::new(move || initial.clone()).with_snapshot(|state, snapshot| {
@@ -89,23 +158,21 @@ fn state_rebuilder(state_type_url: &str, fold: Option<u64>, cb: AngzarrCb) -> Re
     });
     if let Some(id) = fold {
         rebuilder = rebuilder.with_fold(move |state: &mut Any, pages, cover| {
-            let call = abi_pb::FoldCall {
-                state: Some(state.clone()),
-                pages: pages.to_vec(),
-                cover: cover.cloned(),
-            }
-            .encode_to_vec();
-            let (ret, bytes) = invoke(cb, id, "", &call, &[]);
-            match ret {
-                STATUS_OK => {
-                    *state = Any::decode(bytes.unwrap_or_default().as_slice()).map_err(|_| {
-                        CodedError::unhandled("host fold returned undecodable Any bytes")
-                    })?;
-                    Ok(())
+            match fold_call(cb, id, state, pages, cover)? {
+                FoldAnswer::State(next) => *state = next,
+                FoldAnswer::Kept => {}
+                FoldAnswer::Failed => {
+                    return Err(locate_fold_failure(
+                        cb,
+                        id,
+                        state,
+                        pages,
+                        cover,
+                        &state_type_url,
+                    ))
                 }
-                STATUS_OK_EMPTY => Ok(()),
-                _ => Err(CodedError::persisted_corrupt(&state.type_url)),
             }
+            Ok(())
         });
     }
     rebuilder

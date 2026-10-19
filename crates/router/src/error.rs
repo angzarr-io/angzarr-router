@@ -65,6 +65,7 @@ pub mod messages {
     pub const CONFLICT_OVERLAP: &str = "the command's changes overlap the changes it did not see";
     pub const CONFLICT_RESOLUTION_UNSUPPORTED: &str =
         "the component does not support COMMUTATIVE conflict resolution";
+    pub const FOLD_FAILED: &str = "the state fold failed on an event it had accepted";
 }
 
 /// Cross-language detail-key constants.
@@ -75,6 +76,8 @@ pub mod extras {
     pub const UPCAST_TYPE_URL: &str = "upcast_type_url";
     pub const WINDOW_UNITS: &str = "window_units";
     pub const COMMAND_UNITS: &str = "command_units";
+    pub const SEQUENCE: &str = "sequence";
+    pub const STATE_TYPE_URL: &str = "state_type_url";
 }
 
 /// A coded business/framework error: the form every failure takes before
@@ -188,6 +191,26 @@ impl CodedError {
             codes::PERSISTED_EVENT_CORRUPT,
             messages::PERSISTED_EVENT_CORRUPT,
             [(extras::TYPE_URL.to_string(), type_url.to_string())],
+        )
+    }
+
+    /// A state fold that failed on a persisted event (INTERNAL): the event
+    /// was accepted by the same apply logic, so the failure is a handler
+    /// regression, never corrupt data. Names the event's sequence and type
+    /// URL and the state's type URL.
+    pub fn fold_failed(sequence: u64, type_url: &str, state_type_url: &str) -> Self {
+        Self::coded(
+            codes::UNHANDLED_HANDLER_ERROR,
+            messages::FOLD_FAILED,
+            [
+                (extras::SEQUENCE.to_string(), sequence.to_string()),
+                (extras::TYPE_URL.to_string(), type_url.to_string()),
+                (
+                    extras::STATE_TYPE_URL.to_string(),
+                    state_type_url.to_string(),
+                ),
+            ],
+            GrpcCode::Internal,
         )
     }
 

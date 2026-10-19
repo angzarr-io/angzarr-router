@@ -68,6 +68,9 @@ const CB_CHANGED_NONE: u64 = 30;
 /// Upcasts IncreaseByV1 to IncreaseBy (payload unchanged).
 const CB_UPCAST_V1: u64 = 31;
 
+/// A fold that fails whenever it is handed more than one page.
+const CB_FOLD_BATCH_FAILS: u64 = 32;
+
 const FQ_INCREASE_BY_V1: &str = "test.counter.IncreaseByV1";
 
 const FQ_ORDER_CREATED: &str = "test.order.OrderCreated";
@@ -398,6 +401,15 @@ unsafe extern "C" fn host_cb(
             host_fill(out, &[0xFF, 0xFF, 0xFF]);
             STATUS_OK
         }
+        CB_FOLD_BATCH_FAILS => {
+            let call = abi_pb::FoldCall::decode(payload).expect("FoldCall");
+            if call.pages.len() > 1 {
+                return -13;
+            }
+            let value = state_value(call.state.as_ref()) + call.pages.len() as u32;
+            host_fill(out, &state_any(value).encode_to_vec());
+            STATUS_OK
+        }
         CB_OK_ZERO => STATUS_OK,
         CB_OK_EMPTY => STATUS_OK_EMPTY,
         CB_FAILS => -13,
@@ -700,28 +712,56 @@ fn unknown_command_is_invalid_argument_naming_its_type_url() {
     );
 }
 
+/// The ErrorInfo reason and metadata of a Status's bytes.
+fn error_info(bytes: &[u8]) -> (String, std::collections::HashMap<String, String>) {
+    let status = rpc_pb::Status::decode(bytes).expect("Status");
+    let info = rpc_pb::ErrorInfo::decode(status.details[0].value.as_slice()).expect("ErrorInfo");
+    (info.reason, info.metadata.into_iter().collect())
+}
+
+/// Asserts a fold failure answered INTERNAL as a handler bug, naming the
+/// failing event's sequence and type URL and the state type URL.
+fn assert_fold_failed(ret: i32, bytes: &[u8], sequence: u64, type_url: &str) {
+    assert_eq!(ret, -13, "a failing fold is a handler bug (INTERNAL)");
+    let (reason, metadata) = error_info(bytes);
+    assert_eq!(
+        reason,
+        angzarr_router::error::codes::UNHANDLED_HANDLER_ERROR
+    );
+    assert_eq!(metadata.get("sequence"), Some(&sequence.to_string()));
+    assert_eq!(metadata.get("type_url").map(String::as_str), Some(type_url));
+    assert_eq!(
+        metadata.get("state_type_url"),
+        Some(&format!("/{STATE_TYPE}"))
+    );
+}
+
+// Owner ruling 2026-10-19: the events were accepted by the same apply logic,
+// so a fold that fails on one is a code regression, not corrupt data.
 #[test]
-fn corrupt_persisted_event_is_data_loss() {
+fn a_fold_failing_on_a_persisted_event_is_internal_naming_it() {
     let router = Router::with_counter();
-    let mut history = pb::EventBook {
-        next_sequence: 1,
-        ..Default::default()
-    };
-    history.pages = vec![pb::EventPage {
-        payload: Some(Any {
-            type_url: format!("type.googleapis.com/{FQ_INCREASED}"),
-            value: vec![0xFF, 0xFF, 0xFF],
-        }),
-        ..Default::default()
-    }];
-    let (ret, bytes) = router.dispatch(&command_req(
-        FQ_INCREASE_BY,
-        IncreaseBy { n: 1 }.encode_to_vec(),
-        Some(history),
-    ));
-    assert_eq!(ret, -15);
-    let (_, reason) = decode_status(&bytes);
-    assert_eq!(reason, "PERSISTED_EVENT_CORRUPT");
+    let mut history = increased_history(3, 3);
+    history.pages[1].payload.as_mut().unwrap().value = vec![0xFF, 0xFF, 0xFF];
+    let (ret, bytes) = router.dispatch(&increase_one(Some(history)));
+    assert_fold_failed(
+        ret,
+        &bytes,
+        1,
+        &format!("type.googleapis.com/{FQ_INCREASED}"),
+    );
+}
+
+#[test]
+fn a_fold_failing_only_as_a_batch_names_the_batchs_last_event() {
+    let router = counter_with(CB_FOLD_BATCH_FAILS);
+    let (ret, bytes) = router.dispatch(&increase_one(Some(increased_history(3, 3))));
+    assert_fold_failed(
+        ret,
+        &bytes,
+        2,
+        &format!("type.googleapis.com/{FQ_INCREASED}"),
+    );
 }
 
 #[test]
@@ -1398,13 +1438,14 @@ fn a_fold_returning_status_ok_empty_keeps_the_state() {
 }
 
 #[test]
-fn a_failing_fold_is_data_loss() {
+fn a_failing_fold_is_internal_naming_the_first_event_it_fails_on() {
     let router = counter_with(CB_FAILS);
     let (ret, bytes) = router.dispatch(&increase_one(Some(increased_history(2, 2))));
-    assert_eq!(ret, -15);
-    assert_eq!(
-        decode_status(&bytes).1,
-        angzarr_router::error::codes::PERSISTED_EVENT_CORRUPT
+    assert_fold_failed(
+        ret,
+        &bytes,
+        0,
+        &format!("type.googleapis.com/{FQ_INCREASED}"),
     );
 }
 
@@ -1527,13 +1568,14 @@ fn pm_fold_and_handler_succeed_on_either_ok_status() {
 }
 
 #[test]
-fn failing_pm_fold_is_data_loss() {
+fn failing_pm_fold_is_internal_naming_the_event() {
     let router = pm_with(CB_FAILS, CB_OK_EMPTY);
     let (ret, bytes) = router.dispatch_process_manager(&pm_over_state(increased_book(1)));
-    assert_eq!(ret, -15);
-    assert_eq!(
-        decode_status(&bytes).1,
-        angzarr_router::error::codes::PERSISTED_EVENT_CORRUPT
+    assert_fold_failed(
+        ret,
+        &bytes,
+        0,
+        &format!("type.googleapis.com/{FQ_INCREASED}"),
     );
 }
 
