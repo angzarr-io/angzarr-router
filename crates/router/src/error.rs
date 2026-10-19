@@ -80,6 +80,7 @@ pub mod extras {
     pub const COMMAND_UNITS: &str = "command_units";
     pub const SEQUENCE: &str = "sequence";
     pub const STATE_TYPE_URL: &str = "state_type_url";
+    pub const COMPONENT: &str = "component";
 }
 
 /// A coded business/framework error: the form every failure takes before

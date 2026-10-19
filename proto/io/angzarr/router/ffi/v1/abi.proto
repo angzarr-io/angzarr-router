@@ -151,6 +151,9 @@ message ProjectorDescriptor {
   string projection_type_url = 6;
   // The fold over the projection (see above).
   optional uint64 fold_callback_id = 7;
+  // The business binary's full version, baked in at build: carried on the
+  // projector's registration hello (ComponentDescriptor.rules_version).
+  string rules_version = 8;
 }
 
 // Registration payload for one saga component. A stateless translator:
@@ -164,6 +167,17 @@ message SagaDescriptor {
   // Field 5 was `rejections` (compensation input; removed).
   reserved 5;
   reserved "rejections";
+  // The business binary's full version, baked in at build: carried on the
+  // saga's registration hello (ComponentDescriptor.rules_version).
+  string rules_version = 6;
+}
+
+// The registration hellos of every component a router hosts, in
+// registration order (angzarr_router_component_descriptors). The router
+// builds each io.angzarr.v1.ComponentDescriptor from its own tables; the
+// host only sends them to its coordinator.
+message ComponentDescriptors {
+  repeated io.angzarr.v1.ComponentDescriptor components = 1;
 }
 
 // aux payload for command-handler callbacks.

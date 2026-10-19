@@ -48,6 +48,21 @@ fn assert_missing_rules_version(result: Result<pb::ComponentDescriptor, crate::e
     let err = result.expect_err("an empty rules version is refused");
     assert_eq!(err.code, codes::MISSING_RULES_VERSION);
     assert_eq!(err.grpc, GrpcCode::InvalidArgument);
+    assert!(
+        err.extras.contains_key(crate::error::extras::COMPONENT),
+        "the refusal names the component"
+    );
+}
+
+#[test]
+fn the_refusal_names_the_component() {
+    let err = notifier("").component_descriptor().expect_err("refused");
+    assert_eq!(
+        err.extras
+            .get(crate::error::extras::COMPONENT)
+            .map(String::as_str),
+        Some("Notifier")
+    );
 }
 
 #[test]

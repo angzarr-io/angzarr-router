@@ -184,6 +184,10 @@ pub struct FfiRouter {
     projectors: Vec<(String, ProjectorDispatch<Any>)>,
     sagas: Vec<(String, SagaDispatch)>,
     process_managers: Vec<(String, ProcessManagerDispatch<Any>)>,
+    /// Every registered component's registration hello (or the refusal to
+    /// build it), in registration order. The tables are fixed once
+    /// registered, so each is built when its component registers.
+    hellos: Vec<Result<pb::ComponentDescriptor, CodedError>>,
 }
 
 impl FfiRouter {
@@ -193,7 +197,16 @@ impl FfiRouter {
             projectors: Vec::new(),
             sagas: Vec::new(),
             process_managers: Vec::new(),
+            hellos: Vec::new(),
         }
+    }
+
+    /// The registration hellos of every registered component, in
+    /// registration order, as ComponentDescriptors bytes; or the first
+    /// component's refusal to build one (MISSING_RULES_VERSION).
+    pub fn component_descriptors(&self) -> Result<Vec<u8>, CodedError> {
+        let components = self.hellos.iter().cloned().collect::<Result<Vec<_>, _>>()?;
+        Ok(abi_pb::ComponentDescriptors { components }.encode_to_vec())
     }
 
     /// Parses an AggregateDescriptor and populates the core tables with
@@ -326,9 +339,12 @@ impl FfiRouter {
                 }
             });
         }
+        let hello = dispatch.component_descriptor_with_state(&desc.state_type_url);
         // Refuses a second claim of one (domain, command type) (C-0010,
         // C-0064).
-        self.aggregates.push(Box::new(dispatch))
+        self.aggregates.push(Box::new(dispatch))?;
+        self.hellos.push(hello);
+        Ok(())
     }
 
     /// Parses a ProjectorDescriptor and populates a core projector table over
@@ -360,7 +376,8 @@ impl FfiRouter {
             type_url: angzarr_router::type_url(&desc.projection_type_url),
             value: Vec::new(),
         };
-        let mut dispatch = ProjectorDispatch::new(desc.name.clone(), move || initial.clone());
+        let mut dispatch = ProjectorDispatch::new(desc.name.clone(), move || initial.clone())
+            .with_rules_version(desc.rules_version.clone());
         if !desc.domains.is_empty() {
             dispatch = dispatch.for_domains(desc.domains.clone());
         }
@@ -404,6 +421,7 @@ impl FfiRouter {
             })
         });
 
+        self.hellos.push(dispatch.component_descriptor());
         self.projectors.push((desc.name, dispatch));
         Ok(())
     }
@@ -479,7 +497,8 @@ impl FfiRouter {
             desc.name.clone(),
             desc.input_domain.clone(),
             desc.target_domains.clone(),
-        );
+        )
+        .with_rules_version(desc.rules_version.clone());
 
         for event in &desc.events {
             let id = event.callback_id;
@@ -507,6 +526,7 @@ impl FfiRouter {
             });
         }
 
+        self.hellos.push(dispatch.component_descriptor());
         self.sagas.push((desc.name, dispatch));
         Ok(())
     }
@@ -621,6 +641,8 @@ impl FfiRouter {
             );
         }
 
+        self.hellos
+            .push(dispatch.component_descriptor_with_state(&desc.state_type_url));
         self.process_managers.push((desc.name, dispatch));
         Ok(())
     }

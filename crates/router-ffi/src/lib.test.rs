@@ -853,6 +853,7 @@ fn projector_descriptor_bytes() -> Vec<u8> {
         domains: vec!["counter".to_string()],
         projection_type_url: STATE_TYPE.to_string(),
         fold_callback_id: Some(CB_FOLD),
+        rules_version: String::new(),
     }
     .encode_to_vec()
 }
@@ -970,6 +971,7 @@ fn saga_descriptor_bytes() -> Vec<u8> {
             fq_type: FQ_ORDER_CREATED.to_string(),
             callback_id: CB_SAGA_EVENT,
         }],
+        rules_version: String::new(),
     }
     .encode_to_vec()
 }
@@ -1370,6 +1372,7 @@ fn projector_fold_failure_keeps_the_host_status() {
         domains: vec!["counter".to_string()],
         projection_type_url: STATE_TYPE.to_string(),
         fold_callback_id: Some(CB_PROJ_FOLD_REJECTS),
+        rules_version: String::new(),
     }
     .encode_to_vec();
     assert_eq!(
@@ -2112,4 +2115,186 @@ fn an_upcaster_source_type_claimed_twice_is_refused_at_registration() {
         "IncreaseByV1 is already claimed"
     );
     drop(router);
+}
+
+// --- the registration hello (types.proto ComponentDescriptor; C-0535) ------
+
+/// Calls angzarr_router_component_descriptors, copying out and releasing
+/// the router's buffer.
+fn component_descriptors(r: *mut c_void) -> (i32, Vec<u8>) {
+    let mut out = AngzarrBuf {
+        data: std::ptr::null_mut(),
+        len: 0,
+    };
+    let ret = unsafe { angzarr_router_component_descriptors(r, &mut out) };
+    let bytes = if out.data.is_null() {
+        Vec::new()
+    } else {
+        let copied = unsafe { std::slice::from_raw_parts(out.data, out.len) }.to_vec();
+        unsafe { angzarr_buf_release(out.data, out.len) };
+        copied
+    };
+    (ret, bytes)
+}
+
+/// A router hosting one component of every kind, each with `version`,
+/// registered aggregate, saga, process manager, projector.
+fn every_kind(version: &str) -> Router {
+    let r = angzarr_router_new();
+    let mut aggregate = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
+    aggregate.rules_version = version.to_string();
+    aggregate.changed_callback_id = Some(CB_CHANGED_VALUE);
+    assert_eq!(register_aggregate_desc(r, aggregate), 0);
+    let mut saga = abi_pb::SagaDescriptor::decode(saga_descriptor_bytes().as_slice()).unwrap();
+    saga.rules_version = version.to_string();
+    let saga = saga.encode_to_vec();
+    assert_eq!(
+        unsafe { angzarr_router_register_saga(r, saga.as_ptr(), saga.len(), host_cb) },
+        0
+    );
+    let mut pm =
+        abi_pb::ProcessManagerDescriptor::decode(pm_descriptor_bytes().as_slice()).unwrap();
+    pm.rules_version = version.to_string();
+    let pm = pm.encode_to_vec();
+    assert_eq!(
+        unsafe { angzarr_router_register_process_manager(r, pm.as_ptr(), pm.len(), host_cb) },
+        0
+    );
+    let mut projector =
+        abi_pb::ProjectorDescriptor::decode(projector_descriptor_bytes().as_slice()).unwrap();
+    projector.rules_version = version.to_string();
+    let projector = projector.encode_to_vec();
+    assert_eq!(
+        unsafe {
+            angzarr_router_register_projector(r, projector.as_ptr(), projector.len(), host_cb)
+        },
+        0
+    );
+    Router(r)
+}
+
+#[test]
+fn the_router_builds_every_components_registration_hello_in_order() {
+    let router = every_kind("1.4.2+build.7");
+    let (ret, bytes) = component_descriptors(router.0);
+    assert_eq!(ret, 0);
+    let hellos = abi_pb::ComponentDescriptors::decode(bytes.as_slice())
+        .expect("ComponentDescriptors")
+        .components;
+    let summary: Vec<(String, pb::ComponentKind, Vec<String>, Option<String>)> = hellos
+        .iter()
+        .map(|d| {
+            (
+                d.name.clone(),
+                d.kind(),
+                d.inputs.iter().map(|t| t.domain.clone()).collect(),
+                d.state.as_ref().map(|s| s.type_url.clone()),
+            )
+        })
+        .collect();
+    let state = Some(format!("/{STATE_TYPE}"));
+    assert_eq!(
+        summary,
+        vec![
+            (
+                "Counter".into(),
+                pb::ComponentKind::Aggregate,
+                vec![],
+                state.clone()
+            ),
+            (
+                "OrderFulfillment".into(),
+                pb::ComponentKind::Saga,
+                vec!["order".into()],
+                None
+            ),
+            (
+                "OrderPM".into(),
+                pb::ComponentKind::ProcessManager,
+                vec!["orders".into()],
+                state
+            ),
+            (
+                "CounterProjector".into(),
+                pb::ComponentKind::Projector,
+                vec!["counter".into()],
+                None
+            ),
+        ]
+    );
+    assert!(hellos.iter().all(|d| d.rules_version == "1.4.2+build.7"));
+    let resolutions = |d: &pb::ComponentDescriptor| -> Vec<pb::ConflictResolution> {
+        d.state
+            .as_ref()
+            .and_then(|s| s.options.as_ref())
+            .map(|o| o.conflict_resolutions().collect())
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        resolutions(&hellos[0]),
+        vec![
+            pb::ConflictResolution::Commutative,
+            pb::ConflictResolution::Strict,
+            pb::ConflictResolution::AggregateHandles
+        ],
+        "an aggregate with changed() supports COMMUTATIVE"
+    );
+    assert_eq!(
+        resolutions(&hellos[2]),
+        vec![
+            pb::ConflictResolution::Strict,
+            pb::ConflictResolution::AggregateHandles
+        ]
+    );
+}
+
+#[test]
+fn a_component_without_a_rules_version_refuses_the_registration_hello() {
+    let router = every_kind("");
+    let (ret, bytes) = component_descriptors(router.0);
+    assert_eq!(ret, -3, "INVALID_ARGUMENT");
+    assert_eq!(
+        decode_status(&bytes).1,
+        angzarr_router::error::codes::MISSING_RULES_VERSION
+    );
+}
+
+#[test]
+fn the_first_component_missing_a_rules_version_is_the_one_refused() {
+    let r = angzarr_router_new();
+    let mut versioned = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
+    versioned.rules_version = "1".to_string();
+    assert_eq!(register_aggregate_desc(r, versioned), 0);
+    let saga = saga_descriptor_bytes();
+    assert_eq!(
+        unsafe { angzarr_router_register_saga(r, saga.as_ptr(), saga.len(), host_cb) },
+        0
+    );
+    let router = Router(r);
+    let (ret, bytes) = component_descriptors(router.0);
+    assert_eq!(ret, -3);
+    let (status, reason) = decode_status(&bytes);
+    assert_eq!(reason, angzarr_router::error::codes::MISSING_RULES_VERSION);
+    let info = rpc_pb::ErrorInfo::decode(status.details[0].value.as_slice()).expect("ErrorInfo");
+    assert_eq!(
+        info.metadata.get("component").map(String::as_str),
+        Some("OrderFulfillment")
+    );
+}
+
+#[test]
+fn a_router_hosting_nothing_has_no_registration_hellos() {
+    let router = Router(angzarr_router_new());
+    let (ret, bytes) = component_descriptors(router.0);
+    assert_eq!(ret, 0);
+    assert!(abi_pb::ComponentDescriptors::decode(bytes.as_slice())
+        .expect("ComponentDescriptors")
+        .components
+        .is_empty());
+}
+
+#[test]
+fn registration_hellos_of_a_null_router_are_a_coded_failure() {
+    let (ret, _) = component_descriptors(std::ptr::null_mut());
+    assert_eq!(ret, -13);
 }

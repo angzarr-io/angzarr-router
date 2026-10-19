@@ -4,14 +4,14 @@
 
 use std::collections::BTreeSet;
 
-use crate::error::{codes, messages, CodedError};
+use crate::error::{codes, extras, messages, CodedError};
 use crate::pb;
 
 /// A component's ComponentDescriptor. `inputs` are the domains whose events
 /// it consumes (deduplicated and sorted); `state` is set for aggregates and
 /// process managers only. An empty `rules_version` is refused
 /// MISSING_RULES_VERSION (INVALID_ARGUMENT), as the coordinator refuses
-/// such a registration.
+/// such a registration, naming the component.
 pub(crate) fn component_descriptor(
     name: &str,
     kind: pb::ComponentKind,
@@ -23,7 +23,7 @@ pub(crate) fn component_descriptor(
         return Err(CodedError::invalid_argument(
             codes::MISSING_RULES_VERSION,
             messages::MISSING_RULES_VERSION,
-            [],
+            [(extras::COMPONENT.to_string(), name.to_string())],
         ));
     }
     let inputs: BTreeSet<String> = inputs.into_iter().collect();

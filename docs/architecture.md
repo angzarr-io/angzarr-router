@@ -39,7 +39,7 @@ generated wiring  ── typed seam + Register<Component>(router, handler)
         │
 bindings/<lang>    ── registry of callback_id → typed invoker, one trampoline;
         │             stateless (the router owns every state)
-        │  C ABI (crates/router-ffi: 13 extern "C" fns)
+        │  C ABI (crates/router-ffi: 14 extern "C" fns)
         ▼
 crates/router-ffi  ── descriptor → core tables, component claims/routing,
         │             router-held state and projections
@@ -61,7 +61,10 @@ The exported surface (see `crates/router-ffi/src/lib.rs`):
 `angzarr_abi_version`, `angzarr_buf_alloc`, `angzarr_buf_release`,
 `angzarr_router_new`, `angzarr_router_free`, per component kind a
 `register_*` and a `dispatch*` entry point (aggregate, projector, saga,
-process manager) (ABI version 4). The aggregate's `dispatch` takes a
+process manager), and `angzarr_router_component_descriptors`, which
+answers every registered component's registration hello (the spec's
+`ComponentDescriptor`, built by the router; the host only sends it) (ABI
+version 4). The aggregate's `dispatch` takes a
 `ContextualCommand` whose page carries a command or a fact and answers a
 `CommandHandlerResponse`; the saga's takes the source `EventBook`. A component is registered from a serialized descriptor
 (`proto/io/angzarr/router/ffi/v1/abi.proto`) listing `(fq_type,

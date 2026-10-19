@@ -188,6 +188,43 @@ pub unsafe extern "C" fn angzarr_router_dispatch_projector(
     }
 }
 
+/// Fills `out` with the registration hellos of every registered component:
+/// a serialized `io.angzarr.router.ffi.v1.ComponentDescriptors`, each an
+/// `io.angzarr.v1.ComponentDescriptor` the router built from its own tables,
+/// in registration order. The host only sends them to its coordinator. A
+/// component registered without a rules version refuses the call
+/// (`MISSING_RULES_VERSION`, INVALID_ARGUMENT, naming the first such
+/// component): returns the negated gRPC code and fills `out` with
+/// `google.rpc.Status` bytes. Either way the host releases `out` with
+/// `angzarr_buf_release`.
+///
+/// # Safety
+/// `r` must be a live router; `out` must point to a writable `AngzarrBuf`.
+#[no_mangle]
+pub unsafe extern "C" fn angzarr_router_component_descriptors(
+    r: *mut c_void,
+    out: *mut AngzarrBuf,
+) -> i32 {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if r.is_null() {
+            return Err(invalid_pointer("router"));
+        }
+        let router = &*(r as *const FfiRouter);
+        router.component_descriptors()
+    }));
+    match flatten_panic(result) {
+        Ok(response) => {
+            fill_out(out, &response);
+            0
+        }
+        Err(err) => {
+            let code = err.grpc as i32;
+            fill_out(out, &coded_to_status_bytes(err));
+            -code
+        }
+    }
+}
+
 /// Registers one saga component from a serialized
 /// `io.angzarr.router.ffi.v1.SagaDescriptor` and the host's callback
 /// gateway. Returns 0 on success, a negated gRPC code on failure.
