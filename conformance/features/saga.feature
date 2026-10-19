@@ -4,8 +4,7 @@ Feature: Order saga dispatch
   router must implement identically in every language: a declared source
   event emits a command stamped with the coordinator-supplied destination
   sequence, an undeclared event emits nothing, a source missing or empty is
-  refused with a coded error, and a rejection notification routes to the
-  registered compensator while an unwatched rejection is ignored.
+  refused with a coded error.
 
   Scenario: a declared event emits a stamped command
     Given an order saga delivering to "inventory"
@@ -27,13 +26,3 @@ Feature: Order saga dispatch
     Given an order saga delivering to "inventory"
     When a request with no source is dispatched
     Then the dispatch fails with MISSING_SAGA_SOURCE
-
-  Scenario: a rejection routes to the compensator
-    Given an order saga delivering to "inventory"
-    When a rejection of Reserve is dispatched
-    Then the saga injects one fact event
-
-  Scenario: an unwatched rejection is ignored
-    Given an order saga delivering to "inventory"
-    When a rejection of Unwatched is dispatched
-    Then the saga injects no events

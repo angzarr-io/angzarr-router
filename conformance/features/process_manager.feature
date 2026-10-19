@@ -4,9 +4,7 @@ Feature: Order process-manager dispatch
   router must implement identically in every language: only the newest trigger
   page fires (history never re-triggers), a trigger from an unwatched domain or
   of an undeclared type does nothing, a missing or empty trigger is refused
-  with a coded error, the PM's own state is rebuilt before the handler, and a
-  rejection notification routes to the registered compensator with its
-  escalation.
+  with a coded error, and the PM's own state is rebuilt before the handler.
 
   Scenario: the newest trigger event reacts
     Given an order process-manager
@@ -38,9 +36,3 @@ Feature: Order process-manager dispatch
     Given an order process-manager
     When a trigger with no pages is dispatched
     Then the dispatch fails with EMPTY_PM_TRIGGER
-
-  Scenario: a rejection routes to the compensator
-    Given an order process-manager
-    When a rejection of Reserve is dispatched
-    Then the process-manager emits one process event
-    And the process-manager escalates

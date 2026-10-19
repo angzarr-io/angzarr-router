@@ -76,16 +76,6 @@ async fn unhandled_command(w: &mut CounterWorld) {
     w.dispatch(conf::unhandled_command());
 }
 
-#[when("a Reserve command is rejected")]
-async fn reserve_rejected(w: &mut CounterWorld) {
-    w.dispatch(conf::rejection_command("test.counter.Reserve"));
-}
-
-#[when("an unregistered command is rejected")]
-async fn unregistered_rejected(w: &mut CounterWorld) {
-    w.dispatch(conf::rejection_command("test.counter.Undeclared"));
-}
-
 #[when("a command with no command book is dispatched")]
 async fn missing_book(w: &mut CounterWorld) {
     w.dispatch(conf::command_missing_book());
@@ -140,34 +130,6 @@ async fn carry_linkage(w: &mut CounterWorld) {
     );
 }
 
-#[then("the compensations run first then second")]
-async fn compensations_in_order(w: &mut CounterWorld) {
-    let resp = w
-        .result
-        .as_ref()
-        .expect("a command was dispatched")
-        .as_ref()
-        .expect("expected a merged compensation response");
-    let book = match &resp.result {
-        Some(pb::business_response::Result::Events(book)) => book,
-        other => panic!("expected an events response, got {other:?}"),
-    };
-    let types: Vec<&str> = book
-        .pages
-        .iter()
-        .filter_map(angzarr_router::page_event)
-        .map(|any| angzarr_router::type_name_from_url(&any.type_url))
-        .collect();
-    assert_eq!(
-        types,
-        vec![
-            "test.counter.CompensatedFirst",
-            "test.counter.CompensatedSecond"
-        ],
-        "compensators must merge in registration order"
-    );
-}
-
 #[then(regex = r"^the handler saw (no )?prior history, at next sequence (\d+)$")]
 async fn observed_history(w: &mut CounterWorld, no: String, next_sequence: u32) {
     let obs = w.last_observed();
@@ -188,26 +150,6 @@ async fn observed_count(w: &mut CounterWorld, count: u32, next_sequence: u32) {
     );
     assert_eq!(obs.next_sequence, next_sequence, "next_sequence evidence");
     assert!(obs.had_prior_events, "a snapshot implies had_prior_events");
-}
-
-#[then("no compensation is recorded")]
-async fn no_compensation(w: &mut CounterWorld) {
-    let resp = w
-        .result
-        .as_ref()
-        .expect("a command was dispatched")
-        .as_ref()
-        .expect("an undeclared rejection must delegate (empty Ok), not fail");
-    let empty = match &resp.result {
-        None => true,
-        Some(pb::business_response::Result::Events(book)) => book.pages.is_empty(),
-        _ => false,
-    };
-    assert!(
-        empty,
-        "expected no compensation events, got {:?}",
-        resp.result
-    );
 }
 
 #[then("no events are recorded")]

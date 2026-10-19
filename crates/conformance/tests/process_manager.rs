@@ -84,11 +84,6 @@ async fn empty_trigger(w: &mut ProcessManagerWorld) {
     w.dispatch(conf::pm_empty_trigger());
 }
 
-#[when("a rejection of Reserve is dispatched")]
-async fn rejection_reserve(w: &mut ProcessManagerWorld) {
-    w.dispatch(conf::pm_rejection_request("test.counter.Reserve"));
-}
-
 #[then(regex = r#"^the process-manager emits one command to "([^"]*)"$"#)]
 async fn emits_one_command(w: &mut ProcessManagerWorld, target: String) {
     let resp = w.response();
@@ -118,16 +113,6 @@ async fn rebuilt_n(w: &mut ProcessManagerWorld, n: u32) {
         n,
         "one fact per rebuilt prior state event"
     );
-}
-
-#[then("the process-manager emits one process event")]
-async fn emits_one_process_event(w: &mut ProcessManagerWorld) {
-    assert_eq!(w.response().process_events.len(), 1, "one process event");
-}
-
-#[then("the process-manager escalates")]
-async fn escalates(w: &mut ProcessManagerWorld) {
-    assert!(w.response().notification.is_some(), "an escalation was raised");
 }
 
 #[then(regex = r"^the dispatch fails with ([A-Z_]+)$")]

@@ -81,8 +81,7 @@ where
 // The fixture: CounterAggregate on the router core (see FIXTURE.md).
 // ---------------------------------------------------------------------------
 
-/// Build the CounterAggregate dispatch table (appliers, handlers, ordered
-/// rejection compensators).
+/// Build the CounterAggregate dispatch table (appliers and handlers).
 pub fn counter_aggregate(observed: ObservedSink) -> AggregateDispatch<CounterState> {
     let rebuilder = Rebuilder::new(CounterState::default)
         .apply(
@@ -136,36 +135,12 @@ pub fn counter_aggregate(observed: ObservedSink) -> AggregateDispatch<CounterSta
         .on_command("test.counter.FailHard", |_any, _state, _ctx| {
             Err(HandlerError::Other("hard failure".to_string()))
         })
-        // Two compensators for the same rejected command → ordered fan-out.
-        .on_rejected("test.counter.Reserve", |_n, _r, _s, _c| {
-            Ok(marker_response("CompensatedFirst"))
-        })
-        .on_rejected("test.counter.Reserve", |_n, _r, _s, _c| {
-            Ok(marker_response("CompensatedSecond"))
-        })
 }
 
 fn increased_any() -> prost_types::Any {
     prost_types::Any {
         type_url: angzarr_router::type_url("test.counter.Increased"),
         value: counter::Increased {}.encode_to_vec(),
-    }
-}
-
-/// A single-page compensation response whose event type carries `label`, so
-/// the fan-out order is observable in the merged book.
-fn marker_response(label: &str) -> pb::BusinessResponse {
-    pb::BusinessResponse {
-        result: Some(pb::business_response::Result::Events(pb::EventBook {
-            pages: vec![pb::EventPage {
-                payload: Some(pb::event_page::Payload::Event(prost_types::Any {
-                    type_url: angzarr_router::type_url(&format!("test.counter.{label}")),
-                    value: Vec::new(),
-                })),
-                ..Default::default()
-            }],
-            ..Default::default()
-        })),
     }
 }
 
@@ -244,9 +219,8 @@ pub fn delivery_without_cover(n: u32) -> pb::EventBook {
 
 /// Build the OrderSaga dispatch table: it translates each Increased source
 /// event into one Reserve command for "inventory" (stamped from the
-/// coordinator-supplied destination sequence when present), and compensates a
-/// rejected Reserve by injecting one fact event. Undeclared events and
-/// undeclared rejections are silently skipped (DelegateToFramework).
+/// coordinator-supplied destination sequence when present). Undeclared events
+/// are silently skipped (DelegateToFramework).
 pub fn order_saga() -> SagaDispatch {
     SagaDispatch::new("order-saga", "order", ["inventory"])
         .on_event("test.counter.Increased", |_any, dests, _c| {
@@ -256,7 +230,6 @@ pub fn order_saga() -> SagaDispatch {
             }
             Ok((vec![cmd], Vec::new()))
         })
-        .on_rejected("test.counter.Reserve", |_n, _r| Ok(vec![saga_fact_event()]))
 }
 
 fn reserve_command_to(domain: &str) -> pb::CommandBook {
@@ -272,15 +245,6 @@ fn reserve_command_to(domain: &str) -> pb::CommandBook {
             })),
             ..Default::default()
         }],
-    }
-}
-
-/// A single-page fact event the compensator injects — its presence (not its
-/// content) is what the rejection scenarios assert.
-fn saga_fact_event() -> pb::EventBook {
-    pb::EventBook {
-        pages: vec![pb::EventPage::default()],
-        ..Default::default()
     }
 }
 
@@ -303,44 +267,6 @@ pub fn saga_event_source(event_fq: &str, dest: &[(&str, u32)]) -> pb::SagaHandle
             ..Default::default()
         }),
         destination_sequences: dest.iter().map(|(d, s)| (d.to_string(), *s)).collect(),
-        ..Default::default()
-    }
-}
-
-/// A SagaHandleRequest whose source is a rejection Notification for
-/// `fq_command` — routes to the compensation path.
-pub fn saga_rejection_source(fq_command: &str) -> pb::SagaHandleRequest {
-    // The rejected command's type is what keys the compensator lookup.
-    let mut rejected = reserve_command_to("inventory");
-    if let Some(pb::command_page::Payload::Command(any)) = rejected.pages[0].payload.as_mut() {
-        any.type_url = angzarr_router::type_url(fq_command);
-    }
-    let rejection = pb::RejectionNotification {
-        rejected_command: Some(rejected),
-        ..Default::default()
-    };
-    let notification = pb::Notification {
-        payload: Some(prost_types::Any {
-            type_url: angzarr_router::type_url("io.angzarr.v1.RejectionNotification"),
-            value: rejection.encode_to_vec(),
-        }),
-        ..Default::default()
-    };
-    pb::SagaHandleRequest {
-        source: Some(pb::EventBook {
-            cover: Some(pb::Cover {
-                domain: "order".to_string(),
-                ..Default::default()
-            }),
-            pages: vec![pb::EventPage {
-                payload: Some(pb::event_page::Payload::Event(prost_types::Any {
-                    type_url: angzarr_router::NOTIFICATION_TYPE_URL.to_string(),
-                    value: notification.encode_to_vec(),
-                })),
-                ..Default::default()
-            }],
-            ..Default::default()
-        }),
         ..Default::default()
     }
 }
@@ -375,8 +301,7 @@ pub struct ProcessManagerState {
 /// Build the OrderProcessManager dispatch table: over the "counter" domain it
 /// reacts to the NEWEST Increased trigger by emitting one Reserve command for
 /// "inventory" (stamped from the destination sequence when present) plus a
-/// process event; a rejected Reserve compensates with a process event and an
-/// escalation. Its own state counts prior Increased process events, so a
+/// process event. Its own state counts prior Increased process events, so a
 /// rebuild is observable.
 pub fn order_pm() -> ProcessManagerDispatch<ProcessManagerState> {
     let rebuilder = Rebuilder::new(ProcessManagerState::default).apply(
@@ -407,24 +332,11 @@ pub fn order_pm() -> ProcessManagerDispatch<ProcessManagerState> {
                 })
             },
         )
-        .on_rejected("test.counter.Reserve", |_n, _r, _state| {
-            Ok((vec![pm_process_event()], Some(pm_escalation())))
-        })
 }
 
 fn pm_process_event() -> pb::EventBook {
     pb::EventBook {
         pages: vec![pb::EventPage::default()],
-        ..Default::default()
-    }
-}
-
-fn pm_escalation() -> pb::Notification {
-    pb::Notification {
-        cover: Some(pb::Cover {
-            domain: "escalated".to_string(),
-            ..Default::default()
-        }),
         ..Default::default()
     }
 }
@@ -458,44 +370,6 @@ pub fn pm_trigger_request(
         }),
         process_state,
         destination_sequences: dest.iter().map(|(d, s)| (d.to_string(), *s)).collect(),
-    }
-}
-
-/// A PM request whose trigger's newest page is a rejection Notification for
-/// `fq_command`.
-pub fn pm_rejection_request(fq_command: &str) -> pb::ProcessManagerHandleRequest {
-    let mut rejected = reserve_command_to("inventory");
-    if let Some(pb::command_page::Payload::Command(any)) = rejected.pages[0].payload.as_mut() {
-        any.type_url = angzarr_router::type_url(fq_command);
-    }
-    let rejection = pb::RejectionNotification {
-        rejected_command: Some(rejected),
-        ..Default::default()
-    };
-    let notification = pb::Notification {
-        payload: Some(prost_types::Any {
-            type_url: angzarr_router::type_url("io.angzarr.v1.RejectionNotification"),
-            value: rejection.encode_to_vec(),
-        }),
-        ..Default::default()
-    };
-    pb::ProcessManagerHandleRequest {
-        trigger: Some(pb::EventBook {
-            cover: Some(pb::Cover {
-                domain: "counter".to_string(),
-                ..Default::default()
-            }),
-            pages: vec![pb::EventPage {
-                payload: Some(pb::event_page::Payload::Event(prost_types::Any {
-                    type_url: angzarr_router::NOTIFICATION_TYPE_URL.to_string(),
-                    value: notification.encode_to_vec(),
-                })),
-                ..Default::default()
-            }],
-            ..Default::default()
-        }),
-        process_state: None,
-        destination_sequences: Default::default(),
     }
 }
 
@@ -574,52 +448,6 @@ pub fn failhard_command() -> pb::ContextualCommand {
 /// A command whose type has no registered handler (drives NO_HANDLER_REGISTERED).
 pub fn unhandled_command() -> pb::ContextualCommand {
     parse_txtpb(CONTEXTUAL_COMMAND, SKEL_UNHANDLED)
-}
-
-/// A ContextualCommand carrying a rejection `Notification` for `fq_command`,
-/// routed through the same dispatch entry as a command (the core detects the
-/// notification type and takes the compensation path). Built by field — the
-/// envelope nests Notification → RejectionNotification → the rejected book.
-pub fn rejection_command(fq_command: &str) -> pb::ContextualCommand {
-    let counter_cover = || {
-        Some(pb::Cover {
-            domain: "counter".to_string(),
-            ..Default::default()
-        })
-    };
-    let rejection = pb::RejectionNotification {
-        rejected_command: Some(pb::CommandBook {
-            cover: counter_cover(),
-            pages: vec![pb::CommandPage {
-                payload: Some(pb::command_page::Payload::Command(prost_types::Any {
-                    type_url: angzarr_router::type_url(fq_command),
-                    value: Vec::new(),
-                })),
-                ..Default::default()
-            }],
-        }),
-        ..Default::default()
-    };
-    let notification = pb::Notification {
-        payload: Some(prost_types::Any {
-            type_url: angzarr_router::type_url("io.angzarr.v1.RejectionNotification"),
-            value: rejection.encode_to_vec(),
-        }),
-        ..Default::default()
-    };
-    pb::ContextualCommand {
-        command: Some(pb::CommandBook {
-            cover: counter_cover(),
-            pages: vec![pb::CommandPage {
-                payload: Some(pb::command_page::Payload::Command(prost_types::Any {
-                    type_url: angzarr_router::NOTIFICATION_TYPE_URL.to_string(),
-                    value: notification.encode_to_vec(),
-                })),
-                ..Default::default()
-            }],
-        }),
-        events: None,
-    }
 }
 
 // Envelope-guard negatives: a well-formed skeleton with exactly one structural

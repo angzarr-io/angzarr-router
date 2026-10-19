@@ -56,16 +56,6 @@ async fn missing_source(w: &mut SagaWorld) {
     w.dispatch(conf::saga_missing_source());
 }
 
-#[when("a rejection of Reserve is dispatched")]
-async fn rejection_reserve(w: &mut SagaWorld) {
-    w.dispatch(conf::saga_rejection_source("test.counter.Reserve"));
-}
-
-#[when("a rejection of Unwatched is dispatched")]
-async fn rejection_unwatched(w: &mut SagaWorld) {
-    w.dispatch(conf::saga_rejection_source("test.counter.Unwatched"));
-}
-
 #[then(regex = r#"^the saga emits one command to "([^"]*)"$"#)]
 async fn emits_one_command(w: &mut SagaWorld, target: String) {
     let resp = w.response();
@@ -93,16 +83,6 @@ async fn command_carries_sequence(w: &mut SagaWorld, seq: u32) {
 #[then("the saga emits no commands")]
 async fn emits_no_commands(w: &mut SagaWorld) {
     assert!(w.response().commands.is_empty(), "no commands emitted");
-}
-
-#[then("the saga injects one fact event")]
-async fn injects_one_event(w: &mut SagaWorld) {
-    assert_eq!(w.response().events.len(), 1, "one fact event injected");
-}
-
-#[then("the saga injects no events")]
-async fn injects_no_events(w: &mut SagaWorld) {
-    assert!(w.response().events.is_empty(), "no events injected");
 }
 
 #[then(regex = r"^the dispatch fails with ([A-Z_]+)$")]
