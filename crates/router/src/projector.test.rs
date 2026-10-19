@@ -55,7 +55,7 @@ fn counting_projector(domains: Option<&[&str]>) -> ProjectorDispatch<Folded> {
         Ok(pb::Projection {
             cover: events.cover.clone(),
             projector: "write-model".to_string(),
-            sequence: p.entries.len() as u32,
+            next_sequence: p.entries.len() as u64,
             ..Default::default()
         })
     })
@@ -71,7 +71,10 @@ fn every_page_folds_into_one_projection() {
     let proj = d
         .dispatch(&book("order", cover_pages("order", 3)))
         .expect("dispatch");
-    assert_eq!(proj.sequence, 3, "all three pages fold into one projection");
+    assert_eq!(
+        proj.next_sequence, 3,
+        "all three pages fold into one projection"
+    );
 }
 
 #[test]
@@ -82,7 +85,7 @@ fn single_instance_reused_across_delivery() {
     let proj = d
         .dispatch(&book("order", cover_pages("order", 5)))
         .expect("dispatch");
-    assert_eq!(proj.sequence, 5);
+    assert_eq!(proj.next_sequence, 5);
 }
 
 #[test]
@@ -100,7 +103,7 @@ fn unhandled_event_type_is_skipped() {
     let d = counting_projector(None);
     let proj = d.dispatch(&book("order", pages)).expect("dispatch");
     assert_eq!(
-        proj.sequence, 2,
+        proj.next_sequence, 2,
         "unknown type skipped, declared pair folds"
     );
 }
@@ -113,7 +116,7 @@ fn undeclared_domain_folds_nothing_but_finishes() {
     let proj = d
         .dispatch(&book("inventory", cover_pages("inventory", 3)))
         .expect("dispatch");
-    assert_eq!(proj.sequence, 0, "undeclared domain folds nothing");
+    assert_eq!(proj.next_sequence, 0, "undeclared domain folds nothing");
 }
 
 #[test]
@@ -122,7 +125,7 @@ fn declared_domain_folds() {
     let proj = d
         .dispatch(&book("order", cover_pages("order", 2)))
         .expect("dispatch");
-    assert_eq!(proj.sequence, 2);
+    assert_eq!(proj.next_sequence, 2);
 }
 
 #[test]
@@ -131,7 +134,7 @@ fn the_wildcard_domain_folds_every_domain() {
     let proj = d
         .dispatch(&book("inventory", cover_pages("inventory", 3)))
         .expect("dispatch");
-    assert_eq!(proj.sequence, 3, "\"*\" consumes every domain");
+    assert_eq!(proj.next_sequence, 3, "\"*\" consumes every domain");
 }
 
 #[test]
@@ -140,14 +143,14 @@ fn the_wildcard_beside_named_domains_still_folds_every_domain() {
     let proj = d
         .dispatch(&book("billing", cover_pages("billing", 2)))
         .expect("dispatch");
-    assert_eq!(proj.sequence, 2);
+    assert_eq!(proj.next_sequence, 2);
 }
 
 #[test]
 fn empty_book_finishes_with_zero_folds() {
     let d = counting_projector(None);
     let proj = d.dispatch(&book("order", vec![])).expect("dispatch");
-    assert_eq!(proj.sequence, 0);
+    assert_eq!(proj.next_sequence, 0);
 }
 
 #[test]
@@ -172,7 +175,7 @@ fn no_finish_returns_default_projection() {
         .expect("dispatch");
     assert_eq!(proj.projector, "write-model");
     assert_eq!(proj.cover.expect("cover").domain, "order");
-    assert_eq!(proj.sequence, 0);
+    assert_eq!(proj.next_sequence, 0);
     assert!(proj.projection.is_none());
 }
 
@@ -184,14 +187,14 @@ fn finish_customizes_projection() {
             Ok(pb::Projection {
                 cover: events.cover.clone(),
                 projector: "write-model".to_string(),
-                sequence: 99,
+                next_sequence: 99,
                 projection: Some(cover_any(&p.entries.join(","))),
             })
         });
     let proj = d
         .dispatch(&book("order", cover_pages("order", 2)))
         .expect("dispatch");
-    assert_eq!(proj.sequence, 99);
+    assert_eq!(proj.next_sequence, 99);
     assert!(proj.projection.is_some(), "finish sets a custom payload");
 }
 
@@ -215,7 +218,7 @@ fn handler_error_propagates_as_unhandled() {
 }
 
 // Each fold sees its page's place: the book's cover (root) and the page's
-// explicit sequence (0 when absent), for idempotent per-page handling.
+// sequence, for idempotent per-page handling.
 #[test]
 fn folds_observe_the_book_cover_and_page_sequence() {
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -224,21 +227,20 @@ fn folds_observe_the_book_cover_and_page_sequence() {
         &cover_full_name(),
         move |_p, _any, ctx| {
             captured.lock().unwrap().push((
-                ctx.cover.and_then(|c| c.root.clone()).map(|r| r.value),
+                ctx.cover
+                    .and_then(|c| c.root.clone())
+                    .map(|r| r.value.to_vec()),
                 ctx.sequence,
             ));
             Ok(())
         },
     );
     let mut events = book("order", cover_pages("order", 2));
-    events.cover.as_mut().unwrap().root = Some(pb::Uuid { value: vec![9] });
-    events.pages[0].header = Some(pb::PageHeader {
-        sequence_type: Some(pb::page_header::SequenceType::Sequence(4)),
-        ..Default::default()
-    });
+    events.cover.as_mut().unwrap().root = Some(uuid_of(9));
+    events.pages[0].sequence = 4;
     d.dispatch(&events).expect("dispatch");
     assert_eq!(
         *seen.lock().unwrap(),
-        vec![(Some(vec![9]), 4), (Some(vec![9]), 0)]
+        vec![(Some(vec![9; 16]), 4), (Some(vec![9; 16]), 0)]
     );
 }

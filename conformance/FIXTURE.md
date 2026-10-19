@@ -54,7 +54,9 @@ historical-state evidence the framework supplies.
 - **OrderProcessManager** (domain `order-pm`) and **AuditProcessManager**
   (domain `audit-pm`) — co-resident PMs consuming the same `counter`
   trigger, over DIFFERENT state types. The order PM emits a `Reserve`
-  command, one unaddressed process event and one fact per prior state
-  event; the audit PM emits one `audit` fact per prior state event. They
+  command and one unaddressed process event carrying an
+  `OrderProcessManagerState` with the count its rebuilt state held; the
+  audit PM emits one unaddressed process event carrying an
+  `AuditProcessManagerState` with what its rebuilt state saw. They
   prove each PM rebuilds only its own state and that a process state
   reaches only the PM that owns it.

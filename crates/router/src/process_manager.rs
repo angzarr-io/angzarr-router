@@ -1,5 +1,5 @@
-//! ProcessManagerDispatch — the stateful trigger → commands/process-events/
-//! facts table.
+//! ProcessManagerDispatch — the stateful trigger → commands/process-events
+//! table.
 //!
 //! Transliterated from client-go's `engine.go` ProcessManagerDispatch.Dispatch
 //! and `features/process_manager.go`. Unlike the saga, a PM is STATEFUL: it
@@ -11,8 +11,7 @@
 //! (spec C-0022), not an error. Emitted commands and process events pass
 //! through as the handler returned them: the coordinator stamps the commands'
 //! identity and addresses the process events. There is no compensation
-//! input: a Notification-typed trigger is just an
-//! undeclared event type.
+//! input.
 
 use std::collections::HashMap;
 
@@ -20,10 +19,10 @@ use prost_types::Any;
 
 use crate::error::{codes, map_handler_error, messages, CodedError, HandlerError};
 use crate::pb;
-use crate::rebuild::{pack_message_state, Rebuilder, StatePackFn};
+use crate::rebuild::Rebuilder;
 
 /// Handles the newest trigger event against rebuilt PM state, returning the
-/// full response (process events, commands, facts, optional escalation).
+/// full response (process events and commands).
 /// Generated thunks unmarshal to the typed event and call the typed business
 /// method.
 pub type EventFn<S> = Box<
@@ -44,7 +43,6 @@ pub struct ProcessManagerDispatch<S> {
     rebuilder: Rebuilder<S>,
     /// input domain → fully-qualified event type → thunk.
     handlers: HashMap<String, HashMap<String, EventFn<S>>>,
-    state_packer: Option<StatePackFn<S>>,
 }
 
 impl<S> ProcessManagerDispatch<S> {
@@ -63,27 +61,7 @@ impl<S> ProcessManagerDispatch<S> {
             targets: target_domains.into_iter().map(Into::into).collect(),
             rebuilder,
             handlers: HashMap::new(),
-            state_packer: None,
         }
-    }
-
-    /// Supports Replay through the router: replayed state is packed by
-    /// `packer` into the response's `Any`.
-    pub fn with_state_packer(
-        mut self,
-        packer: impl Fn(&S) -> Result<Any, HandlerError> + Send + Sync + 'static,
-    ) -> Self {
-        self.state_packer = Some(Box::new(packer));
-        self
-    }
-
-    /// Supports Replay through the router for a protobuf-message state,
-    /// packed under its fully-qualified name.
-    pub fn with_message_state(self) -> Self
-    where
-        S: prost::Message + prost::Name + 'static,
-    {
-        self.with_state_packer(pack_message_state::<S>)
     }
 
     /// Registers the thunk for (input domain, fully-qualified event type).
@@ -105,20 +83,6 @@ impl<S> ProcessManagerDispatch<S> {
             .or_default()
             .insert(full_name.to_string(), Box::new(thunk));
         self
-    }
-
-    /// The PM's state after folding the base snapshot (when present) and
-    /// then the events, in order — the process-manager counterpart of the
-    /// aggregate's `Replay`.
-    pub fn replay(&self, req: &pb::ReplayRequest) -> Result<S, CodedError> {
-        self.rebuilder.replay(req)
-    }
-
-    /// [`Self::replay`] packed by the state packer; without one the process
-    /// manager does not support Replay (NO_HANDLER_REGISTERED).
-    pub fn packed_replay(&self, req: &pb::ReplayRequest) -> Result<pb::ReplayResponse, CodedError> {
-        self.rebuilder
-            .packed_replay(self.state_packer.as_ref(), &self.pm_domain, req)
     }
 
     /// The component name.
@@ -266,14 +230,19 @@ pub fn select_process_managers(
 }
 
 /// Folds one co-resident PM's response into the merged response: process
-/// events, commands and facts concatenate in dispatch order.
+/// events and commands concatenate in dispatch order; the first non-empty
+/// rules version is kept, and a refused snapshot anywhere marks the merge
+/// refused.
 pub fn merge_response(
     acc: &mut pb::ProcessManagerHandleResponse,
     resp: pb::ProcessManagerHandleResponse,
 ) {
     acc.process_events.extend(resp.process_events);
     acc.commands.extend(resp.commands);
-    acc.facts.extend(resp.facts);
+    if acc.rules_version.is_empty() {
+        acc.rules_version = resp.rules_version;
+    }
+    acc.snapshot_refused |= resp.snapshot_refused;
 }
 
 #[cfg(test)]

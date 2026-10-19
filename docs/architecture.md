@@ -17,10 +17,10 @@ router.
   repo carries no Python binding.
 - **client-rust** dispatches through `crates/router`'s Rust-native API (no
   FFI) and has no engine of its own. That API (`Rebuilder`,
-  `AggregateDispatch` with facts and replay, `SagaDispatch`,
+  `AggregateDispatch` with commands and facts, `SagaDispatch`,
   `ProcessManagerDispatch` with `select_process_managers`/`merge_response`,
   `ProjectorDispatch`, `RouterBuilder`/`Router`/`CommandHandlers`,
-  `CodedError`) is
+  `CodedError`, and the wire types re-exported as `pb`) is
   therefore a public contract, documented on each item; components may be
   registered boxed (`Box<dyn CommandHandler>` and so on).
 - **Not consumers (yet).** The other `angzarr-client-*` libraries still
@@ -39,7 +39,7 @@ generated wiring  ── typed seam + Register<Component>(router, handler)
         │
 bindings/<lang>    ── registry of callback_id → typed invoker, one trampoline,
         │             a per-dispatch session parked in host_ctx
-        │  C ABI (crates/router-ffi: 15 extern "C" fns)
+        │  C ABI (crates/router-ffi: 13 extern "C" fns)
         ▼
 crates/router-ffi  ── descriptor → core tables, component claims/routing,
         │             host_ctx installed for the duration of one dispatch
@@ -61,8 +61,9 @@ The exported surface (see `crates/router-ffi/src/lib.rs`):
 `angzarr_abi_version`, `angzarr_buf_alloc`, `angzarr_buf_release`,
 `angzarr_router_new`, `angzarr_router_free`, per component kind a
 `register_*` and a `dispatch*` entry point (aggregate, projector, saga,
-process manager), and the aggregate's `dispatch_fact` / `dispatch_replay`
-(ABI version 4). A component is registered from a serialized descriptor
+process manager) (ABI version 4). The aggregate's `dispatch` takes a
+`ContextualCommand` whose page carries a command or a fact and answers a
+`CommandHandlerResponse`; the saga's takes the source `EventBook`. A component is registered from a serialized descriptor
 (`proto/io/angzarr/router/ffi/v1/abi.proto`) listing `(fq_type,
 callback_id)` entries; every callback goes through one host function
 `angzarr_cb(host_ctx, callback_id, type_url, payload, aux, out)`.
@@ -93,11 +94,11 @@ keyed by component, never by session alone.
 
 | Semantic | Contract |
 |---|---|
-| State rebuild | Snapshot applies first; pages with an explicit sequence at or below a LOADED snapshot's sequence never re-apply (a snapshot with no loader or no state covers nothing); pageless or unknown-type entries are skipped, never terminal; a corrupt persisted payload fails with `PERSISTED_EVENT_CORRUPT` |
-| Aggregate dispatch | Envelope and command type validate BEFORE rebuild (unknown command → `NO_HANDLER_REGISTERED`); handlers receive `CommandContext` (next sequence, had-prior-events, the handled cover); the emitted book passes through as the handler returned it (the coordinator stamps sequences and meta) |
+| State rebuild | Snapshot applies first; pages at or below a LOADED snapshot's sequence never re-apply (a snapshot with no loader or no state covers nothing); pageless or unknown-type entries are skipped, never terminal; a corrupt persisted payload fails with `PERSISTED_EVENT_CORRUPT` |
+| Aggregate dispatch | `CommandHandlerService.Handle` is the only input: envelope, body arm and type validate BEFORE rebuild (unknown command → `NO_HANDLER_REGISTERED`); handlers receive `CommandContext` (next sequence, had-prior-events, the handled cover); the emitted book passes through as the handler returned it (the coordinator stamps sequences and meta) |
 | Reaction commands | Saga and process-manager commands pass through as the handler emitted them: the coordinator stamps their identity, causation and correlation. A saga handler sees the triggering page's cover and sequence; a process-manager handler sees the trigger cover |
 | Saga dispatch | EVERY page of the source book dispatches; undeclared types are skipped (C-0051) |
-| Facts and replay | `HandleFact` refuses a fact of a type with no fact handler (the aggregate's declared `ComponentOptions.facts`) with `NO_FACT_HANDLER` (INVALID_ARGUMENT) before any handler runs, so nothing is recorded; otherwise it rebuilds from the prior events and walks the facts in order: each fact handler returns the fact to record (it may annotate it, never refuse it) followed by events that flag it, and every recorded event folds before the next fact; the facts' cover and each fact's header are kept, a flag carries no header. `Replay` folds base snapshot then events into state, packed by the component's state packer (none: `NO_HANDLER_REGISTERED`). Facts route by the facts' cover domain; replay by the requested domain, to its first aggregate, else to the process manager whose own domain it is |
+| Facts | A fact arrives in the Fact arm of the command page and runs the fact handler registered for its type; a type with none (a command type included: the arm must match the handler's kind) is `NO_FACT_HANDLER` (INVALID_ARGUMENT) before any rebuild, so nothing is recorded. Otherwise the handler sees the rebuilt state and returns the fact to record (it may annotate it, never refuse it) followed by events that flag it; they come back as the response's events, payloads only. Facts route by (cover domain, fact type), else to the domain's first aggregate, which refuses them. There is no Replay |
 | Process manager | The newest page of the trigger book dispatches; handlers receive the trigger cover; co-resident PMs are selected by identity first — a process state reaches the PM owning its cover domain — and otherwise every PM consuming the trigger domain; responses merge in registration order. Process events pass through as emitted (the coordinator addresses and stamps them) |
 | Projector | Folds every page into one projection instance, each fold seeing the book cover and the page's sequence; undeclared domains fold nothing (C-0032), and a projector declaring `"*"` consumes every domain; unmatched types are skipped with a WARN |
 | Type URLs | Emitted type URLs use the bare `/` prefix; incoming ones match by the fully-qualified name after the last `/`, whatever the prefix |

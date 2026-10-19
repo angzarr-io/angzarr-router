@@ -17,7 +17,7 @@ struct SagaWorld {
 }
 
 impl SagaWorld {
-    fn dispatch(&mut self, req: pb::SagaHandleRequest) {
+    fn dispatch(&mut self, req: pb::EventBook) {
         self.result = Some(conf::order_saga(self.seen.clone()).dispatch(&req));
     }
 
@@ -36,23 +36,18 @@ async fn an_order_saga(_w: &mut SagaWorld, _target: String) {
 }
 
 #[when(regex = r"^an Increased event at sequence (\d+) is dispatched$")]
-async fn increased_at(w: &mut SagaWorld, seq: u32) {
-    w.dispatch(conf::saga_event_source("test.counter.Increased", Some(seq)));
+async fn increased_at(w: &mut SagaWorld, seq: u64) {
+    w.dispatch(conf::saga_event_source("test.counter.Increased", seq));
 }
 
 #[when("a Reserve event is dispatched")]
 async fn reserve_event(w: &mut SagaWorld) {
-    w.dispatch(conf::saga_event_source("test.counter.Reserve", None));
+    w.dispatch(conf::saga_event_source("test.counter.Reserve", 0));
 }
 
 #[when("a source with no pages is dispatched")]
 async fn empty_source(w: &mut SagaWorld) {
     w.dispatch(conf::saga_empty_source());
-}
-
-#[when("a request with no source is dispatched")]
-async fn missing_source(w: &mut SagaWorld) {
-    w.dispatch(conf::saga_missing_source());
 }
 
 #[then(regex = r#"^the saga emits one command to "([^"]*)"$"#)]
@@ -66,15 +61,28 @@ async fn emits_one_command(w: &mut SagaWorld, target: String) {
 }
 
 #[then(regex = r"^the saga handler saw source sequence (\d+)$")]
-async fn handler_saw_sequence(w: &mut SagaWorld, seq: u32) {
+async fn handler_saw_sequence(w: &mut SagaWorld, seq: u64) {
     assert_eq!(*w.seen.lock().unwrap(), vec![seq]);
 }
 
 #[then("the command carries no router-stamped provenance")]
 async fn no_stamped_provenance(w: &mut SagaWorld) {
-    for page in &w.response().commands[0].pages {
-        assert_eq!(page.header, None, "the command passes through as emitted");
-    }
+    let page = w.response().commands[0]
+        .page
+        .as_ref()
+        .expect("a command page");
+    assert_eq!(
+        page.command_id, None,
+        "the coordinator stamps the command id"
+    );
+    assert_eq!(
+        page.correlation_id, None,
+        "the coordinator stamps the correlation"
+    );
+    assert_eq!(
+        page.causation_id, None,
+        "the coordinator stamps the causation"
+    );
 }
 
 #[then("the saga emits no commands")]

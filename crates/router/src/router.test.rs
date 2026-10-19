@@ -1,7 +1,6 @@
 //! RouterBuilder / Router: build-time validation (C-0060, C-0062..C-0064)
 //! and dispatch across composed components of one kind.
 
-use prost::Message;
 use prost_types::Any;
 
 use crate::aggregate::AggregateDispatch;
@@ -9,13 +8,12 @@ use crate::error::{codes, CodedError};
 use crate::pb;
 use crate::process_manager::{ProcessManagerDispatch, ProcessManagerRoute};
 use crate::projector::ProjectorDispatch;
-use crate::rebuild::Rebuilder;
 use crate::router::{
     CommandHandler, CommandHandlers, ProcessManagerHandler, ProjectorHandler, Router, RouterBuilder,
 };
 use crate::saga::SagaDispatch;
 use crate::test_support::{
-    any_of, cover_any, cover_applier, event_page, fresh_rebuilder, TestState,
+    command_page, cover_applier, event_page, fact_page, fresh_rebuilder, TestState,
 };
 use crate::type_url;
 use crate::upcaster::UpcasterDispatch;
@@ -49,25 +47,28 @@ fn command(domain: &str, fq: &str) -> pb::ContextualCommand {
                 domain: domain.to_string(),
                 ..Default::default()
             }),
-            pages: vec![pb::CommandPage {
-                payload: Some(pb::command_page::Payload::Command(any_of_type(fq))),
-                ..Default::default()
-            }],
+            page: Some(command_page(any_of_type(fq))),
+            ..Default::default()
         }),
         events: None,
+        ..Default::default()
     }
 }
 
-fn emitted_label(resp: &pb::BusinessResponse) -> String {
-    match &resp.result {
-        Some(pb::business_response::Result::Events(book)) => match book.pages[0].payload.as_ref() {
-            Some(pb::event_page::Payload::Event(any)) => {
-                crate::type_name_from_url(&any.type_url).to_string()
-            }
-            _ => String::new(),
-        },
-        _ => String::new(),
-    }
+/// A Fact-arm delivery of `fq` to `domain`.
+fn fact(domain: &str, fq: &str) -> pb::ContextualCommand {
+    let mut req = command(domain, fq);
+    req.command.as_mut().unwrap().page = Some(fact_page(any_of_type(fq)));
+    req
+}
+
+fn emitted_label(resp: &pb::CommandHandlerResponse) -> String {
+    resp.events
+        .as_ref()
+        .and_then(|book| book.pages.first())
+        .and_then(|page| page.payload.as_ref())
+        .map(|any| crate::type_name_from_url(&any.type_url).to_string())
+        .unwrap_or_default()
 }
 
 fn build_err(builder: RouterBuilder) -> String {
@@ -147,42 +148,35 @@ fn commands_route_by_domain_and_type() {
     assert_eq!(err.code, codes::NO_HANDLER_REGISTERED);
 }
 
+/// An aggregate in `domain` recording `fq` facts as `label` events.
+fn recorder(label: &'static str, domain: &str, fq: &str) -> AggregateDispatch<TestState> {
+    AggregateDispatch::new(label, domain, fresh_rebuilder()).on_fact(fq, move |_, _| {
+        Ok(crate::aggregate::FactRecord::from(any_of_type(label)))
+    })
+}
+
 #[test]
-fn facts_route_to_the_domain_aggregate() {
+fn facts_route_by_domain_and_fact_type() {
     let router = RouterBuilder::new()
-        .aggregate(
-            aggregate("order", "order", &["test.Create"]).on_fact("test.Fact", |fact, _| {
-                Ok(crate::aggregate::FactRecord::from(fact.clone()))
-            }),
-        )
+        .aggregate(aggregate("order", "order", &["test.Create"]))
+        .aggregate(recorder("paid", "order", "test.Paid"))
+        .aggregate(recorder("shipped", "order", "test.Shipped"))
         .build()
         .expect("build");
-    let facts = pb::EventBook {
-        cover: Some(pb::Cover {
-            domain: "order".to_string(),
-            ..Default::default()
-        }),
-        pages: vec![event_page(any_of_type("test.Fact"))],
-        ..Default::default()
-    };
-    let out = router
-        .handle_fact(&pb::FactRequest {
-            facts: Some(facts.clone()),
-            prior_events: None,
-        })
-        .expect("fact");
-    assert_eq!(out, facts);
+    for (fq, label) in [("test.Paid", "paid"), ("test.Shipped", "shipped")] {
+        let resp = router.dispatch_command(&fact("order", fq)).expect("fact");
+        assert_eq!(emitted_label(&resp), label, "the aggregate recording {fq}");
+    }
     let err = router
-        .handle_fact(&pb::FactRequest {
-            facts: Some(pb::EventBook {
-                cover: Some(pb::Cover {
-                    domain: "billing".to_string(),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            prior_events: None,
-        })
+        .dispatch_command(&fact("order", "test.Unknown"))
+        .expect_err("no aggregate records Unknown");
+    assert_eq!(
+        err.code,
+        codes::NO_FACT_HANDLER,
+        "the domain's first refuses it"
+    );
+    let err = router
+        .dispatch_command(&fact("billing", "test.Paid"))
         .expect_err("no aggregate for billing");
     assert_eq!(err.code, codes::NO_HANDLER_REGISTERED);
 }
@@ -196,7 +190,8 @@ fn sagas_fan_out_and_merge_in_registration_order() {
                     domain: label.to_string(),
                     ..Default::default()
                 }),
-                pages: vec![pb::CommandPage::default()],
+                page: Some(pb::CommandPage::default()),
+                ..Default::default()
             }])
         })
     };
@@ -205,15 +200,12 @@ fn sagas_fan_out_and_merge_in_registration_order() {
         .saga(saga("second"))
         .build()
         .expect("build");
-    let req = pb::SagaHandleRequest {
-        source: Some(pb::EventBook {
-            cover: Some(pb::Cover {
-                domain: "order".to_string(),
-                ..Default::default()
-            }),
-            pages: vec![event_page(any_of_type("test.Created"))],
+    let req = pb::EventBook {
+        cover: Some(pb::Cover {
+            domain: "order".to_string(),
             ..Default::default()
         }),
+        pages: vec![event_page(any_of_type("test.Created"))],
         ..Default::default()
     };
     let resp = router.dispatch_saga(&req).expect("dispatch");
@@ -224,14 +216,7 @@ fn sagas_fan_out_and_merge_in_registration_order() {
         .collect();
     assert_eq!(order, vec!["first", "second"], "C-0013");
     let mut other = req.clone();
-    other
-        .source
-        .as_mut()
-        .unwrap()
-        .cover
-        .as_mut()
-        .unwrap()
-        .domain = "billing".to_string();
+    other.cover.as_mut().unwrap().domain = "billing".to_string();
     assert_eq!(
         router.dispatch_saga(&other).unwrap_err().code,
         codes::NO_HANDLER_REGISTERED
@@ -244,7 +229,7 @@ fn process_managers_route_through_selection() {
         ProcessManagerDispatch::new(name, format!("{name}-pm"), ["inventory"], fresh_rebuilder())
             .on_event("order", "test.Created", move |_, _, _| {
                 Ok(pb::ProcessManagerHandleResponse {
-                    facts: vec![pb::EventBook {
+                    process_events: vec![pb::EventBook {
                         cover: Some(pb::Cover {
                             domain: name.to_string(),
                             ..Default::default()
@@ -271,14 +256,14 @@ fn process_managers_route_through_selection() {
         }),
         process_state: None,
     };
-    let facts = |resp: pb::ProcessManagerHandleResponse| -> Vec<String> {
-        resp.facts
+    let reactions = |resp: pb::ProcessManagerHandleResponse| -> Vec<String> {
+        resp.process_events
             .into_iter()
             .map(|f| f.cover.unwrap().domain)
             .collect()
     };
     assert_eq!(
-        facts(router.dispatch_process_manager(&req).unwrap()),
+        reactions(router.dispatch_process_manager(&req).unwrap()),
         vec!["a", "b"]
     );
     req.process_state = Some(pb::EventBook {
@@ -289,7 +274,7 @@ fn process_managers_route_through_selection() {
         ..Default::default()
     });
     assert_eq!(
-        facts(router.dispatch_process_manager(&req).unwrap()),
+        reactions(router.dispatch_process_manager(&req).unwrap()),
         vec!["b"]
     );
 }
@@ -340,7 +325,7 @@ fn upcasters_chain_across_components_for_their_domain() {
             events: vec![event_page(any_of_type("test.V1"))],
         })
         .expect("upcast");
-    let Some(pb::event_page::Payload::Event(any)) = resp.events[0].payload.as_ref() else {
+    let Some(any) = resp.events[0].payload.as_ref() else {
         panic!("no event");
     };
     assert_eq!(
@@ -372,8 +357,6 @@ fn a_router_refuses_dispatch_of_another_kind() {
     );
 }
 
-// --- every claimant of a notification runs (C-0042) -------------------------
-
 // --- boxed components ------------------------------------------------------
 
 #[test]
@@ -394,7 +377,7 @@ fn boxed_components_build_routers() {
             "test.Created",
             |_, _, _| {
                 Ok(pb::ProcessManagerHandleResponse {
-                    facts: vec![pb::EventBook::default()],
+                    process_events: vec![pb::EventBook::default()],
                     ..Default::default()
                 })
             },
@@ -417,7 +400,7 @@ fn boxed_components_build_routers() {
             process_state: None,
         })
         .expect("dispatch");
-    assert_eq!(resp.facts.len(), 1);
+    assert_eq!(resp.process_events.len(), 1);
 
     let projector: Box<dyn ProjectorHandler> =
         Box::new(ProjectorDispatch::new("p", || ()).finish(|_, _| {
@@ -446,211 +429,20 @@ fn a_boxed_aggregate_keeps_its_routing_view() {
     assert_eq!(boxed.command_types(), vec!["test.Create".to_string()]);
 }
 
-// --- Replay ------------------------------------------------------------------
-
-fn cover_replay(domains: &[&str]) -> pb::ReplayRequest {
-    pb::ReplayRequest {
-        events: domains.iter().map(|d| event_page(cover_any(d))).collect(),
-        ..Default::default()
-    }
-}
-
-fn applied_domains(packed: &pb::ReplayResponse) -> String {
-    String::from_utf8(packed.state.as_ref().expect("state").value.clone()).unwrap()
-}
-
-fn pack_applied(state: &TestState) -> Result<Any, crate::error::HandlerError> {
-    Ok(Any {
-        type_url: type_url("test.Applied"),
-        value: state.applied.join(",").into_bytes(),
-    })
-}
-
-#[test]
-fn replay_routes_to_the_aggregate_of_the_domain_and_packs_its_state() {
-    let router = RouterBuilder::new()
-        .aggregate(aggregate("other", "billing", &["test.Bill"]))
-        .aggregate(
-            AggregateDispatch::new("order", "order", cover_applier(fresh_rebuilder()))
-                .with_state_packer(pack_applied),
-        )
-        .build()
-        .expect("build");
-    let resp = router
-        .replay("order", &cover_replay(&["a", "b"]))
-        .expect("replay");
-    assert_eq!(
-        resp.state.as_ref().unwrap().type_url,
-        type_url("test.Applied")
-    );
-    assert_eq!(applied_domains(&resp), "a,b");
-}
-
-#[test]
-fn replay_folds_the_base_snapshot_first() {
-    let rebuilder = cover_applier(fresh_rebuilder()).with_snapshot(|s: &mut TestState, any| {
-        s.applied.push(format!("snap:{}", any.type_url));
-        Ok(())
-    });
-    let router = RouterBuilder::new()
-        .aggregate(
-            AggregateDispatch::new("order", "order", rebuilder).with_state_packer(pack_applied),
-        )
-        .build()
-        .expect("build");
-    let mut req = cover_replay(&["a"]);
-    req.base_snapshot = Some(pb::Snapshot {
-        state: Some(Any {
-            type_url: "/s".to_string(),
-            value: vec![1],
-        }),
-        ..Default::default()
-    });
-    assert_eq!(
-        applied_domains(&router.replay("order", &req).unwrap()),
-        "snap:/s,a"
-    );
-}
-
-#[test]
-fn a_message_state_packs_under_its_full_name() {
-    let router = RouterBuilder::new()
-        .aggregate(
-            AggregateDispatch::new(
-                "order",
-                "order",
-                Rebuilder::new(pb::Cover::default).apply(
-                    &crate::test_support::cover_full_name(),
-                    |s: &mut pb::Cover, any| {
-                        let c = pb::Cover::decode(any.value.as_slice())?;
-                        s.domain.push_str(&c.domain);
-                        Ok(())
-                    },
-                ),
-            )
-            .with_message_state(),
-        )
-        .build()
-        .expect("build");
-    let resp = router.replay("order", &cover_replay(&["x", "y"])).unwrap();
-    assert_eq!(
-        resp.state,
-        Some(any_of(&pb::Cover {
-            domain: "xy".to_string(),
-            ..Default::default()
-        }))
-    );
-}
-
-#[test]
-fn replay_without_a_state_packer_is_unsupported() {
-    let router = RouterBuilder::new()
-        .aggregate(aggregate("order", "order", &["test.Create"]))
-        .build()
-        .expect("build");
-    let err = router.replay("order", &cover_replay(&[])).unwrap_err();
-    assert_eq!(err.code, codes::NO_HANDLER_REGISTERED);
-    assert_eq!(err.extras.get("domain").map(String::as_str), Some("order"));
-}
-
-#[test]
-fn replay_of_an_unknown_domain_is_no_handler_registered() {
-    let router = RouterBuilder::new()
-        .aggregate(
-            AggregateDispatch::new("order", "order", fresh_rebuilder())
-                .with_state_packer(pack_applied),
-        )
-        .build()
-        .expect("build");
-    let err = router.replay("billing", &cover_replay(&[])).unwrap_err();
-    assert_eq!(err.code, codes::NO_HANDLER_REGISTERED);
-    assert_eq!(
-        err.extras.get("domain").map(String::as_str),
-        Some("billing")
-    );
-}
-
-#[test]
-fn replay_routes_to_the_process_manager_owning_the_domain() {
-    let pm = |name: &'static str| {
-        ProcessManagerDispatch::new(
-            name,
-            format!("{name}-pm"),
-            ["inventory"],
-            cover_applier(fresh_rebuilder()),
-        )
-        .on_event("order", "test.Created", |_, _, _| {
-            Ok(pb::ProcessManagerHandleResponse::default())
-        })
-        .with_state_packer(move |s: &TestState| {
-            Ok(Any {
-                type_url: type_url(name),
-                value: s.applied.join(",").into_bytes(),
-            })
-        })
-    };
-    let router = RouterBuilder::new()
-        .process_manager(pm("a"))
-        .process_manager(pm("b"))
-        .build()
-        .expect("build");
-    let resp = router.replay("b-pm", &cover_replay(&["p", "q"])).unwrap();
-    assert_eq!(resp.state.as_ref().unwrap().type_url, type_url("b"));
-    assert_eq!(applied_domains(&resp), "p,q");
-    assert_eq!(
-        router.replay("c-pm", &cover_replay(&[])).unwrap_err().code,
-        codes::NO_HANDLER_REGISTERED
-    );
-}
-
-#[test]
-fn replay_on_a_router_without_stateful_components_is_refused() {
-    let router = RouterBuilder::new()
-        .saga(SagaDispatch::new("s", "order", ["inventory"]))
-        .build()
-        .expect("build");
-    assert_eq!(
-        router.replay("order", &cover_replay(&[])).unwrap_err().code,
-        codes::NO_HANDLER_REGISTERED
-    );
-}
-
 // --- Compensate delivery across a shared domain ------------------------------
 
 // --- boxed and hand-written components ---------------------------------------
 
 #[test]
-fn a_boxed_aggregate_handles_facts_and_replay() {
-    let boxed: Box<dyn CommandHandler> = Box::new(
-        AggregateDispatch::new("order", "order", cover_applier(fresh_rebuilder()))
-            .on_fact(&crate::test_support::cover_full_name(), |fact, _| {
-                Ok(crate::aggregate::FactRecord::from(fact.clone()))
-            })
-            .with_state_packer(pack_applied),
-    );
-    let facts = pb::EventBook {
-        cover: Some(pb::Cover {
-            domain: "order".to_string(),
-            ..Default::default()
-        }),
-        pages: vec![event_page(cover_any("fact"))],
-        ..Default::default()
-    };
-    let recorded = boxed
-        .handle_fact(&pb::FactRequest {
-            facts: Some(facts.clone()),
-            prior_events: None,
-        })
-        .expect("fact");
-    assert_eq!(recorded, facts);
-    assert_eq!(
-        applied_domains(&boxed.replay(&cover_replay(&["a"])).expect("replay")),
-        "a"
-    );
+fn a_boxed_aggregate_handles_facts() {
+    let boxed: Box<dyn CommandHandler> = Box::new(recorder("paid", "order", "test.Paid"));
+    assert_eq!(boxed.fact_types(), vec!["test.Paid".to_string()]);
+    let resp = boxed.dispatch(&fact("order", "test.Paid")).expect("fact");
+    assert_eq!(emitted_label(&resp), "paid");
 }
 
 #[test]
-fn a_boxed_process_manager_keeps_its_routing_view_and_replays() {
+fn a_boxed_process_manager_keeps_its_routing_view() {
     let boxed: Box<dyn ProcessManagerHandler> = Box::new(
         ProcessManagerDispatch::new(
             "fulfil",
@@ -660,20 +452,15 @@ fn a_boxed_process_manager_keeps_its_routing_view_and_replays() {
         )
         .on_event("order", "test.Created", |_, _, _| {
             Ok(pb::ProcessManagerHandleResponse::default())
-        })
-        .with_state_packer(pack_applied),
+        }),
     );
     assert_eq!(boxed.name(), "fulfil");
     assert_eq!(boxed.pm_domain(), "fulfil-pm");
     assert!(boxed.consumes("order"));
     assert!(!boxed.consumes("billing"));
-    assert_eq!(
-        applied_domains(&boxed.replay(&cover_replay(&["p"])).expect("replay")),
-        "p"
-    );
 }
 
-/// A hand-written aggregate that does not implement Replay.
+/// A hand-written aggregate that records no facts.
 struct Plain;
 
 impl CommandHandler for Plain {
@@ -683,57 +470,26 @@ impl CommandHandler for Plain {
     fn command_types(&self) -> Vec<String> {
         vec!["test.Plain".to_string()]
     }
-    fn dispatch(&self, _: &pb::ContextualCommand) -> Result<pb::BusinessResponse, CodedError> {
-        Ok(pb::BusinessResponse::default())
-    }
-    fn handle_fact(&self, _: &pb::FactRequest) -> Result<pb::EventBook, CodedError> {
-        Ok(pb::EventBook::default())
-    }
-}
-
-/// A hand-written process manager that does not implement Replay.
-struct PlainPm;
-
-impl ProcessManagerRoute for PlainPm {
-    fn name(&self) -> &str {
-        "plain"
-    }
-    fn pm_domain(&self) -> &str {
-        "plain-pm"
-    }
-    fn consumes(&self, _: &str) -> bool {
-        false
-    }
-}
-
-impl ProcessManagerHandler for PlainPm {
     fn dispatch(
         &self,
-        _: &pb::ProcessManagerHandleRequest,
-    ) -> Result<pb::ProcessManagerHandleResponse, CodedError> {
-        Ok(pb::ProcessManagerHandleResponse::default())
+        _: &pb::ContextualCommand,
+    ) -> Result<pb::CommandHandlerResponse, CodedError> {
+        Ok(pb::CommandHandlerResponse::default())
     }
 }
 
 #[test]
-fn a_component_without_replay_refuses_it_with_its_domain() {
+fn a_hand_written_aggregate_records_no_facts_by_default() {
+    assert!(Plain.fact_types().is_empty());
     let router = RouterBuilder::new()
         .aggregate(Plain)
         .build()
         .expect("build");
-    let err = router.replay("plain", &cover_replay(&[])).unwrap_err();
-    assert_eq!(err.code, codes::NO_HANDLER_REGISTERED);
-    assert_eq!(err.extras.get("domain").map(String::as_str), Some("plain"));
-
-    let router = RouterBuilder::new()
-        .process_manager(PlainPm)
-        .build()
-        .expect("build");
-    let err = router.replay("plain-pm", &cover_replay(&[])).unwrap_err();
-    assert_eq!(err.code, codes::NO_HANDLER_REGISTERED);
     assert_eq!(
-        err.extras.get("domain").map(String::as_str),
-        Some("plain-pm")
+        router
+            .dispatch_command(&command("plain", "test.Plain"))
+            .expect("dispatch"),
+        pb::CommandHandlerResponse::default()
     );
 }
 

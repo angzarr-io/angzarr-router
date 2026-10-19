@@ -130,7 +130,7 @@ impl<P> ProjectorDispatch<P> {
                 };
                 let ctx = PageContext {
                     cover: Some(cover),
-                    sequence: crate::page_sequence(page),
+                    sequence: page.sequence,
                 };
                 thunk(&mut projection, event_any, &ctx).map_err(map_handler_error)?;
             }

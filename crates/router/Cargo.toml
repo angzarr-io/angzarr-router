@@ -6,9 +6,12 @@ license.workspace = true
 description = "The shared angzarr client router: dispatch/rebuild semantics, implemented once"
 
 [dependencies]
+angzarr-proto = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
 tracing = { workspace = true }
 
 [build-dependencies]
+heck = "0.5"
 prost-build = { workspace = true }
+prost-types = { workspace = true }

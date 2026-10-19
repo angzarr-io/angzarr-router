@@ -30,7 +30,6 @@ pub mod codes {
     pub const PERSISTED_EVENT_CORRUPT: &str = "PERSISTED_EVENT_CORRUPT";
     pub const UNHANDLED_HANDLER_ERROR: &str = "UNHANDLED_HANDLER_ERROR";
     pub const MISSING_EVENT_BOOK_COVER: &str = "MISSING_EVENT_BOOK_COVER";
-    pub const MISSING_SAGA_SOURCE: &str = "MISSING_SAGA_SOURCE";
     pub const EMPTY_SAGA_SOURCE: &str = "EMPTY_SAGA_SOURCE";
     pub const MISSING_PM_TRIGGER: &str = "MISSING_PM_TRIGGER";
     pub const DUPLICATE_REGISTRATION: &str = "DUPLICATE_REGISTRATION";
@@ -48,7 +47,6 @@ pub mod messages {
     pub const NO_COMMAND_PAGES: &str = "No command pages";
     pub const PERSISTED_EVENT_CORRUPT: &str = "persisted event payload corrupt";
     pub const MISSING_EVENT_BOOK_COVER: &str = "missing event book cover";
-    pub const MISSING_SAGA_SOURCE: &str = "missing saga source";
     pub const EMPTY_SAGA_SOURCE: &str = "empty saga source";
     pub const MISSING_PM_TRIGGER: &str = "missing PM trigger";
     pub const EMPTY_PM_TRIGGER: &str = "empty PM trigger";
@@ -58,7 +56,6 @@ pub mod messages {
     pub const DUPLICATE_COMMAND_HANDLER: &str =
         "two command handlers claim the same (domain, command type)";
     pub const NO_COMPONENT_OF_KIND: &str = "the router hosts no component of this kind";
-    pub const REPLAY_UNSUPPORTED: &str = "the component does not support Replay";
     pub const NO_FACT_HANDLER: &str = "no fact handler for the fact type";
 }
 

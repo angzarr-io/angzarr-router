@@ -23,10 +23,8 @@ fn types(resp: &pb::UpcastResponse) -> Vec<String> {
     resp.events
         .iter()
         .map(|p| match p.payload.as_ref() {
-            Some(pb::event_page::Payload::Event(any)) => {
-                crate::type_name_from_url(&any.type_url).to_string()
-            }
-            _ => String::new(),
+            Some(any) => crate::type_name_from_url(&any.type_url).to_string(),
+            None => String::new(),
         })
         .collect()
 }
@@ -67,17 +65,19 @@ fn rules_apply_in_registration_order_only() {
 }
 
 #[test]
-fn pages_keep_order_headers_and_unmatched_events() {
+fn pages_keep_order_sequences_meta_and_unmatched_events() {
     let u = UpcasterDispatch::new("order-upcaster", "order").on_event("test.V1", to("test.V2"));
     let mut req = request("order", &["test.Other", "test.V1"]);
-    req.events[1].header = Some(pb::PageHeader {
-        sequence_type: Some(pb::page_header::SequenceType::Sequence(3)),
+    req.events[1].sequence = 3;
+    req.events[1].meta = Some(pb::EventMeta {
+        rules_version: "v1".to_string(),
         ..Default::default()
     });
     req.events.push(pb::EventPage::default());
     let resp = u.dispatch(&req).expect("upcast");
     assert_eq!(types(&resp), vec!["test.Other", "test.V2", ""]);
-    assert_eq!(resp.events[1].header, req.events[1].header);
+    assert_eq!(resp.events[1].sequence, 3);
+    assert_eq!(resp.events[1].meta, req.events[1].meta);
 }
 
 #[test]

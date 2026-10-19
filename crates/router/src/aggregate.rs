@@ -1,9 +1,11 @@
 //! AggregateDispatch — the command → events table.
 //!
-//! Envelope and command type validate BEFORE state is rebuilt (an unknown
-//! command must report NO_HANDLER_REGISTERED, not whatever the rebuild
-//! would surface). There is no compensation input: a Notification-typed
-//! payload is just an undeclared command type.
+//! `CommandHandlerService.Handle` is the only input path: the body arm of the
+//! ContextualCommand's page picks the pipeline (Command → a command handler,
+//! Fact → a fact handler) and the payload's type URL picks the handler. The
+//! envelope, the arm and the type validate BEFORE state is rebuilt (an
+//! unknown command must report NO_HANDLER_REGISTERED, not whatever the
+//! rebuild would surface). There is no compensation input.
 
 use std::collections::HashMap;
 
@@ -11,7 +13,7 @@ use prost_types::Any;
 
 use crate::error::{codes, extras, map_handler_error, messages, CodedError, HandlerError};
 use crate::pb;
-use crate::rebuild::{pack_message_state, Rebuilder, StatePackFn};
+use crate::rebuild::Rebuilder;
 
 /// Per-dispatch facts the business method may need beyond its typed
 /// command and rebuilt state.
@@ -19,14 +21,14 @@ use crate::rebuild::{pack_message_state, Rebuilder, StatePackFn};
 pub struct CommandContext {
     /// The aggregate's next event sequence, derived from the prior-events
     /// book the coordinator supplied.
-    pub next_sequence: u32,
+    pub next_sequence: u64,
     /// The "does this aggregate exist" signal — true when the prior-events
     /// book carried any history (pages or snapshot). Exposed because state
     /// factories produce non-default zero states, so business code cannot
     /// infer existence from state.
     pub had_prior_events: bool,
-    /// The cover of the command (or notification delivery) being handled:
-    /// the aggregate's own domain and root.
+    /// The cover of the command being handled: the aggregate's own domain
+    /// and root.
     pub cover: Option<pb::Cover>,
 }
 
@@ -40,8 +42,8 @@ pub type CommandFn<S> = Box<
 >;
 
 /// What a fact handler records: the fact (as received, or annotated) and the
-/// events that flag it, in order. A fact cannot be refused, so there is no
-/// way to record nothing.
+/// events that flag it, in order — the fact command's events. A fact cannot
+/// be refused, so there is no way to record nothing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FactRecord {
     pub fact: Any,
@@ -58,7 +60,7 @@ impl From<Any> for FactRecord {
     }
 }
 
-/// Records one fact against the rebuilt state (ComponentOptions.facts).
+/// Records one fact (a command page's Fact arm) against the rebuilt state.
 /// Generated thunks unmarshal to the typed fact and pack the typed result.
 pub type FactFn<S> = Box<dyn Fn(&Any, &S) -> Result<FactRecord, HandlerError> + Send + Sync>;
 
@@ -69,7 +71,6 @@ pub struct AggregateDispatch<S> {
     rebuilder: Rebuilder<S>,
     handlers: HashMap<String, CommandFn<S>>,
     facts: HashMap<String, FactFn<S>>,
-    state_packer: Option<StatePackFn<S>>,
 }
 
 impl<S> AggregateDispatch<S> {
@@ -85,27 +86,7 @@ impl<S> AggregateDispatch<S> {
             rebuilder,
             handlers: HashMap::new(),
             facts: HashMap::new(),
-            state_packer: None,
         }
-    }
-
-    /// Supports Replay through the router: replayed state is packed by
-    /// `packer` into the response's `Any`.
-    pub fn with_state_packer(
-        mut self,
-        packer: impl Fn(&S) -> Result<Any, HandlerError> + Send + Sync + 'static,
-    ) -> Self {
-        self.state_packer = Some(Box::new(packer));
-        self
-    }
-
-    /// Supports Replay through the router for a protobuf-message state,
-    /// packed under its fully-qualified name.
-    pub fn with_message_state(self) -> Self
-    where
-        S: prost::Message + prost::Name + 'static,
-    {
-        self.with_state_packer(pack_message_state::<S>)
     }
 
     /// Registers the thunk for a fully-qualified command type name.
@@ -121,7 +102,8 @@ impl<S> AggregateDispatch<S> {
         self
     }
 
-    /// Registers the fact handler for a FULLY-QUALIFIED fact (event) type.
+    /// Registers the fact handler for a FULLY-QUALIFIED fact type: a page
+    /// whose Fact arm carries it runs this handler.
     pub fn on_fact(
         mut self,
         fq_fact_type: &str,
@@ -146,15 +128,24 @@ impl<S> AggregateDispatch<S> {
         self.handlers.keys().cloned().collect()
     }
 
-    /// Routes a ContextualCommand: envelope guards with their exact codes,
-    /// validate-before-rebuild, rebuild (corrupt persisted event fails the
-    /// command), thunk with rebuilt state and CommandContext. The emitted
-    /// book passes through as the handler returned it: the coordinator
-    /// stamps sequences and meta.
+    /// The registered fully-qualified fact type names.
+    pub fn fact_types(&self) -> Vec<String> {
+        self.facts.keys().cloned().collect()
+    }
+
+    /// `CommandHandlerService.Handle`: envelope guards with their exact
+    /// codes, then the page's body arm picks the handler table — a Command
+    /// runs its command handler (none: NO_HANDLER_REGISTERED), a Fact its
+    /// fact handler (none: NO_FACT_HANDLER, so a fact never reaches a
+    /// command handler or the reverse) — before rebuild (a corrupt persisted
+    /// event fails the command). The emitted book passes through as the
+    /// handler returned it: the coordinator stamps the cover, sequences and
+    /// meta. A fact handler's record becomes the book: the fact, then its
+    /// flags, payloads only.
     pub fn dispatch(
         &self,
         req: &pb::ContextualCommand,
-    ) -> Result<pb::BusinessResponse, CodedError> {
+    ) -> Result<pb::CommandHandlerResponse, CodedError> {
         let Some(command_book) = req.command.as_ref() else {
             return Err(CodedError::invalid_argument(
                 codes::MISSING_COMMAND_BOOK,
@@ -162,16 +153,57 @@ impl<S> AggregateDispatch<S> {
                 [],
             ));
         };
-        let Some(first_page) = command_book.pages.first() else {
+        let Some(page) = command_book.page.as_ref() else {
             return Err(CodedError::invalid_argument(
                 codes::MISSING_COMMAND_PAGE,
                 messages::NO_COMMAND_PAGES,
                 [],
             ));
         };
-        let command_any = match crate::command_payload(first_page) {
-            Some(any) if !any.type_url.is_empty() => any,
-            _ => {
+        let events = match &page.body {
+            Some(pb::command_page::Body::Command(command)) => {
+                let any = non_empty_payload(command.payload.as_ref())?;
+                let Some(thunk) = self.handlers.get(crate::type_name_from_url(&any.type_url))
+                else {
+                    return Err(CodedError::invalid_argument(
+                        codes::NO_HANDLER_REGISTERED,
+                        messages::UNKNOWN_COMMAND,
+                        [(extras::TYPE_URL.to_string(), any.type_url.clone())],
+                    ));
+                };
+                let (mut state, info) = self.rebuilder.rebuild(req.events.as_ref())?;
+                let cctx = CommandContext {
+                    next_sequence: crate::next_sequence(req.events.as_ref()),
+                    had_prior_events: info.had_prior_events,
+                    cover: command_book.cover.clone(),
+                };
+                thunk(any, &mut state, cctx)
+                    .map_err(map_handler_error)?
+                    .unwrap_or_default()
+            }
+            Some(pb::command_page::Body::Fact(fact)) => {
+                let any = non_empty_payload(fact.payload.as_ref())?;
+                let Some(thunk) = self.facts.get(crate::type_name_from_url(&any.type_url)) else {
+                    return Err(CodedError::invalid_argument(
+                        codes::NO_FACT_HANDLER,
+                        messages::NO_FACT_HANDLER,
+                        [(extras::TYPE_URL.to_string(), any.type_url.clone())],
+                    ));
+                };
+                let (state, _) = self.rebuilder.rebuild(req.events.as_ref())?;
+                let record = thunk(any, &state).map_err(map_handler_error)?;
+                pb::EventBook {
+                    pages: std::iter::once(record.fact)
+                        .chain(record.flags)
+                        .map(|payload| pb::EventPage {
+                            payload: Some(payload),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                }
+            }
+            None => {
                 return Err(CodedError::invalid_argument(
                     codes::MISSING_COMMAND_PAYLOAD,
                     messages::NO_COMMAND_PAGES,
@@ -179,109 +211,23 @@ impl<S> AggregateDispatch<S> {
                 ));
             }
         };
-
-        let Some(thunk) = self
-            .handlers
-            .get(crate::type_name_from_url(&command_any.type_url))
-        else {
-            return Err(CodedError::invalid_argument(
-                codes::NO_HANDLER_REGISTERED,
-                messages::UNKNOWN_COMMAND,
-                [(extras::TYPE_URL.to_string(), command_any.type_url.clone())],
-            ));
-        };
-
-        let (mut state, info) = self.rebuilder.rebuild(req.events.as_ref())?;
-        let next_seq = crate::next_sequence(req.events.as_ref());
-        let events = thunk(
-            command_any,
-            &mut state,
-            CommandContext {
-                next_sequence: next_seq,
-                had_prior_events: info.had_prior_events,
-                cover: command_book.cover.clone(),
-            },
-        )
-        .map_err(map_handler_error)?;
-
-        Ok(pb::BusinessResponse {
-            result: Some(pb::business_response::Result::Events(
-                events.unwrap_or_default(),
-            )),
+        Ok(pb::CommandHandlerResponse {
+            events: Some(events),
+            ..Default::default()
         })
     }
+}
 
-    /// `CommandHandlerService.HandleFact`: every fact type must have a fact
-    /// handler (ComponentOptions.facts) — an undeclared one refuses the whole
-    /// request with NO_FACT_HANDLER (INVALID_ARGUMENT) before any handler runs,
-    /// so nothing is recorded. Then state rebuilds from the prior events and
-    /// the facts are walked in order: each fact's handler returns the fact to
-    /// record (it may annotate it, never refuse it) followed by the events
-    /// that flag it, and every recorded event folds into the state the next
-    /// fact sees. The facts' cover and each fact's header are kept; a flag
-    /// carries no header and its fact's `created_at`. The coordinator assigns
-    /// real sequences. A page with no event is recorded unchanged.
-    pub fn handle_fact(&self, req: &pb::FactRequest) -> Result<pb::EventBook, CodedError> {
-        let pages = req.facts.as_ref().map_or(&[][..], |f| f.pages.as_slice());
-        for event in pages.iter().filter_map(crate::page_event) {
-            if !self
-                .facts
-                .contains_key(crate::type_name_from_url(&event.type_url))
-            {
-                return Err(CodedError::invalid_argument(
-                    codes::NO_FACT_HANDLER,
-                    messages::NO_FACT_HANDLER,
-                    [(extras::TYPE_URL.to_string(), event.type_url.clone())],
-                ));
-            }
-        }
-        let (mut state, _) = self.rebuilder.rebuild(req.prior_events.as_ref())?;
-        let Some(facts) = req.facts.as_ref() else {
-            return Ok(pb::EventBook::default());
-        };
-        let cover = facts.cover.as_ref();
-        let mut out = pb::EventBook {
-            cover: facts.cover.clone(),
-            ..Default::default()
-        };
-        for page in &facts.pages {
-            let Some(event) = crate::page_event(page) else {
-                out.pages.push(page.clone());
-                continue;
-            };
-            let thunk = &self.facts[crate::type_name_from_url(&event.type_url)];
-            let record = thunk(event, &state).map_err(map_handler_error)?;
-            let recorded = pb::EventPage {
-                payload: Some(pb::event_page::Payload::Event(record.fact)),
-                ..page.clone()
-            };
-            self.rebuilder.apply_page(&mut state, &recorded, cover)?;
-            out.pages.push(recorded);
-            for flag in record.flags {
-                let flagged = pb::EventPage {
-                    header: None,
-                    created_at: page.created_at,
-                    payload: Some(pb::event_page::Payload::Event(flag)),
-                };
-                self.rebuilder.apply_page(&mut state, &flagged, cover)?;
-                out.pages.push(flagged);
-            }
-        }
-        Ok(out)
-    }
-
-    /// `CommandHandlerService.Replay`: the state after folding the base
-    /// snapshot (when present) and then the events, in order. The caller packs
-    /// the state into the response's `Any`.
-    pub fn replay(&self, req: &pb::ReplayRequest) -> Result<S, CodedError> {
-        self.rebuilder.replay(req)
-    }
-
-    /// [`Self::replay`] packed by the state packer; without one the aggregate
-    /// does not support Replay (NO_HANDLER_REGISTERED).
-    pub fn packed_replay(&self, req: &pb::ReplayRequest) -> Result<pb::ReplayResponse, CodedError> {
-        self.rebuilder
-            .packed_replay(self.state_packer.as_ref(), &self.domain, req)
+/// A body arm's payload, refused MISSING_COMMAND_PAYLOAD when absent or
+/// untyped.
+fn non_empty_payload(payload: Option<&Any>) -> Result<&Any, CodedError> {
+    match payload {
+        Some(any) if !any.type_url.is_empty() => Ok(any),
+        _ => Err(CodedError::invalid_argument(
+            codes::MISSING_COMMAND_PAYLOAD,
+            messages::NO_COMMAND_PAGES,
+            [],
+        )),
     }
 }
 

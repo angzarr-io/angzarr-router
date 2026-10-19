@@ -6,10 +6,8 @@
 //! claiming one (domain, command type) is DUPLICATE_COMMAND_HANDLER (C-0064).
 //! The built [`Router`] dispatches:
 //!
-//! - commands by (cover domain, command type); facts by the facts' cover
-//!   domain;
-//! - a Replay to the first aggregate of its domain, else to the process
-//!   manager owning it (by its own domain), packed by its state packer;
+//! - commands by (cover domain, command type), facts (a page's Fact arm) by
+//!   (cover domain, fact type);
 //! - saga sources to every saga consuming the source domain, merged in
 //!   registration order (C-0013);
 //! - process-manager requests through [`select_process_managers`], merged;
@@ -39,25 +37,15 @@ pub trait CommandHandler: Send + Sync {
     fn domain(&self) -> &str;
     /// The fully-qualified command types it handles.
     fn command_types(&self) -> Vec<String>;
-    /// `CommandHandlerService.Handle`.
-    fn dispatch(&self, req: &pb::ContextualCommand) -> Result<pb::BusinessResponse, CodedError>;
-    /// `CommandHandlerService.HandleFact`.
-    fn handle_fact(&self, req: &pb::FactRequest) -> Result<pb::EventBook, CodedError>;
-    /// `CommandHandlerService.Replay`: the rebuilt state, packed. A handler
-    /// that cannot pack its state does not support Replay
-    /// (NO_HANDLER_REGISTERED).
-    fn replay(&self, req: &pb::ReplayRequest) -> Result<pb::ReplayResponse, CodedError> {
-        let _ = req;
-        Err(replay_unsupported(self.domain()))
+    /// The fully-qualified fact types it records (none by default).
+    fn fact_types(&self) -> Vec<String> {
+        Vec::new()
     }
-}
-
-fn replay_unsupported(domain: &str) -> CodedError {
-    CodedError::invalid_argument(
-        codes::NO_HANDLER_REGISTERED,
-        messages::REPLAY_UNSUPPORTED,
-        [(extras::DOMAIN.to_string(), domain.to_string())],
-    )
+    /// `CommandHandlerService.Handle`: a command or a fact.
+    fn dispatch(
+        &self,
+        req: &pb::ContextualCommand,
+    ) -> Result<pb::CommandHandlerResponse, CodedError>;
 }
 
 impl<T: CommandHandler + ?Sized> CommandHandler for Box<T> {
@@ -67,14 +55,14 @@ impl<T: CommandHandler + ?Sized> CommandHandler for Box<T> {
     fn command_types(&self) -> Vec<String> {
         (**self).command_types()
     }
-    fn dispatch(&self, req: &pb::ContextualCommand) -> Result<pb::BusinessResponse, CodedError> {
+    fn fact_types(&self) -> Vec<String> {
+        (**self).fact_types()
+    }
+    fn dispatch(
+        &self,
+        req: &pb::ContextualCommand,
+    ) -> Result<pb::CommandHandlerResponse, CodedError> {
         (**self).dispatch(req)
-    }
-    fn handle_fact(&self, req: &pb::FactRequest) -> Result<pb::EventBook, CodedError> {
-        (**self).handle_fact(req)
-    }
-    fn replay(&self, req: &pb::ReplayRequest) -> Result<pb::ReplayResponse, CodedError> {
-        (**self).replay(req)
     }
 }
 
@@ -85,14 +73,14 @@ impl<S> CommandHandler for AggregateDispatch<S> {
     fn command_types(&self) -> Vec<String> {
         AggregateDispatch::command_types(self)
     }
-    fn dispatch(&self, req: &pb::ContextualCommand) -> Result<pb::BusinessResponse, CodedError> {
+    fn fact_types(&self) -> Vec<String> {
+        AggregateDispatch::fact_types(self)
+    }
+    fn dispatch(
+        &self,
+        req: &pb::ContextualCommand,
+    ) -> Result<pb::CommandHandlerResponse, CodedError> {
         AggregateDispatch::dispatch(self, req)
-    }
-    fn handle_fact(&self, req: &pb::FactRequest) -> Result<pb::EventBook, CodedError> {
-        AggregateDispatch::handle_fact(self, req)
-    }
-    fn replay(&self, req: &pb::ReplayRequest) -> Result<pb::ReplayResponse, CodedError> {
-        AggregateDispatch::packed_replay(self, req)
     }
 }
 
@@ -103,12 +91,6 @@ pub trait ProcessManagerHandler: ProcessManagerRoute + Send + Sync {
         &self,
         req: &pb::ProcessManagerHandleRequest,
     ) -> Result<pb::ProcessManagerHandleResponse, CodedError>;
-    /// The PM's rebuilt state, packed. A PM that cannot pack its state does
-    /// not support Replay (NO_HANDLER_REGISTERED).
-    fn replay(&self, req: &pb::ReplayRequest) -> Result<pb::ReplayResponse, CodedError> {
-        let _ = req;
-        Err(replay_unsupported(self.pm_domain()))
-    }
 }
 
 impl<T: ProcessManagerRoute + ?Sized> ProcessManagerRoute for Box<T> {
@@ -130,9 +112,6 @@ impl<T: ProcessManagerHandler + ?Sized> ProcessManagerHandler for Box<T> {
     ) -> Result<pb::ProcessManagerHandleResponse, CodedError> {
         (**self).dispatch(req)
     }
-    fn replay(&self, req: &pb::ReplayRequest) -> Result<pb::ReplayResponse, CodedError> {
-        (**self).replay(req)
-    }
 }
 
 impl<S> ProcessManagerHandler for ProcessManagerDispatch<S> {
@@ -141,9 +120,6 @@ impl<S> ProcessManagerHandler for ProcessManagerDispatch<S> {
         req: &pb::ProcessManagerHandleRequest,
     ) -> Result<pb::ProcessManagerHandleResponse, CodedError> {
         ProcessManagerDispatch::dispatch(self, req)
-    }
-    fn replay(&self, req: &pb::ReplayRequest) -> Result<pb::ReplayResponse, CodedError> {
-        ProcessManagerDispatch::packed_replay(self, req)
     }
 }
 
@@ -353,63 +329,46 @@ impl CommandHandlers {
         )
     }
 
-    /// Routes a command by (cover domain, command type).
+    /// Routes a ContextualCommand by its page's body: a Command by (cover
+    /// domain, command type), a Fact to the first handler of the cover domain
+    /// recording its type. An unrouted fact, or an envelope with no payload,
+    /// goes to the domain's first handler, which reports it
+    /// (NO_FACT_HANDLER, or the envelope's code).
     pub fn dispatch(
         &self,
         req: &pb::ContextualCommand,
-    ) -> Result<pb::BusinessResponse, CodedError> {
+    ) -> Result<pb::CommandHandlerResponse, CodedError> {
         let book = req.command.as_ref();
         let domain = book
             .and_then(|b| b.cover.as_ref())
             .map_or("", |c| c.domain.as_str());
-        let payload = book
-            .and_then(|b| b.pages.first())
-            .and_then(crate::command_payload);
-        let Some(any) = payload else {
-            // Envelope errors are the aggregate's to report.
-            return match self.in_domain(domain).next() {
-                Some(handler) => handler.dispatch(req),
-                None => Err(Self::no_handler(domain)),
+        let page = book.and_then(|b| b.page.as_ref());
+        if let Some(any) = page.and_then(crate::command_payload) {
+            let key = (
+                domain.to_string(),
+                crate::type_name_from_url(&any.type_url).to_string(),
+            );
+            return match self.claims.get(&key) {
+                Some(&index) => self.handlers[index].dispatch(req),
+                None => Err(CodedError::invalid_argument(
+                    codes::NO_HANDLER_REGISTERED,
+                    messages::UNKNOWN_COMMAND,
+                    [
+                        (extras::DOMAIN.to_string(), key.0),
+                        (extras::TYPE_URL.to_string(), any.type_url.clone()),
+                    ],
+                )),
             };
-        };
-        let key = (
-            domain.to_string(),
-            crate::type_name_from_url(&any.type_url).to_string(),
-        );
-        match self.claims.get(&key) {
-            Some(&index) => self.handlers[index].dispatch(req),
-            None => Err(CodedError::invalid_argument(
-                codes::NO_HANDLER_REGISTERED,
-                messages::UNKNOWN_COMMAND,
-                [
-                    (extras::DOMAIN.to_string(), key.0),
-                    (extras::TYPE_URL.to_string(), any.type_url.clone()),
-                ],
-            )),
         }
-    }
-
-    /// Routes facts to the first handler of the facts' cover domain.
-    pub fn handle_fact(&self, req: &pb::FactRequest) -> Result<pb::EventBook, CodedError> {
-        let domain = req
-            .facts
-            .as_ref()
-            .and_then(|f| f.cover.as_ref())
-            .map_or("", |c| c.domain.as_str());
-        match self.in_domain(domain).next() {
-            Some(handler) => handler.handle_fact(req),
-            None => Err(Self::no_handler(domain)),
-        }
-    }
-
-    /// Routes a Replay to the first handler of `domain`.
-    pub fn replay(
-        &self,
-        domain: &str,
-        req: &pb::ReplayRequest,
-    ) -> Result<pb::ReplayResponse, CodedError> {
-        match self.in_domain(domain).next() {
-            Some(handler) => handler.replay(req),
+        let fact_type = page
+            .and_then(crate::fact_payload)
+            .map(|any| crate::type_name_from_url(&any.type_url).to_string());
+        let recorder = fact_type.and_then(|fq| {
+            self.in_domain(domain)
+                .find(|h| h.fact_types().contains(&fq))
+        });
+        match recorder.or_else(|| self.in_domain(domain).next()) {
+            Some(handler) => handler.dispatch(req),
             None => Err(Self::no_handler(domain)),
         }
     }
@@ -438,63 +397,29 @@ fn wrong_kind() -> CodedError {
 }
 
 impl Router {
-    /// Routes a command to its aggregate.
+    /// Routes a command or a fact to its aggregate.
     pub fn dispatch_command(
         &self,
         req: &pb::ContextualCommand,
-    ) -> Result<pb::BusinessResponse, CodedError> {
+    ) -> Result<pb::CommandHandlerResponse, CodedError> {
         match &self.inner {
             Inner::CommandHandlers(handlers) => handlers.dispatch(req),
             _ => Err(wrong_kind()),
         }
     }
 
-    /// Routes facts to the aggregate of their cover domain.
-    pub fn handle_fact(&self, req: &pb::FactRequest) -> Result<pb::EventBook, CodedError> {
-        match &self.inner {
-            Inner::CommandHandlers(handlers) => handlers.handle_fact(req),
-            _ => Err(wrong_kind()),
-        }
-    }
-
-    /// Replays the state of `domain`'s first aggregate, or of the process
-    /// manager whose own domain it is, packed by its state packer. A domain
-    /// no stateful component serves, or one whose component has no state
-    /// packer, is NO_HANDLER_REGISTERED.
-    pub fn replay(
-        &self,
-        domain: &str,
-        req: &pb::ReplayRequest,
-    ) -> Result<pb::ReplayResponse, CodedError> {
-        match &self.inner {
-            Inner::CommandHandlers(handlers) => handlers.replay(domain, req),
-            Inner::ProcessManagers(pms) => match pms.iter().find(|pm| pm.pm_domain() == domain) {
-                Some(pm) => pm.replay(req),
-                None => Err(CommandHandlers::no_handler(domain)),
-            },
-            _ => Err(wrong_kind()),
-        }
-    }
-
     /// Runs every saga consuming the source domain and merges their output in
     /// registration order; a domain no saga consumes is NO_HANDLER_REGISTERED.
-    pub fn dispatch_saga(
-        &self,
-        req: &pb::SagaHandleRequest,
-    ) -> Result<pb::SagaResponse, CodedError> {
+    pub fn dispatch_saga(&self, source: &pb::EventBook) -> Result<pb::SagaResponse, CodedError> {
         let Inner::Sagas(sagas) = &self.inner else {
             return Err(wrong_kind());
         };
-        let domain = req
-            .source
-            .as_ref()
-            .and_then(|s| s.cover.as_ref())
-            .map_or("", |c| c.domain.as_str());
+        let domain = source.cover.as_ref().map_or("", |c| c.domain.as_str());
         let mut merged = pb::SagaResponse::default();
         let mut matched = false;
         for saga in sagas.iter().filter(|s| s.input_domain() == domain) {
             matched = true;
-            merged.commands.extend(saga.dispatch(req)?.commands);
+            merged.commands.extend(saga.dispatch(source)?.commands);
         }
         if !matched {
             return Err(CodedError::invalid_argument(

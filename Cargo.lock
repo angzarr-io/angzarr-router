@@ -12,9 +12,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "angzarr-proto"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "prost",
+ "prost-build",
+ "prost-types",
+ "uuid",
+]
+
+[[package]]
 name = "angzarr-router"
 version = "0.1.0"
 dependencies = [
+ "angzarr-proto",
+ "heck 0.5.0",
  "prost",
  "prost-build",
  "prost-types",
@@ -26,7 +39,6 @@ name = "angzarr-router-conformance"
 version = "0.1.0"
 dependencies = [
  "angzarr-router",
- "angzarr-router-ffi",
  "cucumber",
  "futures",
  "prost",

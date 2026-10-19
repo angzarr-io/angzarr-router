@@ -59,7 +59,7 @@ fn unknown_event_type_skipped() {
     let book = pb::EventBook {
         pages: vec![
             // no applier registered — not all events fold into state
-            event_page(any_of(&pb::Notification::default())),
+            event_page(any_of(&pb::Snapshot::default())),
             event_page(cover_any("a")),
         ],
         ..Default::default()
@@ -85,11 +85,15 @@ fn snapshot_applied_before_pages() {
         Ok(())
     }));
 
-    let mut book = book_of_covers(&["after"]);
-    book.snapshot = Some(pb::Snapshot {
-        state: Some(cover_any("base")),
+    let book = pb::EventBook {
+        snapshot: Some(pb::Snapshot {
+            sequence: 0,
+            state: Some(cover_any("base")),
+            ..Default::default()
+        }),
+        pages: vec![sequenced_event_page(1, cover_any("after"))],
         ..Default::default()
-    });
+    };
 
     let (state, info) = r.rebuild(Some(&book)).expect("rebuild");
     assert_eq!(state.applied, vec!["snap:base", "after"]);
@@ -323,31 +327,8 @@ fn stateless_snapshot_covers_no_pages() {
     assert_eq!(state.applied, vec!["one", "two"]);
 }
 
-// A page with no explicit sequence cannot be proven covered, so it folds.
-#[test]
-fn unsequenced_page_is_never_covered() {
-    let r = cover_applier(fresh_rebuilder().with_snapshot(|s, _| {
-        s.applied.push("snapshot".to_string());
-        Ok(())
-    }));
-    let book = pb::EventBook {
-        snapshot: Some(pb::Snapshot {
-            sequence: 4,
-            state: Some(cover_any("snap")),
-            ..Default::default()
-        }),
-        pages: vec![
-            sequenced_event_page(4, cover_any("covered")),
-            event_page(cover_any("unsequenced")),
-        ],
-        ..Default::default()
-    };
-    let (state, _) = r.rebuild(Some(&book)).expect("rebuild");
-    assert_eq!(state.applied, vec!["snapshot", "unsequenced"]);
-}
-
 // Appliers registered with context see the book's cover and each page's
-// explicit sequence (0 when absent).
+// sequence.
 #[test]
 fn context_appliers_see_the_book_cover_and_page_sequence() {
     let r = fresh_rebuilder().apply_with_context(&cover_full_name(), |s, _any, ctx| {

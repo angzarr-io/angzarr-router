@@ -3,8 +3,8 @@ Feature: Counter aggregate dispatch
   The CounterAggregate proves the dispatch mechanisms the shared router must
   implement identically in every language: prior events fold into state,
   commands emit events with historical context (passed through as the
-  handler emitted them: the coordinator stamps sequences), business rules
-  reject, and unclassified or misrouted commands surface as coded errors.
+  handler emitted them: the coordinator stamps sequences and meta), business
+  rules reject, and unclassified or misrouted commands surface as coded errors.
 
   Scenario Outline: increasing a new counter records that many events
     Given a new counter

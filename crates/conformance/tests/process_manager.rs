@@ -47,15 +47,21 @@ impl ProcessManagerWorld {
         self.result = Some(Ok(merged));
     }
 
-    fn facts_marked(&self, audit: bool) -> usize {
-        self.response()
-            .facts
-            .iter()
-            .filter(|f| {
-                let domain = f.cover.as_ref().map_or("", |c| c.domain.as_str());
-                (domain == conf::AUDIT_MARK) == audit
-            })
-            .count()
+    /// The counts the order PM's process events recorded (one per reaction).
+    fn order_counts(&self) -> Vec<u32> {
+        conf::recorded_states::<conf::counter::OrderProcessManagerState>(self.response())
+            .into_iter()
+            .map(|s| s.count)
+            .collect()
+    }
+
+    /// How many events the audit PM's process events recorded it had seen
+    /// (one entry per reaction).
+    fn audit_counts(&self) -> Vec<u32> {
+        conf::recorded_states::<conf::counter::AuditProcessManagerState>(self.response())
+            .into_iter()
+            .map(|s| s.seen.len() as u32)
+            .collect()
     }
 
     fn response(&self) -> &pb::ProcessManagerHandleResponse {
@@ -73,7 +79,7 @@ async fn an_order_pm(_w: &mut ProcessManagerWorld) {
 }
 
 #[when(regex = r#"^an Increased trigger in domain "([^"]*)" at sequence (\d+) is dispatched$"#)]
-async fn increased_at(w: &mut ProcessManagerWorld, domain: String, seq: u32) {
+async fn increased_at(w: &mut ProcessManagerWorld, domain: String, seq: u64) {
     w.dispatch(conf::pm_trigger_request(
         &domain,
         &["test.counter.Increased"],
@@ -135,9 +141,22 @@ async fn emits_one_command(w: &mut ProcessManagerWorld, target: String) {
 
 #[then("the command carries no router-stamped provenance")]
 async fn no_stamped_provenance(w: &mut ProcessManagerWorld) {
-    for page in &w.response().commands[0].pages {
-        assert_eq!(page.header, None, "the command passes through as emitted");
-    }
+    let page = w.response().commands[0]
+        .page
+        .as_ref()
+        .expect("a command page");
+    assert_eq!(
+        page.command_id, None,
+        "the coordinator stamps the command id"
+    );
+    assert_eq!(
+        page.correlation_id, None,
+        "the coordinator stamps the correlation"
+    );
+    assert_eq!(
+        page.causation_id, None,
+        "the coordinator stamps the causation"
+    );
 }
 
 #[then("the process-manager emits no commands")]
@@ -148,9 +167,9 @@ async fn emits_no_commands(w: &mut ProcessManagerWorld) {
 #[then(regex = r"^the process-manager rebuilt (\d+) prior state events$")]
 async fn rebuilt_n(w: &mut ProcessManagerWorld, n: u32) {
     assert_eq!(
-        w.response().facts.len() as u32,
-        n,
-        "one fact per rebuilt prior state event"
+        w.order_counts(),
+        vec![n],
+        "the process event records the rebuilt count"
     );
 }
 
@@ -191,21 +210,13 @@ async fn increased_over_owned_state(w: &mut ProcessManagerWorld, owner: String, 
 }
 
 #[then(regex = r"^the order process-manager rebuilt (\d+) prior state events$")]
-async fn order_rebuilt(w: &mut ProcessManagerWorld, n: usize) {
-    assert_eq!(
-        w.facts_marked(false),
-        n,
-        "order PM facts = its rebuilt events"
-    );
+async fn order_rebuilt(w: &mut ProcessManagerWorld, n: u32) {
+    assert_eq!(w.order_counts(), vec![n], "the order PM's rebuilt events");
 }
 
 #[then(regex = r"^the audit process-manager rebuilt (\d+) prior state events$")]
-async fn audit_rebuilt(w: &mut ProcessManagerWorld, n: usize) {
-    assert_eq!(
-        w.facts_marked(true),
-        n,
-        "audit PM facts = its rebuilt events"
-    );
+async fn audit_rebuilt(w: &mut ProcessManagerWorld, n: u32) {
+    assert_eq!(w.audit_counts(), vec![n], "the audit PM's rebuilt events");
 }
 
 #[then("the order process-manager did not react")]
@@ -214,7 +225,7 @@ async fn order_did_not_react(w: &mut ProcessManagerWorld) {
         w.response().commands.is_empty(),
         "the order PM emitted no command"
     );
-    assert_eq!(w.facts_marked(false), 0, "the order PM emitted no fact");
+    assert!(w.order_counts().is_empty(), "the order PM recorded nothing");
 }
 
 #[tokio::main]

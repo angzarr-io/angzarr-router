@@ -105,16 +105,9 @@ impl SagaDispatch {
 
     /// Walks EVERY page of the source book: declared event types emit;
     /// undeclared types are skipped. Emitted commands pass through
-    /// unstamped, in emission order. A nil source is MISSING_SAGA_SOURCE;
-    /// a source with no pages is EMPTY_SAGA_SOURCE.
-    pub fn dispatch(&self, req: &pb::SagaHandleRequest) -> Result<pb::SagaResponse, CodedError> {
-        let Some(source) = req.source.as_ref() else {
-            return Err(CodedError::invalid_argument(
-                codes::MISSING_SAGA_SOURCE,
-                messages::MISSING_SAGA_SOURCE,
-                [],
-            ));
-        };
+    /// unstamped, in emission order. A source with no pages is
+    /// EMPTY_SAGA_SOURCE.
+    pub fn dispatch(&self, source: &pb::EventBook) -> Result<pb::SagaResponse, CodedError> {
         if source.pages.is_empty() {
             return Err(CodedError::invalid_argument(
                 codes::EMPTY_SAGA_SOURCE,
@@ -137,7 +130,7 @@ impl SagaDispatch {
             };
             let context = PageContext {
                 cover: source.cover.as_ref(),
-                sequence: crate::page_sequence(page),
+                sequence: page.sequence,
             };
             let commands = thunk(event_any, &context).map_err(map_handler_error)?;
             resp.commands.extend(commands);

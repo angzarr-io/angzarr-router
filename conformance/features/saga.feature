@@ -4,8 +4,8 @@ Feature: Order saga dispatch
   router must implement identically in every language: a declared source
   event emits a command (passed through unstamped: the coordinator stamps
   its identity and provenance) and its handler sees the triggering event's
-  sequence, an undeclared event emits nothing, and a source missing or
-  empty is refused with a coded error.
+  sequence, an undeclared event emits nothing, and an empty source is
+  refused with a coded error.
 
   Scenario: a declared event emits a command
     Given an order saga delivering to "inventory"
@@ -22,11 +22,6 @@ Feature: Order saga dispatch
     Given an order saga delivering to "inventory"
     When a source with no pages is dispatched
     Then the dispatch fails with EMPTY_SAGA_SOURCE
-
-  Scenario: a request with no source is refused
-    Given an order saga delivering to "inventory"
-    When a request with no source is dispatched
-    Then the dispatch fails with MISSING_SAGA_SOURCE
 
   Scenario: a saga handler sees the triggering event's sequence
     Given an order saga delivering to "inventory"

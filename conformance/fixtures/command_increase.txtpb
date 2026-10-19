@@ -2,9 +2,11 @@
 # omitted on purpose — the step definition sets it from the scenario.
 command {
   cover { domain: "counter" }
-  pages {
+  page {
     command {
-      [type.googleapis.com/test.counter.IncreaseBy] {}
+      payload {
+        [type.googleapis.com/test.counter.IncreaseBy] {}
+      }
     }
   }
 }

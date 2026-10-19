@@ -2,7 +2,6 @@ syntax = "proto3";
 package io.angzarr.router.ffi.v1;
 
 import "google/protobuf/any.proto";
-import "io/angzarr/v1/command_handler.proto";
 import "io/angzarr/v1/types.proto";
 
 // Auxiliary payloads crossing the C ABI. These are internal to the FFI
@@ -36,21 +35,22 @@ message AggregateDescriptor {
   // Field 7 was `undoes` (Compensate input; removed).
   reserved 7;
   reserved "undoes";
-  // Fact handlers keyed by FULLY-QUALIFIED fact (event) type: the aggregate's
-  // declared facts (ComponentOptions.facts). The callback receives the fact
-  // Any (type_url / payload) with the session state rebuilt, and returns a
-  // serialized FactRecord (STATUS_OK) or STATUS_OK_EMPTY to record the fact
-  // unchanged with no flags. A fact of an undeclared type never reaches the
-  // host: the router refuses it with NO_FACT_HANDLER.
+  // Fact handlers keyed by FULLY-QUALIFIED fact type: a command page whose
+  // Fact arm carries that type runs its handler. The callback receives the
+  // fact Any (type_url / payload) with the session state rebuilt, and returns
+  // a serialized FactRecord (STATUS_OK) or STATUS_OK_EMPTY to record the fact
+  // unchanged with no flags. A fact of an unregistered type never reaches
+  // the host: the router refuses it with NO_FACT_HANDLER.
   repeated CallbackEntry facts = 8;
-  // Packs the session's current state into a serialized google.protobuf.Any
-  // (for Replay); absent when the aggregate does not support Replay.
-  optional uint64 state_callback_id = 9;
+  // Field 9 was `state_callback_id` (Replay; removed — there is no Replay
+  // RPC).
+  reserved 9;
+  reserved "state_callback_id";
 }
 
 // Response bytes of a fact callback (STATUS_OK): the fact to record (as
-// received, or annotated) and the events that flag it, in order. Each folds
-// through the appliers before the next fact.
+// received, or annotated) and the events that flag it, in order — the fact
+// command's events, payloads only.
 message FactRecord {
   google.protobuf.Any fact = 1;
   repeated google.protobuf.Any flags = 2;
@@ -87,7 +87,7 @@ message SagaDescriptor {
 
 // aux payload for command-handler callbacks.
 message CommandContextAux {
-  uint32 next_sequence = 1;
+  uint64 next_sequence = 1;
   bool had_prior_events = 2;
   // The cover of the command being handled: the aggregate's own domain and
   // root.
@@ -105,8 +105,8 @@ message SagaEventAux {
   // deserialization) so the saga can route emitted commands by the trigger's
   // identity.
   io.angzarr.v1.Cover source_cover = 2;
-  // The source event's explicit sequence (0 when the page carries none).
-  uint32 source_seq = 3;
+  // The source event's sequence.
+  uint64 source_seq = 3;
 }
 
 // Registration payload for one process-manager component. STATEFUL: the PM
@@ -124,10 +124,9 @@ message ProcessManagerDescriptor {
   reserved 6;
   reserved "rejections";
   repeated string target_domains = 7;
-  // Packs the session's current PM state into a serialized
-  // google.protobuf.Any (for Replay); absent when the PM does not support
-  // Replay.
-  optional uint64 state_callback_id = 8;
+  // Field 8 was `state_callback_id` (Replay; removed).
+  reserved 8;
+  reserved "state_callback_id";
 }
 
 // One ((input domain, fully-qualified event type) → host callback) row for a
@@ -148,17 +147,8 @@ message PmEventAux {
 
 // aux payload for projector fold callbacks AND for aggregate / process-manager
 // applier callbacks: where the folded event sits (its book's cover and the
-// page's explicit sequence, 0 when absent).
+// page's sequence).
 message ProjectorEventAux {
   io.angzarr.v1.Cover cover = 1;
-  uint32 sequence = 2;
-}
-
-// Request bytes of angzarr_router_dispatch_replay: the domain the replay is
-// for — an aggregate's domain, or a process manager's own (pm) domain when no
-// aggregate claims it; empty selects a sole registered aggregate — and the
-// request itself.
-message ReplayCall {
-  string domain = 1;
-  io.angzarr.v1.ReplayRequest request = 2;
+  uint64 sequence = 2;
 }

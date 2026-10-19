@@ -51,9 +51,9 @@ async fn delivery_no_cover(w: &mut ProjectorWorld) {
 }
 
 #[then(regex = r"^the projection records (\d+) events?$")]
-async fn records_count(w: &mut ProjectorWorld, count: u32) {
+async fn records_count(w: &mut ProjectorWorld, count: u64) {
     assert_eq!(
-        w.projection().sequence,
+        w.projection().next_sequence,
         count,
         "every delivered event folds into one projection"
     );
@@ -62,7 +62,7 @@ async fn records_count(w: &mut ProjectorWorld, count: u32) {
 #[then("the projection records nothing")]
 async fn records_nothing(w: &mut ProjectorWorld) {
     assert_eq!(
-        w.projection().sequence,
+        w.projection().next_sequence,
         0,
         "an undeclared domain folds nothing"
     );

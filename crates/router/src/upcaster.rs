@@ -3,7 +3,7 @@
 //! Every rule whose source type matches the event's current type applies, in
 //! registration order, and the output of one is the input of the next (C-0136),
 //! so V1 → V2 → V3 composes; the chain stops when no later rule matches the
-//! current type (C-0137). Pages keep their order and headers; events of other
+//! current type (C-0137). Pages keep their order, sequences and meta; events of other
 //! types, pages without events, and requests for another domain pass through
 //! unchanged.
 
@@ -88,8 +88,8 @@ impl UpcasterDispatch {
     /// One page with its event (if any) run through the rule chain.
     pub fn upcast_page(&self, page: &pb::EventPage) -> Result<pb::EventPage, CodedError> {
         let mut out = page.clone();
-        if let Some(pb::event_page::Payload::Event(event)) = page.payload.as_ref() {
-            out.payload = Some(pb::event_page::Payload::Event(self.upcast_event(event)?));
+        if let Some(event) = page.payload.as_ref() {
+            out.payload = Some(self.upcast_event(event)?);
         }
         Ok(out)
     }

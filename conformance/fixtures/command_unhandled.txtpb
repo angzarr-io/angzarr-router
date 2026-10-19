@@ -1,10 +1,12 @@
-# A command with no registered handler (Reserve is a rejection key only,
-# never an on_command) — drives NO_HANDLER_REGISTERED before rebuild.
+# A command with no registered handler (Reserve is the command the saga and
+# PM emit, never an on_command) — drives NO_HANDLER_REGISTERED before rebuild.
 command {
   cover { domain: "counter" }
-  pages {
+  page {
     command {
-      [type.googleapis.com/test.counter.Reserve] {}
+      payload {
+        [type.googleapis.com/test.counter.Reserve] {}
+      }
     }
   }
 }

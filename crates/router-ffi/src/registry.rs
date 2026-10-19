@@ -8,7 +8,7 @@ use std::ffi::c_void;
 use prost::Message;
 
 use angzarr_router::aggregate::{AggregateDispatch, CommandContext, FactRecord};
-use angzarr_router::error::{codes, extras, messages, CodedError, HandlerError};
+use angzarr_router::error::{codes, messages, CodedError, HandlerError};
 use angzarr_router::pb;
 use angzarr_router::process_manager::{
     merge_response, select_process_managers, ProcessManagerDispatch, ProcessManagerRoute,
@@ -88,65 +88,12 @@ fn host_error(ret: i32, bytes: Option<Vec<u8>>) -> HandlerError {
     HandlerError::Coded(status_to_coded(bytes.as_deref(), ret))
 }
 
-/// One registered aggregate: its dispatch table, the host callback that packs
-/// its state for Replay (when supported), and the host gateway.
-struct RegisteredAggregate {
-    dispatch: AggregateDispatch<()>,
-    state_callback: Option<u64>,
-    cb: AngzarrCb,
-}
-
-impl CommandHandler for RegisteredAggregate {
-    fn domain(&self) -> &str {
-        self.dispatch.domain()
-    }
-    fn command_types(&self) -> Vec<String> {
-        self.dispatch.command_types()
-    }
-    fn dispatch(&self, req: &pb::ContextualCommand) -> Result<pb::BusinessResponse, CodedError> {
-        self.dispatch.dispatch(req)
-    }
-    fn handle_fact(&self, req: &pb::FactRequest) -> Result<pb::EventBook, CodedError> {
-        self.dispatch.handle_fact(req)
-    }
-    /// Rebuilds the host state through the appliers, then has the host pack
-    /// it (the state callback).
-    fn replay(&self, req: &pb::ReplayRequest) -> Result<pb::ReplayResponse, CodedError> {
-        self.dispatch.replay(req)?;
-        host_packed_state(self.state_callback, self.cb, self.domain())
-    }
-}
-
-/// The host's packing of the state it just rebuilt; a component with no
-/// state callback does not support Replay (NO_HANDLER_REGISTERED).
-fn host_packed_state(
-    state_callback: Option<u64>,
-    cb: AngzarrCb,
-    domain: &str,
-) -> Result<pb::ReplayResponse, CodedError> {
-    let Some(id) = state_callback else {
-        return Err(CodedError::invalid_argument(
-            codes::NO_HANDLER_REGISTERED,
-            messages::REPLAY_UNSUPPORTED,
-            [(extras::DOMAIN.to_string(), domain.to_string())],
-        ));
-    };
-    let (ret, bytes) = invoke(cb, id, "", &[], &[]);
-    if ret < 0 {
-        return Err(status_to_coded(bytes.as_deref(), ret));
-    }
-    let state = prost_types::Any::decode(bytes.unwrap_or_default().as_slice())
-        .map_err(|_| CodedError::unhandled("host state packer returned undecodable Any bytes"))?;
-    Ok(pb::ReplayResponse { state: Some(state) })
-}
-
 /// The registered tables behind an opaque router handle.
 pub struct FfiRouter {
     aggregates: CommandHandlers,
     projectors: Vec<(String, ProjectorDispatch<()>)>,
     sagas: Vec<(String, SagaDispatch)>,
-    /// (name, table, state-packing callback id, host gateway).
-    process_managers: Vec<(String, ProcessManagerDispatch<()>, Option<u64>, AngzarrCb)>,
+    process_managers: Vec<(String, ProcessManagerDispatch<()>)>,
 }
 
 impl FfiRouter {
@@ -250,11 +197,7 @@ impl FfiRouter {
         }
         // Refuses a second claim of one (domain, command type) (C-0010,
         // C-0064).
-        self.aggregates.push(Box::new(RegisteredAggregate {
-            dispatch,
-            state_callback: desc.state_callback_id,
-            cb,
-        }))
+        self.aggregates.push(Box::new(dispatch))
     }
 
     /// Parses a ProjectorDescriptor and populates a core projector table
@@ -356,74 +299,6 @@ impl FfiRouter {
         self.aggregates.sole()
     }
 
-    /// Decodes FactRequest bytes, routes to the aggregate claiming the facts'
-    /// cover domain, and runs the core's fact handling with the host session
-    /// installed. Returns the EventBook of facts to record.
-    pub fn dispatch_fact(
-        &self,
-        host_ctx: *mut c_void,
-        request: &[u8],
-    ) -> Result<Vec<u8>, CodedError> {
-        let req = pb::FactRequest::decode(request).map_err(|_| {
-            CodedError::invalid_argument(
-                codes::ANY_DECODE_FAILED,
-                "failed to decode FactRequest",
-                [],
-            )
-        })?;
-        let domain = req
-            .facts
-            .as_ref()
-            .and_then(|f| f.cover.as_ref())
-            .map_or("", |c| c.domain.as_str());
-        let _guard = HostCtxGuard::set(host_ctx);
-        let facts = match self.sole_aggregate_for(domain) {
-            Some(sole) => sole.handle_fact(&req)?,
-            None => self.aggregates.handle_fact(&req)?,
-        };
-        Ok(facts.encode_to_vec())
-    }
-
-    /// Decodes ReplayCall bytes and replays the first aggregate of its
-    /// domain, else the process manager owning it, else a sole registered
-    /// aggregate: the appliers rebuild the host state and the host packs it
-    /// (the state callback). Returns ReplayResponse bytes; a component with
-    /// no state callback does not support Replay (NO_HANDLER_REGISTERED).
-    pub fn dispatch_replay(
-        &self,
-        host_ctx: *mut c_void,
-        request: &[u8],
-    ) -> Result<Vec<u8>, CodedError> {
-        let call = abi_pb::ReplayCall::decode(request).map_err(|_| {
-            CodedError::invalid_argument(
-                codes::ANY_DECODE_FAILED,
-                "failed to decode ReplayCall",
-                [],
-            )
-        })?;
-        let request = call.request.unwrap_or_default();
-        let _guard = HostCtxGuard::set(host_ctx);
-        if self.aggregates.serves(&call.domain) {
-            return Ok(self
-                .aggregates
-                .replay(&call.domain, &request)?
-                .encode_to_vec());
-        }
-        if let Some((_, pm, state_callback, cb)) = self
-            .process_managers
-            .iter()
-            .find(|(_, pm, ..)| pm.pm_domain() == call.domain)
-        {
-            pm.replay(&request)?;
-            return Ok(host_packed_state(*state_callback, *cb, &call.domain)?.encode_to_vec());
-        }
-        let resp = match self.aggregates.sole() {
-            Some(sole) => sole.replay(&request)?,
-            None => self.aggregates.replay(&call.domain, &request)?,
-        };
-        Ok(resp.encode_to_vec())
-    }
-
     /// Decodes EventBook bytes, routes to the registered projector (sole
     /// projector claims everything; the core applies its own domain filter),
     /// and runs the core dispatch with the host session installed.
@@ -500,34 +375,25 @@ impl FfiRouter {
         Ok(())
     }
 
-    /// Decodes SagaHandleRequest bytes, routes to the registered saga (sole
-    /// saga claims the source), and runs the core dispatch with the host
-    /// session installed.
+    /// Decodes the source EventBook bytes, routes to the sagas consuming its
+    /// domain, and runs each core dispatch with the host session installed.
     pub fn dispatch_saga(
         &self,
         host_ctx: *mut c_void,
         request: &[u8],
     ) -> Result<Vec<u8>, CodedError> {
-        let req = pb::SagaHandleRequest::decode(request).map_err(|_| {
+        let source = pb::EventBook::decode(request).map_err(|_| {
             CodedError::invalid_argument(
                 codes::ANY_DECODE_FAILED,
-                "failed to decode SagaHandleRequest",
+                "failed to decode the saga source EventBook",
                 [],
             )
         })?;
 
-        // Source-shape validation precedes routing: a nil source is
-        // MISSING_SAGA_SOURCE and a source with no pages is EMPTY_SAGA_SOURCE,
-        // regardless of which (if any) saga consumes its domain. Otherwise an
-        // empty/absent source has no cover domain, matches no saga, and would
-        // mis-report as NO_HANDLER_REGISTERED.
-        let Some(source) = req.source.as_ref() else {
-            return Err(CodedError::invalid_argument(
-                codes::MISSING_SAGA_SOURCE,
-                messages::MISSING_SAGA_SOURCE,
-                [],
-            ));
-        };
+        // Source-shape validation precedes routing: a source with no pages is
+        // EMPTY_SAGA_SOURCE, regardless of which (if any) saga consumes its
+        // domain. Otherwise an empty source has no cover domain, matches no
+        // saga, and would mis-report as NO_HANDLER_REGISTERED.
         if source.pages.is_empty() {
             return Err(CodedError::invalid_argument(
                 codes::EMPTY_SAGA_SOURCE,
@@ -553,7 +419,7 @@ impl FfiRouter {
             .filter(|(_, s)| s.input_domain() == domain)
         {
             matched = true;
-            merged.commands.extend(saga.dispatch(&req)?.commands);
+            merged.commands.extend(saga.dispatch(&source)?.commands);
         }
         // A source domain no saga consumes is NO_HANDLER_REGISTERED (a PM
         // trigger no PM consumes is a no-op instead, C-0022).
@@ -646,8 +512,7 @@ impl FfiRouter {
             );
         }
 
-        self.process_managers
-            .push((desc.name, dispatch, desc.state_callback_id, cb));
+        self.process_managers.push((desc.name, dispatch));
         Ok(())
     }
 
@@ -695,7 +560,7 @@ impl FfiRouter {
         let routes: Vec<&dyn ProcessManagerRoute> = self
             .process_managers
             .iter()
-            .map(|(_, pm, ..)| pm as &dyn ProcessManagerRoute)
+            .map(|(_, pm)| pm as &dyn ProcessManagerRoute)
             .collect();
         let selected = select_process_managers(&routes, &req);
         let _guard = HostCtxGuard::set(host_ctx);

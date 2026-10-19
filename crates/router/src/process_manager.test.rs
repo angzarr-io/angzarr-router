@@ -13,7 +13,8 @@ use crate::pb;
 use crate::process_manager::ProcessManagerDispatch;
 use crate::rebuild::Rebuilder;
 use crate::test_support::{
-    book_of_covers, corrupt_cover_any, cover_applier, event_page, fresh_rebuilder, TestState,
+    book_of_covers, command_page, corrupt_cover_any, cover_applier, event_page, fresh_rebuilder,
+    uuid_of, TestState,
 };
 use crate::type_url;
 
@@ -62,13 +63,11 @@ fn command_to(domain: &str) -> pb::CommandBook {
             domain: domain.to_string(),
             ..Default::default()
         }),
-        pages: vec![pb::CommandPage {
-            payload: Some(pb::command_page::Payload::Command(Any {
-                type_url: type_url("test.Command"),
-                value: Vec::new(),
-            })),
-            ..Default::default()
-        }],
+        page: Some(command_page(Any {
+            type_url: type_url("test.Command"),
+            value: Vec::new(),
+        })),
+        ..Default::default()
     }
 }
 
@@ -212,8 +211,8 @@ fn handler_sees_rebuilt_state() {
 
 #[test]
 fn emitted_commands_pass_through_unstamped() {
-    // The coordinator stamps reaction commands: a handler-set header and a
-    // headerless page both come back exactly as emitted.
+    // The coordinator stamps reaction commands: a handler-set correlation and
+    // an unstamped page both come back exactly as emitted.
     let d = ProcessManagerDispatch::new(
         "fulfillment-pm",
         "fulfillment",
@@ -222,10 +221,7 @@ fn emitted_commands_pass_through_unstamped() {
     )
     .on_event(IN_DOMAIN, FQ_SHIPPED, |_e, _s, _cover| {
         let mut explicit = command_to("inventory");
-        explicit.pages[0].header = Some(pb::PageHeader {
-            sequence_type: Some(pb::page_header::SequenceType::Sequence(9)),
-            ..Default::default()
-        });
+        explicit.page.as_mut().unwrap().correlation_id = Some(uuid_of(9));
         Ok(pb::ProcessManagerHandleResponse {
             commands: vec![explicit, command_to("billing")],
             ..Default::default()
@@ -238,10 +234,7 @@ fn emitted_commands_pass_through_unstamped() {
         ))
         .expect("dispatch");
     let mut explicit = command_to("inventory");
-    explicit.pages[0].header = Some(pb::PageHeader {
-        sequence_type: Some(pb::page_header::SequenceType::Sequence(9)),
-        ..Default::default()
-    });
+    explicit.page.as_mut().unwrap().correlation_id = Some(uuid_of(9));
     assert_eq!(resp.commands, vec![explicit, command_to("billing")]);
 }
 
@@ -260,7 +253,7 @@ fn accessors_report_the_declared_targets() {
 }
 
 #[test]
-fn handler_can_emit_process_events_and_facts() {
+fn handler_can_emit_process_events_and_commands() {
     let d = ProcessManagerDispatch::new(
         "fulfillment-pm",
         "fulfillment",
@@ -270,7 +263,7 @@ fn handler_can_emit_process_events_and_facts() {
     .on_event(IN_DOMAIN, FQ_SHIPPED, |_e, _s, _cover| {
         Ok(pb::ProcessManagerHandleResponse {
             process_events: vec![tagged_book("pe")],
-            facts: vec![tagged_book("fact")],
+            commands: vec![command_to("inventory")],
             ..Default::default()
         })
     });
@@ -281,7 +274,7 @@ fn handler_can_emit_process_events_and_facts() {
         ))
         .expect("dispatch");
     assert_eq!(book_domains(&resp.process_events), vec!["pe".to_string()]);
-    assert_eq!(book_domains(&resp.facts), vec!["fact".to_string()]);
+    assert_eq!(resp.commands, vec![command_to("inventory")]);
 }
 
 // --- envelope + error guards ----------------------------------------------
@@ -475,7 +468,6 @@ fn merge_concatenates_in_order() {
         pb::ProcessManagerHandleResponse {
             process_events: vec![tagged_book("p1")],
             commands: vec![command_to("c1")],
-            facts: vec![tagged_book("f1")],
             ..Default::default()
         },
     );
@@ -484,18 +476,26 @@ fn merge_concatenates_in_order() {
         pb::ProcessManagerHandleResponse {
             process_events: vec![tagged_book("p2")],
             commands: vec![command_to("c2")],
-            facts: vec![tagged_book("f2")],
+            rules_version: "v2".to_string(),
+            snapshot_refused: true,
+        },
+    );
+    merge_response(
+        &mut acc,
+        pb::ProcessManagerHandleResponse {
+            rules_version: "v3".to_string(),
             ..Default::default()
         },
     );
     assert_eq!(book_domains(&acc.process_events), vec!["p1", "p2"]);
-    assert_eq!(book_domains(&acc.facts), vec!["f1", "f2"]);
     let cmd_domains: Vec<_> = acc
         .commands
         .iter()
         .map(|c| c.cover.as_ref().unwrap().domain.clone())
         .collect();
     assert_eq!(cmd_domains, vec!["c1", "c2"]);
+    assert_eq!(acc.rules_version, "v2", "the first reported rules version");
+    assert!(acc.snapshot_refused, "any refusal marks the merge");
 }
 
 // The handler reads the trigger's cover (e.g. to address the trigger's root).
@@ -512,34 +512,10 @@ fn handler_sees_the_trigger_cover() {
         },
     );
     let mut trig = trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED)]);
-    trig.cover.as_mut().unwrap().root = Some(pb::Uuid { value: vec![3] });
+    trig.cover.as_mut().unwrap().root = Some(uuid_of(3));
     pm.dispatch(&request(Some(trig.clone()), None))
         .expect("dispatch");
     assert_eq!(*seen.lock().unwrap(), trig.cover);
-}
-
-#[test]
-fn replay_folds_the_snapshot_then_the_events() {
-    let pm = ProcessManagerDispatch::new(
-        "pm",
-        "pm",
-        ["inventory"],
-        cover_applier(fresh_rebuilder().with_snapshot(|s, _| {
-            s.applied.push("snapshot".to_string());
-            Ok(())
-        })),
-    );
-    let state = pm
-        .replay(&pb::ReplayRequest {
-            base_snapshot: Some(pb::Snapshot {
-                sequence: 1,
-                state: Some(crate::test_support::cover_any("snap")),
-                ..Default::default()
-            }),
-            events: book_of_covers(&["a", "b"]).pages,
-        })
-        .expect("replay");
-    assert_eq!(state.applied, vec!["snapshot", "a", "b"]);
 }
 
 // --- process events pass through: the coordinator addresses them ---------
@@ -555,14 +531,13 @@ fn process_events_pass_through_unaddressed() {
     .on_event(IN_DOMAIN, FQ_SHIPPED, |_e, _s, _cover| {
         Ok(pb::ProcessManagerHandleResponse {
             process_events: vec![pb::EventBook::default(), tagged_book("elsewhere")],
-            facts: vec![pb::EventBook::default()],
             ..Default::default()
         })
     });
     let mut state = book_of_covers(&[]);
     state.cover = Some(pb::Cover {
         domain: "fulfillment".to_string(),
-        root: Some(pb::Uuid { value: vec![7; 16] }),
+        root: Some(uuid_of(7)),
         ..Default::default()
     });
     let resp = d
@@ -575,5 +550,4 @@ fn process_events_pass_through_unaddressed() {
         resp.process_events,
         vec![pb::EventBook::default(), tagged_book("elsewhere")]
     );
-    assert_eq!(resp.facts, vec![pb::EventBook::default()]);
 }

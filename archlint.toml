@@ -4,11 +4,12 @@
 # module graph these rules are checked against.
 #
 # Crate layers, bottom to top:
+#   angzarr-proto               the io.angzarr.v1 wire types (angzarr-project's
+#                               rust/angzarr-proto, a path dependency)
 #   angzarr_router              the engine: dispatch, component model, rebuild
 #   angzarr_router_ffi          the C ABI over the engine (marshaling, registry)
 #   bindings/<lang>             out-of-tree leaves that link the cdylib
 #   angzarr_router_conformance  the harness: drives the engine's public API
-#                               (its tests also drive the exported C ABI)
 #   archlint                    tooling; no product crate depends on it
 #
 # `allow` lists the ONLY workspace targets a module may reference (external
@@ -19,9 +20,9 @@
 
 [[rule]]
 name = "engine-is-the-bottom"
-why = "the engine never depends on the C ABI layer, the conformance harness, tooling, or C FFI types"
+why = "the engine never depends on the C ABI layer, the conformance harness, tooling, or C FFI types; its wire types come from angzarr-project's angzarr-proto crate"
 from = ["angzarr_router::**"]
-allow = ["angzarr_router::**"]
+allow = ["angzarr_router::**", "path:angzarr-project/rust/angzarr-proto"]
 deny = ["std::ffi::**", "core::ffi::**", "std::os::raw::**", "libc::**"]
 
 [[rule]]
@@ -39,13 +40,12 @@ allow = ["angzarr_router_conformance::**", "angzarr_router::**", "path:conforman
 
 [[rule]]
 name = "conformance-tests-use-public-surfaces"
-why = "conformance tests drive the engine API and the C ABI's exported entry points, never FFI internals"
+why = "conformance tests drive the engine's public API, never the C ABI"
 from = ["angzarr_router_conformance::**"]
 scope = "test"
 allow = [
     "angzarr_router_conformance::**",
     "angzarr_router::**",
-    "angzarr_router_ffi",
     "path:conformance/**",
 ]
 
@@ -78,6 +78,7 @@ from = ["angzarr_router", "angzarr_router::rebuild::**"]
 scope = "lib"
 allow = [
     "angzarr_router",
+    "path:angzarr-project/rust/angzarr-proto",
     "angzarr_router::proto::**",
     "angzarr_router::error::**",
     "angzarr_router::rebuild::**",

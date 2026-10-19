@@ -47,7 +47,7 @@ const EVENT_PAGE: &str = "io.angzarr.v1.EventPage";
 /// never crosses the boundary — this is how scenarios assert that evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Observed {
-    pub next_sequence: u32,
+    pub next_sequence: u64,
     pub had_prior_events: bool,
     pub count: u32,
 }
@@ -126,7 +126,7 @@ pub fn counter_aggregate(observed: ObservedSink) -> AggregateDispatch<CounterSta
             }
             let pages = (0..cmd.n)
                 .map(|_| pb::EventPage {
-                    payload: Some(pb::event_page::Payload::Event(increased_any())),
+                    payload: Some(increased_any()),
                     ..Default::default()
                 })
                 .collect();
@@ -183,7 +183,7 @@ pub fn counter_projector(domains: &[&str]) -> ProjectorDispatch<ProjectorState> 
             Ok(pb::Projection {
                 cover: events.cover.clone(),
                 projector: "counter-projector".to_string(),
-                sequence: state.count,
+                next_sequence: u64::from(state.count),
                 projection: Some(prost_types::Any {
                     type_url: angzarr_router::type_url("test.counter.CounterState"),
                     value: CounterState { count: state.count }.encode_to_vec(),
@@ -202,7 +202,7 @@ pub fn delivery(domain: &str, n: u32) -> pb::EventBook {
         }),
         pages: (0..n)
             .map(|_| pb::EventPage {
-                payload: Some(pb::event_page::Payload::Event(increased_any())),
+                payload: Some(increased_any()),
                 ..Default::default()
             })
             .collect(),
@@ -241,61 +241,42 @@ fn reserve_command_to(domain: &str) -> pb::CommandBook {
             domain: domain.to_string(),
             ..Default::default()
         }),
-        pages: vec![pb::CommandPage {
-            payload: Some(pb::command_page::Payload::Command(prost_types::Any {
-                type_url: angzarr_router::type_url("test.counter.Reserve"),
-                value: Vec::new(),
-            })),
-            ..Default::default()
-        }],
-    }
-}
-
-/// A SagaHandleRequest whose source carries one event of `event_fq` in the
-/// "order" domain, at sequence `seq` when given.
-pub fn saga_event_source(event_fq: &str, seq: Option<u32>) -> pb::SagaHandleRequest {
-    pb::SagaHandleRequest {
-        source: Some(pb::EventBook {
-            cover: Some(pb::Cover {
-                domain: "order".to_string(),
-                ..Default::default()
-            }),
-            pages: vec![pb::EventPage {
-                payload: Some(pb::event_page::Payload::Event(prost_types::Any {
-                    type_url: angzarr_router::type_url(event_fq),
+        page: Some(pb::CommandPage {
+            body: Some(pb::command_page::Body::Command(pb::Command {
+                payload: Some(prost_types::Any {
+                    type_url: angzarr_router::type_url("test.counter.Reserve"),
                     value: Vec::new(),
-                })),
-                header: seq.map(sequence_header),
-                ..Default::default()
-            }],
+                }),
+            })),
             ..Default::default()
         }),
         ..Default::default()
     }
 }
 
-/// A page header carrying an explicit sequence.
-pub fn sequence_header(seq: u32) -> pb::PageHeader {
-    pb::PageHeader {
-        sequence_type: Some(pb::page_header::SequenceType::Sequence(seq)),
+/// A saga source carrying one event of `event_fq` in the "order" domain at
+/// sequence `seq`.
+pub fn saga_event_source(event_fq: &str, seq: u64) -> pb::EventBook {
+    pb::EventBook {
+        cover: Some(pb::Cover {
+            domain: "order".to_string(),
+            ..Default::default()
+        }),
+        pages: vec![pb::EventPage {
+            payload: Some(prost_types::Any {
+                type_url: angzarr_router::type_url(event_fq),
+                value: Vec::new(),
+            }),
+            sequence: seq,
+            ..Default::default()
+        }],
         ..Default::default()
     }
 }
 
-/// A SagaHandleRequest whose source book carries no pages → EMPTY_SAGA_SOURCE.
-pub fn saga_empty_source() -> pb::SagaHandleRequest {
-    pb::SagaHandleRequest {
-        source: Some(pb::EventBook::default()),
-        ..Default::default()
-    }
-}
-
-/// A SagaHandleRequest with no source at all → MISSING_SAGA_SOURCE.
-pub fn saga_missing_source() -> pb::SagaHandleRequest {
-    pb::SagaHandleRequest {
-        source: None,
-        ..Default::default()
-    }
+/// A saga source carrying no pages → EMPTY_SAGA_SOURCE.
+pub fn saga_empty_source() -> pb::EventBook {
+    pb::EventBook::default()
 }
 
 // ---------------------------------------------------------------------------
@@ -311,8 +292,9 @@ pub struct ProcessManagerState {
 
 /// Build the OrderProcessManager dispatch table: over the "counter" domain it
 /// reacts to the NEWEST Increased trigger by emitting one Reserve command for
-/// "inventory" plus one unaddressed process event. Its own state
-/// counts prior Increased process events, so a rebuild is observable.
+/// "inventory" plus one unaddressed process event recording the count its
+/// rebuilt state held (an `OrderProcessManagerState`), so the rebuild is
+/// observable.
 pub fn order_pm() -> ProcessManagerDispatch<ProcessManagerState> {
     let rebuilder = Rebuilder::new(ProcessManagerState::default).apply(
         "test.counter.Increased",
@@ -327,14 +309,10 @@ pub fn order_pm() -> ProcessManagerDispatch<ProcessManagerState> {
         "counter",
         "test.counter.Increased",
         |_event, state: &mut ProcessManagerState, _cover| {
-            let cmd = reserve_command_to("inventory");
-            // Emit one fact per prior state event so the rebuild is
-            // observable in the response.
-            let facts = (0..state.count).map(|_| pm_process_event()).collect();
+            let seen = counter::OrderProcessManagerState { count: state.count };
             Ok(pb::ProcessManagerHandleResponse {
-                process_events: vec![pm_process_event()],
-                commands: vec![cmd],
-                facts,
+                process_events: vec![process_event(&seen)],
+                commands: vec![reserve_command_to("inventory")],
                 ..Default::default()
             })
         },
@@ -348,14 +326,11 @@ pub struct AuditState {
     pub seen: Vec<String>,
 }
 
-/// Cover domain the AuditProcessManager stamps on its facts and process
-/// events, so scenarios can tell its reactions from the order PM's.
-pub const AUDIT_MARK: &str = "audit";
-
 /// Build the AuditProcessManager dispatch table (domain "audit-pm"): co-resident
 /// with the order PM over the same "counter" Increased trigger, but over its
-/// own state type. It reacts with one "audit" fact per prior state event and
-/// no commands.
+/// own state type. It reacts with one unaddressed process event recording what
+/// its rebuilt state saw (an `AuditProcessManagerState`, a different type from
+/// the order PM's) and no commands.
 pub fn audit_pm() -> ProcessManagerDispatch<AuditState> {
     let rebuilder = Rebuilder::new(AuditState::default).apply(
         "test.counter.Increased",
@@ -376,23 +351,44 @@ pub fn audit_pm() -> ProcessManagerDispatch<AuditState> {
         "counter",
         "test.counter.Increased",
         |_event, state: &mut AuditState, _cover| {
-            let facts = state.seen.iter().map(|_| audit_book()).collect();
+            let seen = counter::AuditProcessManagerState {
+                seen: state.seen.clone(),
+            };
             Ok(pb::ProcessManagerHandleResponse {
-                facts,
+                process_events: vec![process_event(&seen)],
                 ..Default::default()
             })
         },
     )
 }
 
-fn audit_book() -> pb::EventBook {
+/// One unaddressed process-event book whose single page carries `state`
+/// (payload only: the coordinator addresses and stamps it).
+fn process_event<M: prost::Message + prost::Name>(state: &M) -> pb::EventBook {
     pb::EventBook {
-        cover: Some(pb::Cover {
-            domain: AUDIT_MARK.to_string(),
+        pages: vec![pb::EventPage {
+            payload: Some(prost_types::Any {
+                type_url: angzarr_router::type_url(&M::full_name()),
+                value: state.encode_to_vec(),
+            }),
             ..Default::default()
-        }),
+        }],
         ..Default::default()
     }
+}
+
+/// The state a PM recorded in its process events, decoded as `M` from every
+/// page carrying `M`'s type: one entry per reacting PM of that kind.
+pub fn recorded_states<M: prost::Message + prost::Name + Default>(
+    resp: &pb::ProcessManagerHandleResponse,
+) -> Vec<M> {
+    resp.process_events
+        .iter()
+        .flat_map(|book| &book.pages)
+        .filter_map(|page| page.payload.as_ref())
+        .filter(|any| angzarr_router::type_name_from_url(&any.type_url) == M::full_name())
+        .map(|any| M::decode(any.value.as_slice()).expect("a recorded PM state"))
+        .collect()
 }
 
 /// A PM process-state book of `n` Increased events owned by `pm_domain` (its
@@ -406,13 +402,6 @@ pub fn pm_state_in(pm_domain: &str, n: u32) -> pb::EventBook {
     book
 }
 
-fn pm_process_event() -> pb::EventBook {
-    pb::EventBook {
-        pages: vec![pb::EventPage::default()],
-        ..Default::default()
-    }
-}
-
 /// A PM request whose trigger carries the given event pages in `domain`, the
 /// newest at sequence `newest_seq` when given. `process_state` is the PM's
 /// prior state book.
@@ -420,21 +409,21 @@ pub fn pm_trigger_request(
     domain: &str,
     event_fqs: &[&str],
     process_state: Option<pb::EventBook>,
-    newest_seq: Option<u32>,
+    newest_seq: Option<u64>,
 ) -> pb::ProcessManagerHandleRequest {
     let pages = event_fqs
         .iter()
         .map(|fq| pb::EventPage {
-            payload: Some(pb::event_page::Payload::Event(prost_types::Any {
+            payload: Some(prost_types::Any {
                 type_url: angzarr_router::type_url(fq),
                 value: Vec::new(),
-            })),
+            }),
             ..Default::default()
         })
         .collect();
     let mut pages: Vec<pb::EventPage> = pages;
     if let (Some(seq), Some(last)) = (newest_seq, pages.last_mut()) {
-        last.header = Some(sequence_header(seq));
+        last.sequence = seq;
     }
     pb::ProcessManagerHandleRequest {
         trigger: Some(pb::EventBook {
@@ -470,7 +459,7 @@ pub fn pm_state_of(n: u32) -> pb::EventBook {
     pb::EventBook {
         pages: (0..n)
             .map(|_| pb::EventPage {
-                payload: Some(pb::event_page::Payload::Event(increased_any())),
+                payload: Some(increased_any()),
                 ..Default::default()
             })
             .collect(),
@@ -494,15 +483,6 @@ pub fn increase_command(n: u32) -> pb::ContextualCommand {
     cc
 }
 
-/// A well-known opaque linkage a command's cover carries on behalf of a
-/// parent.
-pub fn parent_linkage() -> prost_types::Any {
-    prost_types::Any {
-        type_url: angzarr_router::type_url("test.counter.Parent"),
-        value: vec![1, 2, 3],
-    }
-}
-
 /// The FailHard command (no scenario data).
 pub fn failhard_command() -> pb::ContextualCommand {
     parse_txtpb(CONTEXTUAL_COMMAND, SKEL_FAILHARD)
@@ -523,17 +503,23 @@ pub fn command_missing_book() -> pb::ContextualCommand {
     cc
 }
 
-/// A command book with no pages → MISSING_COMMAND_PAGE.
+/// A command book with no page → MISSING_COMMAND_PAGE.
 pub fn command_missing_page() -> pb::ContextualCommand {
     let mut cc = increase_command(1);
-    cc.command.as_mut().expect("command book").pages.clear();
+    cc.command.as_mut().expect("command book").page = None;
     cc
 }
 
-/// A command page carrying no payload → MISSING_COMMAND_PAYLOAD.
+/// A command page carrying no body → MISSING_COMMAND_PAYLOAD.
 pub fn command_missing_payload() -> pb::ContextualCommand {
     let mut cc = increase_command(1);
-    cc.command.as_mut().expect("command book").pages[0].payload = None;
+    cc.command
+        .as_mut()
+        .expect("command book")
+        .page
+        .as_mut()
+        .expect("command page")
+        .body = None;
     cc
 }
 
@@ -544,19 +530,15 @@ pub fn prior_history(n: u32) -> Option<pb::EventBook> {
         return None;
     }
     let page: pb::EventPage = parse_txtpb(EVENT_PAGE, SKEL_INCREASED_EVENT);
-    let pages = (0..n)
-        .map(|seq| {
-            let mut p = page.clone();
-            p.header = Some(pb::PageHeader {
-                sync_mode: None,
-                sequence_type: Some(pb::page_header::SequenceType::Sequence(seq)),
-            });
-            p
+    let pages = (0..u64::from(n))
+        .map(|seq| pb::EventPage {
+            sequence: seq,
+            ..page.clone()
         })
         .collect();
     Some(pb::EventBook {
         pages,
-        next_sequence: n,
+        next_sequence: u64::from(n),
         ..Default::default()
     })
 }
@@ -566,13 +548,9 @@ pub fn prior_history(n: u32) -> Option<pb::EventBook> {
 /// PERSISTED_EVENT_CORRUPT when a known command rebuilds over it.
 pub fn corrupt_prior_history() -> Option<pb::EventBook> {
     let mut page: pb::EventPage = parse_txtpb(EVENT_PAGE, SKEL_INCREASED_EVENT);
-    if let Some(pb::event_page::Payload::Event(any)) = page.payload.as_mut() {
+    if let Some(any) = page.payload.as_mut() {
         any.value = vec![0xff, 0xff, 0xff];
     }
-    page.header = Some(pb::PageHeader {
-        sync_mode: None,
-        sequence_type: Some(pb::page_header::SequenceType::Sequence(0)),
-    });
     Some(pb::EventBook {
         pages: vec![page],
         next_sequence: 1,
@@ -585,13 +563,9 @@ pub fn corrupt_prior_history() -> Option<pb::EventBook> {
 /// uncovered page (sequence 11 → applied). A rebuild therefore observes
 /// `count == 11`: snapshot loaded, covered page not refolded, newer page applied.
 pub fn snapshot_history() -> Option<pb::EventBook> {
-    let increased_at = |seq: u32| {
-        let mut p: pb::EventPage = parse_txtpb(EVENT_PAGE, SKEL_INCREASED_EVENT);
-        p.header = Some(pb::PageHeader {
-            sync_mode: None,
-            sequence_type: Some(pb::page_header::SequenceType::Sequence(seq)),
-        });
-        p
+    let increased_at = |seq: u64| pb::EventPage {
+        sequence: seq,
+        ..parse_txtpb(EVENT_PAGE, SKEL_INCREASED_EVENT)
     };
     Some(pb::EventBook {
         snapshot: Some(pb::Snapshot {
@@ -610,11 +584,9 @@ pub fn snapshot_history() -> Option<pb::EventBook> {
 
 fn inner_command_any(cc: &mut pb::ContextualCommand) -> &mut prost_types::Any {
     let book = cc.command.as_mut().expect("command book");
-    match book.pages[0].payload.as_mut().expect("command payload") {
-        pb::command_page::Payload::Command(any) => any,
-        pb::command_page::Payload::External(_) => {
-            panic!("conformance fixtures carry inline commands, not offloaded payloads")
-        }
+    match book.page.as_mut().and_then(|p| p.body.as_mut()) {
+        Some(pb::command_page::Body::Command(pb::Command { payload: Some(any) })) => any,
+        other => panic!("conformance fixtures carry an inline command, got {other:?}"),
     }
 }
 
@@ -627,16 +599,17 @@ pub fn with_type_url_prefix(mut cmd: pb::ContextualCommand, prefix: &str) -> pb:
             angzarr_router::type_name_from_url(&any.type_url)
         );
     };
-    if let Some(book) = cmd.command.as_mut() {
-        for page in &mut book.pages {
-            if let Some(pb::command_page::Payload::Command(any)) = page.payload.as_mut() {
-                rewrite(any);
-            }
-        }
+    if let Some(Some(pb::command_page::Body::Command(pb::Command { payload: Some(any) }))) = cmd
+        .command
+        .as_mut()
+        .and_then(|book| book.page.as_mut())
+        .map(|page| page.body.as_mut())
+    {
+        rewrite(any);
     }
     if let Some(book) = cmd.events.as_mut() {
         for page in &mut book.pages {
-            if let Some(pb::event_page::Payload::Event(any)) = page.payload.as_mut() {
+            if let Some(any) = page.payload.as_mut() {
                 rewrite(any);
             }
         }
@@ -645,7 +618,7 @@ pub fn with_type_url_prefix(mut cmd: pb::ContextualCommand, prefix: &str) -> pb:
 }
 
 // ---------------------------------------------------------------------------
-// Context fixtures: facts, replay, cover access, projector page context
+// Context fixtures: facts, cover access, projector page context
 // (context.feature).
 // ---------------------------------------------------------------------------
 
@@ -661,7 +634,7 @@ pub fn cover_of(domain: &str, label: &str) -> pb::Cover {
     pb::Cover {
         domain: domain.to_string(),
         root: Some(pb::Uuid {
-            value: root_of(label),
+            value: root_of(label).into(),
         }),
         ..Default::default()
     }
@@ -671,22 +644,21 @@ pub fn cover_of(domain: &str, label: &str) -> pb::Cover {
 pub type CoverSink = Arc<Mutex<Vec<Option<pb::Cover>>>>;
 
 /// Page sequences an applier observed.
-pub type SequenceSink = Arc<Mutex<Vec<u32>>>;
+pub type SequenceSink = Arc<Mutex<Vec<u64>>>;
 
-fn increased_page(seq: Option<u32>) -> pb::EventPage {
+fn increased_page(seq: u64) -> pb::EventPage {
     pb::EventPage {
-        header: seq.map(sequence_header),
-        payload: Some(pb::event_page::Payload::Event(increased_any())),
+        payload: Some(increased_any()),
+        sequence: seq,
         ..Default::default()
     }
 }
 
 /// The ledger aggregate (domain "ledger") over CounterState: Increased folds
 /// count += 1 and records the page sequence it applied; a snapshot loads
-/// CounterState; IncreaseBy records the handled cover and emits one Increased
-/// whose cover carries the ledger's own linkage ([`ledger_linkage`]); the
-/// only declared fact, Increased, is recorded as received and flagged by a
-/// CounterState carrying the count it brings the ledger to.
+/// CounterState; IncreaseBy records the handled cover and emits one
+/// Increased; the only fact, Increased, is recorded as received and flagged
+/// by a CounterState carrying the count it brings the ledger to.
 pub fn ledger_aggregate(seen: CoverSink, applied: SequenceSink) -> AggregateDispatch<CounterState> {
     let rebuilder = Rebuilder::new(CounterState::default)
         .apply_with_context(
@@ -705,12 +677,8 @@ pub fn ledger_aggregate(seen: CoverSink, applied: SequenceSink) -> AggregateDisp
         .on_command("test.counter.IncreaseBy", move |_cmd, _state, cctx| {
             seen.lock().unwrap().push(cctx.cover.clone());
             Ok(Some(pb::EventBook {
-                cover: Some(pb::Cover {
-                    ext: Some(ledger_linkage()),
-                    ..Default::default()
-                }),
                 pages: vec![pb::EventPage {
-                    payload: Some(pb::event_page::Payload::Event(increased_any())),
+                    payload: Some(increased_any()),
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -730,87 +698,58 @@ pub fn ledger_aggregate(seen: CoverSink, applied: SequenceSink) -> AggregateDisp
         })
 }
 
-/// A FactRequest of `facts` pages of `test.counter.<fact>` in "ledger" over
-/// `prior` Increased events.
-pub fn fact_request(fact: &str, facts: u32, prior: u32) -> pb::FactRequest {
-    let page = pb::EventPage {
-        payload: Some(pb::event_page::Payload::Event(prost_types::Any {
-            type_url: angzarr_router::type_url(&format!("test.counter.{fact}")),
-            value: Vec::new(),
-        })),
-        ..Default::default()
-    };
-    pb::FactRequest {
-        facts: Some(pb::EventBook {
-            cover: Some(pb::Cover {
-                domain: "ledger".to_string(),
-                ..Default::default()
-            }),
-            pages: (0..facts).map(|_| page.clone()).collect(),
-            ..Default::default()
-        }),
-        prior_events: Some(pb::EventBook {
-            pages: (0..prior).map(|i| increased_page(Some(i))).collect(),
-            next_sequence: prior,
-            ..Default::default()
-        }),
-    }
-}
-
-/// A ReplayRequest: a snapshot of `count` at sequence 1, then `events`
-/// Increased events at sequences 2...
-pub fn replay_request(count: u32, events: u32) -> pb::ReplayRequest {
-    pb::ReplayRequest {
-        base_snapshot: Some(pb::Snapshot {
-            sequence: 1,
-            state: Some(prost_types::Any {
-                type_url: angzarr_router::type_url("test.counter.CounterState"),
-                value: CounterState { count }.encode_to_vec(),
-            }),
-            ..Default::default()
-        }),
-        events: (0..events).map(|i| increased_page(Some(2 + i))).collect(),
-    }
-}
-
-/// A ReplayRequest of `events` Increased events at sequences 0...
-pub fn events_replay_request(events: u32) -> pb::ReplayRequest {
-    pb::ReplayRequest {
-        base_snapshot: None,
-        events: (0..events).map(|i| increased_page(Some(i))).collect(),
-    }
-}
-
 /// An IncreaseBy command for the ledger root `label`.
-/// The parent linkage the ledger sets on its own events.
-pub fn ledger_linkage() -> prost_types::Any {
-    prost_types::Any {
-        type_url: angzarr_router::type_url("test.counter.Parent"),
-        value: vec![4, 5, 6],
-    }
-}
-
-/// [`ledger_command`] on behalf of a parent ([`parent_linkage`]).
-pub fn ledger_command_with_linkage(label: &str) -> pb::ContextualCommand {
-    let mut cc = ledger_command(label);
-    cc.command.as_mut().unwrap().cover.as_mut().unwrap().ext = Some(parent_linkage());
-    cc
-}
-
 pub fn ledger_command(label: &str) -> pb::ContextualCommand {
     pb::ContextualCommand {
         command: Some(pb::CommandBook {
             cover: Some(cover_of("ledger", label)),
-            pages: vec![pb::CommandPage {
-                payload: Some(pb::command_page::Payload::Command(prost_types::Any {
-                    type_url: angzarr_router::type_url("test.counter.IncreaseBy"),
-                    value: counter::IncreaseBy { n: 1 }.encode_to_vec(),
+            page: Some(pb::CommandPage {
+                body: Some(pb::command_page::Body::Command(pb::Command {
+                    payload: Some(prost_types::Any {
+                        type_url: angzarr_router::type_url("test.counter.IncreaseBy"),
+                        value: counter::IncreaseBy { n: 1 }.encode_to_vec(),
+                    }),
                 })),
                 ..Default::default()
-            }],
+            }),
+            ..Default::default()
         }),
-        events: None,
+        ..Default::default()
     }
+}
+
+/// [`ledger_command`] over prior Increased events at `sequences`.
+pub fn ledger_command_over(label: &str, sequences: &[u64]) -> pb::ContextualCommand {
+    let mut cc = ledger_command(label);
+    cc.events = Some(pb::EventBook {
+        pages: sequences.iter().map(|s| increased_page(*s)).collect(),
+        next_sequence: sequences.last().map_or(0, |s| s + 1),
+        ..Default::default()
+    });
+    cc
+}
+
+/// A `test.counter.<fact>` fact (empty payload) for the ledger, delivered in
+/// the Fact arm over `prior` Increased events.
+pub fn ledger_fact(fact: &str, prior: u64) -> pb::ContextualCommand {
+    let mut cc = ledger_command("ledger-1");
+    cc.command.as_mut().expect("command book").page = Some(pb::CommandPage {
+        body: Some(pb::command_page::Body::Fact(pb::Fact {
+            payload: Some(prost_types::Any {
+                type_url: angzarr_router::type_url(&format!("test.counter.{fact}")),
+                value: Vec::new(),
+            }),
+        })),
+        ..Default::default()
+    });
+    if prior > 0 {
+        cc.events = Some(pb::EventBook {
+            pages: (0..prior).map(increased_page).collect(),
+            next_sequence: prior,
+            ..Default::default()
+        });
+    }
+    cc
 }
 
 /// The reserving process-manager (domain "reserving-pm", target
@@ -836,11 +775,11 @@ pub fn reserving_pm(seen: CoverSink) -> ProcessManagerDispatch<CounterState> {
 }
 
 /// An Increased trigger from "counter" root `label` at sequence `seq`.
-pub fn reserving_trigger(label: &str, seq: u32) -> pb::ProcessManagerHandleRequest {
+pub fn reserving_trigger(label: &str, seq: u64) -> pb::ProcessManagerHandleRequest {
     pb::ProcessManagerHandleRequest {
         trigger: Some(pb::EventBook {
             cover: Some(cover_of("counter", label)),
-            pages: vec![increased_page(Some(seq))],
+            pages: vec![increased_page(seq)],
             ..Default::default()
         }),
         process_state: None,
@@ -848,7 +787,7 @@ pub fn reserving_trigger(label: &str, seq: u32) -> pb::ProcessManagerHandleReque
 }
 
 /// (root bytes, sequence) pairs a projector fold observed.
-pub type PageSink = Arc<Mutex<Vec<(Vec<u8>, u32)>>>;
+pub type PageSink = Arc<Mutex<Vec<(Vec<u8>, u64)>>>;
 
 /// The tracking projector: every Increased fold records its book's root and
 /// the page's sequence.
@@ -859,7 +798,7 @@ pub fn tracking_projector(seen: PageSink) -> ProjectorDispatch<()> {
             let root = ctx
                 .cover
                 .and_then(|c| c.root.as_ref())
-                .map(|r| r.value.clone())
+                .map(|r| r.value.to_vec())
                 .unwrap_or_default();
             seen.lock().unwrap().push((root, ctx.sequence));
             Ok(())
@@ -868,10 +807,10 @@ pub fn tracking_projector(seen: PageSink) -> ProjectorDispatch<()> {
 }
 
 /// A book of Increased events of "counter" root `label` at `sequences`.
-pub fn tracked_book(label: &str, sequences: &[u32]) -> pb::EventBook {
+pub fn tracked_book(label: &str, sequences: &[u64]) -> pb::EventBook {
     pb::EventBook {
         cover: Some(cover_of("counter", label)),
-        pages: sequences.iter().map(|s| increased_page(Some(*s))).collect(),
+        pages: sequences.iter().map(|s| increased_page(*s)).collect(),
         ..Default::default()
     }
 }
@@ -888,7 +827,8 @@ mod smoke {
         let cc: pb::ContextualCommand = parse_txtpb(CONTEXTUAL_COMMAND, SKEL_INCREASE);
         let book = cc.command.expect("command book");
         assert_eq!(book.cover.as_ref().expect("cover").domain, "counter");
-        let any = angzarr_router::command_payload(&book.pages[0]).expect("command any");
+        let any = angzarr_router::command_payload(book.page.as_ref().expect("page"))
+            .expect("command any");
         assert!(any.type_url.ends_with("test.counter.IncreaseBy"));
     }
 }

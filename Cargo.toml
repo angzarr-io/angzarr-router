@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["crates/router", "crates/router-ffi", "crates/conformance", "tools/archlint"]
+# The angzarr-project submodule's crates are standalone workspaces of their
+# own (angzarr-proto declares `[workspace]`), consumed here as path
+# dependencies only.
+exclude = ["angzarr-project"]
 
 [workspace.package]
 version = "0.1.0"
@@ -8,6 +12,10 @@ edition = "2021"
 license = "BSD-3-Clause"
 
 [workspace.dependencies]
+# The io.angzarr.v1 wire types, from angzarr-project's angzarr-proto crate at
+# the submodule's commit (the submodule pin is the version pin, as angzarr-cli
+# pins the same crate by full commit). prost and prost-types match its.
+angzarr-proto = { path = "angzarr-project/rust/angzarr-proto" }
 prost = "0.14"
 prost-types = "0.14"
 prost-build = "0.14"

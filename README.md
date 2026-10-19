@@ -39,14 +39,15 @@ they stay per-language either way):
 Per language the dispatch layer would drop **~4,000 → ~1,300** LOC, and the
 *semantic* share drops ~4,000 → ~350 (amortized over six languages).
 Across six languages, **~24,000 → ~7,800** total — and the bug-prone
-invariants (fill-only correlation, last-page-only PM trigger,
-undeclared-is-silent-not-error, exact type-URL match, ordered
-compensation) are implemented, mutation-tested to ~1.0 kill, and proven by
+invariants (last-page-only PM trigger, undeclared-is-silent-not-error,
+exact type-URL match, the body arm matching the handler's kind) are
+implemented, mutation-tested to ~1.0 kill, and proven by
 **one** behavioral conformance suite run against every language — not
 re-derived and re-tested six times. A fix lands once, in every binding.
 
 (Figures are prod-LOC proxies with a hand-drawn dispatch/transport
-boundary, measured during the bootstrap. The shared test bank — core +
+boundary, measured during the bootstrap, before the latest spec moved
+sequence stamping and compensation out of the client libraries. The shared test bank — core +
 FFI + conformance — is likewise written once.)
 
 ## Layout
@@ -65,7 +66,12 @@ proto/             # the router's own ABI protos (io.angzarr.router.ffi.v1)
 
 The framework protos come from the repo-local `angzarr-project/`
 submodule (the org convention); `ANGZARR_PROJECT_PROTO` overrides it
-when set. The `mutation-test` target passes the submodule's absolute
+when set. The io.angzarr.v1 wire types are angzarr-project's
+`rust/angzarr-proto` crate at the submodule's commit (re-exported as
+`angzarr_router::pb`); `crates/router/build.rs` generates only the
+service-proto messages that crate does not compile
+(`CommandHandlerResponse`, `SagaResponse`, `ProcessManagerHandleRequest`/
+`Response`), against its types. The `mutation-test` target passes the submodule's absolute
 path through that env var so cargo-mutants' copied trees build.
 
 ## Development

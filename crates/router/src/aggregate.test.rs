@@ -1,8 +1,8 @@
 //! AggregateDispatch contracts, transliterated from client-go's
 //! engine_test.go + engine_boundaries_test.go aggregate subset:
 //! validate-before-rebuild, exact envelope guard codes, CommandContext
-//! evidence, FQ-keyed rejection routing with ordered fan-out, and
-//! fill-only ext/sequence stamping.
+//! evidence, the Fact arm's ingest path, and pass-through of emitted
+//! events.
 
 use std::sync::{Arc, Mutex};
 
@@ -32,11 +32,8 @@ fn test_agg_dispatch() -> (
     (d, contexts)
 }
 
-fn events_of(resp: &pb::BusinessResponse) -> Option<&pb::EventBook> {
-    match &resp.result {
-        Some(pb::business_response::Result::Events(book)) => Some(book),
-        _ => None,
-    }
+fn events_of(resp: &pb::CommandHandlerResponse) -> Option<&pb::EventBook> {
+    resp.events.as_ref()
 }
 
 #[test]
@@ -72,10 +69,10 @@ fn prior_events_reach_state_and_context() {
 #[test]
 fn unknown_command_coded_before_rebuild() {
     let (d, _) = test_agg_dispatch();
-    // No handler for Edition; corrupt prior events would surface
+    // No handler for Snapshot; corrupt prior events would surface
     // PERSISTED_EVENT_CORRUPT if the dispatcher rebuilt before validating
     // the command type.
-    let mut cmd = command_for(any_of(&pb::Edition::default()));
+    let mut cmd = command_for(any_of(&pb::Snapshot::default()));
     cmd.events = Some(pb::EventBook {
         pages: vec![event_page(corrupt_cover_any())],
         ..Default::default()
@@ -120,7 +117,7 @@ fn missing_command_envelope_guards_exact_codes() {
             command: Some(pb::CommandBook::default()),
             ..Default::default()
         })
-        .expect_err("empty pages");
+        .expect_err("no page");
     assert_eq!(err.code, codes::MISSING_COMMAND_PAGE);
 }
 
@@ -128,14 +125,8 @@ fn missing_command_envelope_guards_exact_codes() {
 fn page_without_payload_coded() {
     let (d, _) = test_agg_dispatch();
     let err = d
-        .dispatch(&pb::ContextualCommand {
-            command: Some(pb::CommandBook {
-                pages: vec![pb::CommandPage::default()],
-                ..Default::default()
-            }),
-            ..Default::default()
-        })
-        .expect_err("page without payload");
+        .dispatch(&contextual(pb::CommandPage::default()))
+        .expect_err("page without a body");
     assert_eq!(err.code, codes::MISSING_COMMAND_PAYLOAD);
 }
 
@@ -164,24 +155,7 @@ fn command_types_exact() {
     assert_eq!(d.command_types(), vec!["test.CreateOrder".to_string()]);
 }
 
-// --- compensation stamping, qualified keys, undo (Compensate) --------------
-
-// --- facts and replay ------------------------------------------------------
-
-fn fact_page(domain: &str) -> pb::EventPage {
-    pb::EventPage {
-        header: Some(pb::PageHeader {
-            sequence_type: Some(pb::page_header::SequenceType::ExternalDeferred(
-                pb::ExternalDeferredSequence {
-                    external_id: format!("ext-{domain}"),
-                    ..Default::default()
-                },
-            )),
-            ..Default::default()
-        }),
-        ..event_page(cover_any(domain))
-    }
-}
+// --- facts: the Fact arm of the command page ------------------------------
 
 /// An aggregate folding Cover events whose Cover fact handler records the
 /// fact annotated with the domains folded so far, flagged by one Cover event
@@ -209,48 +183,33 @@ fn recorded_domains(book: &pb::EventBook) -> Vec<String> {
         .collect()
 }
 
-fn ledger_facts(pages: Vec<pb::EventPage>) -> pb::EventBook {
-    pb::EventBook {
-        cover: Some(pb::Cover {
-            domain: "ledger".to_string(),
-            ..Default::default()
-        }),
-        pages,
-        ..Default::default()
+/// A fact delivery of a Cover fact named `name` over `prior` Cover events.
+fn fact_delivery(name: &str, prior: &[&str]) -> pb::ContextualCommand {
+    let mut req = contextual(fact_page(cover_any(name)));
+    if !prior.is_empty() {
+        req.events = Some(book_of_covers(prior));
     }
+    req
 }
 
 #[test]
-fn each_fact_is_recorded_then_flagged_and_every_recorded_event_folds() {
-    let mut first = fact_page("f1");
-    first.created_at = Some(prost_types::Timestamp {
-        seconds: 42,
-        nanos: 0,
-    });
-    let facts = ledger_facts(vec![first, fact_page("f2")]);
-    let out = fact_aggregate()
-        .handle_fact(&pb::FactRequest {
-            facts: Some(facts.clone()),
-            prior_events: Some(book_of_covers(&["p"])),
-        })
-        .expect("facts");
-    assert_eq!(out.cover, facts.cover, "the facts' cover is kept");
+fn a_fact_is_recorded_then_flagged_against_the_folded_state() {
+    let resp = fact_aggregate()
+        .dispatch(&fact_delivery("f1", &["p", "q"]))
+        .expect("fact");
+    let book = resp.events.expect("events");
     assert_eq!(
-        recorded_domains(&out),
-        vec!["f1<p>", "flag:f1", "f2<p,f1<p>,flag:f1>", "flag:f2"],
-        "each fact, then its flags; each folds before the next fact"
+        recorded_domains(&book),
+        vec!["f1<p,q>", "flag:f1"],
+        "the fact, then its flags, against the rebuilt state"
     );
-    assert_eq!(
-        out.pages[0].header, facts.pages[0].header,
-        "a fact keeps its header"
+    assert_eq!(book.cover, None, "the coordinator supplies the cover");
+    assert!(
+        book.pages
+            .iter()
+            .all(|p| p.meta.is_none() && p.sequence == 0),
+        "payloads only: the coordinator stamps sequences and meta"
     );
-    assert_eq!(out.pages[2].header, facts.pages[1].header);
-    assert_eq!(out.pages[1].header, None, "a flag carries no header");
-    assert_eq!(
-        out.pages[1].created_at, out.pages[0].created_at,
-        "a flag is stamped when its fact was"
-    );
-    assert_eq!(out.pages[3].created_at, None);
 }
 
 #[test]
@@ -259,37 +218,32 @@ fn a_fact_recorded_as_received_needs_no_flags() {
         .on_fact(&cover_full_name(), |fact, _s: &TestState| {
             Ok(FactRecord::from(fact.clone()))
         });
-    let facts = ledger_facts(vec![fact_page("f1")]);
-    let out = d
-        .handle_fact(&pb::FactRequest {
-            facts: Some(facts.clone()),
-            prior_events: None,
-        })
-        .expect("facts");
-    assert_eq!(out.pages, facts.pages);
+    let resp = d.dispatch(&fact_delivery("f1", &[])).expect("fact");
+    assert_eq!(recorded_domains(&resp.events.unwrap()), vec!["f1"]);
 }
 
 #[test]
 fn an_undeclared_fact_type_is_refused_before_any_handler_runs() {
-    let ran = std::sync::Arc::new(std::sync::Mutex::new(0));
+    let ran = Arc::new(Mutex::new(0));
     let seen = ran.clone();
-    let d = AggregateDispatch::new("agg-test", "ledger", fresh_rebuilder()).on_fact(
+    let d = AggregateDispatch::new("agg-test", "ledger", cover_applier(fresh_rebuilder())).on_fact(
         &cover_full_name(),
         move |fact, _s: &TestState| {
             *seen.lock().unwrap() += 1;
             Ok(FactRecord::from(fact.clone()))
         },
     );
-    let undeclared = event_page(Any {
+    let mut req = contextual(fact_page(Any {
         type_url: type_url("test.Undeclared"),
         value: Vec::new(),
+    }));
+    // A corrupt history would surface PERSISTED_EVENT_CORRUPT had the
+    // dispatcher rebuilt before refusing the fact.
+    req.events = Some(pb::EventBook {
+        pages: vec![event_page(corrupt_cover_any())],
+        ..Default::default()
     });
-    let err = d
-        .handle_fact(&pb::FactRequest {
-            facts: Some(ledger_facts(vec![fact_page("f1"), undeclared])),
-            prior_events: None,
-        })
-        .expect_err("an undeclared fact type");
+    let err = d.dispatch(&req).expect_err("an undeclared fact type");
     assert_eq!(err.code, codes::NO_FACT_HANDLER);
     assert_eq!(err.grpc, GrpcCode::InvalidArgument);
     assert_eq!(
@@ -299,31 +253,51 @@ fn an_undeclared_fact_type_is_refused_before_any_handler_runs() {
     assert_eq!(*ran.lock().unwrap(), 0, "no fact handler ran");
 }
 
+// The body arm is the fact marker: an arm that does not match the
+// registered handler's kind is refused, never run by the other kind.
 #[test]
-fn a_fact_page_without_an_event_is_recorded_unchanged() {
-    let d = AggregateDispatch::new("agg-test", "ledger", fresh_rebuilder());
-    let facts = ledger_facts(vec![pb::EventPage {
-        header: fact_page("f1").header,
-        ..Default::default()
-    }]);
-    let out = d
-        .handle_fact(&pb::FactRequest {
-            facts: Some(facts.clone()),
-            prior_events: None,
-        })
-        .expect("facts");
-    assert_eq!(out.pages, facts.pages);
+fn a_command_type_sent_as_a_fact_is_refused() {
+    let (d, contexts) = test_agg_dispatch();
+    let err = d
+        .dispatch(&contextual(fact_page(cover_any("x"))))
+        .expect_err("a command type in the Fact arm");
+    assert_eq!(err.code, codes::NO_FACT_HANDLER);
+    assert!(
+        contexts.lock().unwrap().is_empty(),
+        "no command handler ran"
+    );
 }
 
 #[test]
-fn absent_facts_record_nothing() {
-    let out = fact_aggregate()
-        .handle_fact(&pb::FactRequest {
-            facts: None,
-            prior_events: None,
-        })
-        .expect("facts");
-    assert_eq!(out, pb::EventBook::default());
+fn a_fact_type_sent_as_a_command_is_refused() {
+    let err = fact_aggregate()
+        .dispatch(&command_for(cover_any("f1")))
+        .expect_err("a fact type in the Command arm");
+    assert_eq!(err.code, codes::NO_HANDLER_REGISTERED);
+}
+
+#[test]
+fn a_fact_without_a_payload_is_coded() {
+    let err = fact_aggregate()
+        .dispatch(&contextual(pb::CommandPage {
+            body: Some(pb::command_page::Body::Fact(pb::Fact { payload: None })),
+            ..Default::default()
+        }))
+        .expect_err("a fact with no payload");
+    assert_eq!(err.code, codes::MISSING_COMMAND_PAYLOAD);
+}
+
+#[test]
+fn a_corrupt_prior_event_fails_the_fact() {
+    let mut req = fact_delivery("f1", &[]);
+    req.events = Some(pb::EventBook {
+        pages: vec![event_page(corrupt_cover_any())],
+        ..Default::default()
+    });
+    let err = fact_aggregate()
+        .dispatch(&req)
+        .expect_err("corrupt history");
+    assert_eq!(err.code, codes::PERSISTED_EVENT_CORRUPT);
 }
 
 #[test]
@@ -333,53 +307,26 @@ fn a_failing_fact_handler_fails_the_request() {
             Err(crate::error::HandlerError::Other("broken".to_string()))
         });
     let err = d
-        .handle_fact(&pb::FactRequest {
-            facts: Some(pb::EventBook {
-                pages: vec![fact_page("f1")],
-                ..Default::default()
-            }),
-            prior_events: None,
-        })
+        .dispatch(&fact_delivery("f1", &[]))
         .expect_err("handler error");
     assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
 }
 
 #[test]
-fn replay_folds_the_snapshot_then_the_events() {
-    let d = AggregateDispatch::new(
-        "agg-test",
-        "ledger",
-        cover_applier(fresh_rebuilder().with_snapshot(|s, _| {
-            s.applied.push("snapshot".to_string());
-            Ok(())
-        })),
-    );
-    let state = d
-        .replay(&pb::ReplayRequest {
-            base_snapshot: Some(pb::Snapshot {
-                sequence: 1,
-                state: Some(cover_any("snap")),
-                ..Default::default()
-            }),
-            events: book_of_covers(&["a", "b"]).pages,
-        })
-        .expect("replay");
-    assert_eq!(state.applied, vec!["snapshot", "a", "b"]);
+fn fact_types_exact() {
+    assert_eq!(fact_aggregate().fact_types(), vec![cover_full_name()]);
 }
 
 // The emitted EventBook passes through exactly as the handler returned it:
-// the coordinator stamps sequences and meta, so the router adds no header and
-// copies nothing from the command's cover, and a handler-set header survives.
+// the coordinator stamps the cover, sequences and meta (and refuses output
+// that sets them), so the router adds nothing and polices nothing.
 #[test]
 fn the_emitted_book_passes_through_unstamped() {
     let emitted = pb::EventBook {
         pages: vec![
             pb::EventPage::default(),
             pb::EventPage {
-                header: Some(pb::PageHeader {
-                    sequence_type: Some(pb::page_header::SequenceType::Sequence(99)),
-                    ..Default::default()
-                }),
+                sequence: 99,
                 ..Default::default()
             },
         ],
@@ -394,19 +341,30 @@ fn the_emitted_book_passes_through_unstamped() {
         type_url: format!("{TYPE_URL_PREFIX}test.Create"),
         value: Vec::new(),
     });
-    let cover = req
-        .command
-        .as_mut()
-        .unwrap()
-        .cover
-        .get_or_insert_with(Default::default);
-    cover.domain = "order".to_string();
-    cover.ext = Some(cover_any("parent"));
+    req.command.as_mut().unwrap().cover = Some(pb::Cover {
+        domain: "order".to_string(),
+        ..Default::default()
+    });
     req.events = Some(pb::EventBook {
         next_sequence: 5,
         pages: vec![pb::EventPage::default()],
         ..Default::default()
     });
     let resp = d.dispatch(&req).expect("dispatch");
-    assert_eq!(events_of(&resp), Some(&emitted));
+    assert_eq!(resp.events, Some(emitted));
+    assert_eq!(resp.rules_version, "");
+    assert!(!resp.snapshot_refused);
+}
+
+#[test]
+fn a_handler_emitting_nothing_answers_an_empty_book() {
+    let d = AggregateDispatch::new("agg", "order", fresh_rebuilder())
+        .on_command("test.Create", |_, _: &mut TestState, _| Ok(None));
+    let resp = d
+        .dispatch(&command_for(Any {
+            type_url: type_url("test.Create"),
+            value: Vec::new(),
+        }))
+        .expect("dispatch");
+    assert_eq!(resp.events, Some(pb::EventBook::default()));
 }

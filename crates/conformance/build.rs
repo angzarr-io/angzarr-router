@@ -30,6 +30,7 @@ fn main() {
 
     let mut config = prost_build::Config::new();
     config
+        .enable_type_names()
         .extern_path(".io.angzarr.v1", "::angzarr_router::pb")
         .extern_path(".sererr.v1", "::angzarr_router::proto::sererr::v1")
         .file_descriptor_set_path(&fds_path)

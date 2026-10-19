@@ -15,7 +15,7 @@ struct CounterWorld {
     /// Prior-events book supplied to the next dispatch.
     prior: Option<pb::EventBook>,
     /// Outcome of the dispatched command.
-    result: Option<Result<pb::BusinessResponse, CodedError>>,
+    result: Option<Result<pb::CommandHandlerResponse, CodedError>>,
     /// Historical-state evidence the handler recorded during dispatch.
     observed: conf::ObservedSink,
 }
@@ -51,8 +51,8 @@ async fn prior_increases(w: &mut CounterWorld, n: u32) {
 )]
 async fn prior_increases_prefixed(w: &mut CounterWorld, n: u32, prefix: String) {
     let carrier = pb::ContextualCommand {
-        command: None,
         events: conf::prior_history(n),
+        ..Default::default()
     };
     w.prior = conf::with_type_url_prefix(carrier, &prefix).events;
 }
@@ -119,7 +119,8 @@ async fn recorded(w: &mut CounterWorld, count: u32) {
 #[then("the recorded events carry no router-stamped sequence")]
 async fn no_stamped_sequence(w: &mut CounterWorld) {
     for (i, page) in recorded_book(w).pages.iter().enumerate() {
-        assert_eq!(page.header, None, "event {i} passes through as emitted");
+        assert_eq!(page.sequence, 0, "event {i} passes through unsequenced");
+        assert_eq!(page.meta, None, "event {i} passes through with no meta");
     }
 }
 
@@ -134,7 +135,7 @@ async fn fails_with(w: &mut CounterWorld, code: String) {
 }
 
 #[then(regex = r"^the handler saw (no )?prior history, at next sequence (\d+)$")]
-async fn observed_history(w: &mut CounterWorld, no: String, next_sequence: u32) {
+async fn observed_history(w: &mut CounterWorld, no: String, next_sequence: u64) {
     let obs = w.last_observed();
     assert_eq!(
         obs.had_prior_events,
@@ -145,7 +146,7 @@ async fn observed_history(w: &mut CounterWorld, no: String, next_sequence: u32) 
 }
 
 #[then(regex = r"^the handler saw a counter of (\d+), at next sequence (\d+)$")]
-async fn observed_count(w: &mut CounterWorld, count: u32, next_sequence: u32) {
+async fn observed_count(w: &mut CounterWorld, count: u32, next_sequence: u64) {
     let obs = w.last_observed();
     assert_eq!(
         obs.count, count,
@@ -160,7 +161,7 @@ async fn no_events(w: &mut CounterWorld) {
     // A rejection/failure is an Err and carries no events; if some impl
     // returned Ok, it must carry an empty book.
     if let Some(Ok(resp)) = &w.result {
-        if let Some(pb::business_response::Result::Events(book)) = &resp.result {
+        if let Some(book) = &resp.events {
             assert!(
                 book.pages.is_empty(),
                 "expected no events recorded, got {}",
@@ -177,10 +178,7 @@ fn recorded_book(w: &CounterWorld) -> &pb::EventBook {
         .expect("a command was dispatched")
         .as_ref()
         .expect("expected a successful response");
-    match &resp.result {
-        Some(pb::business_response::Result::Events(book)) => book,
-        other => panic!("expected an events response, got {other:?}"),
-    }
+    resp.events.as_ref().expect("an events response")
 }
 
 fn assert_failed_with(w: &CounterWorld, code: &str) {
