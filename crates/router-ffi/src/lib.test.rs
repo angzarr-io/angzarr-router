@@ -2044,3 +2044,34 @@ fn every_response_reports_the_registered_rules_version_through_the_abi() {
         "2.0.0"
     );
 }
+
+// Registration carries the upcasters' source types, claimed like command
+// types: a second aggregate accepting the same old type is refused.
+#[test]
+fn an_upcaster_source_type_claimed_twice_is_refused_at_registration() {
+    let upcasting = |name: &str, command: &str| {
+        let mut desc = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
+        desc.name = name.to_string();
+        desc.commands = vec![abi_pb::CallbackEntry {
+            fq_type: command.to_string(),
+            callback_id: CB_INCREASE_BY,
+        }];
+        desc.command_upcasters = vec![abi_pb::CallbackEntry {
+            fq_type: FQ_INCREASE_BY_V1.to_string(),
+            callback_id: CB_UPCAST_V1,
+        }];
+        desc
+    };
+    let r = angzarr_router_new();
+    let router = Router(r);
+    assert_eq!(
+        register_aggregate_desc(r, upcasting("first", FQ_INCREASE_BY)),
+        0
+    );
+    assert_eq!(
+        register_aggregate_desc(r, upcasting("second", "test.counter.Other")),
+        -3,
+        "IncreaseByV1 is already claimed"
+    );
+    drop(router);
+}

@@ -41,11 +41,10 @@ pub trait CommandHandler: Send + Sync {
     fn fact_types(&self) -> Vec<String> {
         Vec::new()
     }
-    /// An incoming payload run through its upcaster chains (unchanged by
-    /// default): routing consults it so an old type reaches the handler its
-    /// chain upcasts it for.
-    fn upcast_payload(&self, payload: &prost_types::Any) -> Result<prost_types::Any, CodedError> {
-        Ok(payload.clone())
+    /// The fully-qualified types its upcaster chains accept (none by
+    /// default), claimed for it at registration like its command types.
+    fn upcast_types(&self) -> Vec<String> {
+        Vec::new()
     }
     /// `CommandHandlerService.Handle`: a command or a fact.
     fn dispatch(
@@ -64,8 +63,8 @@ impl<T: CommandHandler + ?Sized> CommandHandler for Box<T> {
     fn fact_types(&self) -> Vec<String> {
         (**self).fact_types()
     }
-    fn upcast_payload(&self, payload: &prost_types::Any) -> Result<prost_types::Any, CodedError> {
-        (**self).upcast_payload(payload)
+    fn upcast_types(&self) -> Vec<String> {
+        (**self).upcast_types()
     }
     fn dispatch(
         &self,
@@ -85,8 +84,8 @@ impl<S> CommandHandler for AggregateDispatch<S> {
     fn fact_types(&self) -> Vec<String> {
         AggregateDispatch::fact_types(self)
     }
-    fn upcast_payload(&self, payload: &prost_types::Any) -> Result<prost_types::Any, CodedError> {
-        AggregateDispatch::upcast_payload(self, payload)
+    fn upcast_types(&self) -> Vec<String> {
+        AggregateDispatch::upcast_types(self)
     }
     fn dispatch(
         &self,
@@ -287,13 +286,16 @@ impl CommandHandlers {
         CommandHandlers::default()
     }
 
-    /// Adds `handler`. Two handlers claiming one (domain, command type) is
+    /// Adds `handler`, claiming its command types and the source types of
+    /// its upcaster chains. Two claims of one (domain, type) — two handlers,
+    /// or an old type that is also a current one — is
     /// DUPLICATE_COMMAND_HANDLER (C-0064); the table is left unchanged.
     pub fn push(&mut self, handler: Box<dyn CommandHandler>) -> Result<(), CodedError> {
         let index = self.handlers.len();
         let keys: Vec<(String, String)> = handler
             .command_types()
             .into_iter()
+            .chain(handler.upcast_types())
             .map(|command| (handler.domain().to_string(), command))
             .collect();
         for (n, key) in keys.iter().enumerate() {
@@ -341,13 +343,12 @@ impl CommandHandlers {
         )
     }
 
-    /// Routes a ContextualCommand by its page's body: a Command by (cover
-    /// domain, command type), a Fact to the first handler of the cover domain
-    /// recording its type. A type no handler claims as sent goes to the first
-    /// handler of the domain whose upcaster chain brings it to a type that
-    /// handler claims, else to the domain's first handler, which refuses it
-    /// (naming the sent type and what its chain produced); an envelope with
-    /// no payload goes to the domain's first handler, which reports it.
+    /// Routes a ContextualCommand by its page's body: a Command by its
+    /// (cover domain, type) claim — a command type, or a source type of the
+    /// claimant's upcaster chain — and a Fact to the first handler of the
+    /// cover domain recording its type or accepting it upcast. An unclaimed
+    /// type is refused here, naming it (no chain ran); an envelope with no
+    /// payload goes to the domain's first handler, which reports it.
     pub fn dispatch(
         &self,
         req: &pb::ContextualCommand,
@@ -358,61 +359,37 @@ impl CommandHandlers {
             .map_or("", |c| c.domain.as_str());
         let page = book.and_then(|b| b.page.as_ref());
         if let Some(any) = page.and_then(crate::command_payload) {
-            let claimed = |fq: &str| {
-                self.claims
-                    .get(&(domain.to_string(), fq.to_string()))
-                    .copied()
-            };
-            if let Some(index) = claimed(crate::type_name_from_url(&any.type_url)) {
-                return self.handlers[index].dispatch(req);
-            }
-            for (index, handler) in self.indexed_in_domain(domain) {
-                let upcast = handler.upcast_payload(any)?;
-                if claimed(crate::type_name_from_url(&upcast.type_url)) == Some(index) {
-                    return handler.dispatch(req);
-                }
-            }
-            return match self.in_domain(domain).next() {
-                Some(handler) => handler.dispatch(req),
+            let key = (
+                domain.to_string(),
+                crate::type_name_from_url(&any.type_url).to_string(),
+            );
+            return match self.claims.get(&key) {
+                Some(&index) => self.handlers[index].dispatch(req),
                 None => Err(CodedError::unknown_type(
                     codes::NO_HANDLER_REGISTERED,
+                    &any.type_url,
+                    [(extras::DOMAIN.to_string(), key.0)],
+                )),
+            };
+        }
+        if let Some(any) = page.and_then(crate::fact_payload) {
+            let fq = crate::type_name_from_url(&any.type_url).to_string();
+            let recorder = self
+                .in_domain(domain)
+                .find(|h| h.fact_types().contains(&fq) || h.upcast_types().contains(&fq));
+            return match recorder {
+                Some(handler) => handler.dispatch(req),
+                None => Err(CodedError::unknown_type(
+                    codes::NO_FACT_HANDLER,
                     &any.type_url,
                     [(extras::DOMAIN.to_string(), domain.to_string())],
                 )),
             };
         }
-        let fact = page.and_then(crate::fact_payload);
-        let mut recorder = None;
-        if let Some(any) = fact {
-            for handler in self.in_domain(domain) {
-                let upcast = handler.upcast_payload(any)?;
-                let fq = crate::type_name_from_url(&upcast.type_url).to_string();
-                if handler.fact_types().contains(&fq) {
-                    recorder = Some(handler);
-                    break;
-                }
-            }
+        match self.in_domain(domain).next() {
+            Some(handler) => handler.dispatch(req),
+            None => Err(Self::no_handler(domain)),
         }
-        match (recorder.or_else(|| self.in_domain(domain).next()), fact) {
-            (Some(handler), _) => handler.dispatch(req),
-            (None, Some(any)) => Err(CodedError::unknown_type(
-                codes::NO_FACT_HANDLER,
-                &any.type_url,
-                [(extras::DOMAIN.to_string(), domain.to_string())],
-            )),
-            (None, None) => Err(Self::no_handler(domain)),
-        }
-    }
-
-    fn indexed_in_domain<'a>(
-        &'a self,
-        domain: &'a str,
-    ) -> impl Iterator<Item = (usize, &'a dyn CommandHandler)> {
-        self.handlers
-            .iter()
-            .enumerate()
-            .map(|(i, h)| (i, h.as_ref()))
-            .filter(move |(_, h)| h.domain() == domain)
     }
 }
 

@@ -86,6 +86,9 @@ pub trait PayloadUpcaster: Send + Sync {
     /// The payload brought up to its current type (unchanged when no rule
     /// matches).
     fn upcast_payload(&self, payload: &Any) -> Result<Any, error::CodedError>;
+    /// The fully-qualified source types the chain accepts: claimed for its
+    /// aggregate at registration, like command types.
+    fn source_types(&self) -> Vec<String>;
 }
 
 /// Where a folded event sits: its book's cover (domain, root) and the page's

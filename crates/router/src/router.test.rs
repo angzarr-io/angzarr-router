@@ -580,3 +580,119 @@ fn an_old_command_type_routes_to_the_aggregate_its_upcaster_chain_serves() {
     assert_eq!(err.code, codes::NO_HANDLER_REGISTERED);
     assert_eq!(err.grpc, crate::error::GrpcCode::InvalidArgument);
 }
+
+/// A chain renaming `from` to `to`, for the domain "order".
+fn renaming(from: &str, to: &'static str) -> UpcasterDispatch {
+    UpcasterDispatch::new("rename", "order").on_event(from, move |any| {
+        Ok(Any {
+            type_url: type_url(to),
+            value: any.value.clone(),
+        })
+    })
+}
+
+// Upcaster source types are claimed at registration like command types
+// (owner ruling): two aggregates accepting one old type, or an old type
+// colliding with a current one, fail the build.
+#[test]
+fn upcaster_source_types_are_claimed_at_registration() {
+    let err = build_err(
+        RouterBuilder::new()
+            .aggregate(
+                aggregate("a", "order", &["test.Ship"])
+                    .with_command_upcaster(renaming("test.ShipV1", "test.Ship")),
+            )
+            .aggregate(
+                aggregate("b", "order", &["test.Send"])
+                    .with_command_upcaster(renaming("test.ShipV1", "test.Send")),
+            ),
+    );
+    assert_eq!(
+        err,
+        codes::DUPLICATE_COMMAND_HANDLER,
+        "one old type, two claimants"
+    );
+
+    let err = build_err(
+        RouterBuilder::new()
+            .aggregate(aggregate("a", "order", &["test.Create"]))
+            .aggregate(
+                aggregate("b", "order", &["test.Ship"])
+                    .with_command_upcaster(renaming("test.Create", "test.Ship")),
+            ),
+    );
+    assert_eq!(
+        err,
+        codes::DUPLICATE_COMMAND_HANDLER,
+        "an old type that is a current one"
+    );
+
+    let err = build_err(
+        RouterBuilder::new().aggregate(
+            aggregate("a", "order", &["test.Ship", "test.ShipV1"])
+                .with_command_upcaster(renaming("test.ShipV1", "test.Ship")),
+        ),
+    );
+    assert_eq!(
+        err,
+        codes::DUPLICATE_COMMAND_HANDLER,
+        "within one aggregate too"
+    );
+}
+
+#[test]
+fn a_claimed_old_type_that_upcasts_to_nothing_is_refused_by_its_claimant() {
+    let router = RouterBuilder::new()
+        .aggregate(aggregate("create", "order", &["test.Create"]))
+        .aggregate(
+            aggregate("ship", "order", &["test.Ship"])
+                .with_command_upcaster(renaming("test.ShipOld", "test.ShipLost")),
+        )
+        .build()
+        .expect("build");
+    let err = router
+        .dispatch_command(&command("order", "test.ShipOld"))
+        .expect_err("ShipLost reaches no handler");
+    assert_eq!(err.code, codes::NO_HANDLER_REGISTERED);
+    assert_eq!(
+        err.extras.get("upcast_type_url").map(String::as_str),
+        Some(type_url("test.ShipLost").as_str()),
+        "the claimant's chain ran"
+    );
+}
+
+#[test]
+fn an_old_fact_type_routes_to_the_aggregate_whose_chain_claims_it() {
+    let router = RouterBuilder::new()
+        .aggregate(recorder("paid", "order", "test.Paid"))
+        .aggregate(
+            recorder("shipped", "order", "test.Shipped")
+                .with_command_upcaster(renaming("test.ShippedV1", "test.Shipped")),
+        )
+        .build()
+        .expect("build");
+    let resp = router
+        .dispatch_command(&fact("order", "test.ShippedV1"))
+        .expect("upcast and routed");
+    assert_eq!(emitted_label(&resp), "shipped");
+}
+
+// One aggregate's chains may name a source type more than once (rules on
+// one type compose in order, C-0136): its own claims never collide.
+#[test]
+fn an_aggregate_naming_a_source_type_twice_claims_it_once() {
+    let chain = renaming("test.ShipV1", "test.ShipV1").on_event("test.ShipV1", |any| {
+        Ok(Any {
+            type_url: type_url("test.Ship"),
+            value: any.value.clone(),
+        })
+    });
+    let router = RouterBuilder::new()
+        .aggregate(aggregate("ship", "order", &["test.Ship"]).with_command_upcaster(chain))
+        .build()
+        .expect("one claimant");
+    let resp = router
+        .dispatch_command(&command("order", "test.ShipV1"))
+        .expect("both rules ran");
+    assert_eq!(emitted_label(&resp), "ship");
+}

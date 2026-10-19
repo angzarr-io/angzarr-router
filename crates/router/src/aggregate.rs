@@ -400,9 +400,17 @@ impl<S> AggregateDispatch<S> {
         })
     }
 
-    /// The payload run through every upcaster chain, in registration order.
-    pub fn upcast_payload(&self, sent: &Any) -> Result<Any, CodedError> {
-        self.upcast(sent)
+    /// The fully-qualified types its upcaster chains accept, claimed for it
+    /// at registration like its command types.
+    pub fn upcast_types(&self) -> Vec<String> {
+        let mut types: Vec<String> = self
+            .upcasters
+            .iter()
+            .flat_map(|u| u.source_types())
+            .collect();
+        types.sort();
+        types.dedup();
+        types
     }
 
     fn upcast(&self, sent: &Any) -> Result<Any, CodedError> {
