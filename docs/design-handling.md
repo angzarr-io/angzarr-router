@@ -3,7 +3,11 @@
 **Status:**
 - **Implemented:** conflict resolution, command upcasting, the rules version
   on every response, and claims for upcaster source types at registration.
-- **In progress:** router-owned state across the C ABI.
+- **Implemented:** router-owned state across the C ABI for aggregates and
+  process managers.
+- **In progress:** router-owned projectors, the retirement of `host_ctx`, and
+  the registration hello (`component_descriptor()`), per the owner rulings
+  recorded under "Registration and projectors" below.
 - **Open:** how the rules version is sourced (the owner intends the binary's
   full build version, emitted by versionator).
 
@@ -165,17 +169,95 @@ aggregates or PMs. Projectors are unchanged; see Open.
 - **State across the C ABI:** router-owned.
 - **Snapshot selection:** the coordinator's (decision 14.1).
 
+## Registration and projectors
+
+These follow the owner rulings on the two open items, against spec b412af8.
+
+### Registration hello: `component_descriptor()`
+
+The router builds the spec's `ComponentDescriptor` once, in Rust, for every
+language. Hosts only send it.
+
+- **Fields.**
+  - `name`.
+  - `kind`: AGGREGATE, SAGA, PROCESS_MANAGER or PROJECTOR.
+  - `inputs`: the domains whose events the component consumes, one
+    `Target` per domain, deduplicated and sorted:
+    - a saga: its input domain;
+    - a process manager: its source domains;
+    - a projector: its declared domains, or `*` when it declares none;
+    - an aggregate: none, because it consumes commands and no events.
+  - `rules_version`.
+  - `state`: set for aggregates and process managers only.
+    - `type_url` is `"/" + S::full_name()` for a native state type `S:
+      prost::Name`, so nobody declares the string by hand. Across the C ABI it
+      is the registered `state_type_url`.
+    - `options.conflict_resolutions` is the full resolved list in enum-number
+      order. The base is STRICT and AGGREGATE_HANDLES; COMMUTATIVE is added
+      first when a `changed()` is registered (`with_commutative`).
+- **Refusal.** A descriptor with an empty `rules_version` is refused
+  `INVALID_ARGUMENT` (`MISSING_RULES_VERSION`), mirroring the coordinator.
+  Every kind needs one, so sagas and projectors gain `with_rules_version`
+  too.
+- **Rust API.**
+  - `AggregateDispatch::component_descriptor()` and
+    `ProcessManagerDispatch::component_descriptor()`, both with
+    `S: prost::Name`.
+  - `..._with_state(state_type_url)` for state held as `Any`, which the C ABI
+    uses.
+  - `SagaDispatch::component_descriptor()` and
+    `ProjectorDispatch::component_descriptor()`.
+- **C ABI.**
+  - New entry point: `angzarr_router_component_descriptors(r, out)`. It fills
+    `out` with a serialized `ComponentDescriptors { repeated
+    io.angzarr.v1.ComponentDescriptor components = 1; }` in registration
+    order, or with a status: the first refusal.
+  - The saga and projector descriptors gain `rules_version`.
+- **Binding.** C-0535 binds against the native order aggregate.
+
+### Router-owned projectors
+
+Projectors now follow the aggregate and process-manager model. Each delivery
+starts from the projection message's default, `Any { type_url: "/" +
+projection_type_url, value: [] }`.
+
+- For a declared domain, one stateless host fold, `FoldCall { state:
+  projection, pages, cover }`, returns the new projection `Any`. An undeclared
+  domain folds nothing.
+- The router answers the `Projection` itself, so the host needs no finish
+  step:
+  - `cover`: the book's cover;
+  - `projector`: the projector's name;
+  - `projection`: the folded `Any`;
+  - `next_sequence`: the last projected page's sequence + 1, or the book's
+    `next_sequence` when it has no pages (types.proto, `Projection`).
+- **Core.**
+  - `ProjectorDispatch::with_fold(fold)` is the batched fold, used in place of
+    the per-type folds.
+  - `ProjectorDispatch::finish` stays for native projectors.
+
+### `host_ctx` retired
+
+With aggregates, process managers and projectors all router-owned, bindings
+keep no state of any kind.
+
+- **Removed:**
+  - the per-dispatch `host_ctx` parameter, from every
+    `angzarr_router_dispatch*` entry point and from the host callback
+    `AngzarrCb`;
+  - the thread-local session pointer behind it.
+- **Unchanged:** a callback is still selected by its `callback_id`.
+
+### `abi.proto` changes in this step
+
+| Message | Added | Removed |
+|---|---|---|
+| `ProjectorDescriptor` | `projection_type_url = 6`, `fold_callback_id = 7`, `rules_version = 8` | `events = 3` and `finish_callback_id = 4`, both reserved because ABI 3 published them |
+| `SagaDescriptor` | `rules_version = 6` | none |
+| `ComponentDescriptors` | new message | none |
+| `ProjectorEventAux` | none | the whole message, which nothing uses any more |
+
 ## Open
 
-- **C-0535, "Registration announces the same build version" (and the state
-  type).** The router produces no `ComponentDescriptor`; its hosts register
-  with the coordinator. The options are:
-  - a `component_descriptor()` on the dispatch tables, which needs a declared
-    state type for native aggregates too;
-  - leaving registration to the hosts.
-
-  The router's suite leaves C-0535 unbound.
-- **Projectors across the C ABI.** One option keeps the projection instance in
-  the host session. The other moves projectors to router-owned state as well
-  (`fold(projection, pages)` plus `finish`), which would retire `host_ctx`
-  sessions entirely.
+Nothing is open from the earlier rounds. C-0535 and the C-ABI projectors are
+settled above.
