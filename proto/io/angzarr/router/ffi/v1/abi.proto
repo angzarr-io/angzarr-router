@@ -18,13 +18,6 @@ message CallbackEntry {
   uint64 callback_id = 2;
 }
 
-// Rejection rows carry ORDERED callback lists: multiple compensators for
-// one rejected command all run, in registration order.
-message RejectionEntry {
-  string fq_command_type = 1; // FULLY-QUALIFIED; short names never match
-  repeated uint64 callback_ids = 2;
-}
-
 // Registration payload for one aggregate component: the dispatch tables
 // the binding's registration API (and later, generated wiring) assembles.
 message AggregateDescriptor {
@@ -32,7 +25,10 @@ message AggregateDescriptor {
   string domain = 2;
   repeated CallbackEntry commands = 3;
   repeated CallbackEntry appliers = 4;
-  repeated RejectionEntry rejections = 5;
+  // Field 5 was `rejections` (compensation input; removed — there is no
+  // compensation input).
+  reserved 5;
+  reserved "rejections";
   // Snapshot loader callback; absent when the aggregate takes no snapshots.
   optional uint64 snapshot_callback_id = 6;
 }
@@ -54,14 +50,16 @@ message ProjectorDescriptor {
 
 // Registration payload for one saga component. A stateless translator:
 // declared events emit commands (the host stamps them from the supplied
-// destination sequences) and/or injected fact events; rejection rows carry
-// ORDERED compensators (C-0042). Empty `target_domains` is allowed.
+// destination sequences) and/or injected fact events. Empty
+// `target_domains` is allowed.
 message SagaDescriptor {
   string name = 1;
   string input_domain = 2;
   repeated string target_domains = 3;
   repeated CallbackEntry events = 4;
-  repeated RejectionEntry rejections = 5;
+  // Field 5 was `rejections` (compensation input; removed).
+  reserved 5;
+  reserved "rejections";
 }
 
 // aux payload for command-handler callbacks.
@@ -86,15 +84,16 @@ message SagaEventAux {
 // Registration payload for one process-manager component. STATEFUL: the PM
 // rebuilds its own event-sourced state (the appliers/snapshot) before each
 // handler. Event handlers are keyed by (input domain, fully-qualified event
-// type) — a 2-level table; rejection rows carry ORDERED compensators
-// (C-0042), the first escalation winning.
+// type) — a 2-level table.
 message ProcessManagerDescriptor {
   string name = 1;
   string pm_domain = 2;
   repeated CallbackEntry appliers = 3; // rebuild the PM's own state
   optional uint64 snapshot_callback_id = 4;
   repeated PmEventEntry events = 5;
-  repeated RejectionEntry rejections = 6;
+  // Field 6 was `rejections` (compensation input; removed).
+  reserved 6;
+  reserved "rejections";
 }
 
 // One ((input domain, fully-qualified event type) → host callback) row for a
@@ -110,11 +109,4 @@ message PmEventEntry {
 // returns a ProcessManagerHandleResponse.
 message PmEventAux {
   map<string, uint32> destination_sequences = 1;
-}
-
-// aux payload for rejection (compensation) callbacks.
-message RejectionAux {
-  bytes notification = 1; // serialized angzarr Notification
-  bytes rejection = 2;    // serialized angzarr RejectionNotification
-  CommandContextAux cctx = 3;
 }

@@ -39,21 +39,16 @@ const FQ_INCREASE_BY: &str = "test.counter.IncreaseBy";
 const FQ_INCREASED: &str = "test.counter.Increased";
 const FQ_FAIL_HARD: &str = "test.counter.FailHard";
 const FQ_RETURN_NOTHING: &str = "test.counter.ReturnNothing";
-const FQ_RESERVE: &str = "test.counter.Reserve";
 
 const CB_APPLIER: u64 = 1;
 const CB_INCREASE_BY: u64 = 2;
 const CB_FAIL_HARD: u64 = 3;
-const CB_COMP_A: u64 = 4;
-const CB_COMP_B: u64 = 5;
 const CB_RETURN_NOTHING: u64 = 6;
 const CB_SNAPSHOT: u64 = 7;
 const CB_PROJ_FOLD: u64 = 8;
 const CB_PROJ_FINISH: u64 = 9;
 const CB_SAGA_EVENT: u64 = 10;
-const CB_SAGA_COMP: u64 = 11;
 const CB_PM_EVENT: u64 = 12;
-const CB_PM_COMP: u64 = 13;
 
 const FQ_ORDER_CREATED: &str = "test.order.OrderCreated";
 const FQ_RESERVE_STOCK: &str = "test.order.ReserveStock";
@@ -65,7 +60,6 @@ const FQ_ORDER_SHIPPED: &str = "test.order.OrderShipped";
 struct Session {
     counter: u32,
     observed_cctx: Vec<(u32, bool)>,
-    markers: Vec<&'static str>,
 }
 
 static SESSIONS: Mutex<Option<HashMap<usize, Session>>> = Mutex::new(None);
@@ -231,20 +225,6 @@ unsafe extern "C" fn host_cb(
             host_fill(out, &resp.encode_to_vec());
             STATUS_OK
         }
-        CB_SAGA_COMP => {
-            let raux = abi_pb::RejectionAux::decode(aux).expect("rejection aux");
-            pb::Notification::decode(raux.notification.as_slice()).expect("notification");
-            pb::RejectionNotification::decode(raux.rejection.as_slice()).expect("rejection");
-            let resp = pb::SagaResponse {
-                commands: Vec::new(),
-                events: vec![pb::EventBook {
-                    pages: vec![pb::EventPage::default()],
-                    ..Default::default()
-                }],
-            };
-            host_fill(out, &resp.encode_to_vec());
-            STATUS_OK
-        }
         CB_PM_EVENT => {
             // Stateful PM: the host reacts to the newest trigger event and
             // emits one stamped command, returning the full PM response.
@@ -277,50 +257,8 @@ unsafe extern "C" fn host_cb(
             host_fill(out, &resp.encode_to_vec());
             STATUS_OK
         }
-        CB_PM_COMP => {
-            let raux = abi_pb::RejectionAux::decode(aux).expect("rejection aux");
-            pb::Notification::decode(raux.notification.as_slice()).expect("notification");
-            pb::RejectionNotification::decode(raux.rejection.as_slice()).expect("rejection");
-            let resp = pb::ProcessManagerHandleResponse {
-                process_events: vec![pb::EventBook {
-                    pages: vec![pb::EventPage::default()],
-                    ..Default::default()
-                }],
-                notification: Some(pb::Notification {
-                    cover: Some(pb::Cover {
-                        domain: "escalated".to_string(),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            };
-            host_fill(out, &resp.encode_to_vec());
-            STATUS_OK
-        }
         CB_FAIL_HARD => -13, // plain failure, no status payload
         CB_RETURN_NOTHING => STATUS_OK_EMPTY,
-        CB_COMP_A | CB_COMP_B => {
-            let raux = abi_pb::RejectionAux::decode(aux).expect("rejection aux");
-            // The aux must round-trip the framework shapes.
-            pb::Notification::decode(raux.notification.as_slice()).expect("notification");
-            pb::RejectionNotification::decode(raux.rejection.as_slice()).expect("rejection");
-            with_session(key, |s| {
-                s.markers.push(if callback_id == CB_COMP_A {
-                    "comp-a"
-                } else {
-                    "comp-b"
-                })
-            });
-            let resp = pb::BusinessResponse {
-                result: Some(pb::business_response::Result::Events(pb::EventBook {
-                    pages: vec![pb::EventPage::default()],
-                    ..Default::default()
-                })),
-            };
-            host_fill(out, &resp.encode_to_vec());
-            STATUS_OK
-        }
         _ => -13,
     }
 }
@@ -348,10 +286,6 @@ fn descriptor_bytes() -> Vec<u8> {
         appliers: vec![abi_pb::CallbackEntry {
             fq_type: FQ_INCREASED.to_string(),
             callback_id: CB_APPLIER,
-        }],
-        rejections: vec![abi_pb::RejectionEntry {
-            fq_command_type: FQ_RESERVE.to_string(),
-            callback_ids: vec![CB_COMP_A, CB_COMP_B],
         }],
         snapshot_callback_id: Some(CB_SNAPSHOT),
     }
@@ -459,8 +393,8 @@ fn increased_history(n: u32, next_sequence: u32) -> pb::EventBook {
 }
 
 #[test]
-fn abi_version_is_one() {
-    assert_eq!(angzarr_abi_version(), 1);
+fn abi_version_is_two() {
+    assert_eq!(angzarr_abi_version(), 2);
 }
 
 #[test]
@@ -657,92 +591,6 @@ fn corrupt_persisted_event_is_data_loss() {
     assert_eq!(ret, -15);
     let (_, reason) = decode_status(&bytes);
     assert_eq!(reason, "PERSISTED_EVENT_CORRUPT");
-}
-
-fn notification_command(fq_command: &str) -> Any {
-    let rejection = pb::RejectionNotification {
-        rejected_command: Some(pb::CommandBook {
-            cover: Some(pb::Cover {
-                domain: "counter".to_string(),
-                ..Default::default()
-            }),
-            pages: vec![pb::CommandPage {
-                payload: Some(pb::command_page::Payload::Command(Any {
-                    type_url: format!("type.googleapis.com/{fq_command}"),
-                    value: Vec::new(),
-                })),
-                ..Default::default()
-            }],
-        }),
-        ..Default::default()
-    };
-    let notification = pb::Notification {
-        payload: Some(Any {
-            type_url: "type.googleapis.com/io.angzarr.v1.RejectionNotification".to_string(),
-            value: rejection.encode_to_vec(),
-        }),
-        ..Default::default()
-    };
-    Any {
-        type_url: angzarr_router::NOTIFICATION_TYPE_URL.to_string(),
-        value: notification.encode_to_vec(),
-    }
-}
-
-#[test]
-fn rejection_fan_out_runs_in_order_and_merges() {
-    let router = Router::with_counter();
-    let session = next_session();
-    let req = pb::ContextualCommand {
-        command: Some(pb::CommandBook {
-            cover: Some(pb::Cover {
-                domain: "counter".to_string(),
-                ..Default::default()
-            }),
-            pages: vec![pb::CommandPage {
-                payload: Some(pb::command_page::Payload::Command(notification_command(
-                    FQ_RESERVE,
-                ))),
-                ..Default::default()
-            }],
-        }),
-        ..Default::default()
-    };
-    let (ret, bytes) = router.dispatch(session, &req);
-    assert_eq!(ret, 0);
-    let s = session_snapshot(session);
-    assert_eq!(s.markers, vec!["comp-a", "comp-b"], "ordered fan-out");
-    let resp = decode_response(&bytes);
-    let Some(pb::business_response::Result::Events(book)) = resp.result else {
-        panic!("expected merged events");
-    };
-    assert_eq!(book.pages.len(), 2, "compensation events merged");
-}
-
-#[test]
-fn undeclared_rejection_yields_empty_response() {
-    let router = Router::with_counter();
-    let req = pb::ContextualCommand {
-        command: Some(pb::CommandBook {
-            cover: Some(pb::Cover {
-                domain: "counter".to_string(),
-                ..Default::default()
-            }),
-            pages: vec![pb::CommandPage {
-                payload: Some(pb::command_page::Payload::Command(notification_command(
-                    "test.counter.Undeclared",
-                ))),
-                ..Default::default()
-            }],
-        }),
-        ..Default::default()
-    };
-    let (ret, bytes) = router.dispatch(next_session(), &req);
-    assert_eq!(ret, 0);
-    assert!(
-        decode_response(&bytes).result.is_none(),
-        "DelegateToFramework is an empty response"
-    );
 }
 
 #[test]
@@ -947,10 +795,6 @@ fn saga_descriptor_bytes() -> Vec<u8> {
             fq_type: FQ_ORDER_CREATED.to_string(),
             callback_id: CB_SAGA_EVENT,
         }],
-        rejections: vec![abi_pb::RejectionEntry {
-            fq_command_type: FQ_RESERVE_STOCK.to_string(),
-            callback_ids: vec![CB_SAGA_COMP],
-        }],
     }
     .encode_to_vec()
 }
@@ -1051,26 +895,6 @@ fn saga_emits_stamped_command_through_the_abi() {
 }
 
 #[test]
-fn saga_compensator_runs_through_the_abi() {
-    // A Notification source page routes to the registered compensator, whose
-    // injected fact event crosses back as a SagaResponse.
-    let router = Router::with_saga();
-    let session = next_session();
-    let notification_page = pb::EventPage {
-        payload: Some(pb::event_page::Payload::Event(notification_command(
-            FQ_RESERVE_STOCK,
-        ))),
-        ..Default::default()
-    };
-    let req = saga_request("order", vec![notification_page], &[]);
-    let (ret, bytes) = router.dispatch_saga(session, &req);
-    assert_eq!(ret, 0);
-    let resp = pb::SagaResponse::decode(bytes.as_slice()).expect("SagaResponse");
-    assert!(resp.commands.is_empty());
-    assert_eq!(resp.events.len(), 1, "compensator injected one fact event");
-}
-
-#[test]
 fn saga_missing_source_through_the_abi_is_missing_saga_source() {
     // Source-shape validation must precede domain routing: a request with no
     // source has no cover domain, matches no saga, and must report
@@ -1111,10 +935,6 @@ fn pm_descriptor_bytes() -> Vec<u8> {
             input_domain: "orders".to_string(),
             fq_type: FQ_ORDER_SHIPPED.to_string(),
             callback_id: CB_PM_EVENT,
-        }],
-        rejections: vec![abi_pb::RejectionEntry {
-            fq_command_type: FQ_RESERVE_STOCK.to_string(),
-            callback_ids: vec![CB_PM_COMP],
         }],
     }
     .encode_to_vec()
@@ -1196,27 +1016,6 @@ fn pm_emits_stamped_command_through_the_abi() {
 }
 
 #[test]
-fn pm_compensator_runs_through_the_abi() {
-    // A Notification trigger routes to the compensator, whose process event +
-    // escalation cross back as a ProcessManagerHandleResponse.
-    let router = Router::with_process_manager();
-    let session = next_session();
-    let notification_page = pb::EventPage {
-        payload: Some(pb::event_page::Payload::Event(notification_command(FQ_RESERVE_STOCK))),
-        ..Default::default()
-    };
-    let req = pm_request("orders", vec![notification_page], &[]);
-    let (ret, bytes) = router.dispatch_process_manager(session, &req);
-    assert_eq!(ret, 0);
-    let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
-    assert_eq!(resp.process_events.len(), 1, "compensator emitted one process event");
-    assert_eq!(
-        resp.notification.expect("escalation").cover.unwrap().domain,
-        "escalated"
-    );
-}
-
-#[test]
 fn two_process_managers_share_a_source_domain_route_by_type() {
     // Two PMs subscribe to the SAME source domain (`orders`) for different event
     // types. A trigger routes to the PM that declares its type; the other no-ops.
@@ -1233,7 +1032,6 @@ fn two_process_managers_share_a_source_domain_route_by_type() {
             fq_type: FQ_ORDER_CREATED.to_string(),
             callback_id: CB_PM_EVENT,
         }],
-        rejections: Vec::new(),
     }
     .encode_to_vec();
     assert_eq!(

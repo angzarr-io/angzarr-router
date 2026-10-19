@@ -13,7 +13,7 @@ use angzarr_router::process_manager::ProcessManagerDispatch;
 use angzarr_router::projector::ProjectorDispatch;
 use angzarr_router::rebuild::Rebuilder;
 use angzarr_router::saga::SagaDispatch;
-use angzarr_router::{pb, NOTIFICATION_TYPE_URL};
+use angzarr_router::pb;
 
 use crate::abi::{consume_out, status_to_coded, AngzarrBuf, AngzarrCb, STATUS_OK, STATUS_OK_EMPTY};
 use crate::proto::io::angzarr::router::ffi::v1 as abi_pb;
@@ -159,42 +159,6 @@ impl FfiRouter {
             });
         }
 
-        for rejection in &desc.rejections {
-            for &id in &rejection.callback_ids {
-                dispatch = dispatch.on_rejected(
-                    &rejection.fq_command_type,
-                    move |notification, rejection, _, cctx| {
-                        let aux = abi_pb::RejectionAux {
-                            notification: notification.encode_to_vec(),
-                            rejection: rejection.encode_to_vec(),
-                            cctx: Some(abi_pb::CommandContextAux {
-                                next_sequence: cctx.next_sequence,
-                                had_prior_events: cctx.had_prior_events,
-                            }),
-                        }
-                        .encode_to_vec();
-                        let (ret, bytes) = invoke(cb, id, NOTIFICATION_TYPE_URL, &[], &aux);
-                        match ret {
-                            STATUS_OK => {
-                                let resp = pb::BusinessResponse::decode(
-                                    bytes.unwrap_or_default().as_slice(),
-                                )
-                                .map_err(|_| {
-                                    HandlerError::Other(
-                                        "host compensator returned undecodable BusinessResponse bytes"
-                                            .to_string(),
-                                    )
-                                })?;
-                                Ok(resp)
-                            }
-                            STATUS_OK_EMPTY => Ok(pb::BusinessResponse::default()),
-                            _ => Err(host_error(ret, bytes)),
-                        }
-                    },
-                );
-            }
-        }
-
         self.aggregates.push((desc.domain, dispatch));
         Ok(())
     }
@@ -324,7 +288,7 @@ impl FfiRouter {
     /// Parses a SagaDescriptor and populates a core saga table with
     /// callback-marshaling thunks. Event thunks pass the coordinator-supplied
     /// destination sequences to the host (which stamps and returns a
-    /// SagaResponse); compensators run in registration order (C-0042).
+    /// SagaResponse).
     pub fn register_saga(&mut self, descriptor: &[u8], cb: AngzarrCb) -> Result<(), CodedError> {
         let desc = abi_pb::SagaDescriptor::decode(descriptor).map_err(|_| {
             CodedError::invalid_argument(
@@ -369,39 +333,6 @@ impl FfiRouter {
                     _ => Err(host_error(ret, bytes)),
                 }
             });
-        }
-
-        for rejection in &desc.rejections {
-            for &id in &rejection.callback_ids {
-                dispatch = dispatch.on_rejected(
-                    &rejection.fq_command_type,
-                    move |notification, rejection| {
-                        let aux = abi_pb::RejectionAux {
-                            notification: notification.encode_to_vec(),
-                            rejection: rejection.encode_to_vec(),
-                            cctx: None, // sagas are stateless — no CommandContext
-                        }
-                        .encode_to_vec();
-                        let (ret, bytes) = invoke(cb, id, NOTIFICATION_TYPE_URL, &[], &aux);
-                        match ret {
-                            STATUS_OK => {
-                                let resp =
-                                    pb::SagaResponse::decode(bytes.unwrap_or_default().as_slice())
-                                        .map_err(|_| {
-                                            HandlerError::Other(
-                                                "host saga compensator returned undecodable \
-                                                 SagaResponse bytes"
-                                                    .to_string(),
-                                            )
-                                        })?;
-                                Ok(resp.events)
-                            }
-                            STATUS_OK_EMPTY => Ok(Vec::new()),
-                            _ => Err(host_error(ret, bytes)),
-                        }
-                    },
-                );
-            }
         }
 
         self.sagas.push((desc.name, dispatch));
@@ -477,8 +408,7 @@ impl FfiRouter {
     /// Parses a ProcessManagerDescriptor and populates a core PM table.
     /// Stateful: appliers/snapshot rebuild the PM's own state across the
     /// callback (host owns the instance); event thunks pass destination
-    /// sequences to the host and return a ProcessManagerHandleResponse;
-    /// compensators run in registration order (C-0042).
+    /// sequences to the host and return a ProcessManagerHandleResponse.
     pub fn register_process_manager(
         &mut self,
         descriptor: &[u8],
@@ -546,40 +476,6 @@ impl FfiRouter {
             });
         }
 
-        for rejection in &desc.rejections {
-            for &id in &rejection.callback_ids {
-                dispatch = dispatch.on_rejected(
-                    &rejection.fq_command_type,
-                    move |notification, rejection, _state| {
-                        let aux = abi_pb::RejectionAux {
-                            notification: notification.encode_to_vec(),
-                            rejection: rejection.encode_to_vec(),
-                            cctx: None, // PM compensators read rebuilt state, not CommandContext
-                        }
-                        .encode_to_vec();
-                        let (ret, bytes) = invoke(cb, id, NOTIFICATION_TYPE_URL, &[], &aux);
-                        match ret {
-                            STATUS_OK => {
-                                let resp = pb::ProcessManagerHandleResponse::decode(
-                                    bytes.unwrap_or_default().as_slice(),
-                                )
-                                .map_err(|_| {
-                                    HandlerError::Other(
-                                        "host PM compensator returned undecodable \
-                                         ProcessManagerHandleResponse bytes"
-                                            .to_string(),
-                                    )
-                                })?;
-                                Ok((resp.process_events, resp.notification))
-                            }
-                            STATUS_OK_EMPTY => Ok((Vec::new(), None)),
-                            _ => Err(host_error(ret, bytes)),
-                        }
-                    },
-                );
-            }
-        }
-
         self.process_managers.push((desc.name, dispatch));
         Ok(())
     }
@@ -634,10 +530,6 @@ impl FfiRouter {
                 acc.process_events.extend(resp.process_events);
                 acc.commands.extend(resp.commands);
                 acc.facts.extend(resp.facts);
-                // First escalation wins (mirrors the compensation merge).
-                if acc.notification.is_none() {
-                    acc.notification = resp.notification;
-                }
             },
         )?;
         // PM tail: an unconsumed trigger domain is a no-op (C-0022), not an error.
