@@ -43,9 +43,10 @@ message ProjectorDescriptor {
   // Packs the folded projection into the wire Projection; absent → the core
   // returns a default Projection (cover + name only).
   optional uint64 finish_callback_id = 4;
-  // Observes events with no fold thunk; absent → such events are skipped
-  // (the core logs a warn).
-  optional uint64 unknown_callback_id = 5;
+  // Field 5 was `unknown_callback_id` (removed — events with no fold thunk
+  // are skipped and the core logs a warn).
+  reserved 5;
+  reserved "unknown_callback_id";
 }
 
 // Registration payload for one saga component. A stateless translator:

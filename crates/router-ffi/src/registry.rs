@@ -193,11 +193,6 @@ impl FfiRouter {
                 Ok(())
             });
         }
-        if let Some(id) = desc.unknown_callback_id {
-            dispatch = dispatch.on_unknown(move |type_url| {
-                invoke(cb, id, type_url, &[], &[]);
-            });
-        }
         if let Some(id) = desc.finish_callback_id {
             dispatch = dispatch.finish(move |_, events| {
                 let book = events.encode_to_vec();

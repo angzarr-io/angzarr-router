@@ -652,7 +652,6 @@ fn projector_descriptor_bytes() -> Vec<u8> {
             callback_id: CB_PROJ_FOLD,
         }],
         finish_callback_id: Some(CB_PROJ_FINISH),
-        unknown_callback_id: None,
     }
     .encode_to_vec()
 }

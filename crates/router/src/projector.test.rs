@@ -4,8 +4,6 @@
 //! nothing but still finish (C-0032), unhandled event types are skipped
 //! (C-0031), and a missing cover is the coded MISSING_EVENT_BOOK_COVER.
 
-use std::sync::{Arc, Mutex};
-
 use prost::Message;
 use prost_types::Any;
 
@@ -175,24 +173,6 @@ fn finish_customizes_projection() {
         .expect("dispatch");
     assert_eq!(proj.sequence, 99);
     assert!(proj.projection.is_some(), "finish sets a custom payload");
-}
-
-#[test]
-fn on_unknown_observes_unhandled_type_url() {
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let captured = seen.clone();
-    let d = ProjectorDispatch::new("write-model", Folded::default)
-        .on_event(&cover_full_name(), fold_cover)
-        .on_unknown(move |url| captured.lock().unwrap().push(url.to_string()));
-    let pages = vec![event_page(Any {
-        type_url: type_url("test.Unregistered"),
-        value: Vec::new(),
-    })];
-    d.dispatch(&book("order", pages)).expect("dispatch");
-    assert_eq!(
-        seen.lock().unwrap().as_slice(),
-        &[type_url("test.Unregistered")]
-    );
 }
 
 #[test]
