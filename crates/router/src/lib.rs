@@ -108,8 +108,3 @@ mod lib_tests;
 #[cfg(test)]
 #[path = "handling.test.rs"]
 mod handling_tests;
-
-// Red design tests for docs/design-handling.md, pending implementation.
-#[cfg(all(test, feature = "pending-handling"))]
-#[path = "snapshot.test.rs"]
-mod snapshot_tests;

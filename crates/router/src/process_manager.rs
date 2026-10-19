@@ -43,6 +43,7 @@ pub struct ProcessManagerDispatch<S> {
     rebuilder: Rebuilder<S>,
     /// input domain → fully-qualified event type → thunk.
     handlers: HashMap<String, HashMap<String, EventFn<S>>>,
+    rules_version: String,
 }
 
 impl<S> ProcessManagerDispatch<S> {
@@ -61,6 +62,7 @@ impl<S> ProcessManagerDispatch<S> {
             targets: target_domains.into_iter().map(Into::into).collect(),
             rebuilder,
             handlers: HashMap::new(),
+            rules_version: String::new(),
         }
     }
 
@@ -113,10 +115,32 @@ impl<S> ProcessManagerDispatch<S> {
             .collect()
     }
 
-    /// Handles a trigger book against rebuilt PM state. Only the NEWEST page
-    /// of the trigger fires; a trigger outside the PM's sources or of an
-    /// undeclared type yields an empty response (C-0022).
+    /// The rules version reported on every response
+    /// (ProcessManagerHandleResponse.rules_version; decision 12.6, backlog RV-2): the
+    /// business binary's full version string, baked in at build. Empty until
+    /// declared.
+    pub fn with_rules_version(mut self, rules_version: impl Into<String>) -> Self {
+        self.rules_version = rules_version.into();
+        self
+    }
+
+    /// Handles a trigger book against rebuilt PM state, reporting the
+    /// declared rules version on every response (a handler's own value stands
+    /// when none is declared).
     pub fn dispatch(
+        &self,
+        req: &pb::ProcessManagerHandleRequest,
+    ) -> Result<pb::ProcessManagerHandleResponse, CodedError> {
+        let mut resp = self.handle(req)?;
+        if !self.rules_version.is_empty() {
+            resp.rules_version = self.rules_version.clone();
+        }
+        Ok(resp)
+    }
+
+    /// Only the NEWEST page of the trigger fires; a trigger outside the PM's
+    /// sources or of an undeclared type yields an empty response (C-0022).
+    fn handle(
         &self,
         req: &pb::ProcessManagerHandleRequest,
     ) -> Result<pb::ProcessManagerHandleResponse, CodedError> {

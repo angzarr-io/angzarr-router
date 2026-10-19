@@ -1,6 +1,6 @@
 //! The handler-facing handling surface: conflict delivery, the COMMUTATIVE
 //! resolver, the overlap rule and command upcasting (docs/design-handling.md).
-//! Snapshot validity and the rules version are in snapshot.test.rs.
+//! Also the rules version every response reports.
 //!
 //! Spec governing each group (angzarr-project spec/20261019-draft):
 //! - rules version: types.proto EventMeta.rules_version,
@@ -29,6 +29,7 @@ use crate::aggregate::{AggregateDispatch, CommandContext};
 use crate::conflict::overlap;
 use crate::error::{codes, GrpcCode};
 use crate::pb;
+use crate::process_manager::ProcessManagerDispatch;
 use crate::rebuild::Rebuilder;
 use crate::test_support::*;
 use crate::type_url;
@@ -511,5 +512,97 @@ fn a_type_with_no_handler_and_no_upcaster_path_is_refused_naming_the_sent_type()
         err.extras.get("upcast_type_url").map(String::as_str),
         Some(type_url("test.BumpV0").as_str()),
         "the chain left it unchanged"
+    );
+}
+
+// --- the rules version every response reports -------------------------------
+//
+// command_handler.proto CommandHandlerResponse.rules_version and
+// process_manager.proto ProcessManagerHandleResponse.rules_version: "the
+// client library fills it from the domain's declaration on every response"
+// (decision 12.6; backlog RV-2). Owner ruling: the binary's full baked
+// version string; snapshot validity is the coordinator's, not the router's.
+
+const RULES: &str = "1.4.2+build.7";
+
+#[test]
+fn every_aggregate_response_reports_the_rules_version() {
+    let d = list_aggregate(Arc::default())
+        .with_rules_version(RULES)
+        .on_fact(&cover_full_name(), |fact, _s| {
+            Ok(crate::aggregate::FactRecord::from(fact.clone()))
+        });
+    let command = d.dispatch(&strict("a", &[])).expect("command");
+    assert_eq!(command.rules_version, RULES);
+    let fact = d
+        .dispatch(&contextual(fact_page(cover_any("f"))))
+        .expect("fact");
+    assert_eq!(fact.rules_version, RULES);
+}
+
+#[test]
+fn an_undeclared_rules_version_reports_empty() {
+    let resp = list_aggregate(Arc::default())
+        .dispatch(&strict("a", &[]))
+        .expect("command");
+    assert_eq!(resp.rules_version, "");
+}
+
+fn shipped(domain: &str) -> pb::ProcessManagerHandleRequest {
+    pb::ProcessManagerHandleRequest {
+        trigger: Some(pb::EventBook {
+            cover: Some(pb::Cover {
+                domain: domain.to_string(),
+                ..Default::default()
+            }),
+            pages: vec![event_page(Any {
+                type_url: type_url("test.Shipped"),
+                value: Vec::new(),
+            })],
+            ..Default::default()
+        }),
+        process_state: None,
+    }
+}
+
+#[test]
+fn every_process_manager_response_reports_the_rules_version() {
+    let pm = ProcessManagerDispatch::new("pm", "pm", ["inventory"], fresh_rebuilder())
+        .with_rules_version(RULES)
+        .on_event("orders", "test.Shipped", |_e, _s, _c| {
+            Ok(pb::ProcessManagerHandleResponse::default())
+        });
+    assert_eq!(
+        pm.dispatch(&shipped("orders"))
+            .expect("handled")
+            .rules_version,
+        RULES
+    );
+    assert_eq!(
+        pm.dispatch(&shipped("billing"))
+            .expect("outside the sources")
+            .rules_version,
+        RULES,
+        "even a trigger the PM does not consume"
+    );
+}
+
+#[test]
+fn a_process_manager_with_no_declared_rules_version_keeps_its_handlers() {
+    let pm = ProcessManagerDispatch::new("pm", "pm", ["inventory"], fresh_rebuilder()).on_event(
+        "orders",
+        "test.Shipped",
+        |_e, _s, _c| {
+            Ok(pb::ProcessManagerHandleResponse {
+                rules_version: "from-the-handler".to_string(),
+                ..Default::default()
+            })
+        },
+    );
+    assert_eq!(
+        pm.dispatch(&shipped("orders"))
+            .expect("handled")
+            .rules_version,
+        "from-the-handler"
     );
 }

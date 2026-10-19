@@ -1060,6 +1060,7 @@ fn pm_descriptor_bytes() -> Vec<u8> {
             callback_id: CB_PM_EVENT,
         }],
         target_domains: vec!["inventory".to_string()],
+        rules_version: String::new(),
     }
     .encode_to_vec()
 }
@@ -1169,6 +1170,7 @@ fn two_process_managers_share_a_source_domain_route_by_type() {
             callback_id: CB_PM_EVENT,
         }],
         target_domains: vec!["inventory".to_string()],
+        rules_version: String::new(),
     }
     .encode_to_vec();
     assert_eq!(
@@ -1234,6 +1236,7 @@ fn pm2_descriptor_bytes() -> Vec<u8> {
             callback_id: CB_PM2_EVENT,
         }],
         target_domains: vec!["inventory".to_string()],
+        rules_version: String::new(),
     }
     .encode_to_vec()
 }
@@ -2000,5 +2003,44 @@ fn commutative_restores_the_host_head_before_folding_the_commands_events() {
         session_snapshot(session).changed_calls,
         vec![(1, 2), (2, 3)],
         "after = head restored (2) + the command's one event, not decide's +10"
+    );
+}
+
+// CommandHandlerResponse / ProcessManagerHandleResponse.rules_version:
+// reported on every response from the registered declaration (RV-2).
+#[test]
+fn every_response_reports_the_registered_rules_version_through_the_abi() {
+    let mut desc = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
+    desc.rules_version = "1.4.2+build.7".to_string();
+    let r = angzarr_router_new();
+    assert_eq!(register_aggregate_desc(r, desc), 0);
+    let router = Router(r);
+    let (ret, bytes) = router.dispatch(
+        next_session(),
+        &command_req(FQ_INCREASE_BY, IncreaseBy { n: 1 }.encode_to_vec(), None),
+    );
+    assert_eq!(ret, 0);
+    assert_eq!(decode_response(&bytes).rules_version, "1.4.2+build.7");
+
+    let mut pm =
+        abi_pb::ProcessManagerDescriptor::decode(pm_descriptor_bytes().as_slice()).unwrap();
+    pm.rules_version = "2.0.0".to_string();
+    let bytes = pm.encode_to_vec();
+    let r = angzarr_router_new();
+    assert_eq!(
+        unsafe { angzarr_router_register_process_manager(r, bytes.as_ptr(), bytes.len(), host_cb) },
+        0
+    );
+    let router = Router(r);
+    let (ret, bytes) = router.dispatch_process_manager(
+        next_session(),
+        &pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)]),
+    );
+    assert_eq!(ret, 0);
+    assert_eq!(
+        pb::ProcessManagerHandleResponse::decode(bytes.as_slice())
+            .unwrap()
+            .rules_version,
+        "2.0.0"
     );
 }

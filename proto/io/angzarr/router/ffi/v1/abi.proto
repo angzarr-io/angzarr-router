@@ -46,6 +46,10 @@ message AggregateDescriptor {
   // RPC).
   reserved 9;
   reserved "state_callback_id";
+  // The rules version reported on every response
+  // (CommandHandlerResponse.rules_version): the business binary's full
+  // version string, baked in at build.
+  string rules_version = 10;
   // COMMUTATIVE conflict resolution (options.proto, the conflict_units
   // region). Packs the session's current state into a serialized
   // google.protobuf.Any; the router captures the state at the expected
@@ -174,6 +178,9 @@ message ProcessManagerDescriptor {
   // Field 8 was `state_callback_id` (Replay; removed).
   reserved 8;
   reserved "state_callback_id";
+  // The rules version reported on every response
+  // (ProcessManagerHandleResponse.rules_version), as on AggregateDescriptor.
+  string rules_version = 9;
 }
 
 // One ((input domain, fully-qualified event type) → host callback) row for a

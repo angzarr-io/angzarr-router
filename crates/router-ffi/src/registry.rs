@@ -160,7 +160,8 @@ impl FfiRouter {
         }
 
         let mut dispatch =
-            AggregateDispatch::new(desc.name.clone(), desc.domain.clone(), rebuilder);
+            AggregateDispatch::new(desc.name.clone(), desc.domain.clone(), rebuilder)
+                .with_rules_version(desc.rules_version.clone());
 
         for command in &desc.commands {
             let id = command.callback_id;
@@ -573,7 +574,8 @@ impl FfiRouter {
             desc.pm_domain.clone(),
             desc.target_domains.clone(),
             rebuilder,
-        );
+        )
+        .with_rules_version(desc.rules_version.clone());
 
         for event in &desc.events {
             let id = event.callback_id;

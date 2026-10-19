@@ -196,6 +196,7 @@ pub struct AggregateDispatch<S> {
     facts: HashMap<String, FactFn<S>>,
     commutative: Option<Box<dyn Resolver<S>>>,
     upcasters: Vec<Box<dyn crate::PayloadUpcaster>>,
+    rules_version: String,
 }
 
 impl<S> AggregateDispatch<S> {
@@ -213,7 +214,17 @@ impl<S> AggregateDispatch<S> {
             facts: HashMap::new(),
             commutative: None,
             upcasters: Vec::new(),
+            rules_version: String::new(),
         }
+    }
+
+    /// The rules version reported on every response
+    /// (CommandHandlerResponse.rules_version; decision 12.6, backlog RV-2): the
+    /// business binary's full version string, baked in at build. Empty until
+    /// declared.
+    pub fn with_rules_version(mut self, rules_version: impl Into<String>) -> Self {
+        self.rules_version = rules_version.into();
+        self
     }
 
     /// Supports COMMUTATIVE conflict resolution with the state's generated
@@ -385,7 +396,8 @@ impl<S> AggregateDispatch<S> {
         };
         Ok(pb::CommandHandlerResponse {
             events: Some(events),
-            ..Default::default()
+            rules_version: self.rules_version.clone(),
+            snapshot_refused: false,
         })
     }
 
