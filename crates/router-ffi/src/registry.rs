@@ -17,6 +17,7 @@ use angzarr_router::projector::ProjectorDispatch;
 use angzarr_router::rebuild::Rebuilder;
 use angzarr_router::router::{CommandHandler, CommandHandlers};
 use angzarr_router::saga::SagaDispatch;
+use angzarr_router::upcaster::UpcasterDispatch;
 
 use crate::abi::{consume_out, status_to_coded, AngzarrBuf, AngzarrCb, STATUS_OK, STATUS_OK_EMPTY};
 use crate::proto::io::angzarr::router::ffi::v1 as abi_pb;
@@ -81,6 +82,18 @@ fn command_context_aux(cctx: &CommandContext) -> abi_pb::CommandContextAux {
         next_sequence: cctx.next_sequence,
         had_prior_events: cctx.had_prior_events,
         cover: cctx.cover.clone(),
+        expected_sequence: cctx.expected_sequence,
+        conflict_resolution: cctx.conflict_resolution as i32,
+        conflict_nonce: cctx
+            .conflict
+            .as_ref()
+            .map(|c| c.nonce().to_vec())
+            .unwrap_or_default(),
+        window: cctx
+            .conflict
+            .as_ref()
+            .map(|c| c.window().to_vec())
+            .unwrap_or_default(),
     }
 }
 
@@ -156,18 +169,97 @@ impl FfiRouter {
                 let (ret, bytes) = invoke(cb, id, &cmd.type_url, &cmd.value, &aux);
                 match ret {
                     STATUS_OK => {
-                        let book = pb::EventBook::decode(bytes.unwrap_or_default().as_slice())
-                            .map_err(|_| {
-                                HandlerError::Other(
-                                    "host handler returned undecodable EventBook bytes".to_string(),
-                                )
-                            })?;
-                        Ok(Some(book))
+                        let output =
+                            abi_pb::CommandOutput::decode(bytes.unwrap_or_default().as_slice())
+                                .map_err(|_| {
+                                    HandlerError::Other(
+                                        "host handler returned undecodable CommandOutput bytes"
+                                            .to_string(),
+                                    )
+                                })?;
+                        // The host's resolve_conflicts(window, nonce), as data.
+                        if let Some(conflict) = cctx.conflict.as_ref() {
+                            if !output.resolved_nonce.is_empty() {
+                                conflict
+                                    .resolve_conflicts(conflict.window(), &output.resolved_nonce);
+                            }
+                        }
+                        Ok(output.events)
                     }
                     STATUS_OK_EMPTY => Ok(None),
                     _ => Err(host_error(ret, bytes)),
                 }
             });
+        }
+        if let Some(changed_id) = desc.changed_callback_id {
+            let (Some(pack_id), Some(restore_id)) =
+                (desc.pack_state_callback_id, desc.snapshot_callback_id)
+            else {
+                return Err(CodedError::invalid_argument(
+                    codes::INCOMPLETE_COMMUTATIVE,
+                    messages::INCOMPLETE_COMMUTATIVE,
+                    [("aggregate".to_string(), desc.name.clone())],
+                ));
+            };
+            dispatch = dispatch.with_commutative_via(
+                move |_| {
+                    let (ret, bytes) = invoke(cb, pack_id, "", &[], &[]);
+                    if ret < 0 {
+                        return Err(host_error(ret, bytes));
+                    }
+                    prost_types::Any::decode(bytes.unwrap_or_default().as_slice()).map_err(|_| {
+                        HandlerError::Other(
+                            "host state packer returned undecodable Any bytes".to_string(),
+                        )
+                    })
+                },
+                move |_, image: &prost_types::Any| {
+                    let (ret, bytes) = invoke(cb, restore_id, &image.type_url, &image.value, &[]);
+                    if ret < 0 {
+                        return Err(host_error(ret, bytes));
+                    }
+                    Ok(())
+                },
+                move |before: &prost_types::Any, after: &prost_types::Any| {
+                    let call = abi_pb::ChangedCall {
+                        before: Some(before.clone()),
+                        after: Some(after.clone()),
+                    }
+                    .encode_to_vec();
+                    let (ret, bytes) = invoke(cb, changed_id, "", &call, &[]);
+                    if ret < 0 {
+                        return Err(host_error(ret, bytes));
+                    }
+                    let units = abi_pb::ChangedUnits::decode(bytes.unwrap_or_default().as_slice())
+                        .map_err(|_| {
+                            HandlerError::Other(
+                                "host changed() returned undecodable ChangedUnits bytes"
+                                    .to_string(),
+                            )
+                        })?;
+                    Ok(units.units)
+                },
+            );
+        }
+        if !desc.command_upcasters.is_empty() {
+            let mut chain = UpcasterDispatch::new(desc.name.clone(), desc.domain.clone());
+            for rule in &desc.command_upcasters {
+                let id = rule.callback_id;
+                chain = chain.on_event(&rule.fq_type, move |any| {
+                    let (ret, bytes) = invoke(cb, id, &any.type_url, &any.value, &[]);
+                    match ret {
+                        STATUS_OK => prost_types::Any::decode(bytes.unwrap_or_default().as_slice())
+                            .map_err(|_| {
+                                HandlerError::Other(
+                                    "host upcaster returned undecodable Any bytes".to_string(),
+                                )
+                            }),
+                        STATUS_OK_EMPTY => Ok(any.clone()),
+                        _ => Err(host_error(ret, bytes)),
+                    }
+                });
+            }
+            dispatch = dispatch.with_command_upcaster(chain);
         }
 
         for fact in &desc.facts {

@@ -1,8 +1,6 @@
-//! DESIGN TESTS (red until implemented): the handler-facing API for the
-//! latest spec's handling surface. Compiled only with the
-//! `pending-handling` feature (`cargo test -p angzarr-router --features
-//! pending-handling`); the gates do not enable it. Proposal:
-//! docs/design-handling.md. Phase (b) drops the feature gate.
+//! The handler-facing handling surface: conflict delivery, the COMMUTATIVE
+//! resolver, the overlap rule and command upcasting (docs/design-handling.md).
+//! Snapshot validity and the rules version are in snapshot.test.rs.
 //!
 //! Spec governing each group (angzarr-project spec/20261019-draft):
 //! - rules version: types.proto EventMeta.rules_version,
@@ -31,24 +29,20 @@ use crate::aggregate::{AggregateDispatch, CommandContext};
 use crate::conflict::overlap;
 use crate::error::{codes, GrpcCode};
 use crate::pb;
-use crate::process_manager::ProcessManagerDispatch;
 use crate::rebuild::Rebuilder;
 use crate::test_support::*;
 use crate::type_url;
 use crate::upcaster::UpcasterDispatch;
 
-const STATE_TYPE: &str = "test.ListState";
-const RULES: &str = "v3";
-
 /// A COMMUTATIVE-capable state: one counter per item key. `changed` below is
 /// what the generator (backlog CR-1) would emit for
 /// `map<string, uint32> items = 1 [(conflict) = {}]`.
 #[derive(Debug, Clone, Default, PartialEq)]
-struct ListState {
-    items: std::collections::BTreeMap<String, u32>,
+pub(crate) struct ListState {
+    pub(crate) items: std::collections::BTreeMap<String, u32>,
 }
 
-fn changed(before: &ListState, after: &ListState) -> Vec<String> {
+pub(crate) fn changed(before: &ListState, after: &ListState) -> Vec<String> {
     let keys: std::collections::BTreeSet<&String> =
         before.items.keys().chain(after.items.keys()).collect();
     keys.into_iter()
@@ -58,11 +52,11 @@ fn changed(before: &ListState, after: &ListState) -> Vec<String> {
 }
 
 /// An event bumping item `key` (a Cover whose domain is the key).
-fn bump(key: &str) -> Any {
+pub(crate) fn bump(key: &str) -> Any {
     cover_any(key)
 }
 
-fn list_rebuilder() -> Rebuilder<ListState> {
+pub(crate) fn list_rebuilder() -> Rebuilder<ListState> {
     Rebuilder::new(ListState::default)
         .apply(&cover_full_name(), |s: &mut ListState, any| {
             let key = <pb::Cover as prost::Message>::decode(any.value.as_slice())?.domain;
@@ -77,11 +71,12 @@ fn list_rebuilder() -> Rebuilder<ListState> {
 
 /// A list aggregate whose `test.Bump` command bumps the item named in the
 /// command's Cover payload, recording each CommandContext it saw.
-fn list_aggregate(seen: Arc<Mutex<Vec<CommandContext>>>) -> AggregateDispatch<ListState> {
-    AggregateDispatch::new("list", "list", list_rebuilder())
-        .with_rules_version(RULES)
-        .with_state_type(STATE_TYPE)
-        .on_command("test.Bump", move |cmd, _state, cctx| {
+pub(crate) fn list_aggregate(
+    seen: Arc<Mutex<Vec<CommandContext>>>,
+) -> AggregateDispatch<ListState> {
+    AggregateDispatch::new("list", "list", list_rebuilder()).on_command(
+        "test.Bump",
+        move |cmd, _state, cctx| {
             let key = <pb::Cover as prost::Message>::decode(cmd.value.as_slice())
                 .unwrap()
                 .domain;
@@ -90,10 +85,11 @@ fn list_aggregate(seen: Arc<Mutex<Vec<CommandContext>>>) -> AggregateDispatch<Li
                 pages: vec![event_page(bump(&key))],
                 ..Default::default()
             }))
-        })
+        },
+    )
 }
 
-fn bump_command(key: &str) -> Any {
+pub(crate) fn bump_command(key: &str) -> Any {
     let mut any = cover_any(key);
     any.type_url = type_url("test.Bump");
     any
@@ -102,7 +98,7 @@ fn bump_command(key: &str) -> Any {
 /// A delivery of `test.Bump(key)` over `history` (bumps of the given keys at
 /// sequences 0..), resolved to `resolution` with expected sequence
 /// `expected`, carrying `nonce`.
-fn delivery(
+pub(crate) fn delivery(
     key: &str,
     history: &[&str],
     expected: u64,
@@ -127,7 +123,7 @@ fn delivery(
     req
 }
 
-fn strict(key: &str, history: &[&str]) -> pb::ContextualCommand {
+pub(crate) fn strict(key: &str, history: &[&str]) -> pb::ContextualCommand {
     delivery(
         key,
         history,
@@ -135,138 +131,6 @@ fn strict(key: &str, history: &[&str]) -> pb::ContextualCommand {
         pb::ConflictResolution::Strict,
         &[],
     )
-}
-
-fn snapshot(type_name: &str, rules_version: &str) -> pb::Snapshot {
-    pb::Snapshot {
-        sequence: 0,
-        state: Some(Any {
-            type_url: type_url(type_name),
-            value: Vec::new(),
-        }),
-        rules_version: rules_version.to_string(),
-    }
-}
-
-// --- rules version (RV-2) ---------------------------------------------------
-
-#[test]
-fn every_response_reports_the_declared_rules_version() {
-    let d = list_aggregate(Arc::default());
-    let resp = d.dispatch(&strict("a", &[])).expect("command");
-    assert_eq!(resp.rules_version, RULES);
-}
-
-#[test]
-fn a_process_manager_reports_its_rules_version() {
-    let pm = ProcessManagerDispatch::new("pm", "pm", ["inventory"], fresh_rebuilder())
-        .with_rules_version(RULES)
-        .on_event("orders", "test.Shipped", |_e, _s, _c| {
-            Ok(pb::ProcessManagerHandleResponse::default())
-        });
-    let resp = pm
-        .dispatch(&pb::ProcessManagerHandleRequest {
-            trigger: Some(pb::EventBook {
-                cover: Some(pb::Cover {
-                    domain: "orders".to_string(),
-                    ..Default::default()
-                }),
-                pages: vec![event_page(Any {
-                    type_url: type_url("test.Shipped"),
-                    value: Vec::new(),
-                })],
-                ..Default::default()
-            }),
-            process_state: None,
-        })
-        .expect("dispatch");
-    assert_eq!(resp.rules_version, RULES);
-}
-
-// --- snapshot refusal (RV-3) ------------------------------------------------
-
-#[test]
-fn a_snapshot_of_the_declared_type_and_rules_loads() {
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let d = list_aggregate(seen.clone());
-    let mut req = strict("a", &[]);
-    req.events.as_mut().unwrap().snapshot = Some(snapshot(STATE_TYPE, RULES));
-    let resp = d.dispatch(&req).expect("dispatch");
-    assert!(!resp.snapshot_refused);
-    assert_eq!(seen.lock().unwrap().len(), 1, "the handler ran");
-}
-
-#[test]
-fn a_snapshot_of_another_state_type_is_refused_before_business_code() {
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let d = list_aggregate(seen.clone());
-    let mut req = strict("a", &["x"]);
-    req.events.as_mut().unwrap().snapshot = Some(snapshot("test.OtherState", RULES));
-    let resp = d
-        .dispatch(&req)
-        .expect("a refusal is a response, not an error");
-    assert!(resp.snapshot_refused);
-    assert_eq!(resp.events, None, "nothing else is set");
-    assert_eq!(resp.rules_version, RULES);
-    assert!(seen.lock().unwrap().is_empty(), "no business code ran");
-}
-
-#[test]
-fn a_snapshot_of_another_rules_version_is_refused() {
-    let d = list_aggregate(Arc::default());
-    let mut req = strict("a", &[]);
-    req.events.as_mut().unwrap().snapshot = Some(snapshot(STATE_TYPE, "v2"));
-    assert!(d.dispatch(&req).expect("dispatch").snapshot_refused);
-}
-
-#[test]
-fn the_snapshot_is_checked_before_the_payload_type() {
-    // Handle step 1 (snapshot) precedes step 2/3 (upcast, dispatch).
-    let d = list_aggregate(Arc::default());
-    let mut req = command_for(Any {
-        type_url: type_url("test.Unknown"),
-        value: Vec::new(),
-    });
-    req.events = Some(pb::EventBook {
-        snapshot: Some(snapshot("test.OtherState", RULES)),
-        ..Default::default()
-    });
-    assert!(d.dispatch(&req).expect("dispatch").snapshot_refused);
-}
-
-#[test]
-fn a_process_manager_refuses_a_foreign_process_state_snapshot() {
-    let ran = Arc::new(Mutex::new(false));
-    let flag = ran.clone();
-    let pm = ProcessManagerDispatch::new("pm", "pm", ["inventory"], fresh_rebuilder())
-        .with_rules_version(RULES)
-        .with_state_type(STATE_TYPE)
-        .on_event("orders", "test.Shipped", move |_e, _s, _c| {
-            *flag.lock().unwrap() = true;
-            Ok(pb::ProcessManagerHandleResponse::default())
-        });
-    let resp = pm
-        .dispatch(&pb::ProcessManagerHandleRequest {
-            trigger: Some(pb::EventBook {
-                cover: Some(pb::Cover {
-                    domain: "orders".to_string(),
-                    ..Default::default()
-                }),
-                pages: vec![event_page(Any {
-                    type_url: type_url("test.Shipped"),
-                    value: Vec::new(),
-                })],
-                ..Default::default()
-            }),
-            process_state: Some(pb::EventBook {
-                snapshot: Some(snapshot(STATE_TYPE, "v1")),
-                ..Default::default()
-            }),
-        })
-        .expect("dispatch");
-    assert!(resp.snapshot_refused);
-    assert!(resp.commands.is_empty() && resp.process_events.is_empty());
-    assert!(!*ran.lock().unwrap(), "no business code ran");
 }
 
 // --- conflict delivery (HD-5, NC-1) -----------------------------------------
@@ -460,6 +324,29 @@ fn commutative_decides_on_the_head() {
     );
 }
 
+// Decide's own mutations of the state are discarded: the command's units
+// are changed(head, head + its events), never what decide did to the state.
+#[test]
+fn commutative_restores_the_head_before_folding_the_commands_events() {
+    let d = AggregateDispatch::new("list", "list", list_rebuilder())
+        .with_commutative(changed)
+        .on_command("test.Bump", |_c, state: &mut ListState, _cctx| {
+            *state.items.entry("b".to_string()).or_default() += 10;
+            Ok(Some(pb::EventBook {
+                pages: vec![event_page(bump("a"))],
+                ..Default::default()
+            }))
+        });
+    d.dispatch(&delivery(
+        "a",
+        &["b"],
+        0,
+        pb::ConflictResolution::Commutative,
+        b"n",
+    ))
+    .expect("mine is items[a] only: disjoint from the window's items[b]");
+}
+
 #[test]
 fn commutative_without_a_changed_function_is_unsupported() {
     let err = list_aggregate(Arc::default())
@@ -523,43 +410,106 @@ fn overlap_follows_the_conflict_units_rules() {
 
 // --- command upcasting (VC-1) -----------------------------------------------
 
+/// A list aggregate whose chain upcasts BumpV1 → Bump and BumpOld →
+/// BumpLost (a type nothing handles), handling Bump as a command and
+/// FactV2 as a fact, and recording the type URL each handler received.
 fn upcasting_aggregate(handled: Arc<Mutex<Vec<String>>>) -> AggregateDispatch<ListState> {
-    let upcaster = UpcasterDispatch::new("cmd-upcaster", "list").on_event("test.BumpV1", |any| {
-        Ok(Any {
-            type_url: type_url("test.Bump"),
-            value: any.value.clone(),
-        })
-    });
+    let rename = |to: &'static str| {
+        move |any: &Any| -> Result<Any, crate::error::HandlerError> {
+            Ok(Any {
+                type_url: type_url(to),
+                value: any.value.clone(),
+            })
+        }
+    };
+    let upcaster = UpcasterDispatch::new("cmd-upcaster", "list")
+        .on_event("test.BumpV1", rename("test.Bump"))
+        .on_event("test.BumpOld", rename("test.BumpLost"))
+        .on_event("test.FactV1", rename("test.FactV2"));
+    let facts = handled.clone();
     AggregateDispatch::new("list", "list", list_rebuilder())
         .with_command_upcaster(upcaster)
         .on_command("test.Bump", move |cmd, _s, _c| {
             handled.lock().unwrap().push(cmd.type_url.clone());
             Ok(None)
         })
+        .on_fact("test.FactV2", move |fact, _s| {
+            facts.lock().unwrap().push(fact.type_url.clone());
+            Ok(crate::aggregate::FactRecord::from(fact.clone()))
+        })
+}
+
+fn typed(name: &str) -> Any {
+    Any {
+        type_url: type_url(name),
+        value: Vec::new(),
+    }
 }
 
 #[test]
 fn an_old_command_type_is_upcast_then_handled_as_the_new_type() {
     let handled = Arc::new(Mutex::new(Vec::new()));
-    let mut old = bump_command("a");
-    old.type_url = type_url("test.BumpV1");
     upcasting_aggregate(handled.clone())
-        .dispatch(&command_for(old))
+        .dispatch(&command_for(typed("test.BumpV1")))
         .expect("upcast to test.Bump");
     assert_eq!(*handled.lock().unwrap(), vec![type_url("test.Bump")]);
+}
+
+// Owner ruling: upcasting runs on both arms.
+#[test]
+fn an_old_fact_type_is_upcast_then_recorded_as_the_new_type() {
+    let handled = Arc::new(Mutex::new(Vec::new()));
+    let resp = upcasting_aggregate(handled.clone())
+        .dispatch(&contextual(fact_page(typed("test.FactV1"))))
+        .expect("upcast to test.FactV2");
+    assert_eq!(*handled.lock().unwrap(), vec![type_url("test.FactV2")]);
+    assert_eq!(
+        resp.events.unwrap().pages[0]
+            .payload
+            .as_ref()
+            .unwrap()
+            .type_url,
+        type_url("test.FactV2"),
+        "the upcast fact is what is recorded"
+    );
+}
+
+// Owner ruling: the refusal names both types: the message names the type
+// URL the client sent, the extras carry the last one the chain produced.
+#[test]
+fn an_upcast_type_with_no_handler_is_refused_naming_both_types() {
+    let err = upcasting_aggregate(Arc::default())
+        .dispatch(&command_for(typed("test.BumpOld")))
+        .expect_err("BumpLost reaches no handler");
+    assert_eq!(err.code, codes::NO_HANDLER_REGISTERED);
+    assert_eq!(err.grpc, GrpcCode::InvalidArgument);
+    assert_eq!(
+        err.message,
+        format!("no handler for type URL {}", type_url("test.BumpOld"))
+    );
+    assert_eq!(
+        err.extras.get("type_url").map(String::as_str),
+        Some(type_url("test.BumpOld").as_str())
+    );
+    assert_eq!(
+        err.extras.get("upcast_type_url").map(String::as_str),
+        Some(type_url("test.BumpLost").as_str())
+    );
 }
 
 #[test]
 fn a_type_with_no_handler_and_no_upcaster_path_is_refused_naming_the_sent_type() {
     let err = upcasting_aggregate(Arc::default())
-        .dispatch(&command_for(Any {
-            type_url: type_url("test.BumpV0"),
-            value: Vec::new(),
-        }))
+        .dispatch(&command_for(typed("test.BumpV0")))
         .expect_err("no path to a handler");
     assert_eq!(err.grpc, GrpcCode::InvalidArgument);
     assert_eq!(
         err.message,
         format!("no handler for type URL {}", type_url("test.BumpV0"))
+    );
+    assert_eq!(
+        err.extras.get("upcast_type_url").map(String::as_str),
+        Some(type_url("test.BumpV0").as_str()),
+        "the chain left it unchanged"
     );
 }

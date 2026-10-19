@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod aggregate;
+pub mod conflict;
 pub mod error;
 pub mod process_manager;
 pub mod projector;
@@ -78,6 +79,15 @@ pub fn fact_payload(page: &pb::CommandPage) -> Option<&Any> {
     }
 }
 
+/// An upcaster chain a command handler runs on incoming command and fact
+/// payloads before dispatch (upcaster.proto; decision 12.11):
+/// [`upcaster::UpcasterDispatch`] is one.
+pub trait PayloadUpcaster: Send + Sync {
+    /// The payload brought up to its current type (unchanged when no rule
+    /// matches).
+    fn upcast_payload(&self, payload: &Any) -> Result<Any, error::CodedError>;
+}
+
 /// Where a folded event sits: its book's cover (domain, root) and the page's
 /// sequence. Projector folds and
 /// state appliers receive it, e.g. for idempotent per-page handling.
@@ -95,7 +105,11 @@ pub(crate) mod test_support;
 #[path = "lib.test.rs"]
 mod lib_tests;
 
-// Red design tests for docs/design-handling.md, pending sign-off.
-#[cfg(all(test, feature = "pending-handling"))]
+#[cfg(test)]
 #[path = "handling.test.rs"]
 mod handling_tests;
+
+// Red design tests for docs/design-handling.md, pending implementation.
+#[cfg(all(test, feature = "pending-handling"))]
+#[path = "snapshot.test.rs"]
+mod snapshot_tests;

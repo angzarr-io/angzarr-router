@@ -554,3 +554,29 @@ fn a_refused_push_leaves_the_table_unchanged() {
         "no claim of Ship survived"
     );
 }
+
+// An old type no aggregate claims as sent routes to the aggregate whose
+// upcaster chain brings it to a type it claims (upcaster.proto; VC-1).
+#[test]
+fn an_old_command_type_routes_to_the_aggregate_its_upcaster_chain_serves() {
+    let upcaster = UpcasterDispatch::new("rename", "order").on_event("test.ShipV1", |any| {
+        Ok(Any {
+            type_url: type_url("test.Ship"),
+            value: any.value.clone(),
+        })
+    });
+    let router = RouterBuilder::new()
+        .aggregate(aggregate("create", "order", &["test.Create"]))
+        .aggregate(aggregate("ship", "order", &["test.Ship"]).with_command_upcaster(upcaster))
+        .build()
+        .expect("build");
+    let resp = router
+        .dispatch_command(&command("order", "test.ShipV1"))
+        .expect("upcast and routed");
+    assert_eq!(emitted_label(&resp), "ship");
+    let err = router
+        .dispatch_command(&command("order", "test.Unknown"))
+        .expect_err("no path to a handler");
+    assert_eq!(err.code, codes::NO_HANDLER_REGISTERED);
+    assert_eq!(err.grpc, crate::error::GrpcCode::InvalidArgument);
+}

@@ -46,6 +46,44 @@ message AggregateDescriptor {
   // RPC).
   reserved 9;
   reserved "state_callback_id";
+  // COMMUTATIVE conflict resolution (options.proto, the conflict_units
+  // region). Packs the session's current state into a serialized
+  // google.protobuf.Any; the router captures the state at the expected
+  // sequence, at the head and after the command's events, and restores the
+  // head through the snapshot loader (snapshot_callback_id).
+  optional uint64 pack_state_callback_id = 12;
+  // The state's generated changed(before, after): payload a serialized
+  // ChangedCall, response a serialized ChangedUnits. Its presence turns
+  // COMMUTATIVE on; it needs pack_state_callback_id and snapshot_callback_id
+  // (registration refuses it without them: INCOMPLETE_COMMUTATIVE).
+  optional uint64 changed_callback_id = 13;
+  // The upcaster chain run on incoming command and fact payloads before
+  // dispatch (upcaster.proto), in order: a rule's callback receives a payload
+  // of type `fq_type` and returns the upcast serialized google.protobuf.Any
+  // (STATUS_OK_EMPTY: unchanged).
+  repeated CallbackEntry command_upcasters = 14;
+}
+
+// Response bytes of a command callback (STATUS_OK): the events (payloads
+// only) and, under AGGREGATE_HANDLES, the nonce the handler resolved the
+// conflict window with (the spec's resolve_conflicts(window, nonce)). The
+// router keeps the events only when resolved_nonce is exactly the delivered
+// conflict_nonce; otherwise CONFLICT_UNRESOLVED (ABORTED).
+message CommandOutput {
+  io.angzarr.v1.EventBook events = 1;
+  bytes resolved_nonce = 2;
+}
+
+// Payload of a changed callback: two serialized states (pack_state images).
+message ChangedCall {
+  google.protobuf.Any before = 1;
+  google.protobuf.Any after = 2;
+}
+
+// Response bytes of a changed callback: the unit paths whose values differ
+// (options.proto, the conflict_units region).
+message ChangedUnits {
+  repeated string units = 1;
 }
 
 // Response bytes of a fact callback (STATUS_OK): the fact to record (as
@@ -92,6 +130,15 @@ message CommandContextAux {
   // The cover of the command being handled: the aggregate's own domain and
   // root.
   io.angzarr.v1.Cover cover = 3;
+  // The resolved Handling (types.proto): the expected sequence and the
+  // conflict resolution.
+  uint64 expected_sequence = 4;
+  io.angzarr.v1.ConflictResolution conflict_resolution = 5;
+  // AGGREGATE_HANDLES only: the delivered nonce and the conflict window (the
+  // pages at sequences expected_sequence..head). The host hands the nonce
+  // back in CommandOutput.resolved_nonce once its handler resolved.
+  bytes conflict_nonce = 6;
+  repeated io.angzarr.v1.EventPage window = 7;
 }
 
 // aux payload for saga event callbacks: the source event's cover passed

@@ -95,6 +95,12 @@ impl UpcasterDispatch {
     }
 }
 
+impl crate::PayloadUpcaster for UpcasterDispatch {
+    fn upcast_payload(&self, payload: &Any) -> Result<Any, CodedError> {
+        self.upcast_event(payload)
+    }
+}
+
 #[cfg(test)]
 #[path = "upcaster.test.rs"]
 mod upcaster_tests;

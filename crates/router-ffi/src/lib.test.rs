@@ -61,6 +61,21 @@ const CB_FAILS: u64 = 19;
 const CB_FACT_ANNOTATE: u64 = 21;
 const CB_FACT_KEEP: u64 = 24;
 const CB_FACT_GARBAGE: u64 = 25;
+/// IncreaseBy that never resolves the conflict window.
+const CB_INCREASE_IGNORES: u64 = 26;
+/// IncreaseBy that resolves with a made-up nonce.
+const CB_INCREASE_MADE_UP: u64 = 27;
+/// Packs the session counter as a CounterState Any.
+const CB_PACK: u64 = 28;
+/// changed(): ["value"] when the counters differ.
+const CB_CHANGED_VALUE: u64 = 29;
+/// changed(): always empty.
+const CB_CHANGED_NONE: u64 = 30;
+/// Upcasts IncreaseByV1 to IncreaseBy (payload unchanged).
+const CB_UPCAST_V1: u64 = 31;
+/// IncreaseBy that also mutates the session counter (+10) while deciding.
+const CB_INCREASE_MUTATES: u64 = 32;
+const FQ_INCREASE_BY_V1: &str = "test.counter.IncreaseByV1";
 
 const FQ_ORDER_CREATED: &str = "test.order.OrderCreated";
 const FQ_RESERVE_STOCK: &str = "test.order.ReserveStock";
@@ -75,6 +90,10 @@ struct Session {
     observed_pages: Vec<(Option<pb::Cover>, u64)>,
     applied_pages: Vec<(Option<pb::Cover>, u64)>,
     observed_cctx: Vec<(u64, bool)>,
+    /// (expected_sequence, conflict_resolution, window sequences, nonce).
+    observed_handling: Vec<(u64, i32, Vec<u64>, Vec<u8>)>,
+    /// (before, after) counters each changed() call compared.
+    changed_calls: Vec<(u32, u32)>,
 }
 
 static SESSIONS: Mutex<Option<HashMap<usize, Session>>> = Mutex::new(None);
@@ -176,12 +195,21 @@ unsafe extern "C" fn host_cb(
             with_session(key, |s| s.counter = state.value);
             STATUS_OK_EMPTY
         }
-        CB_INCREASE_BY => {
+        CB_INCREASE_BY | CB_INCREASE_IGNORES | CB_INCREASE_MADE_UP | CB_INCREASE_MUTATES => {
             let cctx = abi_pb::CommandContextAux::decode(aux).expect("cctx aux");
+            if callback_id == CB_INCREASE_MUTATES {
+                with_session(key, |s| s.counter += 10);
+            }
             with_session(key, |s| {
                 s.observed_cctx
                     .push((cctx.next_sequence, cctx.had_prior_events));
                 s.observed_covers.push(cctx.cover.clone());
+                s.observed_handling.push((
+                    cctx.expected_sequence,
+                    cctx.conflict_resolution,
+                    cctx.window.iter().map(|p| p.sequence).collect(),
+                    cctx.conflict_nonce.clone(),
+                ));
             });
             let cmd = IncreaseBy::decode(payload).expect("IncreaseBy");
             if cmd.n == 0 {
@@ -191,7 +219,50 @@ unsafe extern "C" fn host_cb(
                 );
                 return -9;
             }
-            host_fill(out, &increased_book(cmd.n).encode_to_vec());
+            let resolved_nonce = match callback_id {
+                CB_INCREASE_IGNORES => Vec::new(),
+                CB_INCREASE_MADE_UP => b"made-up".to_vec(),
+                _ => cctx.conflict_nonce.clone(),
+            };
+            let output = abi_pb::CommandOutput {
+                events: Some(increased_book(cmd.n)),
+                resolved_nonce,
+            };
+            host_fill(out, &output.encode_to_vec());
+            STATUS_OK
+        }
+        CB_PACK => {
+            let counter = with_session(key, |s| s.counter);
+            let packed = Any {
+                type_url: "type.googleapis.com/test.counter.CounterState".to_string(),
+                value: CounterState { value: counter }.encode_to_vec(),
+            };
+            host_fill(out, &packed.encode_to_vec());
+            STATUS_OK
+        }
+        CB_CHANGED_VALUE | CB_CHANGED_NONE => {
+            let call = abi_pb::ChangedCall::decode(payload).expect("ChangedCall");
+            let value = |any: Option<Any>| {
+                CounterState::decode(any.expect("a state image").value.as_slice())
+                    .expect("CounterState")
+                    .value
+            };
+            let (before, after) = (value(call.before), value(call.after));
+            with_session(key, |s| s.changed_calls.push((before, after)));
+            let units = if callback_id == CB_CHANGED_VALUE && before != after {
+                vec!["value".to_string()]
+            } else {
+                Vec::new()
+            };
+            host_fill(out, &abi_pb::ChangedUnits { units }.encode_to_vec());
+            STATUS_OK
+        }
+        CB_UPCAST_V1 => {
+            let upcast = Any {
+                type_url: format!("type.googleapis.com/{FQ_INCREASE_BY}"),
+                value: payload.to_vec(),
+            };
+            host_fill(out, &upcast.encode_to_vec());
             STATUS_OK
         }
         CB_PROJ_FOLD => {
@@ -1745,4 +1816,189 @@ fn an_unregistered_fact_never_reaches_the_host() {
         assert_eq!(seen.counter, 0, "refused before any applier ran");
         assert!(seen.observed_cctx.is_empty(), "no command handler ran");
     }
+}
+
+// --- conflict resolution and command upcasting (docs/design-handling.md) -----
+//
+// types.proto Handling, ConflictResolution and ContextualCommand.conflict_nonce;
+// options.proto conflict_units ("The resolver"); upcaster.proto; backlog
+// HD-5, NC-1, CR-1, VC-1.
+
+/// IncreaseBy(1) over `history` Increased events, resolved to `resolution`
+/// at `expected`, carrying `nonce`.
+fn handled_req(
+    history: u32,
+    expected: u64,
+    resolution: pb::ConflictResolution,
+    nonce: &[u8],
+) -> pb::ContextualCommand {
+    let mut req = command_req(
+        FQ_INCREASE_BY,
+        IncreaseBy { n: 1 }.encode_to_vec(),
+        Some(increased_history(history, u64::from(history))),
+    );
+    req.command.as_mut().unwrap().handling = Some(pb::Handling {
+        expected_sequence: Some(expected),
+        conflict_resolution: resolution as i32,
+    });
+    req.conflict_nonce = nonce.to_vec().into();
+    req
+}
+
+/// The counter aggregate with IncreaseBy on `command` and the given
+/// COMMUTATIVE callbacks.
+fn counter_resolving(command: u64, pack: Option<u64>, changed: Option<u64>) -> Router {
+    let mut desc = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
+    desc.commands[0].callback_id = command;
+    desc.pack_state_callback_id = pack;
+    desc.changed_callback_id = changed;
+    let r = angzarr_router_new();
+    assert_eq!(register_aggregate_desc(r, desc), 0);
+    Router(r)
+}
+
+#[test]
+fn strict_hands_the_host_its_handling_and_no_window_through_the_abi() {
+    let router = Router::with_counter();
+    let session = next_session();
+    let (ret, _) = router.dispatch(
+        session,
+        &handled_req(2, 2, pb::ConflictResolution::Strict, &[]),
+    );
+    assert_eq!(ret, 0);
+    assert_eq!(
+        session_snapshot(session).observed_handling,
+        vec![(2, pb::ConflictResolution::Strict as i32, vec![], vec![])]
+    );
+}
+
+#[test]
+fn aggregate_handles_crosses_the_window_and_nonce_and_keeps_resolved_output() {
+    let router = Router::with_counter();
+    let session = next_session();
+    let (ret, bytes) = router.dispatch(
+        session,
+        &handled_req(3, 1, pb::ConflictResolution::AggregateHandles, b"n-1"),
+    );
+    assert_eq!(ret, 0);
+    assert_eq!(decode_events(&bytes), increased_book(1));
+    assert_eq!(
+        session_snapshot(session).observed_handling,
+        vec![(
+            1,
+            pb::ConflictResolution::AggregateHandles as i32,
+            vec![1, 2],
+            b"n-1".to_vec()
+        )]
+    );
+}
+
+#[test]
+fn aggregate_handles_unresolved_or_made_up_is_aborted_through_the_abi() {
+    for command in [CB_INCREASE_IGNORES, CB_INCREASE_MADE_UP] {
+        let router = counter_resolving(command, None, None);
+        let (ret, bytes) = router.dispatch(
+            next_session(),
+            &handled_req(1, 0, pb::ConflictResolution::AggregateHandles, b"n-1"),
+        );
+        assert_eq!(ret, -10, "callback {command}: ABORTED");
+        assert_eq!(
+            decode_status(&bytes).1,
+            angzarr_router::error::codes::CONFLICT_UNRESOLVED
+        );
+    }
+}
+
+#[test]
+fn commutative_runs_the_resolver_over_host_state_through_the_abi() {
+    // History 0..1, expected 1: expected = 1, head = 2, after = 3.
+    let router = counter_resolving(CB_INCREASE_BY, Some(CB_PACK), Some(CB_CHANGED_NONE));
+    let session = next_session();
+    let (ret, bytes) = router.dispatch(
+        session,
+        &handled_req(2, 1, pb::ConflictResolution::Commutative, b"n-1"),
+    );
+    assert_eq!(ret, 0, "disjoint: kept");
+    assert_eq!(decode_events(&bytes), increased_book(1));
+    let seen = session_snapshot(session);
+    assert_eq!(seen.changed_calls, vec![(1, 2), (2, 3)]);
+    assert_eq!(
+        seen.observed_handling[0].3,
+        Vec::<u8>::new(),
+        "the host never sees the nonce under COMMUTATIVE"
+    );
+}
+
+#[test]
+fn commutative_overlap_is_aborted_through_the_abi() {
+    let router = counter_resolving(CB_INCREASE_BY, Some(CB_PACK), Some(CB_CHANGED_VALUE));
+    let (ret, bytes) = router.dispatch(
+        next_session(),
+        &handled_req(2, 1, pb::ConflictResolution::Commutative, b"n-1"),
+    );
+    assert_eq!(ret, -10);
+    let (status, reason) = decode_status(&bytes);
+    assert_eq!(reason, angzarr_router::error::codes::CONFLICT_OVERLAP);
+    assert_eq!(status.code, 10);
+}
+
+#[test]
+fn commutative_without_changed_is_unsupported_through_the_abi() {
+    let router = Router::with_counter();
+    let (ret, bytes) = router.dispatch(
+        next_session(),
+        &handled_req(1, 0, pb::ConflictResolution::Commutative, b"n-1"),
+    );
+    assert_eq!(ret, -3);
+    assert_eq!(
+        decode_status(&bytes).1,
+        angzarr_router::error::codes::CONFLICT_RESOLUTION_UNSUPPORTED
+    );
+}
+
+#[test]
+fn a_changed_callback_without_pack_or_snapshot_is_refused_at_registration() {
+    let mut desc = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
+    desc.changed_callback_id = Some(CB_CHANGED_VALUE);
+    assert_eq!(
+        register_aggregate_desc(angzarr_router_new(), desc.clone()),
+        -3
+    );
+    desc.pack_state_callback_id = Some(CB_PACK);
+    desc.snapshot_callback_id = None;
+    assert_eq!(register_aggregate_desc(angzarr_router_new(), desc), -3);
+}
+
+#[test]
+fn a_command_upcaster_runs_before_dispatch_through_the_abi() {
+    let mut desc = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
+    desc.command_upcasters = vec![abi_pb::CallbackEntry {
+        fq_type: FQ_INCREASE_BY_V1.to_string(),
+        callback_id: CB_UPCAST_V1,
+    }];
+    let r = angzarr_router_new();
+    assert_eq!(register_aggregate_desc(r, desc), 0);
+    let router = Router(r);
+    let (ret, bytes) = router.dispatch(
+        next_session(),
+        &command_req(FQ_INCREASE_BY_V1, IncreaseBy { n: 2 }.encode_to_vec(), None),
+    );
+    assert_eq!(ret, 0, "IncreaseByV1 upcast to IncreaseBy");
+    assert_eq!(decode_events(&bytes), increased_book(2));
+}
+
+#[test]
+fn commutative_restores_the_host_head_before_folding_the_commands_events() {
+    let router = counter_resolving(CB_INCREASE_MUTATES, Some(CB_PACK), Some(CB_CHANGED_NONE));
+    let session = next_session();
+    let (ret, _) = router.dispatch(
+        session,
+        &handled_req(2, 1, pb::ConflictResolution::Commutative, b"n-1"),
+    );
+    assert_eq!(ret, 0);
+    assert_eq!(
+        session_snapshot(session).changed_calls,
+        vec![(1, 2), (2, 3)],
+        "after = head restored (2) + the command's one event, not decide's +10"
+    );
 }

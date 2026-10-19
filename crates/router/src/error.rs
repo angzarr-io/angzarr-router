@@ -15,6 +15,7 @@ pub enum GrpcCode {
     InvalidArgument = 3,
     NotFound = 5,
     FailedPrecondition = 9,
+    Aborted = 10,
     Unimplemented = 12,
     Internal = 13,
     DataLoss = 15,
@@ -39,6 +40,10 @@ pub mod codes {
     pub const EMPTY_PM_TRIGGER: &str = "EMPTY_PM_TRIGGER";
     pub const MISSING_PM_EVENT_PAYLOAD: &str = "MISSING_PM_EVENT_PAYLOAD";
     pub const NO_FACT_HANDLER: &str = "NO_FACT_HANDLER";
+    pub const CONFLICT_UNRESOLVED: &str = "CONFLICT_UNRESOLVED";
+    pub const CONFLICT_OVERLAP: &str = "CONFLICT_OVERLAP";
+    pub const CONFLICT_RESOLUTION_UNSUPPORTED: &str = "CONFLICT_RESOLUTION_UNSUPPORTED";
+    pub const INCOMPLETE_COMMUTATIVE: &str = "INCOMPLETE_COMMUTATIVE";
 }
 
 /// Canonical static message text (byte-equal across languages).
@@ -56,6 +61,13 @@ pub mod messages {
     pub const DUPLICATE_COMMAND_HANDLER: &str =
         "two command handlers claim the same (domain, command type)";
     pub const NO_COMPONENT_OF_KIND: &str = "the router hosts no component of this kind";
+    pub const CONFLICT_UNRESOLVED: &str =
+        "the handler did not resolve the conflict window with the delivered nonce";
+    pub const CONFLICT_OVERLAP: &str = "the command's changes overlap the changes it did not see";
+    pub const CONFLICT_RESOLUTION_UNSUPPORTED: &str =
+        "the component does not support COMMUTATIVE conflict resolution";
+    pub const INCOMPLETE_COMMUTATIVE: &str =
+        "COMMUTATIVE needs a state packer and a snapshot loader beside changed()";
 }
 
 /// Cross-language detail-key constants.
@@ -63,6 +75,9 @@ pub mod extras {
     pub const DOMAIN: &str = "domain";
     pub const TYPE_URL: &str = "type_url";
     pub const COMMAND_TYPE: &str = "command_type";
+    pub const UPCAST_TYPE_URL: &str = "upcast_type_url";
+    pub const WINDOW_UNITS: &str = "window_units";
+    pub const COMMAND_UNITS: &str = "command_units";
 }
 
 /// A coded business/framework error: the form every failure takes before
@@ -146,6 +161,16 @@ impl CodedError {
             std::iter::once((extras::TYPE_URL.to_string(), type_url.to_string())).chain(extras),
             GrpcCode::InvalidArgument,
         )
+    }
+
+    /// A stale command (ABORTED, as STRICT would answer it): its conflict
+    /// window was not resolved, or COMMUTATIVE found an overlap.
+    pub fn stale(
+        code: &str,
+        message: &str,
+        extras: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        Self::coded(code, message, extras, GrpcCode::Aborted)
     }
 
     /// Classifies a store-sourced decode failure (DATA_LOSS on the wire).

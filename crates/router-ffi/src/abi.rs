@@ -164,6 +164,7 @@ pub fn grpc_from_wire(code: i32) -> GrpcCode {
         3 => GrpcCode::InvalidArgument,
         5 => GrpcCode::NotFound,
         9 => GrpcCode::FailedPrecondition,
+        10 => GrpcCode::Aborted,
         12 => GrpcCode::Unimplemented,
         15 => GrpcCode::DataLoss,
         _ => GrpcCode::Internal,
