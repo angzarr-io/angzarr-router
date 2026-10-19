@@ -51,6 +51,8 @@ pub trait CommandHandler: Send + Sync {
         &self,
         req: &pb::ContextualCommand,
     ) -> Result<pb::CommandHandlerResponse, CodedError>;
+    /// The registration hello (types.proto, ComponentDescriptor).
+    fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError>;
 }
 
 impl<T: CommandHandler + ?Sized> CommandHandler for Box<T> {
@@ -71,6 +73,9 @@ impl<T: CommandHandler + ?Sized> CommandHandler for Box<T> {
         req: &pb::ContextualCommand,
     ) -> Result<pb::CommandHandlerResponse, CodedError> {
         (**self).dispatch(req)
+    }
+    fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError> {
+        (**self).component_descriptor()
     }
 }
 
@@ -93,6 +98,9 @@ impl<S> CommandHandler for AggregateDispatch<S> {
     ) -> Result<pb::CommandHandlerResponse, CodedError> {
         AggregateDispatch::dispatch(self, req)
     }
+    fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError> {
+        AggregateDispatch::component_descriptor(self)
+    }
 }
 
 /// A process manager as the router sees it, whatever its state type.
@@ -107,6 +115,8 @@ pub trait ProcessManagerHandler: ProcessManagerRoute + Send + Sync {
         &self,
         req: &pb::ProcessManagerHandleRequest,
     ) -> Result<pb::ProcessManagerHandleResponse, CodedError>;
+    /// The registration hello (types.proto, ComponentDescriptor).
+    fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError>;
 }
 
 impl<T: ProcessManagerRoute + ?Sized> ProcessManagerRoute for Box<T> {
@@ -131,6 +141,9 @@ impl<T: ProcessManagerHandler + ?Sized> ProcessManagerHandler for Box<T> {
     ) -> Result<pb::ProcessManagerHandleResponse, CodedError> {
         (**self).dispatch(req)
     }
+    fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError> {
+        (**self).component_descriptor()
+    }
 }
 
 impl<S> ProcessManagerHandler for ProcessManagerDispatch<S> {
@@ -143,23 +156,34 @@ impl<S> ProcessManagerHandler for ProcessManagerDispatch<S> {
     ) -> Result<pb::ProcessManagerHandleResponse, CodedError> {
         ProcessManagerDispatch::dispatch(self, req)
     }
+    fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError> {
+        ProcessManagerDispatch::component_descriptor(self)
+    }
 }
 
 /// A projector as the router sees it, whatever its projection type.
 pub trait ProjectorHandler: Send + Sync {
     /// `ProjectorService.Handle`.
     fn dispatch(&self, events: &pb::EventBook) -> Result<pb::Projection, CodedError>;
+    /// The registration hello (types.proto, ComponentDescriptor).
+    fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError>;
 }
 
 impl<T: ProjectorHandler + ?Sized> ProjectorHandler for Box<T> {
     fn dispatch(&self, events: &pb::EventBook) -> Result<pb::Projection, CodedError> {
         (**self).dispatch(events)
     }
+    fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError> {
+        (**self).component_descriptor()
+    }
 }
 
 impl<P> ProjectorHandler for ProjectorDispatch<P> {
     fn dispatch(&self, events: &pb::EventBook) -> Result<pb::Projection, CodedError> {
         ProjectorDispatch::dispatch(self, events)
+    }
+    fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError> {
+        ProjectorDispatch::component_descriptor(self)
     }
 }
 
@@ -297,6 +321,15 @@ impl CommandHandlers {
         CommandHandlers::default()
     }
 
+    /// Every handler's registration hello, in registration order; refused
+    /// with the first handler whose hello fails.
+    pub fn component_descriptors(&self) -> Result<Vec<pb::ComponentDescriptor>, CodedError> {
+        self.handlers
+            .iter()
+            .map(|handler| handler.component_descriptor())
+            .collect()
+    }
+
     /// Adds `handler`, claiming its command types and the source types of
     /// its upcaster chains. Two claims of one (domain, type) — two handlers,
     /// or an old type that is also a current one — is
@@ -429,6 +462,26 @@ fn wrong_kind() -> CodedError {
 }
 
 impl Router {
+    /// The registration hellos (types.proto, ComponentDescriptor) of every
+    /// component, in registration order: the same shape the C ABI's
+    /// `angzarr_router_component_descriptors` answers. Refused with the first
+    /// component whose hello fails. An upcaster router has none.
+    pub fn component_descriptors(&self) -> Result<Vec<pb::ComponentDescriptor>, CodedError> {
+        match &self.inner {
+            Inner::CommandHandlers(handlers) => handlers.component_descriptors(),
+            Inner::Sagas(sagas) => sagas
+                .iter()
+                .map(SagaDispatch::component_descriptor)
+                .collect(),
+            Inner::ProcessManagers(pms) => pms.iter().map(|pm| pm.component_descriptor()).collect(),
+            Inner::Projectors(projectors) => projectors
+                .iter()
+                .map(|projector| projector.component_descriptor())
+                .collect(),
+            Inner::Upcasters(_) => Ok(Vec::new()),
+        }
+    }
+
     /// Routes a command or a fact to its aggregate.
     pub fn dispatch_command(
         &self,

@@ -8,12 +8,13 @@ use crate::error::{codes, CodedError};
 use crate::pb;
 use crate::process_manager::{ProcessManagerDispatch, ProcessManagerRoute};
 use crate::projector::ProjectorDispatch;
+use crate::rebuild::Rebuilder;
 use crate::router::{
     CommandHandler, CommandHandlers, ProcessManagerHandler, ProjectorHandler, Router, RouterBuilder,
 };
 use crate::saga::SagaDispatch;
 use crate::test_support::{
-    command_page, cover_applier, event_page, fact_page, fresh_rebuilder, TestState,
+    command_page, cover_applier, event_page, fact_page, fresh_rebuilder, LedgerState, TestState,
 };
 use crate::type_url;
 use crate::upcaster::UpcasterDispatch;
@@ -494,6 +495,12 @@ impl CommandHandler for Plain {
     ) -> Result<pb::CommandHandlerResponse, CodedError> {
         Ok(pb::CommandHandlerResponse::default())
     }
+    fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError> {
+        Ok(pb::ComponentDescriptor {
+            name: "plain".to_string(),
+            ..Default::default()
+        })
+    }
 }
 
 #[test]
@@ -700,4 +707,154 @@ fn an_aggregate_naming_a_source_type_twice_claims_it_once() {
         .dispatch_command(&command("order", "test.ShipV1"))
         .expect("both rules ran");
     assert_eq!(emitted_label(&resp), "ship");
+}
+
+// --- the registration hellos (types.proto ComponentDescriptor) --------------
+
+/// The (name, kind) of each hello `router` answers.
+fn hellos(router: &Router) -> Vec<(String, pb::ComponentKind)> {
+    router
+        .component_descriptors()
+        .expect("hellos")
+        .into_iter()
+        .map(|d| {
+            let kind = d.kind();
+            (d.name, kind)
+        })
+        .collect()
+}
+
+fn ledger(name: &str, domain: &str, version: &str) -> AggregateDispatch<LedgerState> {
+    AggregateDispatch::new(name, domain, Rebuilder::of_message())
+        .with_rules_version(version)
+        .on_command(&format!("test.{name}"), |_, _, _| Ok(None))
+}
+
+#[test]
+fn a_router_answers_its_aggregates_hellos_in_registration_order() {
+    let router = RouterBuilder::new()
+        .aggregate(ledger("Second", "b", "1"))
+        .aggregate(Box::new(ledger("First", "a", "1")) as Box<dyn CommandHandler>)
+        .aggregate(Plain)
+        .build()
+        .expect("build");
+    assert_eq!(
+        hellos(&router),
+        vec![
+            ("Second".to_string(), pb::ComponentKind::Aggregate),
+            ("First".to_string(), pb::ComponentKind::Aggregate),
+            ("plain".to_string(), pb::ComponentKind::Unspecified),
+        ]
+    );
+    let first = &router.component_descriptors().unwrap()[0];
+    assert_eq!(
+        first.state.as_ref().expect("state").type_url,
+        "/test.ledger.LedgerState"
+    );
+}
+
+#[test]
+fn a_router_answers_every_kinds_hellos() {
+    let sagas = RouterBuilder::new()
+        .saga(SagaDispatch::new("s1", "order", ["x"]).with_rules_version("1"))
+        .saga(SagaDispatch::new("s2", "order", ["x"]).with_rules_version("1"))
+        .build()
+        .expect("build");
+    assert_eq!(
+        hellos(&sagas),
+        vec![
+            ("s1".to_string(), pb::ComponentKind::Saga),
+            ("s2".to_string(), pb::ComponentKind::Saga),
+        ]
+    );
+    let pm = |name: &str| {
+        ProcessManagerDispatch::new(name, "pm", ["x"], Rebuilder::<LedgerState>::of_message())
+            .with_rules_version("1")
+    };
+    let pms = RouterBuilder::new()
+        .process_manager(pm("p1"))
+        .process_manager(Box::new(pm("p2")) as Box<dyn ProcessManagerHandler>)
+        .build()
+        .expect("build");
+    assert_eq!(
+        hellos(&pms),
+        vec![
+            ("p1".to_string(), pb::ComponentKind::ProcessManager),
+            ("p2".to_string(), pb::ComponentKind::ProcessManager),
+        ]
+    );
+    let projectors = RouterBuilder::new()
+        .projector(ProjectorDispatch::new("v1", || ()).with_rules_version("1"))
+        .projector(
+            Box::new(ProjectorDispatch::new("v2", || ()).with_rules_version("1"))
+                as Box<dyn ProjectorHandler>,
+        )
+        .build()
+        .expect("build");
+    assert_eq!(
+        hellos(&projectors),
+        vec![
+            ("v1".to_string(), pb::ComponentKind::Projector),
+            ("v2".to_string(), pb::ComponentKind::Projector),
+        ]
+    );
+}
+
+#[test]
+fn an_upcaster_router_has_no_hellos() {
+    let router = RouterBuilder::new()
+        .upcaster(UpcasterDispatch::new("v1-v2", "order"))
+        .build()
+        .expect("build");
+    assert!(router.component_descriptors().expect("none").is_empty());
+}
+
+#[test]
+fn a_router_refuses_with_its_first_components_refusal() {
+    let check = |router: Router, refused: &str| {
+        let err = router.component_descriptors().expect_err("refused");
+        assert_eq!(err.code, codes::MISSING_RULES_VERSION);
+        assert_eq!(
+            err.extras
+                .get(crate::error::extras::COMPONENT)
+                .map(String::as_str),
+            Some(refused)
+        );
+    };
+    check(
+        RouterBuilder::new()
+            .aggregate(ledger("Fine", "a", "1"))
+            .aggregate(ledger("Bad", "b", ""))
+            .aggregate(ledger("Worse", "c", ""))
+            .build()
+            .expect("build"),
+        "Bad",
+    );
+    check(
+        RouterBuilder::new()
+            .saga(SagaDispatch::new("ok", "order", ["x"]).with_rules_version("1"))
+            .saga(SagaDispatch::new("bad", "order", ["x"]))
+            .build()
+            .expect("build"),
+        "bad",
+    );
+    check(
+        RouterBuilder::new()
+            .process_manager(ProcessManagerDispatch::new(
+                "bad",
+                "pm",
+                ["x"],
+                Rebuilder::<LedgerState>::of_message(),
+            ))
+            .build()
+            .expect("build"),
+        "bad",
+    );
+    check(
+        RouterBuilder::new()
+            .projector(ProjectorDispatch::new("bad", || ()))
+            .build()
+            .expect("build"),
+        "bad",
+    );
 }

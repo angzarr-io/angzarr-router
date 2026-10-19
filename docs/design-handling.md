@@ -7,7 +7,7 @@
   process managers and projectors, the retirement of `host_ctx`, and the
   registration hello (`component_descriptor()`), per the owner rulings
   recorded under "Registration and projectors" below; C-0535 is bound.
-- **In progress:** fold failures everywhere are INTERNAL and typed, and the
+- **Implemented:** fold failures everywhere are INTERNAL and typed, and the
   native `Router` gathers registration hellos, per the owner rulings recorded
   under "Fold failures and the native Router" below.
 - **Open:** how the rules version is sourced (the owner intends the binary's
