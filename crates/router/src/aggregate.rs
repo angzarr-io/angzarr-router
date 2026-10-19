@@ -273,15 +273,13 @@ fn stamp_emitted_book(events: &mut pb::EventBook, cmd_cover: Option<&pb::Cover>,
             cover.ext = Some(ext.clone());
         }
     }
-    let mut seq = next_seq;
-    for page in &mut events.pages {
+    for (seq, page) in (next_seq..).zip(events.pages.iter_mut()) {
         if page.header.is_none() {
             page.header = Some(pb::PageHeader {
                 sequence_type: Some(pb::page_header::SequenceType::Sequence(seq)),
                 ..Default::default()
             });
         }
-        seq += 1;
     }
 }
 
