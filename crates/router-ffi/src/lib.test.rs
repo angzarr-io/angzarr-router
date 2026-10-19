@@ -41,11 +41,11 @@ const FQ_FAIL_HARD: &str = "test.counter.FailHard";
 const FQ_RETURN_NOTHING: &str = "test.counter.ReturnNothing";
 const FQ_RESERVE: &str = "test.counter.Reserve";
 
-const CB_APPLIER: u64 = 1;
+/// The fold over router-owned CounterState: one per Increased page.
+const CB_FOLD: u64 = 1;
 const CB_INCREASE_BY: u64 = 2;
 const CB_FAIL_HARD: u64 = 3;
 const CB_RETURN_NOTHING: u64 = 6;
-const CB_SNAPSHOT: u64 = 7;
 const CB_PROJ_FOLD: u64 = 8;
 const CB_PROJ_FINISH: u64 = 9;
 const CB_SAGA_EVENT: u64 = 10;
@@ -65,16 +65,13 @@ const CB_FACT_GARBAGE: u64 = 25;
 const CB_INCREASE_IGNORES: u64 = 26;
 /// IncreaseBy that resolves with a made-up nonce.
 const CB_INCREASE_MADE_UP: u64 = 27;
-/// Packs the session counter as a CounterState Any.
-const CB_PACK: u64 = 28;
 /// changed(): ["value"] when the counters differ.
 const CB_CHANGED_VALUE: u64 = 29;
 /// changed(): always empty.
 const CB_CHANGED_NONE: u64 = 30;
 /// Upcasts IncreaseByV1 to IncreaseBy (payload unchanged).
 const CB_UPCAST_V1: u64 = 31;
-/// IncreaseBy that also mutates the session counter (+10) while deciding.
-const CB_INCREASE_MUTATES: u64 = 32;
+
 const FQ_INCREASE_BY_V1: &str = "test.counter.IncreaseByV1";
 
 const FQ_ORDER_CREATED: &str = "test.order.OrderCreated";
@@ -94,6 +91,31 @@ struct Session {
     observed_handling: Vec<(u64, i32, Vec<u64>, Vec<u8>)>,
     /// (before, after) counters each changed() call compared.
     changed_calls: Vec<(u32, u32)>,
+    /// The router-owned state value each decide / fact / PM handler saw.
+    observed_state: Vec<u32>,
+    /// The type URL of each state a decide was handed.
+    observed_state_type: Vec<String>,
+    /// The page sequences of each fold call.
+    fold_calls: Vec<Vec<u64>>,
+}
+
+const STATE_TYPE: &str = "test.counter.CounterState";
+
+/// The CounterState value of a router-owned state Any (0 for the empty
+/// default).
+fn state_value(state: Option<&Any>) -> u32 {
+    state.map_or(0, |any| {
+        CounterState::decode(any.value.as_slice())
+            .expect("CounterState")
+            .value
+    })
+}
+
+fn state_any(value: u32) -> Any {
+    Any {
+        type_url: format!("/{STATE_TYPE}"),
+        value: CounterState { value }.encode_to_vec(),
+    }
 }
 
 static SESSIONS: Mutex<Option<HashMap<usize, Session>>> = Mutex::new(None);
@@ -177,30 +199,42 @@ unsafe extern "C" fn host_cb(
     };
 
     match callback_id {
-        CB_APPLIER => {
-            if Increased::decode(payload).is_err() {
-                return -3;
+        CB_FOLD => {
+            // Stateless: fold every Increased page into the state handed in.
+            let call = abi_pb::FoldCall::decode(payload).expect("FoldCall");
+            let mut value = state_value(call.state.as_ref());
+            for page in &call.pages {
+                let Some(event) = page.payload.as_ref() else {
+                    continue;
+                };
+                if !event.type_url.ends_with(FQ_INCREASED) {
+                    continue;
+                }
+                if Increased::decode(event.value.as_slice()).is_err() {
+                    return -3;
+                }
+                value += 1;
+                with_session(key, |s| {
+                    s.applied_pages.push((call.cover.clone(), page.sequence))
+                });
             }
-            let paux = abi_pb::ProjectorEventAux::decode(aux).expect("applier page aux");
             with_session(key, |s| {
-                s.counter += 1;
-                s.applied_pages.push((paux.cover, paux.sequence));
+                s.fold_calls
+                    .push(call.pages.iter().map(|p| p.sequence).collect())
             });
-            STATUS_OK_EMPTY
+            host_fill(out, &state_any(value).encode_to_vec());
+            STATUS_OK
         }
-        CB_SNAPSHOT => {
-            let Ok(state) = CounterState::decode(payload) else {
-                return -3;
-            };
-            with_session(key, |s| s.counter = state.value);
-            STATUS_OK_EMPTY
-        }
-        CB_INCREASE_BY | CB_INCREASE_IGNORES | CB_INCREASE_MADE_UP | CB_INCREASE_MUTATES => {
+        CB_INCREASE_BY | CB_INCREASE_IGNORES | CB_INCREASE_MADE_UP => {
             let cctx = abi_pb::CommandContextAux::decode(aux).expect("cctx aux");
-            if callback_id == CB_INCREASE_MUTATES {
-                with_session(key, |s| s.counter += 10);
-            }
             with_session(key, |s| {
+                s.observed_state.push(state_value(cctx.state.as_ref()));
+                s.observed_state_type.push(
+                    cctx.state
+                        .as_ref()
+                        .map(|a| a.type_url.clone())
+                        .unwrap_or_default(),
+                );
                 s.observed_cctx
                     .push((cctx.next_sequence, cctx.had_prior_events));
                 s.observed_covers.push(cctx.cover.clone());
@@ -229,15 +263,6 @@ unsafe extern "C" fn host_cb(
                 resolved_nonce,
             };
             host_fill(out, &output.encode_to_vec());
-            STATUS_OK
-        }
-        CB_PACK => {
-            let counter = with_session(key, |s| s.counter);
-            let packed = Any {
-                type_url: "type.googleapis.com/test.counter.CounterState".to_string(),
-                value: CounterState { value: counter }.encode_to_vec(),
-            };
-            host_fill(out, &packed.encode_to_vec());
             STATUS_OK
         }
         CB_CHANGED_VALUE | CB_CHANGED_NONE => {
@@ -330,6 +355,9 @@ unsafe extern "C" fn host_cb(
             // Stateful PM: the host reacts to the newest trigger event and
             // emits one stamped command, returning the full PM response.
             let paux = abi_pb::PmEventAux::decode(aux).expect("pm event aux");
+            with_session(key, |s| {
+                s.observed_state.push(state_value(paux.state.as_ref()))
+            });
             let cmd = pb::CommandBook {
                 cover: Some(pb::Cover {
                     domain: "inventory".to_string(),
@@ -373,9 +401,10 @@ unsafe extern "C" fn host_cb(
             STATUS_OK
         }
         CB_FACT_ANNOTATE => {
-            // Annotates a fact with the folded counter (the state the fact
-            // sees) and flags it with an Increased, which folds in turn.
-            let counter = with_session(key, |s| s.counter);
+            // Annotates a fact with the router-owned state it was handed and
+            // flags it with an Increased.
+            let cctx = abi_pb::CommandContextAux::decode(aux).expect("fact aux");
+            let counter = state_value(cctx.state.as_ref());
             let record = abi_pb::FactRecord {
                 fact: Some(Any {
                     type_url: "type.googleapis.com/test.counter.CounterState".to_string(),
@@ -427,11 +456,8 @@ fn descriptor_bytes() -> Vec<u8> {
                 callback_id: CB_RETURN_NOTHING,
             },
         ],
-        appliers: vec![abi_pb::CallbackEntry {
-            fq_type: FQ_INCREASED.to_string(),
-            callback_id: CB_APPLIER,
-        }],
-        snapshot_callback_id: Some(CB_SNAPSHOT),
+        state_type_url: STATE_TYPE.to_string(),
+        fold_callback_id: Some(CB_FOLD),
         ..Default::default()
     }
     .encode_to_vec()
@@ -590,11 +616,12 @@ fn empty_history_command_emits_unstamped_events() {
         vec![(0, false)],
         "fresh aggregate evidence"
     );
-    assert_eq!(s.counter, 0, "no history — appliers must not run");
+    assert!(s.fold_calls.is_empty(), "no history: the fold must not run");
+    assert_eq!(s.observed_state, vec![0]);
 }
 
 #[test]
-fn prior_events_fold_through_host_appliers() {
+fn prior_events_fold_through_one_host_fold_call() {
     let router = Router::with_counter();
     let session = next_session();
     let (ret, bytes) = router.dispatch(
@@ -607,7 +634,16 @@ fn prior_events_fold_through_host_appliers() {
     );
     assert_eq!(ret, 0);
     let s = session_snapshot(session);
-    assert_eq!(s.counter, 2, "both history pages folded host-side");
+    assert_eq!(
+        s.fold_calls,
+        vec![vec![0, 1]],
+        "one batched call over both pages"
+    );
+    assert_eq!(
+        s.observed_state,
+        vec![2],
+        "the router handed decide the folded state"
+    );
     assert_eq!(
         s.observed_cctx,
         vec![(2, true)],
@@ -630,10 +666,7 @@ fn snapshot_loads_and_covered_pages_skip() {
     let mut history = pb::EventBook {
         snapshot: Some(pb::Snapshot {
             sequence: 2,
-            state: Some(Any {
-                type_url: "type.googleapis.com/test.counter.CounterState".to_string(),
-                value: CounterState { value: 10 }.encode_to_vec(),
-            }),
+            state: Some(state_any(10)),
             ..Default::default()
         }),
         next_sequence: 4,
@@ -659,7 +692,16 @@ fn snapshot_loads_and_covered_pages_skip() {
     );
     assert_eq!(ret, 0);
     let s = session_snapshot(session);
-    assert_eq!(s.counter, 11, "snapshot 10 + one uncovered page");
+    assert_eq!(
+        s.fold_calls,
+        vec![vec![3]],
+        "the covered page never reaches the fold"
+    );
+    assert_eq!(
+        s.observed_state,
+        vec![11],
+        "snapshot 10 + one uncovered page"
+    );
     assert_eq!(s.observed_cctx, vec![(4, true)]);
 }
 
@@ -763,7 +805,11 @@ fn concurrent_dispatches_isolate_sessions() {
     });
     for session in sessions {
         let s = session_snapshot(session);
-        assert_eq!(s.counter, 3, "each session folded only its own history");
+        assert_eq!(
+            s.observed_state,
+            vec![3],
+            "each dispatch folded its own history"
+        );
         assert_eq!(s.observed_cctx, vec![(3, true)]);
     }
 }
@@ -1052,8 +1098,8 @@ fn pm_descriptor_bytes() -> Vec<u8> {
     abi_pb::ProcessManagerDescriptor {
         name: "OrderPM".to_string(),
         pm_domain: "order-pm".to_string(),
-        appliers: Vec::new(),
-        snapshot_callback_id: None,
+        state_type_url: STATE_TYPE.to_string(),
+        fold_callback_id: Some(CB_FOLD),
         events: vec![abi_pb::PmEventEntry {
             input_domain: "orders".to_string(),
             fq_type: FQ_ORDER_SHIPPED.to_string(),
@@ -1162,8 +1208,8 @@ fn two_process_managers_share_a_source_domain_route_by_type() {
     let pm2 = abi_pb::ProcessManagerDescriptor {
         name: "OtherPM".to_string(),
         pm_domain: "other-pm".to_string(),
-        appliers: Vec::new(),
-        snapshot_callback_id: None,
+        state_type_url: STATE_TYPE.to_string(),
+        fold_callback_id: Some(CB_FOLD),
         events: vec![abi_pb::PmEventEntry {
             input_domain: "orders".to_string(),
             fq_type: FQ_ORDER_CREATED.to_string(),
@@ -1228,8 +1274,8 @@ fn pm2_descriptor_bytes() -> Vec<u8> {
     abi_pb::ProcessManagerDescriptor {
         name: "Pm2".to_string(),
         pm_domain: "other-pm".to_string(),
-        appliers: Vec::new(),
-        snapshot_callback_id: None,
+        state_type_url: STATE_TYPE.to_string(),
+        fold_callback_id: Some(CB_FOLD),
         events: vec![abi_pb::PmEventEntry {
             input_domain: "orders".to_string(),
             fq_type: FQ_ORDER_SHIPPED.to_string(),
@@ -1370,24 +1416,22 @@ fn register_aggregate_desc(r: *mut c_void, desc: abi_pb::AggregateDescriptor) ->
     unsafe { angzarr_router_register_aggregate(r, bytes.as_ptr(), bytes.len(), host_cb) }
 }
 
-/// The counter aggregate with its applier and snapshot loader replaced.
-fn counter_with(applier: u64, snapshot: u64) -> Router {
+/// The counter aggregate with its fold replaced.
+fn counter_with(fold: u64) -> Router {
     let mut desc = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
-    desc.appliers[0].callback_id = applier;
-    desc.snapshot_callback_id = Some(snapshot);
+    desc.fold_callback_id = Some(fold);
     let r = angzarr_router_new();
     assert_eq!(register_aggregate_desc(r, desc), 0);
     Router(r)
 }
 
+/// A snapshot of CounterState 1 at sequence 0, then Increased pages at
+/// sequences 0 (covered) and 1.
 fn snapshot_history_book() -> pb::EventBook {
-    let mut book = increased_history(1, 2);
+    let mut book = increased_history(2, 2);
     book.snapshot = Some(pb::Snapshot {
         sequence: 0,
-        state: Some(Any {
-            type_url: "type.googleapis.com/test.counter.CounterState".to_string(),
-            value: CounterState { value: 1 }.encode_to_vec(),
-        }),
+        state: Some(state_any(1)),
         ..Default::default()
     });
     book
@@ -1397,30 +1441,60 @@ fn increase_one(events: Option<pb::EventBook>) -> pb::ContextualCommand {
     command_req(FQ_INCREASE_BY, IncreaseBy { n: 1 }.encode_to_vec(), events)
 }
 
+// Router-owned state (docs/design-handling.md): a delivered snapshot is the
+// initial state the router hands the fold; covered pages never reach it.
 #[test]
-fn applier_returning_status_ok_is_success() {
-    let router = counter_with(CB_OK_ZERO, CB_OK_ZERO);
-    let (ret, _) = router.dispatch(next_session(), &increase_one(Some(increased_history(2, 2))));
+fn a_delivered_snapshot_is_the_initial_state_the_fold_continues() {
+    let router = Router::with_counter();
+    let session = next_session();
+    let (ret, _) = router.dispatch(session, &increase_one(Some(snapshot_history_book())));
     assert_eq!(ret, 0);
+    let seen = session_snapshot(session);
+    assert_eq!(seen.fold_calls, vec![vec![1]], "only the uncovered page");
+    assert_eq!(seen.observed_state, vec![2], "snapshot 1 + one folded page");
 }
 
 #[test]
-fn snapshot_loader_returning_status_ok_is_success() {
-    let router = counter_with(CB_OK_ZERO, CB_OK_ZERO);
-    let (ret, _) = router.dispatch(next_session(), &increase_one(Some(snapshot_history_book())));
+fn a_fold_returning_status_ok_empty_keeps_the_state() {
+    let router = counter_with(CB_OK_EMPTY);
+    let session = next_session();
+    let (ret, _) = router.dispatch(session, &increase_one(Some(snapshot_history_book())));
     assert_eq!(ret, 0);
+    assert_eq!(session_snapshot(session).observed_state, vec![1]);
 }
 
 #[test]
-fn failing_snapshot_loader_is_data_loss() {
-    let router = counter_with(CB_OK_ZERO, CB_FAILS);
+fn a_failing_fold_is_data_loss() {
+    let router = counter_with(CB_FAILS);
     let (ret, bytes) =
-        router.dispatch(next_session(), &increase_one(Some(snapshot_history_book())));
+        router.dispatch(next_session(), &increase_one(Some(increased_history(2, 2))));
     assert_eq!(ret, -15);
-    let (_, reason) = decode_status(&bytes);
     assert_eq!(
-        reason,
+        decode_status(&bytes).1,
         angzarr_router::error::codes::PERSISTED_EVENT_CORRUPT
+    );
+}
+
+#[test]
+fn an_undecodable_fold_answer_is_an_unhandled_error() {
+    let router = counter_with(CB_FACT_GARBAGE);
+    let (ret, _) = router.dispatch(next_session(), &increase_one(Some(increased_history(1, 1))));
+    assert_eq!(ret, -13);
+}
+
+#[test]
+fn a_fresh_aggregate_starts_from_the_registered_state_types_default() {
+    let router = Router::with_counter();
+    let session = next_session();
+    let (ret, _) = router.dispatch(session, &increase_one(None));
+    assert_eq!(ret, 0);
+    let seen = session_snapshot(session);
+    assert!(seen.fold_calls.is_empty(), "nothing to fold");
+    assert_eq!(seen.observed_state, vec![0]);
+    assert_eq!(
+        seen.observed_state_type,
+        vec![format!("/{STATE_TYPE}")],
+        "the default of the registered state type"
     );
 }
 
@@ -1464,16 +1538,11 @@ fn saga_handler_emitting_nothing_is_an_empty_response() {
     );
 }
 
-/// The order PM with an applier and snapshot loader for Increased, and its
-/// event handler replaced.
-fn pm_with(applier: u64, snapshot: u64, event: u64) -> Router {
+/// The order PM with its fold and event handler replaced.
+fn pm_with(fold: u64, event: u64) -> Router {
     let mut desc =
         abi_pb::ProcessManagerDescriptor::decode(pm_descriptor_bytes().as_slice()).unwrap();
-    desc.appliers = vec![abi_pb::CallbackEntry {
-        fq_type: FQ_INCREASED.to_string(),
-        callback_id: applier,
-    }];
-    desc.snapshot_callback_id = Some(snapshot);
+    desc.fold_callback_id = Some(fold);
     desc.events[0].callback_id = event;
     let bytes = desc.encode_to_vec();
     let r = angzarr_router_new();
@@ -1491,9 +1560,21 @@ fn pm_over_state(state: pb::EventBook) -> pb::ProcessManagerHandleRequest {
 }
 
 #[test]
-fn pm_applier_and_loader_succeed_on_either_ok_status() {
+fn a_pm_handler_receives_its_router_owned_state() {
+    let router = pm_with(CB_FOLD, CB_PM_EVENT);
+    let session = next_session();
+    let (ret, _) =
+        router.dispatch_process_manager(session, &pm_over_state(snapshot_history_book()));
+    assert_eq!(ret, 0);
+    let seen = session_snapshot(session);
+    assert_eq!(seen.fold_calls, vec![vec![1]]);
+    assert_eq!(seen.observed_state, vec![2]);
+}
+
+#[test]
+fn pm_fold_and_handler_succeed_on_either_ok_status() {
     for ok in [CB_OK_ZERO, CB_OK_EMPTY] {
-        let router = pm_with(ok, ok, CB_OK_EMPTY);
+        let router = pm_with(CB_OK_EMPTY, ok);
         let (ret, bytes) = router
             .dispatch_process_manager(next_session(), &pm_over_state(snapshot_history_book()));
         assert_eq!(ret, 0, "callback status {ok} is success");
@@ -1506,8 +1587,8 @@ fn pm_applier_and_loader_succeed_on_either_ok_status() {
 }
 
 #[test]
-fn failing_pm_applier_is_data_loss() {
-    let router = pm_with(CB_FAILS, CB_OK_EMPTY, CB_OK_EMPTY);
+fn failing_pm_fold_is_data_loss() {
+    let router = pm_with(CB_FAILS, CB_OK_EMPTY);
     let (ret, bytes) =
         router.dispatch_process_manager(next_session(), &pm_over_state(increased_book(1)));
     assert_eq!(ret, -15);
@@ -1515,14 +1596,6 @@ fn failing_pm_applier_is_data_loss() {
         decode_status(&bytes).1,
         angzarr_router::error::codes::PERSISTED_EVENT_CORRUPT
     );
-}
-
-#[test]
-fn failing_pm_snapshot_loader_is_data_loss() {
-    let router = pm_with(CB_OK_EMPTY, CB_FAILS, CB_OK_EMPTY);
-    let (ret, _) =
-        router.dispatch_process_manager(next_session(), &pm_over_state(snapshot_history_book()));
-    assert_eq!(ret, -15);
 }
 
 // --- aggregate routing by command domain
@@ -1849,11 +1922,10 @@ fn handled_req(
 }
 
 /// The counter aggregate with IncreaseBy on `command` and the given
-/// COMMUTATIVE callbacks.
-fn counter_resolving(command: u64, pack: Option<u64>, changed: Option<u64>) -> Router {
+/// changed() callback.
+fn counter_resolving(command: u64, changed: Option<u64>) -> Router {
     let mut desc = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
     desc.commands[0].callback_id = command;
-    desc.pack_state_callback_id = pack;
     desc.changed_callback_id = changed;
     let r = angzarr_router_new();
     assert_eq!(register_aggregate_desc(r, desc), 0);
@@ -1899,7 +1971,7 @@ fn aggregate_handles_crosses_the_window_and_nonce_and_keeps_resolved_output() {
 #[test]
 fn aggregate_handles_unresolved_or_made_up_is_aborted_through_the_abi() {
     for command in [CB_INCREASE_IGNORES, CB_INCREASE_MADE_UP] {
-        let router = counter_resolving(command, None, None);
+        let router = counter_resolving(command, None);
         let (ret, bytes) = router.dispatch(
             next_session(),
             &handled_req(1, 0, pb::ConflictResolution::AggregateHandles, b"n-1"),
@@ -1915,7 +1987,7 @@ fn aggregate_handles_unresolved_or_made_up_is_aborted_through_the_abi() {
 #[test]
 fn commutative_runs_the_resolver_over_host_state_through_the_abi() {
     // History 0..1, expected 1: expected = 1, head = 2, after = 3.
-    let router = counter_resolving(CB_INCREASE_BY, Some(CB_PACK), Some(CB_CHANGED_NONE));
+    let router = counter_resolving(CB_INCREASE_BY, Some(CB_CHANGED_NONE));
     let session = next_session();
     let (ret, bytes) = router.dispatch(
         session,
@@ -1934,7 +2006,7 @@ fn commutative_runs_the_resolver_over_host_state_through_the_abi() {
 
 #[test]
 fn commutative_overlap_is_aborted_through_the_abi() {
-    let router = counter_resolving(CB_INCREASE_BY, Some(CB_PACK), Some(CB_CHANGED_VALUE));
+    let router = counter_resolving(CB_INCREASE_BY, Some(CB_CHANGED_VALUE));
     let (ret, bytes) = router.dispatch(
         next_session(),
         &handled_req(2, 1, pb::ConflictResolution::Commutative, b"n-1"),
@@ -1960,19 +2032,6 @@ fn commutative_without_changed_is_unsupported_through_the_abi() {
 }
 
 #[test]
-fn a_changed_callback_without_pack_or_snapshot_is_refused_at_registration() {
-    let mut desc = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
-    desc.changed_callback_id = Some(CB_CHANGED_VALUE);
-    assert_eq!(
-        register_aggregate_desc(angzarr_router_new(), desc.clone()),
-        -3
-    );
-    desc.pack_state_callback_id = Some(CB_PACK);
-    desc.snapshot_callback_id = None;
-    assert_eq!(register_aggregate_desc(angzarr_router_new(), desc), -3);
-}
-
-#[test]
 fn a_command_upcaster_runs_before_dispatch_through_the_abi() {
     let mut desc = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
     desc.command_upcasters = vec![abi_pb::CallbackEntry {
@@ -1988,22 +2047,6 @@ fn a_command_upcaster_runs_before_dispatch_through_the_abi() {
     );
     assert_eq!(ret, 0, "IncreaseByV1 upcast to IncreaseBy");
     assert_eq!(decode_events(&bytes), increased_book(2));
-}
-
-#[test]
-fn commutative_restores_the_host_head_before_folding_the_commands_events() {
-    let router = counter_resolving(CB_INCREASE_MUTATES, Some(CB_PACK), Some(CB_CHANGED_NONE));
-    let session = next_session();
-    let (ret, _) = router.dispatch(
-        session,
-        &handled_req(2, 1, pb::ConflictResolution::Commutative, b"n-1"),
-    );
-    assert_eq!(ret, 0);
-    assert_eq!(
-        session_snapshot(session).changed_calls,
-        vec![(1, 2), (2, 3)],
-        "after = head restored (2) + the command's one event, not decide's +10"
-    );
 }
 
 // CommandHandlerResponse / ProcessManagerHandleResponse.rules_version:

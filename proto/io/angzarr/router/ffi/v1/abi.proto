@@ -21,23 +21,39 @@ message CallbackEntry {
 
 // Registration payload for one aggregate component: the dispatch tables
 // the binding's registration API (and later, generated wiring) assembles.
+//
+// Router-owned state: the router holds the aggregate's state as a serialized
+// google.protobuf.Any of the registered `state_type_url` and hands it to
+// every callback; the host keeps none. The initial state is a delivered
+// snapshot's `state` (pages at or below its sequence are covered) or, with
+// none, `Any { type_url: "/" + state_type_url, value: [] }` (the message's
+// default). Rebuilding folds every uncovered page through ONE fold call.
 message AggregateDescriptor {
   string name = 1;
   string domain = 2;
+  // Deciders keyed by FULLY-QUALIFIED command type: payload the command,
+  // aux a CommandContextAux carrying the state; STATUS_OK answers a
+  // CommandOutput, STATUS_OK_EMPTY no events.
   repeated CallbackEntry commands = 3;
-  repeated CallbackEntry appliers = 4;
+  // Field 4 was `appliers` (per-event host folds into session state;
+  // replaced by fold_callback_id over router-owned state).
+  reserved 4;
+  reserved "appliers";
   // Field 5 was `rejections` (compensation input; removed — there is no
   // compensation input).
   reserved 5;
   reserved "rejections";
-  // Snapshot loader callback; absent when the aggregate takes no snapshots.
-  optional uint64 snapshot_callback_id = 6;
+  // Field 6 was `snapshot_callback_id` (a delivered snapshot is now the
+  // initial state the router passes in).
+  reserved 6;
+  reserved "snapshot_callback_id";
   // Field 7 was `undoes` (Compensate input; removed).
   reserved 7;
   reserved "undoes";
   // Fact handlers keyed by FULLY-QUALIFIED fact type: a command page whose
   // Fact arm carries that type runs its handler. The callback receives the
-  // fact Any (type_url / payload) with the session state rebuilt, and returns
+  // fact Any (type_url / payload) with a CommandContextAux carrying the
+  // rebuilt state, and returns
   // a serialized FactRecord (STATUS_OK) or STATUS_OK_EMPTY to record the fact
   // unchanged with no flags. A fact of an unregistered type never reaches
   // the host: the router refuses it with NO_FACT_HANDLER.
@@ -50,16 +66,18 @@ message AggregateDescriptor {
   // (CommandHandlerResponse.rules_version): the business binary's full
   // version string, baked in at build.
   string rules_version = 10;
+  // The state message's fully-qualified name (e.g. "orders.v1.OrderState").
+  string state_type_url = 11;
+  // The fold: payload a serialized FoldCall (the state, every uncovered page
+  // of the rebuild, the book's cover); STATUS_OK answers the new state as a
+  // serialized google.protobuf.Any, STATUS_OK_EMPTY leaves it unchanged. A
+  // failure is PERSISTED_EVENT_CORRUPT (DATA_LOSS). Absent: events never
+  // change the state.
+  optional uint64 fold_callback_id = 12;
   // COMMUTATIVE conflict resolution (options.proto, the conflict_units
-  // region). Packs the session's current state into a serialized
-  // google.protobuf.Any; the router captures the state at the expected
-  // sequence, at the head and after the command's events, and restores the
-  // head through the snapshot loader (snapshot_callback_id).
-  optional uint64 pack_state_callback_id = 12;
-  // The state's generated changed(before, after): payload a serialized
-  // ChangedCall, response a serialized ChangedUnits. Its presence turns
-  // COMMUTATIVE on; it needs pack_state_callback_id and snapshot_callback_id
-  // (registration refuses it without them: INCOMPLETE_COMMUTATIVE).
+  // region): the state's generated changed(before, after), payload a
+  // serialized ChangedCall of two states, response a serialized
+  // ChangedUnits. Its presence turns COMMUTATIVE on.
   optional uint64 changed_callback_id = 13;
   // The upcaster chain run on incoming command and fact payloads before
   // dispatch (upcaster.proto), in order: a rule's callback receives a payload
@@ -78,7 +96,15 @@ message CommandOutput {
   bytes resolved_nonce = 2;
 }
 
-// Payload of a changed callback: two serialized states (pack_state images).
+// Payload of a fold callback: the current state and the pages to fold into
+// it, in order, with their book's cover.
+message FoldCall {
+  google.protobuf.Any state = 1;
+  repeated io.angzarr.v1.EventPage pages = 2;
+  io.angzarr.v1.Cover cover = 3;
+}
+
+// Payload of a changed callback: two states.
 message ChangedCall {
   google.protobuf.Any before = 1;
   google.protobuf.Any after = 2;
@@ -143,6 +169,8 @@ message CommandContextAux {
   // back in CommandOutput.resolved_nonce once its handler resolved.
   bytes conflict_nonce = 6;
   repeated io.angzarr.v1.EventPage window = 7;
+  // The rebuilt state (router-owned; see AggregateDescriptor).
+  google.protobuf.Any state = 8;
 }
 
 // aux payload for saga event callbacks: the source event's cover passed
@@ -168,8 +196,10 @@ message SagaEventAux {
 message ProcessManagerDescriptor {
   string name = 1;
   string pm_domain = 2;
-  repeated CallbackEntry appliers = 3; // rebuild the PM's own state
-  optional uint64 snapshot_callback_id = 4;
+  // Fields 3 and 4 were `appliers` and `snapshot_callback_id`: the PM's state
+  // is router-owned, as an aggregate's (state_type_url, fold_callback_id).
+  reserved 3, 4;
+  reserved "appliers", "snapshot_callback_id";
   repeated PmEventEntry events = 5;
   // Field 6 was `rejections` (compensation input; removed).
   reserved 6;
@@ -181,6 +211,11 @@ message ProcessManagerDescriptor {
   // The rules version reported on every response
   // (ProcessManagerHandleResponse.rules_version), as on AggregateDescriptor.
   string rules_version = 9;
+  // The PM state message's fully-qualified name; its state is router-owned
+  // exactly as an aggregate's (see AggregateDescriptor).
+  string state_type_url = 10;
+  // The fold over the PM's own events, as AggregateDescriptor.fold_callback_id.
+  optional uint64 fold_callback_id = 11;
 }
 
 // One ((input domain, fully-qualified event type) → host callback) row for a
@@ -191,17 +226,18 @@ message PmEventEntry {
   uint64 callback_id = 3;
 }
 
-// aux payload for process-manager event callbacks: the trigger book's cover.
-// The host returns a ProcessManagerHandleResponse, taken as emitted.
+// aux payload for process-manager event callbacks: the trigger book's cover
+// and the PM's rebuilt state. The host returns a
+// ProcessManagerHandleResponse, taken as emitted.
 message PmEventAux {
   reserved 1;
   reserved "destination_sequences";
   io.angzarr.v1.Cover trigger_cover = 2;
+  google.protobuf.Any state = 3;
 }
 
-// aux payload for projector fold callbacks AND for aggregate / process-manager
-// applier callbacks: where the folded event sits (its book's cover and the
-// page's sequence).
+// aux payload for projector fold callbacks: where the folded event sits (its
+// book's cover and the page's sequence).
 message ProjectorEventAux {
   io.angzarr.v1.Cover cover = 1;
   uint64 sequence = 2;

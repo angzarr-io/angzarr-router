@@ -47,7 +47,15 @@ pub struct Rebuilder<S> {
     factory: Box<dyn Fn() -> S + Send + Sync>,
     snapshot: Option<SnapshotFn<S>>,
     appliers: HashMap<String, ApplierFn<S>>,
+    fold: Option<FoldFn<S>>,
 }
+
+/// Folds a batch of event pages (with their book's cover) into state in one
+/// call: the batched alternative to per-type appliers, for state the router
+/// holds on a host's behalf (router-owned state across the C ABI).
+pub type FoldFn<S> = Box<
+    dyn Fn(&mut S, &[pb::EventPage], Option<&pb::Cover>) -> Result<(), CodedError> + Send + Sync,
+>;
 
 impl<S> Rebuilder<S> {
     /// A Rebuilder whose fresh state comes from `factory`.
@@ -56,6 +64,7 @@ impl<S> Rebuilder<S> {
             factory: Box::new(factory),
             snapshot: None,
             appliers: HashMap::new(),
+            fold: None,
         }
     }
 
@@ -90,6 +99,21 @@ impl<S> Rebuilder<S> {
             + 'static,
     ) -> Self {
         self.appliers.insert(full_name.to_string(), Box::new(thunk));
+        self
+    }
+
+    /// Folds pages through one batched `fold` instead of the per-type
+    /// appliers: a rebuild hands it every uncovered page (and the book's
+    /// cover) in a single call, and none when there are none. Its error
+    /// fails the rebuild as returned.
+    pub fn with_fold(
+        mut self,
+        fold: impl Fn(&mut S, &[pb::EventPage], Option<&pb::Cover>) -> Result<(), CodedError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.fold = Some(Box::new(fold));
         self
     }
 
@@ -132,6 +156,20 @@ impl<S> Rebuilder<S> {
             }
         }
 
+        if let Some(fold) = self.fold.as_ref() {
+            let uncovered: Vec<pb::EventPage> = book
+                .pages
+                .iter()
+                .filter(|p| covered_through.is_none_or(|covered| p.sequence > covered))
+                .cloned()
+                .collect();
+            if !uncovered.is_empty() {
+                fold(&mut state, &uncovered, book.cover.as_ref())?;
+                info.applied_count = uncovered.len();
+            }
+            return Ok((state, info));
+        }
+
         for page in &book.pages {
             let Some(event) = crate::page_event(page) else {
                 continue;
@@ -159,8 +197,30 @@ impl<S> Rebuilder<S> {
 }
 
 impl<S> Rebuilder<S> {
-    /// Folds one page of a book with `cover` into `state` through its applier,
-    /// returning whether an applier ran. A page with no event or an unapplied type is skipped; a
+    /// Folds `pages` of a book with `cover` into `state`: through the
+    /// batched fold in one call when one is registered (none for no pages),
+    /// otherwise page by page through the appliers ([`Self::apply_page`]).
+    pub fn apply_pages(
+        &self,
+        state: &mut S,
+        pages: &[pb::EventPage],
+        cover: Option<&pb::Cover>,
+    ) -> Result<(), CodedError> {
+        if let Some(fold) = self.fold.as_ref() {
+            if pages.is_empty() {
+                return Ok(());
+            }
+            return fold(state, pages, cover);
+        }
+        for page in pages {
+            self.apply_page(state, page, cover)?;
+        }
+        Ok(())
+    }
+
+    /// Folds one page of a book with `cover` into `state` through the batched
+    /// fold when one is registered, else its applier, returning whether
+    /// anything ran. A page with no event or an unapplied type is skipped; a
     /// corrupt payload is PERSISTED_EVENT_CORRUPT.
     pub fn apply_page(
         &self,
@@ -168,6 +228,10 @@ impl<S> Rebuilder<S> {
         page: &pb::EventPage,
         cover: Option<&pb::Cover>,
     ) -> Result<bool, CodedError> {
+        if let Some(fold) = self.fold.as_ref() {
+            fold(state, std::slice::from_ref(page), cover)?;
+            return Ok(true);
+        }
         let Some(event) = crate::page_event(page) else {
             return Ok(false);
         };

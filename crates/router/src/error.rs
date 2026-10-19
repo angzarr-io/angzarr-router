@@ -43,7 +43,6 @@ pub mod codes {
     pub const CONFLICT_UNRESOLVED: &str = "CONFLICT_UNRESOLVED";
     pub const CONFLICT_OVERLAP: &str = "CONFLICT_OVERLAP";
     pub const CONFLICT_RESOLUTION_UNSUPPORTED: &str = "CONFLICT_RESOLUTION_UNSUPPORTED";
-    pub const INCOMPLETE_COMMUTATIVE: &str = "INCOMPLETE_COMMUTATIVE";
 }
 
 /// Canonical static message text (byte-equal across languages).
@@ -66,8 +65,6 @@ pub mod messages {
     pub const CONFLICT_OVERLAP: &str = "the command's changes overlap the changes it did not see";
     pub const CONFLICT_RESOLUTION_UNSUPPORTED: &str =
         "the component does not support COMMUTATIVE conflict resolution";
-    pub const INCOMPLETE_COMMUTATIVE: &str =
-        "COMMUTATIVE needs a state packer and a snapshot loader beside changed()";
 }
 
 /// Cross-language detail-key constants.

@@ -28,12 +28,16 @@
 //! # Threading and panics
 //! Callbacks are invoked synchronously on the dispatching thread — one
 //! callback at a time per dispatch; dispatches on different host_ctx
-//! values may run concurrently. `host_ctx` is opaque to Rust: it is where
-//! the binding parks the per-dispatch session (state never crosses). One
-//! dispatch may run several components under the same `host_ctx`
-//! (co-resident sagas or process managers), so the host keys any lazily
-//! created state by component (each component's callback ids), never by
-//! session alone. Registration takes the router exclusively: it must not run
+//! values may run concurrently. `host_ctx` is opaque to Rust and passed
+//! back on every callback.
+//!
+//! # State
+//! Aggregate and process-manager state is router-owned: the router holds it
+//! as a serialized `google.protobuf.Any` of the registered state type and
+//! hands it to every callback (fold, decide, fact, PM event), which are
+//! stateless; a delivered snapshot is the initial state. Only a projector's
+//! projection instance still lives in the host's per-dispatch session
+//! (`host_ctx`), keyed by component, never by session alone. Registration takes the router exclusively: it must not run
 //! concurrently with any other call on the same router.
 //! Every entry point wraps `catch_unwind`; a Rust panic surfaces as a
 //! coded UNHANDLED_HANDLER_ERROR failure — never an abort, never an

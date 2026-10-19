@@ -501,23 +501,17 @@ impl<S> AggregateDispatch<S> {
                 let (mut state, _) = self.rebuilder.rebuild(Some(&prefix))?;
                 let resolved = resolver.resolve(
                     &mut state,
-                    &mut |state| {
-                        for page in &window {
-                            self.rebuilder.apply_page(state, page, cover)?;
-                        }
-                        Ok(())
-                    },
+                    &mut |state| self.rebuilder.apply_pages(state, &window, cover),
                     &mut |state| run(state, context(had_prior_events, None)),
                     &mut |state, book| {
-                        for page in &book.pages {
-                            self.rebuilder.apply_page(state, page, cover).map_err(|e| {
+                        self.rebuilder
+                            .apply_pages(state, &book.pages, cover)
+                            .map_err(|e| {
                                 CodedError::unhandled(&format!(
                                     "an emitted event does not fold into state: {}",
                                     e.message
                                 ))
-                            })?;
-                        }
-                        Ok(())
+                            })
                     },
                 )?;
                 if crate::conflict::overlap(&resolved.window, &resolved.mine) {

@@ -6,6 +6,7 @@ use std::cell::Cell;
 use std::ffi::c_void;
 
 use prost::Message;
+use prost_types::Any;
 
 use angzarr_router::aggregate::{AggregateDispatch, CommandContext, FactRecord};
 use angzarr_router::error::{codes, messages, CodedError, HandlerError};
@@ -77,8 +78,9 @@ fn invoke(
     (ret, consume_out(&mut out))
 }
 
-fn command_context_aux(cctx: &CommandContext) -> abi_pb::CommandContextAux {
+fn command_context_aux(cctx: &CommandContext, state: &Any) -> abi_pb::CommandContextAux {
     abi_pb::CommandContextAux {
+        state: Some(state.clone()),
         next_sequence: cctx.next_sequence,
         had_prior_events: cctx.had_prior_events,
         cover: cctx.cover.clone(),
@@ -101,12 +103,50 @@ fn host_error(ret: i32, bytes: Option<Vec<u8>>) -> HandlerError {
     HandlerError::Coded(status_to_coded(bytes.as_deref(), ret))
 }
 
+/// A rebuilder over router-owned state: a serialized `Any` of
+/// `state_type_url`, starting from the message's default (empty bytes) or a
+/// delivered snapshot's state, folded through the host's stateless fold
+/// callback in one batched call per rebuild (abi.proto, FoldCall). A failed
+/// fold is PERSISTED_EVENT_CORRUPT; an undecodable answer a host bug.
+fn state_rebuilder(state_type_url: &str, fold: Option<u64>, cb: AngzarrCb) -> Rebuilder<Any> {
+    let initial = Any {
+        type_url: angzarr_router::type_url(state_type_url),
+        value: Vec::new(),
+    };
+    let mut rebuilder = Rebuilder::new(move || initial.clone()).with_snapshot(|state, snapshot| {
+        *state = snapshot.clone();
+        Ok(())
+    });
+    if let Some(id) = fold {
+        rebuilder = rebuilder.with_fold(move |state: &mut Any, pages, cover| {
+            let call = abi_pb::FoldCall {
+                state: Some(state.clone()),
+                pages: pages.to_vec(),
+                cover: cover.cloned(),
+            }
+            .encode_to_vec();
+            let (ret, bytes) = invoke(cb, id, "", &call, &[]);
+            match ret {
+                STATUS_OK => {
+                    *state = Any::decode(bytes.unwrap_or_default().as_slice()).map_err(|_| {
+                        CodedError::unhandled("host fold returned undecodable Any bytes")
+                    })?;
+                    Ok(())
+                }
+                STATUS_OK_EMPTY => Ok(()),
+                _ => Err(CodedError::persisted_corrupt(&state.type_url)),
+            }
+        });
+    }
+    rebuilder
+}
+
 /// The registered tables behind an opaque router handle.
 pub struct FfiRouter {
     aggregates: CommandHandlers,
     projectors: Vec<(String, ProjectorDispatch<()>)>,
     sagas: Vec<(String, SagaDispatch)>,
-    process_managers: Vec<(String, ProcessManagerDispatch<()>)>,
+    process_managers: Vec<(String, ProcessManagerDispatch<Any>)>,
 }
 
 impl FfiRouter {
@@ -133,31 +173,7 @@ impl FfiRouter {
                 [],
             )
         })?;
-        let mut rebuilder: Rebuilder<()> = Rebuilder::new(|| ());
-        for applier in &desc.appliers {
-            let id = applier.callback_id;
-            rebuilder = rebuilder.apply_with_context(&applier.fq_type, move |_, any, ctx| {
-                let aux = abi_pb::ProjectorEventAux {
-                    cover: ctx.cover.cloned(),
-                    sequence: ctx.sequence,
-                }
-                .encode_to_vec();
-                let (ret, _) = invoke(cb, id, &any.type_url, &any.value, &aux);
-                if ret < 0 {
-                    return Err("host applier failed".into());
-                }
-                Ok(())
-            });
-        }
-        if let Some(id) = desc.snapshot_callback_id {
-            rebuilder = rebuilder.with_snapshot(move |_, any| {
-                let (ret, _) = invoke(cb, id, &any.type_url, &any.value, &[]);
-                if ret < 0 {
-                    return Err("host snapshot loader failed".into());
-                }
-                Ok(())
-            });
-        }
+        let rebuilder = state_rebuilder(&desc.state_type_url, desc.fold_callback_id, cb);
 
         let mut dispatch =
             AggregateDispatch::new(desc.name.clone(), desc.domain.clone(), rebuilder)
@@ -165,8 +181,8 @@ impl FfiRouter {
 
         for command in &desc.commands {
             let id = command.callback_id;
-            dispatch = dispatch.on_command(&command.fq_type, move |cmd, _, cctx| {
-                let aux = command_context_aux(&cctx).encode_to_vec();
+            dispatch = dispatch.on_command(&command.fq_type, move |cmd, state, cctx| {
+                let aux = command_context_aux(&cctx, state).encode_to_vec();
                 let (ret, bytes) = invoke(cb, id, &cmd.type_url, &cmd.value, &aux);
                 match ret {
                     STATUS_OK => {
@@ -193,35 +209,15 @@ impl FfiRouter {
             });
         }
         if let Some(changed_id) = desc.changed_callback_id {
-            let (Some(pack_id), Some(restore_id)) =
-                (desc.pack_state_callback_id, desc.snapshot_callback_id)
-            else {
-                return Err(CodedError::invalid_argument(
-                    codes::INCOMPLETE_COMMUTATIVE,
-                    messages::INCOMPLETE_COMMUTATIVE,
-                    [("aggregate".to_string(), desc.name.clone())],
-                ));
-            };
+            // Router-owned state: COMMUTATIVE captures and restores by copying
+            // the state bytes; only changed() crosses to the host.
             dispatch = dispatch.with_commutative_via(
-                move |_| {
-                    let (ret, bytes) = invoke(cb, pack_id, "", &[], &[]);
-                    if ret < 0 {
-                        return Err(host_error(ret, bytes));
-                    }
-                    prost_types::Any::decode(bytes.unwrap_or_default().as_slice()).map_err(|_| {
-                        HandlerError::Other(
-                            "host state packer returned undecodable Any bytes".to_string(),
-                        )
-                    })
-                },
-                move |_, image: &prost_types::Any| {
-                    let (ret, bytes) = invoke(cb, restore_id, &image.type_url, &image.value, &[]);
-                    if ret < 0 {
-                        return Err(host_error(ret, bytes));
-                    }
+                |state: &Any| Ok(state.clone()),
+                |state: &mut Any, image: &Any| {
+                    *state = image.clone();
                     Ok(())
                 },
-                move |before: &prost_types::Any, after: &prost_types::Any| {
+                move |before: &Any, after: &Any| {
                     let call = abi_pb::ChangedCall {
                         before: Some(before.clone()),
                         after: Some(after.clone()),
@@ -265,8 +261,13 @@ impl FfiRouter {
 
         for fact in &desc.facts {
             let id = fact.callback_id;
-            dispatch = dispatch.on_fact(&fact.fq_type, move |any, _| {
-                let (ret, bytes) = invoke(cb, id, &any.type_url, &any.value, &[]);
+            dispatch = dispatch.on_fact(&fact.fq_type, move |any, state| {
+                let aux = abi_pb::CommandContextAux {
+                    state: Some(state.clone()),
+                    ..Default::default()
+                }
+                .encode_to_vec();
+                let (ret, bytes) = invoke(cb, id, &any.type_url, &any.value, &aux);
                 match ret {
                     STATUS_OK => {
                         let record =
@@ -527,8 +528,8 @@ impl FfiRouter {
     }
 
     /// Parses a ProcessManagerDescriptor and populates a core PM table.
-    /// Stateful: appliers/snapshot rebuild the PM's own state across the
-    /// callback (host owns the instance); event thunks return a
+    /// Stateful over router-owned state (state_type_url, fold_callback_id):
+    /// event thunks receive the rebuilt state in PmEventAux and return a
     /// ProcessManagerHandleResponse, taken as emitted.
     pub fn register_process_manager(
         &mut self,
@@ -543,31 +544,7 @@ impl FfiRouter {
             )
         })?;
 
-        let mut rebuilder: Rebuilder<()> = Rebuilder::new(|| ());
-        for applier in &desc.appliers {
-            let id = applier.callback_id;
-            rebuilder = rebuilder.apply_with_context(&applier.fq_type, move |_, any, ctx| {
-                let aux = abi_pb::ProjectorEventAux {
-                    cover: ctx.cover.cloned(),
-                    sequence: ctx.sequence,
-                }
-                .encode_to_vec();
-                let (ret, _) = invoke(cb, id, &any.type_url, &any.value, &aux);
-                if ret < 0 {
-                    return Err("host applier failed".into());
-                }
-                Ok(())
-            });
-        }
-        if let Some(id) = desc.snapshot_callback_id {
-            rebuilder = rebuilder.with_snapshot(move |_, any| {
-                let (ret, _) = invoke(cb, id, &any.type_url, &any.value, &[]);
-                if ret < 0 {
-                    return Err("host snapshot loader failed".into());
-                }
-                Ok(())
-            });
-        }
+        let rebuilder = state_rebuilder(&desc.state_type_url, desc.fold_callback_id, cb);
 
         let mut dispatch = ProcessManagerDispatch::new(
             desc.name.clone(),
@@ -582,9 +559,10 @@ impl FfiRouter {
             dispatch = dispatch.on_event(
                 &event.input_domain,
                 &event.fq_type,
-                move |any, _state, trigger_cover| {
+                move |any, state, trigger_cover| {
                     let aux = abi_pb::PmEventAux {
                         trigger_cover: trigger_cover.cloned(),
+                        state: Some(state.clone()),
                     }
                     .encode_to_vec();
                     let (ret, bytes) = invoke(cb, id, &any.type_url, &any.value, &aux);
@@ -612,9 +590,8 @@ impl FfiRouter {
 
     /// Decodes ProcessManagerHandleRequest bytes, routes to the addressed
     /// co-resident PMs, and runs each core dispatch with the host session
-    /// installed. Every selected PM runs under the same host_ctx; the host keys
-    /// its lazily created state per component (by callback id), so no PM ever
-    /// folds into another's state.
+    /// installed. Each PM's state is router-owned and rebuilt from its own
+    /// process state, so no PM ever folds into another's state.
     pub fn dispatch_process_manager(
         &self,
         host_ctx: *mut c_void,

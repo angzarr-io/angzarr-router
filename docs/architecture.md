@@ -87,23 +87,23 @@ Go (cgo), Java (FFM), C# (P/Invoke), TypeScript (koffi),
 C++ (static link). **Parked:** every binding is still written against ABI 3
 and the pre-latest-spec protos; CI does not build them until each is ported
 to ABI 4. Each binding checks `angzarr_abi_version` against the
-version it was written for before first use. Each dispatch creates one
-session (the `host_ctx`); several components may run under one session
-(co-resident sagas or process managers), so lazily created host state is
+version it was written for before first use. Aggregate and process-manager
+callbacks are stateless (the router owns their state); each dispatch still
+creates one session (the `host_ctx`) for a projector's projection instance,
 keyed by component, never by session alone.
 
 ## Engine semantics
 
 | Semantic | Contract |
 |---|---|
-| State rebuild | Snapshot applies first; pages at or below a LOADED snapshot's sequence never re-apply (a snapshot with no loader or no state covers nothing); pageless or unknown-type entries are skipped, never terminal; a corrupt persisted payload fails with `PERSISTED_EVENT_CORRUPT` |
+| State rebuild | Snapshot applies first; pages at or below a LOADED snapshot's sequence never re-apply (a snapshot with no loader or no state covers nothing); pageless or unknown-type entries are skipped, never terminal; a corrupt persisted payload fails with `PERSISTED_EVENT_CORRUPT`; a batched fold (`Rebuilder::with_fold`) gets every uncovered page in one call. Across the C ABI, aggregate and process-manager state is router-owned: a serialized `Any` of the registered state type, the delivered snapshot's state as the initial value, folded by one stateless host fold call per rebuild and handed to every decide / fact / PM callback |
 | Aggregate dispatch | `CommandHandlerService.Handle` is the only input: envelope, body arm and type validate BEFORE rebuild (unknown command → `NO_HANDLER_REGISTERED`, INVALID_ARGUMENT); handlers receive `CommandContext` (next sequence, had-prior-events, the handled cover); the emitted book passes through as the handler returned it (the coordinator stamps sequences and meta) |
 | Reaction commands | Saga and process-manager commands pass through as the handler emitted them: the coordinator stamps their identity, causation and correlation. A saga handler sees the triggering page's cover and sequence; a process-manager handler sees the trigger cover |
 | Saga dispatch | EVERY page of the source book dispatches; undeclared types are skipped (C-0051) |
 | Facts | A fact arrives in the Fact arm of the command page and runs the fact handler registered for its type; a type with none (a command type included: the arm must match the handler's kind) is `NO_FACT_HANDLER` (INVALID_ARGUMENT) before any rebuild, so nothing is recorded. Otherwise the handler sees the rebuilt state and returns the fact to record (it may annotate it, never refuse it) followed by events that flag it; they come back as the response's events, payloads only. Facts route by (cover domain, fact type), else to the domain's first aggregate, which refuses them. There is no Replay |
 | Command upcasting | Command and fact payloads run through the aggregate's upcaster chains before dispatch; a refusal names the sent type URL, its extras the chain's last (`upcast_type_url`); routing tries the sent type, then the aggregate of the domain whose chain serves it (docs/design-handling.md) |
 | Conflicts | Handlers see the resolved `Handling` (`expected_sequence`, `conflict_resolution`). AGGREGATE_HANDLES hands the window and nonce in `CommandContext.conflict`; output without `resolve_conflicts(window, nonce)` on exactly that nonce is discarded: `CONFLICT_UNRESOLVED` (ABORTED). COMMUTATIVE runs in the router over the generated `changed()`: decide on the head, keep the events iff `changed(expected, head)` and `changed(head, head + events)` do not overlap, else `CONFLICT_OVERLAP` (ABORTED); none registered: `CONFLICT_RESOLUTION_UNSUPPORTED` |
-| Rules version | Every `CommandHandlerResponse` and `ProcessManagerHandleResponse` reports the component's declared rules version. Snapshot validity is the coordinator's, not the router's |
+| Rules version | Every `CommandHandlerResponse` and `ProcessManagerHandleResponse` carries the binary's declared rules version, overwriting a handler's; co-hosted PMs share it. Snapshot selection is the coordinator's (decision 14.1) |
 | Process manager | The newest page of the trigger book dispatches; handlers receive the trigger cover; co-resident PMs are selected by identity first — a process state reaches the PM owning its cover domain — and otherwise every PM consuming the trigger domain; responses merge in registration order. Process events pass through as emitted (the coordinator addresses and stamps them) |
 | Projector | Folds every page into one projection instance, each fold seeing the book cover and the page's sequence; undeclared domains fold nothing (C-0032), and a projector declaring `"*"` consumes every domain; unmatched types are skipped with a WARN |
 | Type URLs | Emitted type URLs use the bare `/` prefix; incoming ones match by the fully-qualified name after the last `/`, whatever the prefix |

@@ -370,3 +370,106 @@ fn context_appliers_see_the_book_cover_and_page_sequence() {
         .apply_page(&mut state, &pb::EventPage::default(), None)
         .expect("no event"));
 }
+
+// --- the batched fold (router-owned state across the C ABI) ----------------
+
+/// Each batched fold call: its page sequences and cover domain.
+type FoldCalls = Arc<std::sync::Mutex<Vec<(Vec<u64>, String)>>>;
+
+/// A fold recording each call's page sequences and the cover domain.
+fn batch_rebuilder(calls: FoldCalls) -> crate::rebuild::Rebuilder<TestState> {
+    fresh_rebuilder()
+        .with_snapshot(|s, _| {
+            s.applied.push("snap".to_string());
+            Ok(())
+        })
+        .with_fold(move |s: &mut TestState, pages, cover| {
+            calls.lock().unwrap().push((
+                pages.iter().map(|p| p.sequence).collect(),
+                cover.map(|c| c.domain.clone()).unwrap_or_default(),
+            ));
+            s.applied.push(format!("fold{}", pages.len()));
+            Ok(())
+        })
+}
+
+#[test]
+fn a_batched_fold_sees_every_uncovered_page_in_one_call() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let r = batch_rebuilder(calls.clone());
+    let book = pb::EventBook {
+        cover: Some(pb::Cover {
+            domain: "ledger".to_string(),
+            ..Default::default()
+        }),
+        snapshot: Some(pb::Snapshot {
+            sequence: 1,
+            state: Some(cover_any("snap")),
+            ..Default::default()
+        }),
+        pages: vec![
+            sequenced_event_page(1, cover_any("covered")),
+            sequenced_event_page(2, cover_any("a")),
+            sequenced_event_page(3, pb::EventPage::default().payload.unwrap_or_default()),
+        ],
+        ..Default::default()
+    };
+    let (state, info) = r.rebuild(Some(&book)).expect("rebuild");
+    assert_eq!(state.applied, vec!["snap", "fold2"]);
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![(vec![2, 3], "ledger".to_string())]
+    );
+    assert_eq!(info.applied_count, 2, "every folded page counts");
+}
+
+#[test]
+fn a_batched_fold_is_not_called_without_pages() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let r = batch_rebuilder(calls.clone());
+    r.rebuild(None).expect("absent");
+    r.rebuild(Some(&pb::EventBook::default())).expect("empty");
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_batched_fold_failure_fails_the_rebuild_with_its_code() {
+    let r = fresh_rebuilder().with_fold(|_s: &mut TestState, _pages, _cover| {
+        Err(crate::error::CodedError::persisted_corrupt("/test.Bad"))
+    });
+    let err = r
+        .rebuild(Some(&book_of_covers(&["a"])))
+        .expect_err("the fold failed");
+    assert_eq!(err.code, codes::PERSISTED_EVENT_CORRUPT);
+}
+
+#[test]
+fn apply_pages_folds_a_batch_in_one_call() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let r = batch_rebuilder(calls.clone());
+    let mut state = TestState::default();
+    let book = book_of_covers(&["a", "b"]);
+    r.apply_pages(&mut state, &book.pages, None)
+        .expect("folded");
+    r.apply_pages(&mut state, &[], None)
+        .expect("nothing to fold");
+    assert_eq!(*calls.lock().unwrap(), vec![(vec![0, 1], String::new())]);
+
+    // Without a batched fold, apply_pages applies each page through its applier.
+    let r = cover_applier(fresh_rebuilder());
+    let mut state = TestState::default();
+    r.apply_pages(&mut state, &book.pages, None)
+        .expect("applied");
+    assert_eq!(state.applied, vec!["a", "b"]);
+}
+
+#[test]
+fn apply_page_goes_through_a_batched_fold_when_registered() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let r = batch_rebuilder(calls.clone());
+    let mut state = TestState::default();
+    assert!(r
+        .apply_page(&mut state, &sequenced_event_page(4, cover_any("a")), None)
+        .expect("folded"));
+    assert_eq!(*calls.lock().unwrap(), vec![(vec![4], String::new())]);
+}
