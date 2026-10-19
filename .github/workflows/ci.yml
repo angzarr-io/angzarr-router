@@ -2,6 +2,8 @@
 # every recipe runs in the org's pinned toolchain image. Codegen never touches
 # the Buf Schema Registry: protos come from the angzarr-project submodule, and
 # protoc, protoc-gen-es and the angzarr CLI are pinned (justfile.container).
+# The language bindings (bindings/<lang>) are parked at ABI 3 and not built
+# here until each is ported to ABI 4.
 name: CI
 
 on:
@@ -48,36 +50,3 @@ jobs:
 
       - name: Proto format
         run: just buf-format
-
-  binding:
-    name: binding (${{ matrix.lang }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        lang: [go, java, csharp, cpp, ts]
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: true
-
-      - uses: extractions/setup-just@v2
-
-      - name: Log in to ghcr.io (toolchain images)
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Pinned codegen toolchain cache
-        uses: actions/cache@v4
-        with:
-          path: .tools
-          key: tools-${{ matrix.lang }}-${{ hashFiles('justfile.container') }}
-
-      - name: Conformance
-        run: just ${{ matrix.lang }}-binding-test
-
-      - name: Lint
-        run: just ${{ matrix.lang }}-binding-lint

@@ -84,7 +84,9 @@ core:
 ### bindings/<language>
 
 Go (cgo), Java (FFM), C# (P/Invoke), TypeScript (koffi),
-C++ (static link). Each binding checks `angzarr_abi_version` against the
+C++ (static link). **Parked:** every binding is still written against ABI 3
+and the pre-latest-spec protos; CI does not build them until each is ported
+to ABI 4. Each binding checks `angzarr_abi_version` against the
 version it was written for before first use. Each dispatch creates one
 session (the `host_ctx`); several components may run under one session
 (co-resident sagas or process managers), so lazily created host state is
@@ -113,7 +115,7 @@ libraries.
 - `just test`: the core unit bank, the FFI's raw-pointer ABI consumer test
   (`crates/router-ffi/src/lib.test.rs`), and the conformance features
   driven natively by cucumber-rs (`crates/conformance`).
-- `just <lang>-binding-test`: the same `conformance/features` run through
+- `just <lang>-binding-test` (parked at ABI 3, not run in CI): the same `conformance/features` run through
   each binding against fixtures implementing the generated handler
   interfaces from `conformance/proto/test/counter/counter.proto`, plus
   binding-local tests.

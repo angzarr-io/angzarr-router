@@ -82,7 +82,7 @@ just test               # core + FFI ABI tests + native conformance suite
 just mutation-test      # cargo-mutants over the core, the FFI registry and archlint
 just lint               # clippy -D warnings
 just archlint           # module-level layer rules (archlint.toml)
-just <lang>-binding-test  # go | py | java | csharp | cpp | ts: conformance via that binding
+just <lang>-binding-test  # go | java | csharp | cpp | ts: conformance via that binding (parked at ABI 3)
 ```
 
 Every recipe runs in the org toolchain image for its language (see
