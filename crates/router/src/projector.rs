@@ -40,6 +40,7 @@ pub struct ProjectorDispatch<P> {
     handlers: HashMap<String, EventFn<P>>,
     fold: Option<BatchFoldFn<P>>,
     finish: Option<FinishFn<P>>,
+    rules_version: String,
 }
 
 impl<P> ProjectorDispatch<P> {
@@ -52,6 +53,7 @@ impl<P> ProjectorDispatch<P> {
             handlers: HashMap::new(),
             fold: None,
             finish: None,
+            rules_version: String::new(),
         }
     }
 
@@ -102,6 +104,31 @@ impl<P> ProjectorDispatch<P> {
     ) -> Self {
         self.finish = Some(Box::new(thunk));
         self
+    }
+
+    /// The rules version the projector registers with: the business
+    /// binary's full version, baked in at build. Empty until declared.
+    pub fn with_rules_version(mut self, rules_version: impl Into<String>) -> Self {
+        self.rules_version = rules_version.into();
+        self
+    }
+
+    /// The registration hello (types.proto, ComponentDescriptor): kind
+    /// PROJECTOR, its declared domains as inputs (`*` when it declares
+    /// none), and no state. Refused MISSING_RULES_VERSION without a rules
+    /// version.
+    pub fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError> {
+        let inputs: Vec<String> = match self.domains.as_ref() {
+            Some(domains) => domains.iter().cloned().collect(),
+            None => vec![crate::WILDCARD_DOMAIN.to_string()],
+        };
+        crate::descriptor::component_descriptor(
+            &self.name,
+            pb::ComponentKind::Projector,
+            inputs,
+            &self.rules_version,
+            None,
+        )
     }
 
     /// The component name.

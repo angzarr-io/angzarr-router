@@ -30,6 +30,7 @@ pub struct SagaDispatch {
     input_domain: String,
     targets: Vec<String>,
     handlers: HashMap<String, EventFn>,
+    rules_version: String,
 }
 
 impl SagaDispatch {
@@ -45,6 +46,7 @@ impl SagaDispatch {
             input_domain: input_domain.into(),
             targets: target_domains.into_iter().map(Into::into).collect(),
             handlers: HashMap::new(),
+            rules_version: String::new(),
         }
     }
 
@@ -74,6 +76,26 @@ impl SagaDispatch {
     ) -> Self {
         self.handlers.insert(full_name.to_string(), Box::new(thunk));
         self
+    }
+
+    /// The rules version the saga registers with: the business binary's
+    /// full version, baked in at build. Empty until declared.
+    pub fn with_rules_version(mut self, rules_version: impl Into<String>) -> Self {
+        self.rules_version = rules_version.into();
+        self
+    }
+
+    /// The registration hello (types.proto, ComponentDescriptor): kind SAGA,
+    /// its input domain as its input, and no state. Refused
+    /// MISSING_RULES_VERSION without a rules version.
+    pub fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError> {
+        crate::descriptor::component_descriptor(
+            &self.name,
+            pb::ComponentKind::Saga,
+            [self.input_domain.clone()],
+            &self.rules_version,
+            None,
+        )
     }
 
     /// The component name.

@@ -227,6 +227,36 @@ impl<S> AggregateDispatch<S> {
         self
     }
 
+    /// The registration hello (types.proto, ComponentDescriptor): kind
+    /// AGGREGATE, no inputs (an aggregate consumes commands, not events), and
+    /// the state named by `S`'s prost name. Refused MISSING_RULES_VERSION
+    /// without a rules version.
+    pub fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError>
+    where
+        S: prost::Name,
+    {
+        self.component_descriptor_with_state(&S::full_name())
+    }
+
+    /// [`Self::component_descriptor`] for state held as something other
+    /// than its own message (an `Any` across the C ABI): `state_full_name`
+    /// is the state message's fully-qualified name.
+    pub fn component_descriptor_with_state(
+        &self,
+        state_full_name: &str,
+    ) -> Result<pb::ComponentDescriptor, CodedError> {
+        crate::descriptor::component_descriptor(
+            &self.name,
+            pb::ComponentKind::Aggregate,
+            [],
+            &self.rules_version,
+            Some(crate::descriptor::state_descriptor(
+                state_full_name,
+                self.commutative.is_some(),
+            )),
+        )
+    }
+
     /// Supports COMMUTATIVE conflict resolution with the state's generated
     /// `changed(before, after)` (backlog CR-1): the router folds the state to
     /// the expected sequence and to the head, runs decide on the head, and

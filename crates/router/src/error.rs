@@ -43,6 +43,7 @@ pub mod codes {
     pub const CONFLICT_UNRESOLVED: &str = "CONFLICT_UNRESOLVED";
     pub const CONFLICT_OVERLAP: &str = "CONFLICT_OVERLAP";
     pub const CONFLICT_RESOLUTION_UNSUPPORTED: &str = "CONFLICT_RESOLUTION_UNSUPPORTED";
+    pub const MISSING_RULES_VERSION: &str = "MISSING_RULES_VERSION";
 }
 
 /// Canonical static message text (byte-equal across languages).
@@ -65,6 +66,7 @@ pub mod messages {
     pub const CONFLICT_OVERLAP: &str = "the command's changes overlap the changes it did not see";
     pub const CONFLICT_RESOLUTION_UNSUPPORTED: &str =
         "the component does not support COMMUTATIVE conflict resolution";
+    pub const MISSING_RULES_VERSION: &str = "a component registers with its rules version";
     pub const FOLD_FAILED: &str = "the state fold failed on an event it had accepted";
 }
 
