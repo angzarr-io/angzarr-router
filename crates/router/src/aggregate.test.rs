@@ -1,7 +1,7 @@
 //! AggregateDispatch contracts, transliterated from client-go's
 //! engine_test.go + engine_boundaries_test.go aggregate subset:
 //! validate-before-rebuild, exact envelope guard codes, CommandContext
-//! evidence, and fill-only ext/sequence stamping.
+//! evidence, and an emitted book that passes through unstamped.
 
 use std::sync::{Arc, Mutex};
 
@@ -162,109 +162,46 @@ fn command_types_exact() {
     assert_eq!(d.command_types(), vec!["test.CreateOrder".to_string()]);
 }
 
-// The dispatch path stamps the command's cover.ext onto the emitted
-// EventBook's cover — FILL-ONLY, never overriding a handler-set ext.
-// Emitted pages without headers get consecutive sequences from the
-// aggregate's next sequence (fill-only).
+// The router stamps nothing on the emitted EventBook: no page sequences
+// and no cover propagation from the command (the coordinator stamps
+// sequences and metadata). The handler's book passes through unchanged.
 #[test]
-fn stamps_ext_and_sequences_fill_only() {
-    let parent = cover_any("parent");
-    let handler_ext = cover_any("handler-set");
-
-    let explicit_ext = handler_ext.clone();
-    let d = AggregateDispatch::new("agg", "order", fresh_rebuilder())
-        .on_command("test.Create", |_, _: &mut TestState, _| {
+fn emitted_book_passes_through_unstamped() {
+    let d = AggregateDispatch::new("agg", "order", fresh_rebuilder()).on_command(
+        "test.Create",
+        |_, _: &mut TestState, _| {
             Ok(Some(pb::EventBook {
                 pages: vec![pb::EventPage::default(), pb::EventPage::default()],
                 ..Default::default()
             }))
-        })
-        .on_command("test.Explicit", move |_, _: &mut TestState, _| {
-            Ok(Some(pb::EventBook {
-                cover: Some(pb::Cover {
-                    ext: Some(explicit_ext.clone()),
-                    ..Default::default()
-                }),
-                pages: vec![pb::EventPage {
-                    header: Some(pb::PageHeader {
-                        sequence_type: Some(pb::page_header::SequenceType::Sequence(99)),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }],
+        },
+    );
+    let req = pb::ContextualCommand {
+        command: Some(pb::CommandBook {
+            cover: Some(pb::Cover {
+                domain: "order".to_string(),
+                ext: Some(cover_any("parent")),
                 ..Default::default()
-            }))
-        });
-
-    let cmd_with = |fq_type: &str, ext: Option<Any>, next_seq: u32| {
-        let mut req = pb::ContextualCommand {
-            command: Some(pb::CommandBook {
-                cover: Some(pb::Cover {
-                    domain: "order".to_string(),
-                    ext,
-                    ..Default::default()
-                }),
-                pages: vec![pb::CommandPage {
-                    payload: Some(pb::command_page::Payload::Command(Any {
-                        type_url: format!("{TYPE_URL_PREFIX}{fq_type}"),
-                        value: Vec::new(),
-                    })),
-                    ..Default::default()
-                }],
             }),
-            ..Default::default()
-        };
-        if next_seq > 0 {
-            req.events = Some(pb::EventBook {
-                next_sequence: next_seq,
-                pages: vec![pb::EventPage::default()],
+            pages: vec![pb::CommandPage {
+                payload: Some(pb::command_page::Payload::Command(Any {
+                    type_url: format!("{TYPE_URL_PREFIX}test.Create"),
+                    value: Vec::new(),
+                })),
                 ..Default::default()
-            });
-        }
-        req
+            }],
+        }),
+        events: Some(pb::EventBook {
+            next_sequence: 5,
+            pages: vec![pb::EventPage::default()],
+            ..Default::default()
+        }),
     };
-
-    // Fill: command ext propagates to the emitted book's cover; headerless
-    // pages get sequences next_seq, next_seq+1.
-    let resp = d
-        .dispatch(&cmd_with("test.Create", Some(parent.clone()), 5))
-        .expect("dispatch");
+    let resp = d.dispatch(&req).expect("dispatch");
     let events = events_of(&resp).expect("events");
-    assert_eq!(
-        events
-            .cover
-            .as_ref()
-            .and_then(|c| c.ext.as_ref())
-            .map(|e| e.type_url.as_str()),
-        Some(parent.type_url.as_str()),
-        "command cover.ext not stamped onto emitted book"
-    );
-    let seqs: Vec<u32> = events.pages.iter().map(crate::page_sequence).collect();
-    assert_eq!(seqs, vec![5, 6], "fill-only sequence stamping");
-
-    // Never override: handler-set ext and explicit headers survive.
-    let resp = d
-        .dispatch(&cmd_with("test.Explicit", Some(parent.clone()), 5))
-        .expect("dispatch");
-    let events = events_of(&resp).expect("events");
-    assert_eq!(
-        events.cover.as_ref().and_then(|c| c.ext.as_ref()),
-        Some(&handler_ext),
-        "handler-set ext was overridden"
-    );
-    assert_eq!(
-        crate::page_sequence(&events.pages[0]),
-        99,
-        "explicit page header was overridden"
-    );
-
-    // No ext on the command → emitted cover.ext stays unset.
-    let resp = d
-        .dispatch(&cmd_with("test.Create", None, 0))
-        .expect("dispatch");
-    let events = events_of(&resp).expect("events");
+    assert!(events.cover.is_none(), "router must not stamp a cover");
     assert!(
-        events.cover.as_ref().and_then(|c| c.ext.as_ref()).is_none(),
-        "ext invented from nothing"
+        events.pages.iter().all(|p| p.header.is_none()),
+        "router must not stamp page sequences"
     );
 }

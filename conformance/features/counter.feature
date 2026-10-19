@@ -8,7 +8,8 @@ Feature: Counter aggregate dispatch
   Scenario Outline: increasing a new counter records that many events
     Given a new counter
     When the operator increases the counter by <amount>
-    Then <amount> increases are recorded, starting at sequence 0
+    Then <amount> increases are recorded
+    And the recorded events carry no router-stamped sequence
 
     Examples:
       | amount |
@@ -19,7 +20,8 @@ Feature: Counter aggregate dispatch
   Scenario: a prior increase folds in before the next command
     Given a counter that has already recorded 1 increase
     When the operator increases the counter by 2
-    Then 2 increases are recorded, continuing from sequence 1
+    Then 2 increases are recorded
+    And the handler saw prior history, at next sequence 1
 
   Scenario: increasing by zero is rejected and records nothing
     Given a new counter
@@ -53,11 +55,6 @@ Feature: Counter aggregate dispatch
     Given a counter whose history holds a corrupt event
     When the operator increases the counter by 1
     Then the command fails with PERSISTED_EVENT_CORRUPT
-
-  Scenario: emitted events inherit the command's parent linkage
-    Given a new counter
-    When the operator increases the counter by 1 on behalf of a parent
-    Then the recorded events carry the parent linkage
 
   Scenario: a fresh counter supplies no prior-history evidence to the handler
     Given a new counter

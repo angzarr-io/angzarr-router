@@ -418,28 +418,6 @@ pub fn increase_command(n: u32) -> pb::ContextualCommand {
     cc
 }
 
-/// A well-known opaque linkage stamped on a command's cover, used to prove
-/// fill-only ext propagation onto emitted events.
-pub fn parent_linkage() -> prost_types::Any {
-    prost_types::Any {
-        type_url: angzarr_router::type_url("test.counter.Parent"),
-        value: vec![1, 2, 3],
-    }
-}
-
-/// An IncreaseBy command carrying parent linkage on its cover.
-pub fn increase_command_with_linkage(n: u32) -> pb::ContextualCommand {
-    let mut cc = increase_command(n);
-    cc.command
-        .as_mut()
-        .expect("command book")
-        .cover
-        .as_mut()
-        .expect("cover")
-        .ext = Some(parent_linkage());
-    cc
-}
-
 /// The FailHard command (no scenario data).
 pub fn failhard_command() -> pb::ContextualCommand {
     parse_txtpb(CONTEXTUAL_COMMAND, SKEL_FAILHARD)
