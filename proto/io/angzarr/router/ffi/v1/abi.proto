@@ -66,15 +66,15 @@ message ProjectorDescriptor {
   // Packs the folded projection into the wire Projection; absent → the core
   // returns a default Projection (cover + name only).
   optional uint64 finish_callback_id = 4;
-  // Observes events with no fold thunk; absent → such events are skipped
-  // (the core logs a warn).
-  optional uint64 unknown_callback_id = 5;
+  // Field 5 was `unknown_callback_id` (removed — events with no fold thunk
+  // are skipped and the core logs a warn).
+  reserved 5;
+  reserved "unknown_callback_id";
 }
 
 // Registration payload for one saga component. A stateless translator:
-// declared events emit commands (deferred; the router stamps their
-// provenance) and/or injected fact events. Empty `target_domains` is
-// allowed.
+// declared events emit commands, passed through as emitted (the coordinator
+// stamps their identity and provenance). Empty `target_domains` is allowed.
 message SagaDescriptor {
   string name = 1;
   string input_domain = 2;
@@ -96,18 +96,16 @@ message CommandContextAux {
 
 // aux payload for saga event callbacks: the source event's cover passed
 // through whole (serialized angzarr Cover) so the saga can route emitted
-// commands by the trigger's identity (root, ext). The host returns a
-// SagaResponse (commands + injected fact events); the router stamps the
-// commands deferred.
+// commands by the trigger's identity. The host returns a SagaResponse whose
+// `commands` are taken as emitted.
 message SagaEventAux {
   reserved 1;
   reserved "destination_sequences";
   // The source book's cover, passed through whole and typed (Rust owns the
   // deserialization) so the saga can route emitted commands by the trigger's
-  // identity (root, ext).
+  // identity.
   io.angzarr.v1.Cover source_cover = 2;
-  // The source event's explicit sequence (0 when the page carries none): the
-  // source_seq the router records on the emitted commands.
+  // The source event's explicit sequence (0 when the page carries none).
   uint32 source_seq = 3;
 }
 
@@ -141,8 +139,7 @@ message PmEventEntry {
 }
 
 // aux payload for process-manager event callbacks: the trigger book's cover.
-// The host returns a ProcessManagerHandleResponse; the router stamps its
-// commands deferred.
+// The host returns a ProcessManagerHandleResponse, taken as emitted.
 message PmEventAux {
   reserved 1;
   reserved "destination_sequences";

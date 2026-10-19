@@ -301,13 +301,6 @@ impl FfiRouter {
                 Ok(())
             });
         }
-        if let Some(id) = desc.unknown_callback_id {
-            // The unknown-event hook is an observer: its status is not part
-            // of the projection outcome.
-            dispatch = dispatch.on_unknown(move |type_url| {
-                invoke(cb, id, type_url, &[], &[]);
-            });
-        }
         if let Some(id) = desc.finish_callback_id {
             dispatch = dispatch.finish(move |_, events| {
                 let book = events.encode_to_vec();
@@ -461,8 +454,8 @@ impl FfiRouter {
 
     /// Parses a SagaDescriptor and populates a core saga table with
     /// callback-marshaling thunks. Event thunks pass the source cover and the
-    /// event's sequence to the host, which returns a SagaResponse; the core
-    /// stamps its commands deferred.
+    /// event's sequence to the host, which returns a SagaResponse whose
+    /// commands are taken as emitted.
     pub fn register_saga(&mut self, descriptor: &[u8], cb: AngzarrCb) -> Result<(), CodedError> {
         let desc = abi_pb::SagaDescriptor::decode(descriptor).map_err(|_| {
             CodedError::invalid_argument(
@@ -479,30 +472,28 @@ impl FfiRouter {
 
         for event in &desc.events {
             let id = event.callback_id;
-            dispatch =
-                dispatch.on_event_with_context(&event.fq_type, move |any, _dests, source| {
-                    let aux = abi_pb::SagaEventAux {
-                        source_cover: source.cover.cloned(),
-                        source_seq: source.sequence,
-                    }
-                    .encode_to_vec();
-                    let (ret, bytes) = invoke(cb, id, &any.type_url, &any.value, &aux);
-                    match ret {
-                        STATUS_OK => {
-                            let resp =
-                                pb::SagaResponse::decode(bytes.unwrap_or_default().as_slice())
-                                    .map_err(|_| {
-                                        HandlerError::Other(
+            dispatch = dispatch.on_event_with_context(&event.fq_type, move |any, source| {
+                let aux = abi_pb::SagaEventAux {
+                    source_cover: source.cover.cloned(),
+                    source_seq: source.sequence,
+                }
+                .encode_to_vec();
+                let (ret, bytes) = invoke(cb, id, &any.type_url, &any.value, &aux);
+                match ret {
+                    STATUS_OK => {
+                        let resp = pb::SagaResponse::decode(bytes.unwrap_or_default().as_slice())
+                            .map_err(|_| {
+                            HandlerError::Other(
                                 "host saga handler returned undecodable SagaResponse bytes"
                                     .to_string(),
                             )
-                                    })?;
-                            Ok((resp.commands, resp.events))
-                        }
-                        STATUS_OK_EMPTY => Ok((Vec::new(), Vec::new())),
-                        _ => Err(host_error(ret, bytes)),
+                        })?;
+                        Ok(resp.commands)
                     }
-                });
+                    STATUS_OK_EMPTY => Ok(Vec::new()),
+                    _ => Err(host_error(ret, bytes)),
+                }
+            });
         }
 
         self.sagas.push((desc.name, dispatch));
@@ -562,9 +553,7 @@ impl FfiRouter {
             .filter(|(_, s)| s.input_domain() == domain)
         {
             matched = true;
-            let resp = saga.dispatch(&req)?;
-            merged.commands.extend(resp.commands);
-            merged.events.extend(resp.events);
+            merged.commands.extend(saga.dispatch(&req)?.commands);
         }
         // A source domain no saga consumes is NO_HANDLER_REGISTERED (a PM
         // trigger no PM consumes is a no-op instead, C-0022).
@@ -581,7 +570,7 @@ impl FfiRouter {
     /// Parses a ProcessManagerDescriptor and populates a core PM table.
     /// Stateful: appliers/snapshot rebuild the PM's own state across the
     /// callback (host owns the instance); event thunks return a
-    /// ProcessManagerHandleResponse whose commands the core stamps deferred.
+    /// ProcessManagerHandleResponse, taken as emitted.
     pub fn register_process_manager(
         &mut self,
         descriptor: &[u8],
@@ -633,7 +622,7 @@ impl FfiRouter {
             dispatch = dispatch.on_event(
                 &event.input_domain,
                 &event.fq_type,
-                move |any, _state, _dests, trigger_cover| {
+                move |any, _state, trigger_cover| {
                     let aux = abi_pb::PmEventAux {
                         trigger_cover: trigger_cover.cloned(),
                     }

@@ -196,24 +196,6 @@ fn finish_customizes_projection() {
 }
 
 #[test]
-fn on_unknown_observes_unhandled_type_url() {
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let captured = seen.clone();
-    let d = ProjectorDispatch::new("write-model", Folded::default)
-        .on_event(&cover_full_name(), fold_cover)
-        .on_unknown(move |url| captured.lock().unwrap().push(url.to_string()));
-    let pages = vec![event_page(Any {
-        type_url: type_url("test.Unregistered"),
-        value: Vec::new(),
-    })];
-    d.dispatch(&book("order", pages)).expect("dispatch");
-    assert_eq!(
-        seen.lock().unwrap().as_slice(),
-        &[type_url("test.Unregistered")]
-    );
-}
-
-#[test]
 fn accessors_report_name_and_registered_types() {
     let d = counting_projector(None);
     assert_eq!(d.name(), "write-model");

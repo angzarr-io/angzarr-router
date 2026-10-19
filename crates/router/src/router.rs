@@ -494,9 +494,7 @@ impl Router {
         let mut matched = false;
         for saga in sagas.iter().filter(|s| s.input_domain() == domain) {
             matched = true;
-            let resp = saga.dispatch(req)?;
-            merged.commands.extend(resp.commands);
-            merged.events.extend(resp.events);
+            merged.commands.extend(saga.dispatch(req)?.commands);
         }
         if !matched {
             return Err(CodedError::invalid_argument(

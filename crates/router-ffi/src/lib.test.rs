@@ -475,7 +475,7 @@ fn abi_version_is_four() {
 }
 
 #[test]
-fn empty_history_command_emits_stamped_events() {
+fn empty_history_command_emits_unstamped_events() {
     let router = Router::with_counter();
     let session = next_session();
     let (ret, bytes) = router.dispatch(
@@ -487,13 +487,11 @@ fn empty_history_command_emits_stamped_events() {
     let Some(pb::business_response::Result::Events(book)) = resp.result else {
         panic!("expected events result");
     };
-    assert_eq!(book.pages.len(), 2);
-    let seqs: Vec<u32> = book
-        .pages
-        .iter()
-        .map(angzarr_router::page_sequence)
-        .collect();
-    assert_eq!(seqs, vec![0, 1], "fill-only stamping from next_sequence 0");
+    assert_eq!(
+        book,
+        increased_book(2),
+        "the host's book crosses back as emitted: the coordinator stamps sequences"
+    );
 
     let s = session_snapshot(session);
     assert_eq!(
@@ -502,33 +500,6 @@ fn empty_history_command_emits_stamped_events() {
         "fresh aggregate evidence"
     );
     assert_eq!(s.counter, 0, "no history — appliers must not run");
-}
-
-#[test]
-fn command_cover_ext_survives_the_round_trip() {
-    // Fill-only ext is not an aux channel — it rides in-band inside the
-    // ContextualCommand / BusinessResponse book bytes. This pins that the
-    // stamped cover.ext survives the FFI seam, not just the native path.
-    let router = Router::with_counter();
-    let session = next_session();
-    let ext = Any {
-        type_url: "type.googleapis.com/test.counter.Parent".to_string(),
-        value: vec![1, 2, 3],
-    };
-    let mut req = command_req(FQ_INCREASE_BY, IncreaseBy { n: 1 }.encode_to_vec(), None);
-    req.command.as_mut().unwrap().cover.as_mut().unwrap().ext = Some(ext.clone());
-
-    let (ret, bytes) = router.dispatch(session, &req);
-    assert_eq!(ret, 0);
-    let resp = decode_response(&bytes);
-    let Some(pb::business_response::Result::Events(book)) = resp.result else {
-        panic!("expected events result");
-    };
-    assert_eq!(
-        book.cover.as_ref().and_then(|c| c.ext.as_ref()),
-        Some(&ext),
-        "command cover.ext must survive the FFI round-trip onto the emitted book",
-    );
 }
 
 #[test]
@@ -557,12 +528,9 @@ fn prior_events_fold_through_host_appliers() {
         panic!("expected events result");
     };
     assert_eq!(
-        book.pages
-            .iter()
-            .map(angzarr_router::page_sequence)
-            .collect::<Vec<_>>(),
-        vec![2],
-        "emitted sequence continues prior history"
+        book,
+        increased_book(1),
+        "the emitted book crosses back unstamped"
     );
 }
 
@@ -783,7 +751,6 @@ fn projector_descriptor_bytes() -> Vec<u8> {
             callback_id: CB_PROJ_FOLD,
         }],
         finish_callback_id: Some(CB_PROJ_FINISH),
-        unknown_callback_id: None,
     }
     .encode_to_vec()
 }
@@ -938,10 +905,10 @@ fn event_page_of(fq: &str) -> pb::EventPage {
 }
 
 #[test]
-fn saga_emits_deferred_command_through_the_abi() {
+fn saga_emits_its_command_through_the_abi() {
     // The whole saga path across raw pointers: register a saga, dispatch a
-    // source book, and confirm the host's command came back deferred from the
-    // triggering page.
+    // source book, and confirm the host's command came back as emitted (the
+    // coordinator stamps its provenance).
     let router = Router::with_saga();
     let mut page = event_page_of(FQ_ORDER_CREATED);
     page.header = Some(pb::PageHeader {
@@ -955,15 +922,10 @@ fn saga_emits_deferred_command_through_the_abi() {
     assert_eq!(resp.commands.len(), 1, "one command emitted");
     let cmd = &resp.commands[0];
     assert_eq!(cmd.cover.as_ref().unwrap().domain, "inventory");
-    let Some(pb::page_header::SequenceType::AngzarrDeferred(d)) = cmd.pages[0]
-        .header
-        .as_ref()
-        .and_then(|h| h.sequence_type.clone())
-    else {
-        panic!("command page is not deferred");
-    };
-    assert_eq!(d.source_seq, 7);
-    assert_eq!(d.source.map(|c| c.domain), Some("order".to_string()));
+    assert_eq!(
+        cmd.pages[0].header, None,
+        "the command crosses back unstamped"
+    );
 }
 
 #[test]
@@ -1095,10 +1057,10 @@ fn pm_request(domain: &str, pages: Vec<pb::EventPage>) -> pb::ProcessManagerHand
 }
 
 #[test]
-fn pm_emits_deferred_command_through_the_abi() {
+fn pm_emits_its_command_through_the_abi() {
     // The whole PM path across raw pointers: the host sees the trigger cover
     // in its aux (it echoes the root into its command), and the command comes
-    // back deferred from the newest trigger page.
+    // back as emitted.
     let router = Router::with_process_manager();
     let mut page = event_page_of(FQ_ORDER_SHIPPED);
     page.header = Some(pb::PageHeader {
@@ -1117,14 +1079,10 @@ fn pm_emits_deferred_command_through_the_abi() {
         Some(pb::Uuid { value: vec![8] }),
         "the trigger cover crossed to the host"
     );
-    let Some(pb::page_header::SequenceType::AngzarrDeferred(d)) = cmd.pages[0]
-        .header
-        .as_ref()
-        .and_then(|h| h.sequence_type.clone())
-    else {
-        panic!("command page is not deferred");
-    };
-    assert_eq!(d.source_seq, 4);
+    assert_eq!(
+        cmd.pages[0].header, None,
+        "the command crosses back unstamped"
+    );
 }
 
 #[test]
@@ -1325,7 +1283,6 @@ fn projector_fold_failure_keeps_the_host_status() {
             callback_id: CB_PROJ_FOLD_REJECTS,
         }],
         finish_callback_id: Some(CB_PROJ_FINISH),
-        unknown_callback_id: None,
     }
     .encode_to_vec();
     assert_eq!(

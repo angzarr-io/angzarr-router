@@ -148,8 +148,9 @@ impl<S> AggregateDispatch<S> {
 
     /// Routes a ContextualCommand: envelope guards with their exact codes,
     /// validate-before-rebuild, rebuild (corrupt persisted event fails the
-    /// command), thunk with rebuilt state and CommandContext, fill-only
-    /// stamping on the emitted book.
+    /// command), thunk with rebuilt state and CommandContext. The emitted
+    /// book passes through as the handler returned it: the coordinator
+    /// stamps sequences and meta.
     pub fn dispatch(
         &self,
         req: &pb::ContextualCommand,
@@ -203,10 +204,6 @@ impl<S> AggregateDispatch<S> {
         )
         .map_err(map_handler_error)?;
 
-        let events = events.map(|mut book| {
-            stamp_emitted_book(&mut book, command_book.cover.as_ref(), next_seq);
-            book
-        });
         Ok(pb::BusinessResponse {
             result: Some(pb::business_response::Result::Events(
                 events.unwrap_or_default(),
@@ -285,31 +282,6 @@ impl<S> AggregateDispatch<S> {
     pub fn packed_replay(&self, req: &pb::ReplayRequest) -> Result<pb::ReplayResponse, CodedError> {
         self.rebuilder
             .packed_replay(self.state_packer.as_ref(), &self.domain, req)
-    }
-}
-
-/// Applies the dispatch path's FILL-ONLY stamps to an emitted EventBook:
-///   - the command cover's ext propagates onto the book's cover so child
-///     aggregates carry their parent linkage — never overriding an ext
-///     the handler set itself;
-///   - pages without headers receive consecutive sequences from the
-///     aggregate's next sequence — explicit headers are preserved.
-fn stamp_emitted_book(events: &mut pb::EventBook, cmd_cover: Option<&pb::Cover>, next_seq: u32) {
-    if let Some(ext) = cmd_cover.and_then(|c| c.ext.as_ref()) {
-        let cover = events.cover.get_or_insert_with(pb::Cover::default);
-        if cover.ext.is_none() {
-            cover.ext = Some(ext.clone());
-        }
-    }
-    let mut seq = next_seq;
-    for page in &mut events.pages {
-        if page.header.is_none() {
-            page.header = Some(pb::PageHeader {
-                sequence_type: Some(pb::page_header::SequenceType::Sequence(seq)),
-                ..Default::default()
-            });
-        }
-        seq += 1;
     }
 }
 

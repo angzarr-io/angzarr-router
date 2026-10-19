@@ -1,34 +1,25 @@
-//! SagaDispatch — the stateless source-event → commands+events translator.
+//! SagaDispatch — the stateless source-event → commands translator.
 //!
 //! A saga holds NO state and rebuilds nothing: every page of the source book
-//! is a fresh trigger. Declared event types emit commands and/or injected
-//! fact events; an undeclared event type is skipped (C-0051), not an error.
-//! There is no compensation input. Emitted commands are deferred: the router stamps each
-//! command's `angzarr_deferred` provenance from the triggering page (source
-//! cover, source_seq, command_index) and never an explicit sequence, and
-//! they inherit the source correlation id FILL-ONLY.
+//! is a fresh trigger. Declared event types emit commands; an undeclared
+//! event type is skipped (C-0051), not an error. There is no compensation
+//! input. Emitted commands pass through as the handler returned them: the
+//! coordinator stamps their identity, causation and correlation.
 
 use std::collections::HashMap;
 
 use prost_types::Any;
 
-use crate::destinations::Destinations;
 use crate::error::{codes, map_handler_error, messages, CodedError, HandlerError};
 use crate::pb;
 use crate::PageContext;
 
-/// Translates one source event into commands and/or injected fact events.
-/// Generated thunks unmarshal to the typed event, call the typed business
-/// method; the declared output domains arrive as Destinations, the source
-/// event's place as a [`PageContext`] (the source book's cover and the
-/// event's sequence, which the router records as the commands' `source_seq`),
-/// and the router stamps the emitted commands deferred.
+/// Translates one source event into commands. Generated thunks unmarshal
+/// to the typed event and call the typed business method; the source event's
+/// place arrives as a [`PageContext`] (the source book's cover and the
+/// event's sequence).
 pub type EventFn = Box<
-    dyn for<'a> Fn(
-            &Any,
-            &Destinations,
-            &PageContext<'a>,
-        ) -> Result<(Vec<pb::CommandBook>, Vec<pb::EventBook>), HandlerError>
+    dyn for<'a> Fn(&Any, &PageContext<'a>) -> Result<Vec<pb::CommandBook>, HandlerError>
         + Send
         + Sync,
 >;
@@ -62,18 +53,12 @@ impl SagaDispatch {
     pub fn on_event(
         self,
         full_name: &str,
-        thunk: impl Fn(
-                &Any,
-                &Destinations,
-                Option<&pb::Cover>,
-            ) -> Result<(Vec<pb::CommandBook>, Vec<pb::EventBook>), HandlerError>
+        thunk: impl Fn(&Any, Option<&pb::Cover>) -> Result<Vec<pb::CommandBook>, HandlerError>
             + Send
             + Sync
             + 'static,
     ) -> Self {
-        self.on_event_with_context(full_name, move |any, dests, source| {
-            thunk(any, dests, source.cover)
-        })
+        self.on_event_with_context(full_name, move |any, source| thunk(any, source.cover))
     }
 
     /// Registers the translation thunk for a fully-qualified event type; it
@@ -82,12 +67,7 @@ impl SagaDispatch {
     pub fn on_event_with_context(
         mut self,
         full_name: &str,
-        thunk: impl for<'a> Fn(
-                &Any,
-                &Destinations,
-                &PageContext<'a>,
-            )
-                -> Result<(Vec<pb::CommandBook>, Vec<pb::EventBook>), HandlerError>
+        thunk: impl for<'a> Fn(&Any, &PageContext<'a>) -> Result<Vec<pb::CommandBook>, HandlerError>
             + Send
             + Sync
             + 'static,
@@ -124,9 +104,8 @@ impl SagaDispatch {
     }
 
     /// Walks EVERY page of the source book: declared event types emit;
-    /// undeclared types are skipped. Each page's
-    /// emitted commands are stamped deferred from that page, and inherit the
-    /// source correlation id fill-only. A nil source is MISSING_SAGA_SOURCE;
+    /// undeclared types are skipped. Emitted commands pass through
+    /// unstamped, in emission order. A nil source is MISSING_SAGA_SOURCE;
     /// a source with no pages is EMPTY_SAGA_SOURCE.
     pub fn dispatch(&self, req: &pb::SagaHandleRequest) -> Result<pb::SagaResponse, CodedError> {
         let Some(source) = req.source.as_ref() else {
@@ -144,7 +123,6 @@ impl SagaDispatch {
             ));
         }
 
-        let dests = Destinations::new(self.targets.iter().cloned());
         let mut resp = pb::SagaResponse::default();
 
         for page in &source.pages {
@@ -161,29 +139,10 @@ impl SagaDispatch {
                 cover: source.cover.as_ref(),
                 sequence: crate::page_sequence(page),
             };
-            let (mut commands, events) =
-                thunk(event_any, &dests, &context).map_err(map_handler_error)?;
-            crate::stamp_deferred(&mut commands, context.cover, context.sequence);
+            let commands = thunk(event_any, &context).map_err(map_handler_error)?;
             resp.commands.extend(commands);
-            resp.events.extend(events);
         }
 
-        // FILL-ONLY correlation propagation: emitted commands inherit the
-        // source book's correlation id unless the handler stamped one — the
-        // saga sibling of the aggregate's stampEmittedBook.
-        if let Some(corr) = source
-            .cover
-            .as_ref()
-            .map(|c| c.correlation_id.as_str())
-            .filter(|c| !c.is_empty())
-        {
-            for cmd in &mut resp.commands {
-                let cover = cmd.cover.get_or_insert_with(pb::Cover::default);
-                if cover.correlation_id.is_empty() {
-                    cover.correlation_id = corr.to_string();
-                }
-            }
-        }
         Ok(resp)
     }
 }

@@ -73,14 +73,13 @@ allow = ["angzarr_router::error::**"]
 
 [[rule]]
 name = "engine-kernel-below-components"
-why = "the shared kernel (crate-root helpers, destinations, rebuild) sits below the component dispatchers and the router"
-from = ["angzarr_router", "angzarr_router::destinations::**", "angzarr_router::rebuild::**"]
+why = "the shared kernel (crate-root helpers, rebuild) sits below the component dispatchers and the router"
+from = ["angzarr_router", "angzarr_router::rebuild::**"]
 scope = "lib"
 allow = [
     "angzarr_router",
     "angzarr_router::proto::**",
     "angzarr_router::error::**",
-    "angzarr_router::destinations::**",
     "angzarr_router::rebuild::**",
 ]
 
@@ -100,7 +99,6 @@ allow = [
     "angzarr_router",
     "angzarr_router::proto::**",
     "angzarr_router::error::**",
-    "angzarr_router::destinations::**",
     "angzarr_router::rebuild::**",
 ]
 

@@ -133,40 +133,10 @@ async fn emits_one_command(w: &mut ProcessManagerWorld, target: String) {
     );
 }
 
-#[then(regex = r"^the command is deferred from source sequence (\d+) at command index (\d+)$")]
-async fn command_is_deferred(w: &mut ProcessManagerWorld, seq: u32, index: u32) {
-    let cmd = &w.response().commands[0];
-    for page in &cmd.pages {
-        let Some(pb::page_header::SequenceType::AngzarrDeferred(d)) =
-            page.header.as_ref().and_then(|h| h.sequence_type.as_ref())
-        else {
-            panic!("command page is not deferred");
-        };
-        assert_eq!(d.source_seq, seq, "source_seq is the trigger's");
-        assert_eq!(
-            d.command_index, index,
-            "command_index is the emission position"
-        );
-        assert_eq!(
-            d.source.as_ref().map(|c| c.domain.as_str()),
-            Some("counter"),
-            "the source cover is the trigger book's"
-        );
-    }
-}
-
-#[then("the command leaves its source component to the coordinator")]
-async fn no_source_component(w: &mut ProcessManagerWorld) {
+#[then("the command carries no router-stamped provenance")]
+async fn no_stamped_provenance(w: &mut ProcessManagerWorld) {
     for page in &w.response().commands[0].pages {
-        let Some(pb::page_header::SequenceType::AngzarrDeferred(d)) =
-            page.header.as_ref().and_then(|h| h.sequence_type.as_ref())
-        else {
-            panic!("command page is not deferred");
-        };
-        assert_eq!(
-            d.source_component, "",
-            "the coordinator stamps the component"
-        );
+        assert_eq!(page.header, None, "the command passes through as emitted");
     }
 }
 
@@ -184,14 +154,11 @@ async fn rebuilt_n(w: &mut ProcessManagerWorld, n: u32) {
     );
 }
 
-#[then(regex = r#"^the process event is addressed to "([^"]*)"$"#)]
-async fn process_event_addressed_to(w: &mut ProcessManagerWorld, domain: String) {
+#[then("the process event carries no cover")]
+async fn process_event_unaddressed(w: &mut ProcessManagerWorld) {
     let books = &w.response().process_events;
     assert_eq!(books.len(), 1, "one process event");
-    assert_eq!(
-        books[0].cover.as_ref().map(|c| c.domain.as_str()),
-        Some(domain.as_str())
-    );
+    assert_eq!(books[0].cover, None, "the coordinator addresses it");
 }
 
 #[then(regex = r"^the dispatch fails with ([A-Z_]+)$")]

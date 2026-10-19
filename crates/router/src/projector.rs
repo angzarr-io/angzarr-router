@@ -4,8 +4,7 @@
 //! order (the instance is reused across pages — spec C-0086), then an
 //! optional Finish packs it into the wire Projection. Unlike the aggregate
 //! there is no prior-state rebuild, no snapshot, and no rejection path: an
-//! event with no registered handler is skipped (a registered `on_unknown`
-//! sees its type URL); events whose book cover carries an undeclared domain
+//! event with no registered handler is skipped with a warn; events whose book cover carries an undeclared domain
 //! never fold, though Finish still runs.
 
 use std::collections::{HashMap, HashSet};
@@ -27,16 +26,12 @@ pub type EventFn<P> =
 pub type FinishFn<P> =
     Box<dyn Fn(&mut P, &pb::EventBook) -> Result<pb::Projection, HandlerError> + Send + Sync>;
 
-/// Observes the type URL of an event that matched no fold thunk.
-pub type UnknownFn = Box<dyn Fn(&str) + Send + Sync>;
-
 /// The dispatch table for one projector component.
 pub struct ProjectorDispatch<P> {
     name: String,
     factory: Box<dyn Fn() -> P + Send + Sync>,
     domains: Option<HashSet<String>>,
     handlers: HashMap<String, EventFn<P>>,
-    unknown: Option<UnknownFn>,
     finish: Option<FinishFn<P>>,
 }
 
@@ -48,7 +43,6 @@ impl<P> ProjectorDispatch<P> {
             factory: Box::new(factory),
             domains: None,
             handlers: HashMap::new(),
-            unknown: None,
             finish: None,
         }
     }
@@ -71,14 +65,6 @@ impl<P> ProjectorDispatch<P> {
             + 'static,
     ) -> Self {
         self.handlers.insert(full_name.to_string(), Box::new(thunk));
-        self
-    }
-
-    /// Registers a catch-all for events with no fold thunk. Without one such
-    /// events are skipped and a warn is logged (parity with the Go engine's
-    /// projectorLogger.Warn); a binding that wants to react registers here.
-    pub fn on_unknown(mut self, thunk: impl Fn(&str) + Send + Sync + 'static) -> Self {
-        self.unknown = Some(Box::new(thunk));
         self
     }
 
@@ -134,15 +120,12 @@ impl<P> ProjectorDispatch<P> {
                     .handlers
                     .get(crate::type_name_from_url(&event_any.type_url))
                 else {
-                    match self.unknown.as_ref() {
-                        Some(unknown) => unknown(&event_any.type_url),
-                        // Parity with the Go engine's projectorLogger.Warn.
-                        None => tracing::warn!(
-                            projector = %self.name,
-                            type_url = %event_any.type_url,
-                            "projector received event with no matching handler"
-                        ),
-                    }
+                    // Parity with the Go engine's projectorLogger.Warn.
+                    tracing::warn!(
+                        projector = %self.name,
+                        type_url = %event_any.type_url,
+                        "projector received event with no matching handler"
+                    );
                     continue;
                 };
                 let ctx = PageContext {

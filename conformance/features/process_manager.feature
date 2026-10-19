@@ -2,23 +2,21 @@ Feature: Order process-manager dispatch
 
   The OrderProcessManager proves the stateful trigger-side dispatch the shared
   router must implement identically in every language: only the newest trigger
-  page fires (history never re-triggers) and its commands are deferred from
-  that page, a trigger from an unwatched domain or
-  of an undeclared type does nothing, a missing or empty trigger is refused
-  with a coded error, and the PM's own state is rebuilt before the handler. A
-  process event the handler leaves unaddressed belongs to the process-manager's
-  own domain.
+  page fires (history never re-triggers) and its commands pass through
+  unstamped, a trigger from an unwatched domain or of an undeclared type does
+  nothing, a missing or empty trigger is refused with a coded error, and the
+  PM's own state is rebuilt before the handler. The coordinator stamps the
+  commands' identity and addresses the process events.
 
   Co-resident process-managers share one router: each rebuilds only its own
   state (never another PM's, even within one dispatch), and a process state
   reaches only the PM that owns it.
 
-  Scenario: the newest trigger event reacts with a deferred command
+  Scenario: the newest trigger event reacts with a command
     Given an order process-manager
     When an Increased trigger in domain "counter" at sequence 4 is dispatched
     Then the process-manager emits one command to "inventory"
-    And the command is deferred from source sequence 4 at command index 0
-    And the command leaves its source component to the coordinator
+    And the command carries no router-stamped provenance
 
   Scenario: history does not re-trigger
     Given an order process-manager
@@ -57,7 +55,7 @@ Feature: Order process-manager dispatch
     Then the audit process-manager rebuilt 2 prior state events
     And the order process-manager did not react
 
-  Scenario: an unaddressed process event belongs to the process-manager's own domain
+  Scenario: an unaddressed process event is left for the coordinator to address
     Given an order process-manager
     When an Increased trigger in domain "counter" is dispatched
-    Then the process event is addressed to "order-pm"
+    Then the process event carries no cover

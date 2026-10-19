@@ -23,7 +23,6 @@ pub enum GrpcCode {
 /// Cross-language error codes (the slice's subset of the 47-code inventory).
 pub mod codes {
     pub const ANY_DECODE_FAILED: &str = "ANY_DECODE_FAILED";
-    pub const VALUE_NOT_POSITIVE: &str = "VALUE_NOT_POSITIVE";
     pub const NO_HANDLER_REGISTERED: &str = "NO_HANDLER_REGISTERED";
     pub const MISSING_COMMAND_BOOK: &str = "MISSING_COMMAND_BOOK";
     pub const MISSING_COMMAND_PAGE: &str = "MISSING_COMMAND_PAGE";
@@ -40,7 +39,6 @@ pub mod codes {
     pub const DUPLICATE_COMMAND_HANDLER: &str = "DUPLICATE_COMMAND_HANDLER";
     pub const EMPTY_PM_TRIGGER: &str = "EMPTY_PM_TRIGGER";
     pub const MISSING_PM_EVENT_PAYLOAD: &str = "MISSING_PM_EVENT_PAYLOAD";
-    pub const UNDECLARED_OUTPUT_DOMAIN: &str = "UNDECLARED_OUTPUT_DOMAIN";
     pub const NO_FACT_HANDLER: &str = "NO_FACT_HANDLER";
 }
 
@@ -60,7 +58,6 @@ pub mod messages {
     pub const DUPLICATE_COMMAND_HANDLER: &str =
         "two command handlers claim the same (domain, command type)";
     pub const NO_COMPONENT_OF_KIND: &str = "the router hosts no component of this kind";
-    pub const UNDECLARED_OUTPUT_DOMAIN: &str = "domain is not a declared output domain";
     pub const REPLAY_UNSUPPORTED: &str = "the component does not support Replay";
     pub const NO_FACT_HANDLER: &str = "no fact handler for the fact type";
 }

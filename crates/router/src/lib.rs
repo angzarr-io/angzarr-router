@@ -10,7 +10,6 @@
 #![forbid(unsafe_code)]
 
 pub mod aggregate;
-pub mod destinations;
 pub mod error;
 pub mod process_manager;
 pub mod projector;
@@ -63,7 +62,7 @@ pub fn page_event(page: &pb::EventPage) -> Option<&Any> {
 }
 
 /// The explicit sequence of a page header, or 0 when absent.
-pub fn page_sequence(page: &pb::EventPage) -> u32 {
+pub(crate) fn page_sequence(page: &pb::EventPage) -> u32 {
     match page.header.as_ref().and_then(|h| h.sequence_type.as_ref()) {
         Some(pb::page_header::SequenceType::Sequence(seq)) => *seq,
         _ => 0,
@@ -75,19 +74,6 @@ pub fn command_payload(page: &pb::CommandPage) -> Option<&Any> {
     match &page.payload {
         Some(pb::command_page::Payload::Command(any)) => Some(any),
         _ => None,
-    }
-}
-
-/// Stamps every page of saga/PM-emitted `commands` as deferred (see
-/// [`destinations::stamp_pages`]), each command indexed by its position in
-/// this invocation's output.
-pub fn stamp_deferred(
-    commands: &mut [pb::CommandBook],
-    source_cover: Option<&pb::Cover>,
-    source_seq: u32,
-) {
-    for (index, cmd) in commands.iter_mut().enumerate() {
-        destinations::stamp_pages(cmd, source_cover, source_seq, index as u32);
     }
 }
 

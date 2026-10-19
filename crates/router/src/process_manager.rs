@@ -8,17 +8,16 @@
 //! the NEWEST page fires, so history never re-triggers. Handlers are keyed by
 //! (input domain, fully-qualified event type). A trigger from a domain outside
 //! the PM's sources, or an undeclared event type, yields an empty response
-//! (spec C-0022), not an error. Emitted commands are deferred: the router
-//! stamps their `angzarr_deferred` provenance from the trigger (source cover,
-//! source_seq, command_index), never an explicit sequence (C-0181). There
-//! is no compensation input: a Notification-typed trigger is just an
+//! (spec C-0022), not an error. Emitted commands and process events pass
+//! through as the handler returned them: the coordinator stamps the commands'
+//! identity and addresses the process events. There is no compensation
+//! input: a Notification-typed trigger is just an
 //! undeclared event type.
 
 use std::collections::HashMap;
 
 use prost_types::Any;
 
-use crate::destinations::Destinations;
 use crate::error::{codes, map_handler_error, messages, CodedError, HandlerError};
 use crate::pb;
 use crate::rebuild::{pack_message_state, Rebuilder, StatePackFn};
@@ -31,7 +30,6 @@ pub type EventFn<S> = Box<
     dyn Fn(
             &Any,
             &mut S,
-            &Destinations,
             Option<&pb::Cover>,
         ) -> Result<pb::ProcessManagerHandleResponse, HandlerError>
         + Send
@@ -96,7 +94,6 @@ impl<S> ProcessManagerDispatch<S> {
         thunk: impl Fn(
                 &Any,
                 &mut S,
-                &Destinations,
                 Option<&pb::Cover>,
             ) -> Result<pb::ProcessManagerHandleResponse, HandlerError>
             + Send
@@ -194,46 +191,7 @@ impl<S> ProcessManagerDispatch<S> {
         };
 
         let (mut state, _info) = self.rebuilder.rebuild(req.process_state.as_ref())?;
-        let dests = Destinations::new(self.targets.iter().cloned());
-        let mut resp = thunk(event_any, &mut state, &dests, trigger.cover.as_ref())
-            .map_err(map_handler_error)?;
-        crate::stamp_deferred(
-            &mut resp.commands,
-            trigger.cover.as_ref(),
-            crate::page_sequence(last),
-        );
-        self.address_process_events(&mut resp, trigger, req.process_state.as_ref());
-        Ok(resp)
-    }
-
-    /// FILL-ONLY addressing of the PM's own stream (C-0477): a process event
-    /// the handler left unaddressed takes the PM's domain, the process
-    /// state's root and the trigger's correlation id; whatever the handler
-    /// set is kept.
-    fn address_process_events(
-        &self,
-        resp: &mut pb::ProcessManagerHandleResponse,
-        trigger: &pb::EventBook,
-        process_state: Option<&pb::EventBook>,
-    ) {
-        let state_root = process_state
-            .and_then(|s| s.cover.as_ref())
-            .and_then(|c| c.root.as_ref());
-        let correlation_id = trigger.cover.as_ref().map(|c| c.correlation_id.as_str());
-        for book in &mut resp.process_events {
-            let cover = book.cover.get_or_insert_with(pb::Cover::default);
-            if cover.domain.is_empty() {
-                cover.domain = self.pm_domain.clone();
-            }
-            if cover.root.is_none() {
-                cover.root = state_root.cloned();
-            }
-            if cover.correlation_id.is_empty() {
-                if let Some(id) = correlation_id {
-                    cover.correlation_id = id.to_string();
-                }
-            }
-        }
+        thunk(event_any, &mut state, trigger.cover.as_ref()).map_err(map_handler_error)
     }
 }
 

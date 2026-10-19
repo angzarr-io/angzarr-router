@@ -90,7 +90,7 @@ message CounterState {
 
 // --- saga ---
 
-// OrderSaga translates each Increased source event into one deferred Reserve
+// OrderSaga translates each Increased source event into one Reserve
 // command for "inventory". A stateless saga has no state message, so it is
 // declared on this marker.
 message OrderSaga {
@@ -117,7 +117,7 @@ message CounterProjectorState {
 // --- process manager ---
 
 // OrderProcessManager folds Increased into its own state (applies) AND reacts to
-// the newest Increased trigger from "counter" by emitting a deferred Reserve
+// the newest Increased trigger from "counter" by emitting a Reserve
 // command for "inventory" plus one process event and one fact per prior state
 // event.
 message OrderProcessManagerState {

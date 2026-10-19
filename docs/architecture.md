@@ -20,7 +20,7 @@ router.
   `AggregateDispatch` with facts and replay, `SagaDispatch`,
   `ProcessManagerDispatch` with `select_process_managers`/`merge_response`,
   `ProjectorDispatch`, `RouterBuilder`/`Router`/`CommandHandlers`,
-  `Destinations`, `stamp_deferred`, `CodedError`) is
+  `CodedError`) is
   therefore a public contract, documented on each item; components may be
   registered boxed (`Box<dyn CommandHandler>` and so on).
 - **Not consumers (yet).** The other `angzarr-client-*` libraries still
@@ -46,7 +46,7 @@ crates/router-ffi  ── descriptor → core tables, component claims/routing,
         ▼
 crates/router      ── Rebuilder, AggregateDispatch, SagaDispatch,
                       ProcessManagerDispatch (+ co-resident selection),
-                      ProjectorDispatch, Destinations, CodedError
+                      ProjectorDispatch, CodedError
 ```
 
 ### crates/router (core)
@@ -94,13 +94,12 @@ keyed by component, never by session alone.
 | Semantic | Contract |
 |---|---|
 | State rebuild | Snapshot applies first; pages with an explicit sequence at or below a LOADED snapshot's sequence never re-apply (a snapshot with no loader or no state covers nothing); pageless or unknown-type entries are skipped, never terminal; a corrupt persisted payload fails with `PERSISTED_EVENT_CORRUPT` |
-| Aggregate dispatch | Envelope and command type validate BEFORE rebuild (unknown command → `NO_HANDLER_REGISTERED`); handlers receive `CommandContext` (next sequence, had-prior-events, the handled cover) |
-| Fill-only stamping | The command cover's ext propagates onto emitted books and pages without headers get consecutive sequences from the next sequence, never overriding values the handler set |
-| Deferred commands | Saga and process-manager commands carry `angzarr_deferred` (source cover, source_seq of the triggering page, command_index in emission order) and never an explicit sequence; `source_component` is stamped by the coordinator. Saga commands inherit the source correlation id fill-only. A saga handler sees the triggering page's cover and sequence. `Destinations` are the declared output domains only; `Destinations::stamp_command` stamps one command the same way, refusing an undeclared domain (`UNDECLARED_OUTPUT_DOMAIN`) |
+| Aggregate dispatch | Envelope and command type validate BEFORE rebuild (unknown command → `NO_HANDLER_REGISTERED`); handlers receive `CommandContext` (next sequence, had-prior-events, the handled cover); the emitted book passes through as the handler returned it (the coordinator stamps sequences and meta) |
+| Reaction commands | Saga and process-manager commands pass through as the handler emitted them: the coordinator stamps their identity, causation and correlation. A saga handler sees the triggering page's cover and sequence; a process-manager handler sees the trigger cover |
 | Saga dispatch | EVERY page of the source book dispatches; undeclared types are skipped (C-0051) |
 | Facts and replay | `HandleFact` refuses a fact of a type with no fact handler (the aggregate's declared `ComponentOptions.facts`) with `NO_FACT_HANDLER` (INVALID_ARGUMENT) before any handler runs, so nothing is recorded; otherwise it rebuilds from the prior events and walks the facts in order: each fact handler returns the fact to record (it may annotate it, never refuse it) followed by events that flag it, and every recorded event folds before the next fact; the facts' cover and each fact's header are kept, a flag carries no header. `Replay` folds base snapshot then events into state, packed by the component's state packer (none: `NO_HANDLER_REGISTERED`). Facts route by the facts' cover domain; replay by the requested domain, to its first aggregate, else to the process manager whose own domain it is |
-| Process manager | The newest page of the trigger book dispatches; handlers receive the trigger cover; co-resident PMs are selected by identity first — a process state reaches the PM owning its cover domain — and otherwise every PM consuming the trigger domain; responses merge in registration order. A process event the handler leaves unaddressed takes, fill-only, the PM's own domain, the process state's root and the trigger's correlation id (C-0477) |
-| Projector | Folds every page into one projection instance, each fold seeing the book cover and the page's sequence; undeclared domains fold nothing (C-0032), and a projector declaring `"*"` consumes every domain; unmatched types invoke the on-unknown hook or WARN |
+| Process manager | The newest page of the trigger book dispatches; handlers receive the trigger cover; co-resident PMs are selected by identity first — a process state reaches the PM owning its cover domain — and otherwise every PM consuming the trigger domain; responses merge in registration order. Process events pass through as emitted (the coordinator addresses and stamps them) |
+| Projector | Folds every page into one projection instance, each fold seeing the book cover and the page's sequence; undeclared domains fold nothing (C-0032), and a projector declaring `"*"` consumes every domain; unmatched types are skipped with a WARN |
 | Type URLs | Emitted type URLs use the bare `/` prefix; incoming ones match by the fully-qualified name after the last `/`, whatever the prefix |
 | Errors | One `map_handler_error` table: rejections keep their gRPC code, `NO_HANDLER_REGISTERED` → UNIMPLEMENTED, `PERSISTED_EVENT_CORRUPT` → DATA_LOSS, other coded client errors → INVALID_ARGUMENT, unclassified → INTERNAL + `UNHANDLED_HANDLER_ERROR`. Codes ride a `google.rpc.ErrorInfo` detail (domain `angzarr.io`); assertions key on codes, never message substrings |
 

@@ -34,6 +34,10 @@ const SKEL_UNHANDLED: &str = include_str!("../../../conformance/fixtures/command
 const SKEL_INCREASED_EVENT: &str =
     include_str!("../../../conformance/fixtures/event_increased.txtpb");
 
+/// The CounterAggregate's business rejection code (`IncreaseBy { n: 0 }`).
+/// A fixture code, not a router code.
+pub const VALUE_NOT_POSITIVE: &str = "VALUE_NOT_POSITIVE";
+
 const CONTEXTUAL_COMMAND: &str = "io.angzarr.v1.ContextualCommand";
 const EVENT_PAGE: &str = "io.angzarr.v1.EventPage";
 
@@ -115,7 +119,7 @@ pub fn counter_aggregate(observed: ObservedSink) -> AggregateDispatch<CounterSta
                 .map_err(|e| HandlerError::Other(format!("decode IncreaseBy: {e}")))?;
             if cmd.n == 0 {
                 return Err(HandlerError::Coded(CodedError::rejection_invalid_argument(
-                    "VALUE_NOT_POSITIVE",
+                    VALUE_NOT_POSITIVE,
                     "increase amount must be positive",
                     [],
                 )));
@@ -218,15 +222,15 @@ pub fn delivery_without_cover(n: u32) -> pb::EventBook {
 // ---------------------------------------------------------------------------
 
 /// Build the OrderSaga dispatch table: it translates each Increased source
-/// event into one Reserve command for "inventory" (deferred: the router stamps
-/// its provenance), recording each triggering event's sequence in `seen`.
-/// Undeclared events are skipped.
+/// event into one Reserve command for "inventory" (passed through unstamped),
+/// recording each triggering event's sequence in `seen`. Undeclared events
+/// are skipped.
 pub fn order_saga(seen: SequenceSink) -> SagaDispatch {
     SagaDispatch::new("order-saga", "order", ["inventory"]).on_event_with_context(
         "test.counter.Increased",
-        move |_any, _dests, source| {
+        move |_any, source| {
             seen.lock().unwrap().push(source.sequence);
-            Ok((vec![reserve_command_to("inventory")], Vec::new()))
+            Ok(vec![reserve_command_to("inventory")])
         },
     )
 }
@@ -245,60 +249,6 @@ fn reserve_command_to(domain: &str) -> pb::CommandBook {
             ..Default::default()
         }],
     }
-}
-
-/// A SagaHandleRequest whose source carries one Increased event of order
-/// root `label` at sequence `seq`.
-pub fn saga_rooted_source(label: &str, seq: u32) -> pb::SagaHandleRequest {
-    let mut req = saga_event_source("test.counter.Increased", Some(seq));
-    req.source.as_mut().unwrap().cover = Some(cover_of("order", label));
-    req
-}
-
-/// The parity saga ("order" → "inventory"): its Increased handler emits
-/// [`parity_command`] twice.
-pub fn parity_saga() -> SagaDispatch {
-    SagaDispatch::new("parity-saga", "order", ["inventory"])
-        .on_event("test.counter.Increased", |_any, _dests, _cover| {
-            Ok((vec![parity_command(), parity_command()], Vec::new()))
-        })
-}
-
-/// The parity command: cover "inventory", root bytes 10..1f, correlation
-/// "corr-1"; one page whose command is "/example.Foo" carrying 01020304.
-pub fn parity_command() -> pb::CommandBook {
-    pb::CommandBook {
-        cover: Some(pb::Cover {
-            domain: "inventory".to_string(),
-            root: Some(pb::Uuid {
-                value: (0x10u8..=0x1f).collect(),
-            }),
-            correlation_id: "corr-1".to_string(),
-            ..Default::default()
-        }),
-        pages: vec![pb::CommandPage {
-            payload: Some(pb::command_page::Payload::Command(prost_types::Any {
-                type_url: "/example.Foo".to_string(),
-                value: vec![1, 2, 3, 4],
-            })),
-            ..Default::default()
-        }],
-    }
-}
-
-/// The parity source: one Increased event at sequence `seq` under cover
-/// "order", root bytes 00..0f, correlation "corr-1".
-pub fn parity_source(seq: u32) -> pb::SagaHandleRequest {
-    let mut req = saga_event_source("test.counter.Increased", Some(seq));
-    req.source.as_mut().unwrap().cover = Some(pb::Cover {
-        domain: "order".to_string(),
-        root: Some(pb::Uuid {
-            value: (0x00u8..=0x0f).collect(),
-        }),
-        correlation_id: "corr-1".to_string(),
-        ..Default::default()
-    });
-    req
 }
 
 /// A SagaHandleRequest whose source carries one event of `event_fq` in the
@@ -361,7 +311,7 @@ pub struct ProcessManagerState {
 
 /// Build the OrderProcessManager dispatch table: over the "counter" domain it
 /// reacts to the NEWEST Increased trigger by emitting one Reserve command for
-/// "inventory" (deferred) plus one unaddressed process event. Its own state
+/// "inventory" plus one unaddressed process event. Its own state
 /// counts prior Increased process events, so a rebuild is observable.
 pub fn order_pm() -> ProcessManagerDispatch<ProcessManagerState> {
     let rebuilder = Rebuilder::new(ProcessManagerState::default).apply(
@@ -376,7 +326,7 @@ pub fn order_pm() -> ProcessManagerDispatch<ProcessManagerState> {
     ProcessManagerDispatch::new("order-pm", "order-pm", ["inventory"], rebuilder).on_event(
         "counter",
         "test.counter.Increased",
-        |_event, state: &mut ProcessManagerState, _dests, _cover| {
+        |_event, state: &mut ProcessManagerState, _cover| {
             let cmd = reserve_command_to("inventory");
             // Emit one fact per prior state event so the rebuild is
             // observable in the response.
@@ -425,7 +375,7 @@ pub fn audit_pm() -> ProcessManagerDispatch<AuditState> {
     .on_event(
         "counter",
         "test.counter.Increased",
-        |_event, state: &mut AuditState, _dests, _cover| {
+        |_event, state: &mut AuditState, _cover| {
             let facts = state.seen.iter().map(|_| audit_book()).collect();
             Ok(pb::ProcessManagerHandleResponse {
                 facts,
@@ -544,26 +494,13 @@ pub fn increase_command(n: u32) -> pb::ContextualCommand {
     cc
 }
 
-/// A well-known opaque linkage stamped on a command's cover, used to prove
-/// fill-only ext propagation onto emitted events.
+/// A well-known opaque linkage a command's cover carries on behalf of a
+/// parent.
 pub fn parent_linkage() -> prost_types::Any {
     prost_types::Any {
         type_url: angzarr_router::type_url("test.counter.Parent"),
         value: vec![1, 2, 3],
     }
-}
-
-/// An IncreaseBy command carrying parent linkage on its cover.
-pub fn increase_command_with_linkage(n: u32) -> pb::ContextualCommand {
-    let mut cc = increase_command(n);
-    cc.command
-        .as_mut()
-        .expect("command book")
-        .cover
-        .as_mut()
-        .expect("cover")
-        .ext = Some(parent_linkage());
-    cc
 }
 
 /// The FailHard command (no scenario data).
@@ -892,14 +829,10 @@ pub fn reserving_pm(seen: CoverSink) -> ProcessManagerDispatch<CounterState> {
             },
         ),
     )
-    .on_event(
-        "counter",
-        "test.counter.Increased",
-        move |_e, _s, _d, cover| {
-            seen.lock().unwrap().push(cover.cloned());
-            Ok(pb::ProcessManagerHandleResponse::default())
-        },
-    )
+    .on_event("counter", "test.counter.Increased", move |_e, _s, cover| {
+        seen.lock().unwrap().push(cover.cloned());
+        Ok(pb::ProcessManagerHandleResponse::default())
+    })
 }
 
 /// An Increased trigger from "counter" root `label` at sequence `seq`.

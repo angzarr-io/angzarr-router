@@ -82,11 +82,6 @@ async fn increase_by_prefixed(w: &mut CounterWorld, n: u32, prefix: String) {
     ));
 }
 
-#[when(regex = r"^the operator increases the counter by (\d+) on behalf of a parent$")]
-async fn increase_on_behalf(w: &mut CounterWorld, n: u32) {
-    w.dispatch(conf::increase_command_with_linkage(n));
-}
-
 #[when("the operator triggers a hard failure")]
 async fn hard_failure(w: &mut CounterWorld) {
     w.dispatch(conf::failhard_command());
@@ -112,14 +107,20 @@ async fn missing_payload(w: &mut CounterWorld) {
     w.dispatch(conf::command_missing_payload());
 }
 
-#[then(regex = r"^(\d+) increases are recorded, starting at sequence (\d+)$")]
-async fn recorded_starting(w: &mut CounterWorld, count: u32, start: u32) {
-    assert_recorded(w, count, start);
+#[then(regex = r"^(\d+) increases are recorded$")]
+async fn recorded(w: &mut CounterWorld, count: u32) {
+    assert_eq!(
+        recorded_book(w).pages.len() as u32,
+        count,
+        "recorded event count"
+    );
 }
 
-#[then(regex = r"^(\d+) increases are recorded, continuing from sequence (\d+)$")]
-async fn recorded_continuing(w: &mut CounterWorld, count: u32, start: u32) {
-    assert_recorded(w, count, start);
+#[then("the recorded events carry no router-stamped sequence")]
+async fn no_stamped_sequence(w: &mut CounterWorld) {
+    for (i, page) in recorded_book(w).pages.iter().enumerate() {
+        assert_eq!(page.header, None, "event {i} passes through as emitted");
+    }
 }
 
 #[then(regex = r"^the command is rejected as ([A-Z_]+)$")]
@@ -130,44 +131,6 @@ async fn rejected_as(w: &mut CounterWorld, code: String) {
 #[then(regex = r"^the command fails with ([A-Z_]+)$")]
 async fn fails_with(w: &mut CounterWorld, code: String) {
     assert_failed_with(w, &code);
-}
-
-#[then("the recorded events carry the parent linkage")]
-async fn carry_linkage(w: &mut CounterWorld) {
-    let resp = w
-        .result
-        .as_ref()
-        .expect("a command was dispatched")
-        .as_ref()
-        .expect("expected a successful response");
-    let book = match &resp.result {
-        Some(pb::business_response::Result::Events(book)) => book,
-        other => panic!("expected an events response, got {other:?}"),
-    };
-    assert_eq!(
-        book.cover.as_ref().and_then(|c| c.ext.as_ref()),
-        Some(&conf::parent_linkage()),
-        "emitted events must inherit the command's parent linkage (fill-only ext)"
-    );
-}
-
-#[then("the recorded events carry no parent linkage")]
-async fn carry_no_linkage(w: &mut CounterWorld) {
-    let resp = w
-        .result
-        .as_ref()
-        .expect("a command was dispatched")
-        .as_ref()
-        .expect("expected a successful response");
-    let Some(pb::business_response::Result::Events(book)) = &resp.result else {
-        panic!("expected an events response, got {:?}", resp.result);
-    };
-    assert!(!book.pages.is_empty(), "events were recorded");
-    assert_eq!(
-        book.cover.as_ref().and_then(|c| c.ext.as_ref()),
-        None,
-        "no command linkage, no handler linkage: none on the events"
-    );
 }
 
 #[then(regex = r"^the handler saw (no )?prior history, at next sequence (\d+)$")]
@@ -207,24 +170,16 @@ async fn no_events(w: &mut CounterWorld) {
     }
 }
 
-fn assert_recorded(w: &CounterWorld, count: u32, start: u32) {
+fn recorded_book(w: &CounterWorld) -> &pb::EventBook {
     let resp = w
         .result
         .as_ref()
         .expect("a command was dispatched")
         .as_ref()
         .expect("expected a successful response");
-    let book = match &resp.result {
+    match &resp.result {
         Some(pb::business_response::Result::Events(book)) => book,
         other => panic!("expected an events response, got {other:?}"),
-    };
-    assert_eq!(book.pages.len() as u32, count, "recorded event count");
-    for (i, page) in book.pages.iter().enumerate() {
-        assert_eq!(
-            angzarr_router::page_sequence(page),
-            start + i as u32,
-            "sequence of recorded event {i}"
-        );
     }
 }
 

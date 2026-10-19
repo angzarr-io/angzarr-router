@@ -190,17 +190,14 @@ fn facts_route_to_the_domain_aggregate() {
 #[test]
 fn sagas_fan_out_and_merge_in_registration_order() {
     let saga = |label: &'static str| {
-        SagaDispatch::new(label, "order", ["inventory"]).on_event("test.Created", move |_, _, _| {
-            Ok((
-                vec![pb::CommandBook {
-                    cover: Some(pb::Cover {
-                        domain: label.to_string(),
-                        ..Default::default()
-                    }),
-                    pages: vec![pb::CommandPage::default()],
-                }],
-                Vec::new(),
-            ))
+        SagaDispatch::new(label, "order", ["inventory"]).on_event("test.Created", move |_, _| {
+            Ok(vec![pb::CommandBook {
+                cover: Some(pb::Cover {
+                    domain: label.to_string(),
+                    ..Default::default()
+                }),
+                pages: vec![pb::CommandPage::default()],
+            }])
         })
     };
     let router = RouterBuilder::new()
@@ -245,7 +242,7 @@ fn sagas_fan_out_and_merge_in_registration_order() {
 fn process_managers_route_through_selection() {
     let pm = |name: &'static str| {
         ProcessManagerDispatch::new(name, format!("{name}-pm"), ["inventory"], fresh_rebuilder())
-            .on_event("order", "test.Created", move |_, _, _, _| {
+            .on_event("order", "test.Created", move |_, _, _| {
                 Ok(pb::ProcessManagerHandleResponse {
                     facts: vec![pb::EventBook {
                         cover: Some(pb::Cover {
@@ -395,7 +392,7 @@ fn boxed_components_build_routers() {
         ProcessManagerDispatch::new("pm", "pm", ["inventory"], fresh_rebuilder()).on_event(
             "order",
             "test.Created",
-            |_, _, _, _| {
+            |_, _, _| {
                 Ok(pb::ProcessManagerHandleResponse {
                     facts: vec![pb::EventBook::default()],
                     ..Default::default()
@@ -582,7 +579,7 @@ fn replay_routes_to_the_process_manager_owning_the_domain() {
             ["inventory"],
             cover_applier(fresh_rebuilder()),
         )
-        .on_event("order", "test.Created", |_, _, _, _| {
+        .on_event("order", "test.Created", |_, _, _| {
             Ok(pb::ProcessManagerHandleResponse::default())
         })
         .with_state_packer(move |s: &TestState| {
@@ -661,7 +658,7 @@ fn a_boxed_process_manager_keeps_its_routing_view_and_replays() {
             ["inventory"],
             cover_applier(fresh_rebuilder()),
         )
-        .on_event("order", "test.Created", |_, _, _, _| {
+        .on_event("order", "test.Created", |_, _, _| {
             Ok(pb::ProcessManagerHandleResponse::default())
         })
         .with_state_packer(pack_applied),
