@@ -1,108 +1,92 @@
-# Design: rules version, snapshot validity, conflict resolution and command upcasting
+# Design: rules version, conflict resolution, command upcasting and snapshot validity
 
-**Status:** proposal, pending owner sign-off. The tests that pin this API are
-already in the tree and red. `crates/router/src/handling.test.rs` compiles
-only with `--features pending-handling`, and
-`conformance/features/handling.feature` is tagged `@wip` and has no runner yet.
-Nothing below is implemented. ABI_VERSION stays at 4, because nothing has been
-published since the bump.
+**Status:**
+- **Implemented, as signed off:** conflict resolution, command upcasting and
+  the rules version reported on every response. Commits c33c930 and 6588184
+  carry them, and `conformance/features/handling.feature` plus
+  `crates/router/src/handling.test.rs` pin them.
+- **Open:** how the rules version is sourced. The owner intends the business
+  binary to bake its full version string in at build time (versionator emits
+  it), and the router just reports whatever it is given.
+- **Superseded:** snapshot validity. The coordinator decides which snapshot to
+  offer, from a startup hello in which the business logic sends its version.
+  The router validates no snapshot and never answers `snapshot_refused`.
 
-## What the spec asks for
+ABI_VERSION stays at 4.
 
-Everything here comes from angzarr-project `spec/20261019-draft`:
-`command_handler.proto` (`CommandHandlerService.Handle`,
-`CommandHandlerResponse`), `types.proto` (`Snapshot`, `Handling`,
-`ConflictResolution`, `ContextualCommand`), the `conflict_units` region of
-`options.proto`, and `upcaster.proto`. The governing decisions are 12.6, 12.7
-and 12.11, and the backlog items are RV-2, RV-3, HD-5, NC-1, CR-1 and VC-1.
-The project's feature files have no scenario ids for any of this yet; see
-"Spec ambiguities" below.
+## Spec
 
-Inside `Handle` the router (the "client library" in the spec's terms) works
-through these steps in order:
+These are from angzarr-project `spec/20261019-draft`:
+- `command_handler.proto` (`CommandHandlerService.Handle`,
+  `CommandHandlerResponse`);
+- `types.proto` (`Handling`, `ConflictResolution`, `ContextualCommand`);
+- `options.proto` (the `conflict_units` region);
+- `upcaster.proto`.
 
-1. **Snapshot validity (RV-3).** Before decoding a delivered snapshot, compare
-   its state type URL and its `rules_version` with the component's own. On any
-   mismatch, answer `snapshot_refused`. Nothing else is set, and no business
-   code runs.
-2. **Upcast (VC-1).** Run the payload through the component's upcaster chain,
-   by type URL. A type URL that reaches no handler is refused
-   `INVALID_ARGUMENT`, and the refusal names it. That refusal is already
-   implemented (commit 965b61a).
-3. **Dispatch.** The body arm and the type URL pick the handler. Already
-   implemented.
-4. **Conflicts (HD-5, NC-1, CR-1).**
-   - **STRICT:** nothing to do.
-   - **AGGREGATE_HANDLES:** decide receives the window and the nonce, and must
-     call `resolve_conflicts` with exactly that nonce. Otherwise its output is
-     discarded and the command fails `ABORTED`.
-   - **COMMUTATIVE:** the library folds the state to `expected_sequence`, then
-     to the head, and runs decide on the head. It compares
-     `changed(expected, head)` against `changed(head, head + events)`. Disjoint
-     unit sets mean the library acknowledges the nonce itself and keeps the
-     events; overlapping sets mean `ABORTED`.
+The governing decisions are 12.6, 12.7 and 12.11, and the backlog items are
+RV-2, HD-5, NC-1, CR-1 and VC-1. The project features have no scenario ids for
+these yet.
 
-Every response also reports the component's `rules_version` (RV-2), for both
-aggregates and process managers.
+## What `Handle` does, in order
 
-## Rust API (crates/router)
+1. **Upcast (VC-1).** The payload of either arm (Command or Fact) runs through
+   the component's upcaster chains, by type URL.
+2. **Dispatch.** The body arm and the upcast type URL pick the handler. If no
+   handler claims that type, the command is refused `INVALID_ARGUMENT`:
+   - the message names the type URL the client sent;
+   - with an upcaster chain, the extras also carry the last type URL the chain
+     produced, under `upcast_type_url`.
+3. **Conflicts (HD-5, NC-1, CR-1)**, for the Command arm only (a fact is never
+   conflict-resolved):
+   - **STRICT** (or unspecified): decide runs on the head.
+   - **AGGREGATE_HANDLES:** decide runs on the head with the window and nonce.
+     If the handler does not call `resolve_conflicts` with the delivered nonce,
+     its output is discarded with `CONFLICT_UNRESOLVED` (ABORTED).
+   - **COMMUTATIVE:** the router:
+     1. folds the state to the expected sequence and captures it;
+     2. folds the window and captures the head;
+     3. runs decide on the head;
+     4. restores the head, which discards anything decide did to the state;
+     5. folds the command's events and captures the result;
+     6. keeps the events if `changed(expected, head)` and `changed(head,
+        after)` do not overlap, and otherwise answers `CONFLICT_OVERLAP`
+        (ABORTED).
 
-### New builder methods
+     With no `changed` registered the answer is
+     `CONFLICT_RESOLUTION_UNSUPPORTED` (INVALID_ARGUMENT), returned before
+     rebuild.
+4. **Rules version.** Every response reports the component's rules version
+   (RV-2).
+
+`CommandHandlers` (and so the Rust `Router` and the C ABI registry) routes an
+old type by first trying the sent type. Failing that, it tries each aggregate
+of the domain whose chain brings the type to one that aggregate claims. Failing
+that, the domain's first aggregate gets it and produces the refusal.
+
+## Rust API
 
 | Symbol | Purpose |
 |---|---|
-| `AggregateDispatch::with_rules_version(impl Into<String>)` | The rules version reported on every response, and compared against a delivered snapshot's. |
-| `AggregateDispatch::with_state_type(impl Into<String>)` | The state message's fully-qualified name, compared against the snapshot state's type URL. |
-| `AggregateDispatch::with_commutative(changed)` where `S: Clone` | Supplies the generated `changed(before, after) -> Vec<String>` (backlog CR-1) and turns on the library resolver. |
-| `AggregateDispatch::with_command_upcaster(UpcasterDispatch)` | Adds an event-style upcaster chain for command and fact payloads. Repeated calls run in registration order. |
-| `ProcessManagerDispatch::with_rules_version` and `with_state_type` | The same checks for a process manager's `process_state` snapshot and its response. |
-
-### New and changed types
-
-- `CommandContext` gains three fields:
-  - `expected_sequence: u64` and `conflict_resolution: pb::ConflictResolution`,
-    both read from the resolved `Handling`;
-  - `conflict: Option<aggregate::Conflict>`, which is `Some` only under
-    AGGREGATE_HANDLES. It stays `None` under STRICT, and under COMMUTATIVE,
-    where the library resolves and the handler never sees the nonce.
-- `aggregate::Conflict` provides:
-  - `window() -> &[pb::EventPage]`: the pages at sequences `E..head`;
-  - `nonce() -> &[u8]`;
-  - `resolve_conflicts(&self, window: &[pb::EventPage], nonce: &[u8])`, which
-    records the acknowledgement. Only the nonce is checked. The window argument
-    exists so the call has the spec's signature, `resolve_conflicts(window,
-    nonce)`, in every language.
-- `conflict::overlap(a: &[String], b: &[String]) -> bool` implements the
-  spec's overlap rule: a wildcard against any non-empty set, equal units, or
-  prefixes that end at a `.` or `[` boundary.
-
-### New error codes
-
-- `codes::CONFLICT_UNRESOLVED`: AGGREGATE_HANDLES output was discarded. Maps to
-  ABORTED.
-- `codes::CONFLICT_OVERLAP`: COMMUTATIVE found an overlap. Maps to ABORTED, and
-  the extras carry both unit sets.
-- `codes::CONFLICT_RESOLUTION_UNSUPPORTED`: a COMMUTATIVE delivery reached an
-  aggregate that registered no `changed`. Maps to INVALID_ARGUMENT.
-- `GrpcCode::Aborted = 10` is added, and `abi::grpc_from_wire` maps 10 to it.
-
-### Response behaviour
-
-- **Snapshot refused:** `Ok(CommandHandlerResponse { snapshot_refused: true,
-  events: None, rules_version })`, and likewise
-  `ProcessManagerHandleResponse.snapshot_refused`. A refusal is an answer, not
-  an error.
-- **Handler output kept:** `events` and `rules_version` are filled.
-
-### A Rust handler author
+| `AggregateDispatch::with_rules_version` and `ProcessManagerDispatch::with_rules_version` | The string reported on every response. A process manager with none declared keeps its handler's own value. |
+| `AggregateDispatch::with_commutative(changed)` (needs `S: Clone`) | COMMUTATIVE through the generated `changed` (backlog CR-1). |
+| `AggregateDispatch::with_commutative_via(capture, restore, changed)` | The same, over state images, for state the router can't clone (host state behind the C ABI). |
+| `AggregateDispatch::with_command_upcaster(impl PayloadUpcaster)` | An upcaster chain for command and fact payloads. `UpcasterDispatch` implements `PayloadUpcaster`. |
+| `CommandContext.expected_sequence`, `conflict_resolution`, `conflict` | The resolved `Handling`. `conflict` is `Some` only under AGGREGATE_HANDLES. |
+| `aggregate::Conflict` | `window()`, `nonce()`, `resolve_conflicts(window, nonce)` (only the nonce is checked), `is_resolved()`. |
+| `CommandHandler::upcast_payload` | Has a default. Routing consults it so an old type reaches the aggregate its chain serves. |
+| `conflict::overlap` | The spec's overlap rule. |
+| `codes::CONFLICT_UNRESOLVED`, `CONFLICT_OVERLAP` | Both ABORTED; `GrpcCode::Aborted` is new. |
+| `codes::CONFLICT_RESOLUTION_UNSUPPORTED` | INVALID_ARGUMENT. |
+| `codes::INCOMPLETE_COMMUTATIVE` | INVALID_ARGUMENT, at C ABI registration. |
+| `extras::UPCAST_TYPE_URL`, `WINDOW_UNITS`, `COMMAND_UNITS` | Extras keys on the refusals above. |
 
 ```rust
 AggregateDispatch::new("list", "list", rebuilder)
-    .with_rules_version("v3")
-    .with_state_type("hatpick.v1.ListState")
-    .with_commutative(ListState::changed)        // generated (CR-1)
+    .with_rules_version(env!("CARGO_PKG_VERSION"))   // sourcing: open
+    .with_commutative(ListState::changed)             // generated (CR-1)
+    .with_command_upcaster(command_upcasters)
     .on_command("hatpick.v1.Rename", |cmd, state, cctx| {
-        if let Some(conflict) = &cctx.conflict {   // AGGREGATE_HANDLES only
+        if let Some(conflict) = &cctx.conflict {      // AGGREGATE_HANDLES only
             /* examine conflict.window() */
             conflict.resolve_conflicts(conflict.window(), conflict.nonce());
         }
@@ -110,119 +94,80 @@ AggregateDispatch::new("list", "list", rebuilder)
     })
 ```
 
-Generated wiring (`registry.register::<D>()`, CR-3) would make the
-`with_rules_version`, `with_state_type` and `with_commutative` calls from the
-`State` implementation, so a hand-written component rarely makes them itself.
+## C ABI (ABI 4, language-neutral)
 
-## C ABI additions (ABI_VERSION 4, language-neutral)
+### `abi.proto` additions
 
-### `abi.proto` changes
+- **`AggregateDescriptor`** gains:
+  - `rules_version = 10`;
+  - `pack_state_callback_id = 12`: the host packs its session state into an
+    `Any`;
+  - `changed_callback_id = 13`: receives a `ChangedCall { before, after }` and
+    returns `ChangedUnits { units }`. Registration requires both the packer and
+    `snapshot_callback_id`, which is how the router restores the head;
+    otherwise it refuses with `INCOMPLETE_COMMUTATIVE`;
+  - `command_upcasters = 14`: ordered rules, each returning a serialized `Any`.
+    `STATUS_OK_EMPTY` means the payload is unchanged.
+- **`ProcessManagerDescriptor`** gains `rules_version = 9`.
+- **`CommandContextAux`** gains `expected_sequence = 4`,
+  `conflict_resolution = 5`, and `conflict_nonce = 6` and `window = 7`, both
+  set only under AGGREGATE_HANDLES.
+- **A command callback's STATUS_OK output** is now `CommandOutput { events = 1,
+  resolved_nonce = 2 }`. A host's `resolve_conflicts` sets `resolved_nonce`.
 
-- **`AggregateDescriptor` gains:**
-  - `string rules_version = 10;`
-  - `string state_type_url = 11;` holding the fully-qualified state name, or
-    empty to skip the type check (see the ambiguities).
-  - `optional uint64 pack_state_callback_id = 12;` The host packs its current
-    session state into a serialized `google.protobuf.Any`. This is required
-    for COMMUTATIVE.
-  - `optional uint64 changed_callback_id = 13;` The callback receives a
-    `ChangedCall { Any before = 1; Any after = 2; }` and returns
-    `ChangedUnits { repeated string units = 1; }`. Its presence turns on
-    COMMUTATIVE, and it needs both `pack_state_callback_id` and
-    `snapshot_callback_id`.
-  - `repeated CallbackEntry command_upcasters = 14;` These are ordered rules.
-    Each takes a payload of type `fq_type` and returns a serialized `Any`.
-- **`ProcessManagerDescriptor` gains:** `string rules_version = 9;` and
-  `string state_type_url = 10;`.
-- **`CommandContextAux` gains:**
-  - `uint64 expected_sequence = 4;`
-  - `io.angzarr.v1.ConflictResolution conflict_resolution = 5;`
-  - `bytes conflict_nonce = 6;`, set only under AGGREGATE_HANDLES;
-  - `repeated io.angzarr.v1.EventPage window = 7;`, also set only under
-    AGGREGATE_HANDLES.
-- **The command callback's STATUS_OK output changes** from `EventBook` to a
-  new message, `CommandOutput { io.angzarr.v1.EventBook events = 1; bytes
-  resolved_nonce = 2; }`. A host's `resolve_conflicts` sets `resolved_nonce`.
-  `STATUS_OK_EMPTY` still means no events and no acknowledgement.
+The C function signatures don't change. Field 11 of `AggregateDescriptor` is
+unused: it was proposed for `state_type_url`, which the coordinator-side
+snapshot design made unnecessary.
 
-The C function signatures and entry points do not change. Rules version,
-snapshot refusal and the resolver all run inside `angzarr_router_dispatch`.
+**A binding's role:**
+- At registration it sends its generated rules version, `changed`, state
+  packer and upcasters.
+- For each command callback it builds the handler context from
+  `CommandContextAux`. Calling `resolve_conflicts` on that context stores the
+  nonce, and the binding returns it in `CommandOutput.resolved_nonce`.
+- For COMMUTATIVE, the router drives the host's single session state through
+  pack, restore (via the snapshot loader) and `changed`. The overlap rule runs
+  once, in Rust.
 
-### How the router runs COMMUTATIVE against host-owned state
+## Rejected alternatives
 
-Host state lives in the binding's session; the router only ever sees `()`. For
-COMMUTATIVE the router works the same single session instance in sequence:
+- **A re-entrant `angzarr_router_resolve_conflicts` entry point:** it would
+  re-enter the router mid-dispatch. The acknowledgement travels as data
+  instead.
+- **A COMMUTATIVE resolver in each binding:** that would implement the overlap
+  rule once per language.
+- **`Conflict::resolve_conflicts(nonce)` without the window:** it diverges from
+  the spec's signature.
+- **An upcaster as a separate router component:** a router hosts one kind, and
+  the chain belongs to the aggregate's own `Handle`.
 
-1. Fold the pages before `E`, then pack the state as `expected`.
-2. Fold the window, then pack the state as `head`.
-3. Run decide.
-4. Restore `head` through the snapshot loader. This undoes any mutation decide
-   made.
-5. Fold the emitted events, then pack the state as `after`.
-6. Call `changed` twice and compute the overlap in Rust.
+## Owner rulings applied
 
-The overlap rule is therefore implemented once, in the router. Each language
-supplies only its generated `changed`.
+- **Stale outcomes:** two codes, both ABORTED. COMMUTATIVE with no `changed` is
+  `CONFLICT_RESOLUTION_UNSUPPORTED` (INVALID_ARGUMENT).
+- **Upcasting** runs on both arms. An unknown-after-upcast refusal names the
+  sent type in the message and the chain's last type in the extras.
+- **Process managers** use the existing merge rule: `rules_version` is the
+  first non-empty value.
+- **Snapshot validity** (superseded): the coordinator decides, via the startup
+  hello. The router-side state-type check, rules-version comparison and
+  `snapshot_refused` answers were never implemented, and their design tests
+  were dropped.
 
-### A binding
+## Decisions taken in implementation (not covered by the rulings)
 
-At registration, the binding sends its generated rules version, state type,
-`changed`, pack callback and upcasters. When a command callback runs, it builds
-the handler context from `CommandContextAux`. Calling `resolve_conflicts` on
-that context stores the nonce, and the binding returns it in
-`CommandOutput.resolved_nonce`.
-
-## Alternatives rejected
-
-- **A re-entrant `angzarr_router_resolve_conflicts(host_ctx, nonce)` entry
-  point** that the host calls during the callback. It mirrors the call-shaped
-  API, but it re-enters the router mid-dispatch and adds thread-local
-  acknowledgement state. Returning the acknowledgement as data in
-  `CommandOutput` keeps every callback a pure request/response.
-- **A host-side COMMUTATIVE resolver**, where the binding folds, diffs and
-  decides overlap itself. That would implement the overlap rule once per
-  language, which the router exists to avoid. With the proposed design the
-  host provides only `changed` and state packing.
-- **Requiring `S: prost::Message` for COMMUTATIVE in Rust,** to pack and diff
-  bytes. `changed` is typed over the state, so `S: Clone` is enough.
-- **`Conflict::resolve_conflicts(nonce)` without the window argument.** It is
-  simpler, but it diverges from the spec's `resolve_conflicts(window, nonce)`,
-  which every language mirrors. If the owner prefers the shorter form, it is a
-  one-line change.
-- **Validating snapshots inside `Rebuilder`.** The rules version is a property
-  of the component, not of the fold. The dispatch tables own both checks and
-  run them before rebuild.
-- **Upcasting by composing an upcaster component into the same `Router`.** A
-  router hosts one kind (MIXED_HANDLER_KINDS), and command upcasting belongs to
-  the aggregate's own `Handle`. The chain is therefore attached to the
-  aggregate.
-
-## Spec ambiguities (owner calls)
-
-1. **A component with no declared state type.** Should its snapshots be
-   checked only against the rules version (proposed), always refused, or never
-   checked? The proposal compares whatever the component declares, and
-   generated wiring always declares both.
-2. **Snapshot check versus an unknown type.** `Handle` validates the snapshot
-   (step 1) before upcast and dispatch (steps 2 and 3), so an unknown type that
-   arrives with a stale snapshot is answered `snapshot_refused` first and only
-   refused on redelivery. The tests pin this literal order.
-3. **Which type URL an unknown-after-upcasting command names:** the one the
-   client sent (proposed and pinned) or the last one in the chain.
-4. **Are facts upcast?** Step 2 says "the payload", so the proposal upcasts
-   both arms.
-5. **COMMUTATIVE reaching a component with no `changed`.** The coordinator
-   should never deliver it (CR-2/CR-3). The proposal refuses it
-   INVALID_ARGUMENT as `CONFLICT_RESOLUTION_UNSUPPORTED`. The alternative is
-   ABORTED, which would treat it like STRICT.
-6. **Error codes for the stale outcomes.** Should they be two codes
-   (`CONFLICT_UNRESOLVED`, `CONFLICT_OVERLAP`) or one shared `STALE_COMMAND`?
-   The spec fixes only the gRPC status, ABORTED.
-7. **Co-resident process managers.** Each one validates its own
-   `process_state` snapshot. In the merged response `snapshot_refused` is OR'd
-   and the first non-empty rules version wins; that merge rule already exists.
-8. **The feature files are stale.** `merge_strategy.feature` (C-0149..C-0176)
-   in the coordinator contract still describes MergeStrategy, MANUAL and the
-   coordinator-side Replay diff that decision 12.7 removed. C-0197 and C-0198
-   are client sync-mode scenarios and don't govern the router. New scenario ids
-   are needed in angzarr-project for RV-2, RV-3, NC-1, CR-1 and VC-1.
+- **Envelope guards come first.** `MISSING_COMMAND_BOOK`, `MISSING_COMMAND_PAGE`
+  and `MISSING_COMMAND_PAYLOAD` still precede upcasting.
+- **Failing to fold an emitted event** during the COMMUTATIVE `after` fold is
+  `UNHANDLED_HANDLER_ERROR` (INTERNAL, a handler bug), not
+  `PERSISTED_EVENT_CORRUPT`.
+- **Routing of old types.** `CommandHandler::upcast_payload` was added so the
+  shared-domain router can route an old type to the aggregate whose chain
+  serves it.
+- **A process manager with no declared rules version** keeps the value its
+  handler returned. A declared value overrides it.
+- **`resolved_nonce` empty** means "did not resolve". A host that leaves it
+  empty fails stale even when the delivered nonce is empty, which the spec
+  never sends under AGGREGATE_HANDLES.
+- **`INCOMPLETE_COMMUTATIVE`** is a new registration-time code for
+  `changed_callback_id` without both the packer and the snapshot loader.

@@ -815,6 +815,192 @@ pub fn tracked_book(label: &str, sequences: &[u64]) -> pb::EventBook {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The list aggregate: conflict resolution and command upcasting
+// (handling.feature).
+// ---------------------------------------------------------------------------
+
+/// How the list aggregate's Bump handler answers a conflict window under
+/// AGGREGATE_HANDLES.
+#[derive(Debug, Clone, Default)]
+pub enum Ack {
+    /// resolve_conflicts with the delivered nonce.
+    #[default]
+    Delivered,
+    /// Never call resolve_conflicts.
+    Never,
+    /// resolve_conflicts with this value instead.
+    With(Vec<u8>),
+}
+
+/// What the Bump handler saw.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ListObserved {
+    /// The fully-qualified type the handler received (after upcasting).
+    pub command: String,
+    pub expected_sequence: u64,
+    pub conflict_resolution: pb::ConflictResolution,
+    /// The conflict window's sequences, when the handler got a conflict.
+    pub window: Option<Vec<u64>>,
+    /// The item keys of the state it decided on, sorted.
+    pub items: Vec<String>,
+}
+
+/// Sink the harness passes into the list aggregate.
+pub type ListSink = Arc<Mutex<Vec<ListObserved>>>;
+
+/// The generated `changed(before, after)` for `ListState` with
+/// `map<string, uint32> items = 1 [(conflict) = {}]` (backlog CR-1): one
+/// unit per item key that differs.
+pub fn list_changed(before: &counter::ListState, after: &counter::ListState) -> Vec<String> {
+    let keys: std::collections::BTreeSet<&String> =
+        before.items.keys().chain(after.items.keys()).collect();
+    keys.into_iter()
+        .filter(|k| before.items.get(*k) != after.items.get(*k))
+        .map(|k| format!("items[{k}]"))
+        .collect()
+}
+
+fn rename(
+    to: &'static str,
+) -> impl Fn(&prost_types::Any) -> Result<prost_types::Any, HandlerError> {
+    move |any| {
+        Ok(prost_types::Any {
+            type_url: angzarr_router::type_url(to),
+            value: any.value.clone(),
+        })
+    }
+}
+
+/// The list aggregate (domain "list") over `ListState` at `rules_version`:
+/// Bumped(key) folds items[key] += 1; Bump(key) records what it saw in
+/// `seen`, answers a conflict per `ack`, and records Bumped(key); its
+/// upcaster chain renames BumpV1 to Bump and BumpOld to BumpLost (nothing
+/// handles BumpLost); COMMUTATIVE runs through [`list_changed`].
+pub fn list_aggregate(
+    rules_version: &str,
+    ack: Ack,
+    seen: ListSink,
+) -> AggregateDispatch<counter::ListState> {
+    let rebuilder = Rebuilder::new(counter::ListState::default).apply(
+        "test.counter.Bumped",
+        |state: &mut counter::ListState, event| {
+            let key = counter::Bumped::decode(event.value.as_slice())?.key;
+            *state.items.entry(key).or_default() += 1;
+            Ok(())
+        },
+    );
+    let upcaster = angzarr_router::upcaster::UpcasterDispatch::new("list-commands", "list")
+        .on_event("test.counter.BumpV1", rename("test.counter.Bump"))
+        .on_event("test.counter.BumpOld", rename("test.counter.BumpLost"));
+    AggregateDispatch::new("List", "list", rebuilder)
+        .with_rules_version(rules_version)
+        .with_commutative(list_changed)
+        .with_command_upcaster(upcaster)
+        .on_command("test.counter.Bump", move |cmd, state, cctx| {
+            let key = counter::Bump::decode(cmd.value.as_slice())
+                .map_err(|e| HandlerError::Other(format!("decode Bump: {e}")))?
+                .key;
+            seen.lock().unwrap().push(ListObserved {
+                command: angzarr_router::type_name_from_url(&cmd.type_url).to_string(),
+                expected_sequence: cctx.expected_sequence,
+                conflict_resolution: cctx.conflict_resolution,
+                window: cctx
+                    .conflict
+                    .as_ref()
+                    .map(|c| c.window().iter().map(|p| p.sequence).collect()),
+                items: {
+                    let mut keys: Vec<String> = state.items.keys().cloned().collect();
+                    keys.sort();
+                    keys
+                },
+            });
+            if let Some(conflict) = cctx.conflict.as_ref() {
+                match &ack {
+                    Ack::Delivered => {
+                        conflict.resolve_conflicts(conflict.window(), conflict.nonce())
+                    }
+                    Ack::Never => {}
+                    Ack::With(value) => conflict.resolve_conflicts(conflict.window(), value),
+                }
+            }
+            Ok(Some(pb::EventBook {
+                pages: vec![pb::EventPage {
+                    payload: Some(bumped(&key)),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }))
+        })
+}
+
+fn bumped(key: &str) -> prost_types::Any {
+    prost_types::Any {
+        type_url: angzarr_router::type_url("test.counter.Bumped"),
+        value: counter::Bumped {
+            key: key.to_string(),
+        }
+        .encode_to_vec(),
+    }
+}
+
+/// A `test.counter.<command>` command for item `key` to the list aggregate,
+/// over Bumped events of `history` at sequences 0.., resolved to
+/// `(expected_sequence, resolution, nonce)` when given.
+pub fn list_command(
+    command: &str,
+    key: &str,
+    history: &[String],
+    handling: Option<(u64, pb::ConflictResolution, Vec<u8>)>,
+) -> pb::ContextualCommand {
+    let (handling, nonce) = match handling {
+        Some((expected, resolution, nonce)) => (
+            Some(pb::Handling {
+                expected_sequence: Some(expected),
+                conflict_resolution: resolution as i32,
+            }),
+            nonce,
+        ),
+        None => (None, Vec::new()),
+    };
+    pb::ContextualCommand {
+        command: Some(pb::CommandBook {
+            cover: Some(pb::Cover {
+                domain: "list".to_string(),
+                ..Default::default()
+            }),
+            page: Some(pb::CommandPage {
+                body: Some(pb::command_page::Body::Command(pb::Command {
+                    payload: Some(prost_types::Any {
+                        type_url: angzarr_router::type_url(&format!("test.counter.{command}")),
+                        // Bump, BumpV1 and BumpOld share the key field.
+                        value: counter::Bump {
+                            key: key.to_string(),
+                        }
+                        .encode_to_vec(),
+                    }),
+                })),
+                ..Default::default()
+            }),
+            handling,
+        }),
+        events: Some(pb::EventBook {
+            pages: history
+                .iter()
+                .zip(0u64..)
+                .map(|(k, sequence)| pb::EventPage {
+                    payload: Some(bumped(k)),
+                    sequence,
+                    ..Default::default()
+                })
+                .collect(),
+            next_sequence: history.len() as u64,
+            ..Default::default()
+        }),
+        conflict_nonce: nonce.into(),
+    }
+}
+
 #[cfg(test)]
 mod smoke {
     use super::*;

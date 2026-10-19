@@ -60,3 +60,15 @@ historical-state evidence the framework supplies.
   `AuditProcessManagerState` with what its rebuilt state saw. They
   prove each PM rebuilds only its own state and that a process state
   reaches only the PM that owns it.
+
+## The list aggregate (handling.feature)
+
+Built by hand in the harness (no component options; the messages are at the
+end of `counter.proto`): `ListState` keeps one counter per item key, with
+the conflict unit `items[<key>]` (its `changed()` is hand-written to what the
+generator would emit). `Bump(key)` records `Bumped(key)`; the upcaster chain
+renames `BumpV1` to `Bump` and `BumpOld` to `BumpLost`, which nothing
+handles. It exercises the rules version on every response, the conflict
+window and nonce under AGGREGATE_HANDLES, the COMMUTATIVE resolver, and
+command upcasting.
+
