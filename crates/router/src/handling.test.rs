@@ -1,0 +1,565 @@
+//! DESIGN TESTS (red until implemented): the handler-facing API for the
+//! latest spec's handling surface. Compiled only with the
+//! `pending-handling` feature (`cargo test -p angzarr-router --features
+//! pending-handling`); the gates do not enable it. Proposal:
+//! docs/design-handling.md. Phase (b) drops the feature gate.
+//!
+//! Spec governing each group (angzarr-project spec/20261019-draft):
+//! - rules version: types.proto EventMeta.rules_version,
+//!   command_handler.proto CommandHandlerResponse.rules_version,
+//!   process_manager.proto ProcessManagerHandleResponse.rules_version;
+//!   decision 12.6; backlog RV-2.
+//! - snapshot refusal: types.proto Snapshot (Validity),
+//!   command_handler.proto CommandHandlerService.Handle step 1; decision
+//!   12.6; backlog RV-3.
+//! - conflict delivery: types.proto Handling, ConflictResolution,
+//!   ContextualCommand.conflict_nonce; decision 12.7; backlog HD-5, NC-1.
+//! - COMMUTATIVE resolver and overlap: options.proto conflict_units region
+//!   ("Overlap", "The resolver"); backlog CR-1.
+//! - command upcasting: upcaster.proto, command_handler.proto Handle step 2;
+//!   decision 12.11; backlog VC-1.
+//!
+//! The angzarr-project features carry no scenario ids for these yet: the
+//! coordinator-contract merge_strategy.feature (C-0149..C-0176) still
+//! describes the superseded MergeStrategy and coordinator-side Replay diff.
+
+use std::sync::{Arc, Mutex};
+
+use prost_types::Any;
+
+use crate::aggregate::{AggregateDispatch, CommandContext};
+use crate::conflict::overlap;
+use crate::error::{codes, GrpcCode};
+use crate::pb;
+use crate::process_manager::ProcessManagerDispatch;
+use crate::rebuild::Rebuilder;
+use crate::test_support::*;
+use crate::type_url;
+use crate::upcaster::UpcasterDispatch;
+
+const STATE_TYPE: &str = "test.ListState";
+const RULES: &str = "v3";
+
+/// A COMMUTATIVE-capable state: one counter per item key. `changed` below is
+/// what the generator (backlog CR-1) would emit for
+/// `map<string, uint32> items = 1 [(conflict) = {}]`.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct ListState {
+    items: std::collections::BTreeMap<String, u32>,
+}
+
+fn changed(before: &ListState, after: &ListState) -> Vec<String> {
+    let keys: std::collections::BTreeSet<&String> =
+        before.items.keys().chain(after.items.keys()).collect();
+    keys.into_iter()
+        .filter(|k| before.items.get(*k) != after.items.get(*k))
+        .map(|k| format!("items[{k}]"))
+        .collect()
+}
+
+/// An event bumping item `key` (a Cover whose domain is the key).
+fn bump(key: &str) -> Any {
+    cover_any(key)
+}
+
+fn list_rebuilder() -> Rebuilder<ListState> {
+    Rebuilder::new(ListState::default)
+        .apply(&cover_full_name(), |s: &mut ListState, any| {
+            let key = <pb::Cover as prost::Message>::decode(any.value.as_slice())?.domain;
+            *s.items.entry(key).or_default() += 1;
+            Ok(())
+        })
+        .with_snapshot(|s: &mut ListState, _any| {
+            s.items.insert("snap".to_string(), 1);
+            Ok(())
+        })
+}
+
+/// A list aggregate whose `test.Bump` command bumps the item named in the
+/// command's Cover payload, recording each CommandContext it saw.
+fn list_aggregate(seen: Arc<Mutex<Vec<CommandContext>>>) -> AggregateDispatch<ListState> {
+    AggregateDispatch::new("list", "list", list_rebuilder())
+        .with_rules_version(RULES)
+        .with_state_type(STATE_TYPE)
+        .on_command("test.Bump", move |cmd, _state, cctx| {
+            let key = <pb::Cover as prost::Message>::decode(cmd.value.as_slice())
+                .unwrap()
+                .domain;
+            seen.lock().unwrap().push(cctx);
+            Ok(Some(pb::EventBook {
+                pages: vec![event_page(bump(&key))],
+                ..Default::default()
+            }))
+        })
+}
+
+fn bump_command(key: &str) -> Any {
+    let mut any = cover_any(key);
+    any.type_url = type_url("test.Bump");
+    any
+}
+
+/// A delivery of `test.Bump(key)` over `history` (bumps of the given keys at
+/// sequences 0..), resolved to `resolution` with expected sequence
+/// `expected`, carrying `nonce`.
+fn delivery(
+    key: &str,
+    history: &[&str],
+    expected: u64,
+    resolution: pb::ConflictResolution,
+    nonce: &[u8],
+) -> pb::ContextualCommand {
+    let mut req = command_for(bump_command(key));
+    req.events = Some(pb::EventBook {
+        pages: history
+            .iter()
+            .zip(0..)
+            .map(|(k, seq)| sequenced_event_page(seq, bump(k)))
+            .collect(),
+        next_sequence: history.len() as u64,
+        ..Default::default()
+    });
+    req.command.as_mut().unwrap().handling = Some(pb::Handling {
+        expected_sequence: Some(expected),
+        conflict_resolution: resolution as i32,
+    });
+    req.conflict_nonce = nonce.to_vec().into();
+    req
+}
+
+fn strict(key: &str, history: &[&str]) -> pb::ContextualCommand {
+    delivery(
+        key,
+        history,
+        history.len() as u64,
+        pb::ConflictResolution::Strict,
+        &[],
+    )
+}
+
+fn snapshot(type_name: &str, rules_version: &str) -> pb::Snapshot {
+    pb::Snapshot {
+        sequence: 0,
+        state: Some(Any {
+            type_url: type_url(type_name),
+            value: Vec::new(),
+        }),
+        rules_version: rules_version.to_string(),
+    }
+}
+
+// --- rules version (RV-2) ---------------------------------------------------
+
+#[test]
+fn every_response_reports_the_declared_rules_version() {
+    let d = list_aggregate(Arc::default());
+    let resp = d.dispatch(&strict("a", &[])).expect("command");
+    assert_eq!(resp.rules_version, RULES);
+}
+
+#[test]
+fn a_process_manager_reports_its_rules_version() {
+    let pm = ProcessManagerDispatch::new("pm", "pm", ["inventory"], fresh_rebuilder())
+        .with_rules_version(RULES)
+        .on_event("orders", "test.Shipped", |_e, _s, _c| {
+            Ok(pb::ProcessManagerHandleResponse::default())
+        });
+    let resp = pm
+        .dispatch(&pb::ProcessManagerHandleRequest {
+            trigger: Some(pb::EventBook {
+                cover: Some(pb::Cover {
+                    domain: "orders".to_string(),
+                    ..Default::default()
+                }),
+                pages: vec![event_page(Any {
+                    type_url: type_url("test.Shipped"),
+                    value: Vec::new(),
+                })],
+                ..Default::default()
+            }),
+            process_state: None,
+        })
+        .expect("dispatch");
+    assert_eq!(resp.rules_version, RULES);
+}
+
+// --- snapshot refusal (RV-3) ------------------------------------------------
+
+#[test]
+fn a_snapshot_of_the_declared_type_and_rules_loads() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let d = list_aggregate(seen.clone());
+    let mut req = strict("a", &[]);
+    req.events.as_mut().unwrap().snapshot = Some(snapshot(STATE_TYPE, RULES));
+    let resp = d.dispatch(&req).expect("dispatch");
+    assert!(!resp.snapshot_refused);
+    assert_eq!(seen.lock().unwrap().len(), 1, "the handler ran");
+}
+
+#[test]
+fn a_snapshot_of_another_state_type_is_refused_before_business_code() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let d = list_aggregate(seen.clone());
+    let mut req = strict("a", &["x"]);
+    req.events.as_mut().unwrap().snapshot = Some(snapshot("test.OtherState", RULES));
+    let resp = d
+        .dispatch(&req)
+        .expect("a refusal is a response, not an error");
+    assert!(resp.snapshot_refused);
+    assert_eq!(resp.events, None, "nothing else is set");
+    assert_eq!(resp.rules_version, RULES);
+    assert!(seen.lock().unwrap().is_empty(), "no business code ran");
+}
+
+#[test]
+fn a_snapshot_of_another_rules_version_is_refused() {
+    let d = list_aggregate(Arc::default());
+    let mut req = strict("a", &[]);
+    req.events.as_mut().unwrap().snapshot = Some(snapshot(STATE_TYPE, "v2"));
+    assert!(d.dispatch(&req).expect("dispatch").snapshot_refused);
+}
+
+#[test]
+fn the_snapshot_is_checked_before_the_payload_type() {
+    // Handle step 1 (snapshot) precedes step 2/3 (upcast, dispatch).
+    let d = list_aggregate(Arc::default());
+    let mut req = command_for(Any {
+        type_url: type_url("test.Unknown"),
+        value: Vec::new(),
+    });
+    req.events = Some(pb::EventBook {
+        snapshot: Some(snapshot("test.OtherState", RULES)),
+        ..Default::default()
+    });
+    assert!(d.dispatch(&req).expect("dispatch").snapshot_refused);
+}
+
+#[test]
+fn a_process_manager_refuses_a_foreign_process_state_snapshot() {
+    let ran = Arc::new(Mutex::new(false));
+    let flag = ran.clone();
+    let pm = ProcessManagerDispatch::new("pm", "pm", ["inventory"], fresh_rebuilder())
+        .with_rules_version(RULES)
+        .with_state_type(STATE_TYPE)
+        .on_event("orders", "test.Shipped", move |_e, _s, _c| {
+            *flag.lock().unwrap() = true;
+            Ok(pb::ProcessManagerHandleResponse::default())
+        });
+    let resp = pm
+        .dispatch(&pb::ProcessManagerHandleRequest {
+            trigger: Some(pb::EventBook {
+                cover: Some(pb::Cover {
+                    domain: "orders".to_string(),
+                    ..Default::default()
+                }),
+                pages: vec![event_page(Any {
+                    type_url: type_url("test.Shipped"),
+                    value: Vec::new(),
+                })],
+                ..Default::default()
+            }),
+            process_state: Some(pb::EventBook {
+                snapshot: Some(snapshot(STATE_TYPE, "v1")),
+                ..Default::default()
+            }),
+        })
+        .expect("dispatch");
+    assert!(resp.snapshot_refused);
+    assert!(resp.commands.is_empty() && resp.process_events.is_empty());
+    assert!(!*ran.lock().unwrap(), "no business code ran");
+}
+
+// --- conflict delivery (HD-5, NC-1) -----------------------------------------
+
+#[test]
+fn strict_hands_the_handler_its_handling_and_no_conflict() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    list_aggregate(seen.clone())
+        .dispatch(&strict("a", &["x", "y"]))
+        .expect("dispatch");
+    let cctx = seen.lock().unwrap()[0].clone();
+    assert_eq!(cctx.expected_sequence, 2);
+    assert_eq!(cctx.conflict_resolution, pb::ConflictResolution::Strict);
+    assert!(cctx.conflict.is_none(), "STRICT has no window or nonce");
+}
+
+/// An AGGREGATE_HANDLES aggregate whose handler records the window it saw and
+/// acknowledges with `ack(nonce)` (None: never calls resolve_conflicts).
+fn handles(
+    ack: impl Fn(&[u8]) -> Option<Vec<u8>> + Send + Sync + 'static,
+    windows: Arc<Mutex<Vec<Vec<u64>>>>,
+) -> AggregateDispatch<ListState> {
+    AggregateDispatch::new("list", "list", list_rebuilder()).on_command(
+        "test.Bump",
+        move |_cmd, _state, cctx| {
+            let conflict = cctx
+                .conflict
+                .as_ref()
+                .expect("AGGREGATE_HANDLES carries a conflict");
+            windows
+                .lock()
+                .unwrap()
+                .push(conflict.window().iter().map(|p| p.sequence).collect());
+            if let Some(value) = ack(conflict.nonce()) {
+                conflict.resolve_conflicts(conflict.window(), &value);
+            }
+            Ok(Some(pb::EventBook {
+                pages: vec![event_page(bump("a"))],
+                ..Default::default()
+            }))
+        },
+    )
+}
+
+#[test]
+fn aggregate_handles_delivers_the_window_and_keeps_resolved_output() {
+    let windows = Arc::new(Mutex::new(Vec::new()));
+    let d = handles(|nonce| Some(nonce.to_vec()), windows.clone());
+    let resp = d
+        .dispatch(&delivery(
+            "a",
+            &["x", "y", "z"],
+            1,
+            pb::ConflictResolution::AggregateHandles,
+            b"n-1",
+        ))
+        .expect("resolved");
+    assert_eq!(*windows.lock().unwrap(), vec![vec![1, 2]], "pages E..head");
+    assert_eq!(resp.events.expect("events").pages.len(), 1);
+}
+
+#[test]
+fn aggregate_handles_without_resolve_conflicts_fails_stale() {
+    let d = handles(|_| None, Arc::default());
+    let err = d
+        .dispatch(&delivery(
+            "a",
+            &["x"],
+            0,
+            pb::ConflictResolution::AggregateHandles,
+            b"n-1",
+        ))
+        .expect_err("the handler ignored the window");
+    assert_eq!(err.code, codes::CONFLICT_UNRESOLVED);
+    assert_eq!(err.grpc, GrpcCode::Aborted);
+}
+
+#[test]
+fn aggregate_handles_with_another_nonce_fails_stale() {
+    let d = handles(|_| Some(b"made-up".to_vec()), Arc::default());
+    let err = d
+        .dispatch(&delivery(
+            "a",
+            &["x"],
+            0,
+            pb::ConflictResolution::AggregateHandles,
+            b"n-1",
+        ))
+        .expect_err("a made-up nonce");
+    assert_eq!(err.code, codes::CONFLICT_UNRESOLVED);
+}
+
+#[test]
+fn aggregate_handles_with_an_empty_window_still_demands_the_nonce() {
+    let windows = Arc::new(Mutex::new(Vec::new()));
+    let d = handles(|_| None, windows.clone());
+    let err = d
+        .dispatch(&delivery(
+            "a",
+            &["x"],
+            1,
+            pb::ConflictResolution::AggregateHandles,
+            b"n-1",
+        ))
+        .expect_err("uniform handler path");
+    assert_eq!(err.code, codes::CONFLICT_UNRESOLVED);
+    assert_eq!(*windows.lock().unwrap(), vec![Vec::<u64>::new()]);
+}
+
+// --- COMMUTATIVE: the library resolver (CR-1) -------------------------------
+
+fn commutative(seen: Arc<Mutex<Vec<CommandContext>>>) -> AggregateDispatch<ListState> {
+    list_aggregate(seen).with_commutative(changed)
+}
+
+#[test]
+fn commutative_keeps_a_stale_command_disjoint_from_the_window() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let resp = commutative(seen.clone())
+        .dispatch(&delivery(
+            "a",
+            &["b", "b"],
+            0,
+            pb::ConflictResolution::Commutative,
+            b"n",
+        ))
+        .expect("items[a] vs items[b]: disjoint");
+    assert_eq!(resp.events.expect("events").pages.len(), 1);
+    let cctx = seen.lock().unwrap()[0].clone();
+    assert!(
+        cctx.conflict.is_none(),
+        "the library resolves; the handler never sees the nonce"
+    );
+    assert_eq!(
+        cctx.conflict_resolution,
+        pb::ConflictResolution::Commutative
+    );
+}
+
+#[test]
+fn commutative_fails_stale_on_overlap() {
+    let err = commutative(Arc::default())
+        .dispatch(&delivery(
+            "b",
+            &["a", "b"],
+            1,
+            pb::ConflictResolution::Commutative,
+            b"n",
+        ))
+        .expect_err("items[b] in both window and mine");
+    assert_eq!(err.code, codes::CONFLICT_OVERLAP);
+    assert_eq!(err.grpc, GrpcCode::Aborted);
+}
+
+#[test]
+fn commutative_only_counts_events_from_the_expected_sequence() {
+    // items[b] changed at sequence 0, which the command saw (expected 1).
+    commutative(Arc::default())
+        .dispatch(&delivery(
+            "b",
+            &["b", "a"],
+            1,
+            pb::ConflictResolution::Commutative,
+            b"n",
+        ))
+        .expect("window is items[a] only");
+}
+
+#[test]
+fn commutative_decides_on_the_head() {
+    let states = Arc::new(Mutex::new(Vec::new()));
+    let sink = states.clone();
+    let d = AggregateDispatch::new("list", "list", list_rebuilder())
+        .with_commutative(changed)
+        .on_command("test.Bump", move |_c, state: &mut ListState, _cctx| {
+            sink.lock().unwrap().push(state.clone());
+            Ok(None)
+        });
+    d.dispatch(&delivery(
+        "a",
+        &["b", "c"],
+        0,
+        pb::ConflictResolution::Commutative,
+        b"n",
+    ))
+    .expect("an empty mine is disjoint");
+    assert_eq!(
+        states.lock().unwrap()[0].items.len(),
+        2,
+        "decide saw the window's effects"
+    );
+}
+
+#[test]
+fn commutative_without_a_changed_function_is_unsupported() {
+    let err = list_aggregate(Arc::default())
+        .dispatch(&delivery(
+            "a",
+            &["b"],
+            0,
+            pb::ConflictResolution::Commutative,
+            b"n",
+        ))
+        .expect_err("no conflict units registered");
+    assert_eq!(err.code, codes::CONFLICT_RESOLUTION_UNSUPPORTED);
+    assert_eq!(err.grpc, GrpcCode::InvalidArgument);
+}
+
+// --- the overlap rule (options.proto conflict_units, "Overlap") -------------
+
+fn units(paths: &[&str]) -> Vec<String> {
+    paths.iter().map(|p| p.to_string()).collect()
+}
+
+#[test]
+fn overlap_follows_the_conflict_units_rules() {
+    assert!(
+        !overlap(&units(&[]), &units(&["items[a]"])),
+        "an empty set is disjoint"
+    );
+    assert!(
+        overlap(&units(&["*notes"]), &units(&["title"])),
+        "a wildcard vs non-empty"
+    );
+    assert!(
+        !overlap(&units(&["*notes"]), &units(&[])),
+        "a wildcard vs empty"
+    );
+    assert!(
+        overlap(&units(&["items[42]"]), &units(&["items[42]"])),
+        "equal units"
+    );
+    assert!(
+        overlap(&units(&["items[42]"]), &units(&["items[42].weight"])),
+        "a prefix at a `.` boundary"
+    );
+    assert!(
+        overlap(&units(&["settings"]), &units(&["settings.cooldown_days"])),
+        "a prefix at a `.` boundary"
+    );
+    assert!(
+        overlap(&units(&["columns"]), &units(&["columns[due]"])),
+        "a prefix at `[`"
+    );
+    assert!(
+        !overlap(&units(&["items[4]"]), &units(&["items[42]"])),
+        "no boundary"
+    );
+    assert!(
+        !overlap(&units(&["title"]), &units(&["titles"])),
+        "no boundary"
+    );
+}
+
+// --- command upcasting (VC-1) -----------------------------------------------
+
+fn upcasting_aggregate(handled: Arc<Mutex<Vec<String>>>) -> AggregateDispatch<ListState> {
+    let upcaster = UpcasterDispatch::new("cmd-upcaster", "list").on_event("test.BumpV1", |any| {
+        Ok(Any {
+            type_url: type_url("test.Bump"),
+            value: any.value.clone(),
+        })
+    });
+    AggregateDispatch::new("list", "list", list_rebuilder())
+        .with_command_upcaster(upcaster)
+        .on_command("test.Bump", move |cmd, _s, _c| {
+            handled.lock().unwrap().push(cmd.type_url.clone());
+            Ok(None)
+        })
+}
+
+#[test]
+fn an_old_command_type_is_upcast_then_handled_as_the_new_type() {
+    let handled = Arc::new(Mutex::new(Vec::new()));
+    let mut old = bump_command("a");
+    old.type_url = type_url("test.BumpV1");
+    upcasting_aggregate(handled.clone())
+        .dispatch(&command_for(old))
+        .expect("upcast to test.Bump");
+    assert_eq!(*handled.lock().unwrap(), vec![type_url("test.Bump")]);
+}
+
+#[test]
+fn a_type_with_no_handler_and_no_upcaster_path_is_refused_naming_the_sent_type() {
+    let err = upcasting_aggregate(Arc::default())
+        .dispatch(&command_for(Any {
+            type_url: type_url("test.BumpV0"),
+            value: Vec::new(),
+        }))
+        .expect_err("no path to a handler");
+    assert_eq!(err.grpc, GrpcCode::InvalidArgument);
+    assert_eq!(
+        err.message,
+        format!("no handler for type URL {}", type_url("test.BumpV0"))
+    );
+}

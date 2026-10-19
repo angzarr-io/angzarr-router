@@ -94,3 +94,8 @@ pub(crate) mod test_support;
 #[cfg(test)]
 #[path = "lib.test.rs"]
 mod lib_tests;
+
+// Red design tests for docs/design-handling.md, pending sign-off.
+#[cfg(all(test, feature = "pending-handling"))]
+#[path = "handling.test.rs"]
+mod handling_tests;
