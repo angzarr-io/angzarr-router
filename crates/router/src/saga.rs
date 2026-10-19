@@ -3,9 +3,7 @@
 //! A saga holds NO state and rebuilds nothing: every page of the source book
 //! is a fresh trigger. Declared event types emit commands and/or injected
 //! fact events; an undeclared event type is skipped (C-0051), not an error.
-//! Sagas never receive rejections (only aggregates and process managers
-//! declare `compensates`), so a Notification page is skipped like any
-//! undeclared type. Emitted commands are deferred: the router stamps each
+//! There is no compensation input. Emitted commands are deferred: the router stamps each
 //! command's `angzarr_deferred` provenance from the triggering page (source
 //! cover, source_seq, command_index) and never an explicit sequence, and
 //! they inherit the source correlation id FILL-ONLY.
@@ -126,7 +124,7 @@ impl SagaDispatch {
     }
 
     /// Walks EVERY page of the source book: declared event types emit;
-    /// undeclared types (and Notification pages) are skipped. Each page's
+    /// undeclared types are skipped. Each page's
     /// emitted commands are stamped deferred from that page, and inherit the
     /// source correlation id fill-only. A nil source is MISSING_SAGA_SOURCE;
     /// a source with no pages is EMPTY_SAGA_SOURCE.

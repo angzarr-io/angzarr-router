@@ -9,6 +9,7 @@ use prost::Message;
 
 use angzarr_router::aggregate::{AggregateDispatch, CommandContext, FactRecord};
 use angzarr_router::error::{codes, extras, messages, CodedError, HandlerError};
+use angzarr_router::pb;
 use angzarr_router::process_manager::{
     merge_response, select_process_managers, ProcessManagerDispatch, ProcessManagerRoute,
 };
@@ -16,7 +17,6 @@ use angzarr_router::projector::ProjectorDispatch;
 use angzarr_router::rebuild::Rebuilder;
 use angzarr_router::router::{CommandHandler, CommandHandlers};
 use angzarr_router::saga::SagaDispatch;
-use angzarr_router::{pb, NOTIFICATION_TYPE_URL};
 
 use crate::abi::{consume_out, status_to_coded, AngzarrBuf, AngzarrCb, STATUS_OK, STATUS_OK_EMPTY};
 use crate::proto::io::angzarr::router::ffi::v1 as abi_pb;
@@ -102,12 +102,6 @@ impl CommandHandler for RegisteredAggregate {
     }
     fn command_types(&self) -> Vec<String> {
         self.dispatch.command_types()
-    }
-    fn claims_notification(&self, notification_any: &prost_types::Any) -> bool {
-        self.dispatch.claims_notification(notification_any)
-    }
-    fn validate(&self) -> Result<(), CodedError> {
-        self.dispatch.validate()
     }
     fn dispatch(&self, req: &pb::ContextualCommand) -> Result<pb::BusinessResponse, CodedError> {
         self.dispatch.dispatch(req)
@@ -229,62 +223,6 @@ impl FfiRouter {
             });
         }
 
-        for rejection in &desc.rejections {
-            for &id in &rejection.callback_ids {
-                dispatch = dispatch.on_rejected(
-                    &rejection.compensates,
-                    move |notification, rejection, _, cctx| {
-                        let aux = abi_pb::RejectionAux {
-                            notification: notification.encode_to_vec(),
-                            rejection: rejection.encode_to_vec(),
-                            cctx: Some(command_context_aux(&cctx)),
-                        }
-                        .encode_to_vec();
-                        let (ret, bytes) = invoke(cb, id, NOTIFICATION_TYPE_URL, &[], &aux);
-                        match ret {
-                            STATUS_OK => {
-                                let resp = pb::BusinessResponse::decode(
-                                    bytes.unwrap_or_default().as_slice(),
-                                )
-                                .map_err(|_| {
-                                    HandlerError::Other(
-                                        "host compensator returned undecodable BusinessResponse bytes"
-                                            .to_string(),
-                                    )
-                                })?;
-                                Ok(resp)
-                            }
-                            STATUS_OK_EMPTY => Ok(pb::BusinessResponse::default()),
-                            _ => Err(host_error(ret, bytes)),
-                        }
-                    },
-                );
-            }
-        }
-
-        for undo in &desc.undoes {
-            let id = undo.callback_id;
-            dispatch = dispatch.on_undo(&undo.fq_type, move |notification, compensate, _, cctx| {
-                let aux = abi_pb::UndoAux {
-                    notification: notification.encode_to_vec(),
-                    compensate: compensate.encode_to_vec(),
-                    cctx: Some(command_context_aux(&cctx)),
-                }
-                .encode_to_vec();
-                let (ret, bytes) = invoke(cb, id, NOTIFICATION_TYPE_URL, &[], &aux);
-                match ret {
-                    STATUS_OK => pb::BusinessResponse::decode(bytes.unwrap_or_default().as_slice())
-                        .map_err(|_| {
-                            HandlerError::Other(
-                                "host undo handler returned undecodable BusinessResponse bytes"
-                                    .to_string(),
-                            )
-                        }),
-                    STATUS_OK_EMPTY => Ok(pb::BusinessResponse::default()),
-                    _ => Err(host_error(ret, bytes)),
-                }
-            });
-        }
         for fact in &desc.facts {
             let id = fact.callback_id;
             dispatch = dispatch.on_fact(&fact.fq_type, move |any, _| {
@@ -310,8 +248,8 @@ impl FfiRouter {
                 }
             });
         }
-        // Validates the table and refuses a second claim of one (domain,
-        // command type) (C-0010, C-0064).
+        // Refuses a second claim of one (domain, command type) (C-0010,
+        // C-0064).
         self.aggregates.push(Box::new(RegisteredAggregate {
             dispatch,
             state_callback: desc.state_callback_id,
@@ -392,8 +330,7 @@ impl FfiRouter {
     }
 
     /// Decodes ContextualCommand bytes, routes it through the aggregates'
-    /// claims (by domain and command type; a Notification to every claiming
-    /// aggregate of its domain, C-0042; a sole registered aggregate claims
+    /// claims (by domain and command type; a sole registered aggregate claims
     /// any domain), and runs the core dispatch with the host session
     /// installed.
     pub fn dispatch(&self, host_ctx: *mut c_void, request: &[u8]) -> Result<Vec<u8>, CodedError> {
@@ -534,14 +471,6 @@ impl FfiRouter {
                 [],
             )
         })?;
-        if !desc.rejections.is_empty() {
-            return Err(CodedError::invalid_argument(
-                codes::SAGA_COMPENSATES,
-                messages::SAGA_COMPENSATES,
-                [("saga".to_string(), desc.name.clone())],
-            ));
-        }
-
         let mut dispatch = SagaDispatch::new(
             desc.name.clone(),
             desc.input_domain.clone(),
@@ -652,8 +581,7 @@ impl FfiRouter {
     /// Parses a ProcessManagerDescriptor and populates a core PM table.
     /// Stateful: appliers/snapshot rebuild the PM's own state across the
     /// callback (host owns the instance); event thunks return a
-    /// ProcessManagerHandleResponse whose commands the core stamps deferred;
-    /// compensators run in registration order (C-0042).
+    /// ProcessManagerHandleResponse whose commands the core stamps deferred.
     pub fn register_process_manager(
         &mut self,
         descriptor: &[u8],
@@ -729,41 +657,6 @@ impl FfiRouter {
             );
         }
 
-        for rejection in &desc.rejections {
-            for &id in &rejection.callback_ids {
-                dispatch = dispatch.on_rejected(
-                    &rejection.compensates,
-                    move |notification, rejection, _state| {
-                        let aux = abi_pb::RejectionAux {
-                            notification: notification.encode_to_vec(),
-                            rejection: rejection.encode_to_vec(),
-                            cctx: None, // PM compensators read rebuilt state, not CommandContext
-                        }
-                        .encode_to_vec();
-                        let (ret, bytes) = invoke(cb, id, NOTIFICATION_TYPE_URL, &[], &aux);
-                        match ret {
-                            STATUS_OK => {
-                                let resp = pb::ProcessManagerHandleResponse::decode(
-                                    bytes.unwrap_or_default().as_slice(),
-                                )
-                                .map_err(|_| {
-                                    HandlerError::Other(
-                                        "host PM compensator returned undecodable \
-                                         ProcessManagerHandleResponse bytes"
-                                            .to_string(),
-                                    )
-                                })?;
-                                Ok(resp)
-                            }
-                            STATUS_OK_EMPTY => Ok(pb::ProcessManagerHandleResponse::default()),
-                            _ => Err(host_error(ret, bytes)),
-                        }
-                    },
-                );
-            }
-        }
-
-        dispatch.validate()?;
         self.process_managers
             .push((desc.name, dispatch, desc.state_callback_id, cb));
         Ok(())
@@ -806,7 +699,7 @@ impl FfiRouter {
         }
 
         // Route by identity, then by subscription (select_process_managers):
-        // a process-state book and a rejection each belong to one PM; a new
+        // a process-state book belongs to one PM; a new
         // workflow's trigger reaches every PM consuming its domain, each
         // no-opping on event types it does not declare (C-0022). Responses
         // merge in registration order (merge_response).

@@ -3,15 +3,11 @@
 //! [`RouterBuilder`] collects components and validates the configuration at
 //! build time: an empty configuration is NO_HANDLERS_REGISTERED (C-0060),
 //! mixing kinds is MIXED_HANDLER_KINDS (C-0063), two command handlers
-//! claiming one (domain, command type) is DUPLICATE_COMMAND_HANDLER (C-0064),
-//! and each table's own validation (ambiguous `compensates` entries) runs once.
+//! claiming one (domain, command type) is DUPLICATE_COMMAND_HANDLER (C-0064).
 //! The built [`Router`] dispatches:
 //!
-//! - commands by (cover domain, command type); a Notification to every
-//!   aggregate in its domain that declares a handler for it, in registration
-//!   order, their results merged (C-0042) — else to the first aggregate of
-//!   the domain, which answers DelegateToFramework or NO_UNDO_HANDLER; facts
-//!   by the facts' cover domain;
+//! - commands by (cover domain, command type); facts by the facts' cover
+//!   domain;
 //! - a Replay to the first aggregate of its domain, else to the process
 //!   manager owning it (by its own domain), packed by its state packer;
 //! - saga sources to every saga consuming the source domain, merged in
@@ -27,7 +23,7 @@
 
 use std::collections::HashMap;
 
-use crate::aggregate::{merge_compensation, AggregateDispatch};
+use crate::aggregate::AggregateDispatch;
 use crate::error::{codes, extras, messages, CodedError};
 use crate::pb;
 use crate::process_manager::{
@@ -43,10 +39,6 @@ pub trait CommandHandler: Send + Sync {
     fn domain(&self) -> &str;
     /// The fully-qualified command types it handles.
     fn command_types(&self) -> Vec<String>;
-    /// True when it declares a handler for the Notification.
-    fn claims_notification(&self, notification_any: &prost_types::Any) -> bool;
-    /// Refuses an invalid table (e.g. ambiguous `compensates` entries).
-    fn validate(&self) -> Result<(), CodedError>;
     /// `CommandHandlerService.Handle`.
     fn dispatch(&self, req: &pb::ContextualCommand) -> Result<pb::BusinessResponse, CodedError>;
     /// `CommandHandlerService.HandleFact`.
@@ -75,12 +67,6 @@ impl<T: CommandHandler + ?Sized> CommandHandler for Box<T> {
     fn command_types(&self) -> Vec<String> {
         (**self).command_types()
     }
-    fn claims_notification(&self, notification_any: &prost_types::Any) -> bool {
-        (**self).claims_notification(notification_any)
-    }
-    fn validate(&self) -> Result<(), CodedError> {
-        (**self).validate()
-    }
     fn dispatch(&self, req: &pb::ContextualCommand) -> Result<pb::BusinessResponse, CodedError> {
         (**self).dispatch(req)
     }
@@ -99,12 +85,6 @@ impl<S> CommandHandler for AggregateDispatch<S> {
     fn command_types(&self) -> Vec<String> {
         AggregateDispatch::command_types(self)
     }
-    fn claims_notification(&self, notification_any: &prost_types::Any) -> bool {
-        AggregateDispatch::claims_notification(self, notification_any)
-    }
-    fn validate(&self) -> Result<(), CodedError> {
-        AggregateDispatch::validate(self)
-    }
     fn dispatch(&self, req: &pb::ContextualCommand) -> Result<pb::BusinessResponse, CodedError> {
         AggregateDispatch::dispatch(self, req)
     }
@@ -118,8 +98,6 @@ impl<S> CommandHandler for AggregateDispatch<S> {
 
 /// A process manager as the router sees it, whatever its state type.
 pub trait ProcessManagerHandler: ProcessManagerRoute + Send + Sync {
-    /// Refuses an invalid table (e.g. ambiguous `compensates` entries).
-    fn validate(&self) -> Result<(), CodedError>;
     /// `ProcessManagerService.Handle`.
     fn dispatch(
         &self,
@@ -146,9 +124,6 @@ impl<T: ProcessManagerRoute + ?Sized> ProcessManagerRoute for Box<T> {
 }
 
 impl<T: ProcessManagerHandler + ?Sized> ProcessManagerHandler for Box<T> {
-    fn validate(&self) -> Result<(), CodedError> {
-        (**self).validate()
-    }
     fn dispatch(
         &self,
         req: &pb::ProcessManagerHandleRequest,
@@ -161,9 +136,6 @@ impl<T: ProcessManagerHandler + ?Sized> ProcessManagerHandler for Box<T> {
 }
 
 impl<S> ProcessManagerHandler for ProcessManagerDispatch<S> {
-    fn validate(&self) -> Result<(), CodedError> {
-        ProcessManagerDispatch::validate(self)
-    }
     fn dispatch(
         &self,
         req: &pb::ProcessManagerHandleRequest,
@@ -302,9 +274,6 @@ impl RouterBuilder {
         } else if !sagas.is_empty() {
             Inner::Sagas(sagas)
         } else if !pms.is_empty() {
-            for pm in &pms {
-                pm.validate()?;
-            }
             Inner::ProcessManagers(pms)
         } else if !projectors.is_empty() {
             Inner::Projectors(projectors)
@@ -330,11 +299,9 @@ impl CommandHandlers {
         CommandHandlers::default()
     }
 
-    /// Validates `handler` and adds it. Two handlers claiming one (domain,
-    /// command type) is DUPLICATE_COMMAND_HANDLER (C-0064); the table is left
-    /// unchanged.
+    /// Adds `handler`. Two handlers claiming one (domain, command type) is
+    /// DUPLICATE_COMMAND_HANDLER (C-0064); the table is left unchanged.
     pub fn push(&mut self, handler: Box<dyn CommandHandler>) -> Result<(), CodedError> {
-        handler.validate()?;
         let index = self.handlers.len();
         let keys: Vec<(String, String)> = handler
             .command_types()
@@ -386,13 +353,7 @@ impl CommandHandlers {
         )
     }
 
-    /// Routes a command by (cover domain, command type). A Notification runs
-    /// every handler of its domain that claims it, in registration order;
-    /// their results merge as one aggregate's compensators do (events
-    /// concatenate, each later claimant's sequenced pages shifted past those
-    /// already merged so sequences continue after prior history; the first
-    /// escalation wins). An unclaimed Notification goes to the domain's first
-    /// handler (DelegateToFramework or NO_UNDO_HANDLER).
+    /// Routes a command by (cover domain, command type).
     pub fn dispatch(
         &self,
         req: &pb::ContextualCommand,
@@ -411,9 +372,6 @@ impl CommandHandlers {
                 None => Err(Self::no_handler(domain)),
             };
         };
-        if crate::is_notification_type_url(&any.type_url) {
-            return self.dispatch_notification(req, domain, any);
-        }
         let key = (
             domain.to_string(),
             crate::type_name_from_url(&any.type_url).to_string(),
@@ -429,35 +387,6 @@ impl CommandHandlers {
                 ],
             )),
         }
-    }
-
-    fn dispatch_notification(
-        &self,
-        req: &pb::ContextualCommand,
-        domain: &str,
-        notification: &prost_types::Any,
-    ) -> Result<pb::BusinessResponse, CodedError> {
-        let mut claimants = self
-            .in_domain(domain)
-            .filter(|h| h.claims_notification(notification))
-            .peekable();
-        if claimants.peek().is_none() {
-            return match self.in_domain(domain).next() {
-                Some(handler) => handler.dispatch(req),
-                None => Err(Self::no_handler(domain)),
-            };
-        }
-        let mut merged: Option<pb::business_response::Result> = None;
-        let mut emitted = 0u32;
-        for handler in claimants {
-            let mut result = handler.dispatch(req)?.result;
-            if let Some(pb::business_response::Result::Events(book)) = result.as_mut() {
-                shift_sequences(book, emitted);
-                emitted += book.pages.len() as u32;
-            }
-            merged = merge_compensation(merged, result);
-        }
-        Ok(pb::BusinessResponse { result: merged })
     }
 
     /// Routes facts to the first handler of the facts' cover domain.
@@ -486,20 +415,6 @@ impl CommandHandlers {
     }
 }
 
-/// Moves every explicitly sequenced page of `book` `by` places on.
-fn shift_sequences(book: &mut pb::EventBook, by: u32) {
-    if by == 0 {
-        return;
-    }
-    for page in &mut book.pages {
-        if let Some(pb::page_header::SequenceType::Sequence(seq)) =
-            page.header.as_mut().and_then(|h| h.sequence_type.as_mut())
-        {
-            *seq += by;
-        }
-    }
-}
-
 enum Inner {
     CommandHandlers(CommandHandlers),
     Sagas(Vec<SagaDispatch>),
@@ -523,7 +438,7 @@ fn wrong_kind() -> CodedError {
 }
 
 impl Router {
-    /// Routes a command (or Notification delivery) to its aggregate.
+    /// Routes a command to its aggregate.
     pub fn dispatch_command(
         &self,
         req: &pb::ContextualCommand,

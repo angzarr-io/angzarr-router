@@ -20,16 +20,6 @@ message CallbackEntry {
   uint64 callback_id = 2;
 }
 
-// Rejection rows carry ORDERED callback lists: multiple compensators for
-// one compensates entry all run, in registration order.
-message RejectionEntry {
-  // The declared compensates entry: the rejected command's FULLY-QUALIFIED
-  // type ("fq.Type", sent to any domain) or "domain:fq.Type" (only when it was
-  // sent to that domain). Short names never match.
-  string compensates = 1;
-  repeated uint64 callback_ids = 2;
-}
-
 // Registration payload for one aggregate component: the dispatch tables
 // the binding's registration API (and later, generated wiring) assembles.
 message AggregateDescriptor {
@@ -37,12 +27,15 @@ message AggregateDescriptor {
   string domain = 2;
   repeated CallbackEntry commands = 3;
   repeated CallbackEntry appliers = 4;
-  repeated RejectionEntry rejections = 5;
+  // Field 5 was `rejections` (compensation input; removed — there is no
+  // compensation input).
+  reserved 5;
+  reserved "rejections";
   // Snapshot loader callback; absent when the aggregate takes no snapshots.
   optional uint64 snapshot_callback_id = 6;
-  // Undo handlers keyed by the FULLY-QUALIFIED type of the executed command
-  // a Compensate undoes (fq_type = Compensate.command_type).
-  repeated CallbackEntry undoes = 7;
+  // Field 7 was `undoes` (Compensate input; removed).
+  reserved 7;
+  reserved "undoes";
   // Fact handlers keyed by FULLY-QUALIFIED fact (event) type: the aggregate's
   // declared facts (ComponentOptions.facts). The callback receives the fact
   // Any (type_url / payload) with the session state rebuilt, and returns a
@@ -80,25 +73,24 @@ message ProjectorDescriptor {
 
 // Registration payload for one saga component. A stateless translator:
 // declared events emit commands (deferred; the router stamps their
-// provenance) and/or injected fact events. Sagas receive no rejections.
-// Empty `target_domains` is allowed.
+// provenance) and/or injected fact events. Empty `target_domains` is
+// allowed.
 message SagaDescriptor {
   string name = 1;
   string input_domain = 2;
   repeated string target_domains = 3;
   repeated CallbackEntry events = 4;
-  // Sagas never receive rejections (the source aggregate compensates), so a
-  // saga declaring any is refused at registration (SAGA_COMPENSATES,
-  // INVALID_ARGUMENT).
-  repeated RejectionEntry rejections = 5;
+  // Field 5 was `rejections` (compensation input; removed).
+  reserved 5;
+  reserved "rejections";
 }
 
 // aux payload for command-handler callbacks.
 message CommandContextAux {
   uint32 next_sequence = 1;
   bool had_prior_events = 2;
-  // The cover of the command (or notification delivery) being handled: the
-  // aggregate's own domain and root.
+  // The cover of the command being handled: the aggregate's own domain and
+  // root.
   io.angzarr.v1.Cover cover = 3;
 }
 
@@ -122,16 +114,17 @@ message SagaEventAux {
 // Registration payload for one process-manager component. STATEFUL: the PM
 // rebuilds its own event-sourced state (the appliers/snapshot) before each
 // handler. Event handlers are keyed by (input domain, fully-qualified event
-// type) — a 2-level table; rejection rows carry ORDERED compensators
-// (C-0042), the first escalation winning. `target_domains` are the PM's
-// declared output domains (its command targets).
+// type) — a 2-level table. `target_domains` are the PM's declared output
+// domains (its command targets).
 message ProcessManagerDescriptor {
   string name = 1;
   string pm_domain = 2;
   repeated CallbackEntry appliers = 3; // rebuild the PM's own state
   optional uint64 snapshot_callback_id = 4;
   repeated PmEventEntry events = 5;
-  repeated RejectionEntry rejections = 6;
+  // Field 6 was `rejections` (compensation input; removed).
+  reserved 6;
+  reserved "rejections";
   repeated string target_domains = 7;
   // Packs the session's current PM state into a serialized
   // google.protobuf.Any (for Replay); absent when the PM does not support
@@ -171,22 +164,4 @@ message ProjectorEventAux {
 message ReplayCall {
   string domain = 1;
   io.angzarr.v1.ReplayRequest request = 2;
-}
-
-// aux payload for rejection (compensation) callbacks. An aggregate
-// compensator returns a BusinessResponse; a process-manager compensator
-// returns a full ProcessManagerHandleResponse (process events, commands,
-// facts, escalation).
-message RejectionAux {
-  bytes notification = 1; // serialized angzarr Notification
-  bytes rejection = 2; // serialized angzarr RejectionNotification
-  CommandContextAux cctx = 3;
-}
-
-// aux payload for undo callbacks (a Compensate routed to the handler for its
-// command type).
-message UndoAux {
-  bytes notification = 1; // serialized angzarr Notification
-  bytes compensate = 2; // serialized angzarr Compensate
-  CommandContextAux cctx = 3;
 }

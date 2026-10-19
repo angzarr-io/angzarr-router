@@ -15,8 +15,7 @@ use crate::router::{
 };
 use crate::saga::SagaDispatch;
 use crate::test_support::{
-    any_of, cover_any, cover_applier, event_page, fresh_rebuilder, notification_page_for,
-    sequenced_event_page, TestState,
+    any_of, cover_any, cover_applier, event_page, fresh_rebuilder, TestState,
 };
 use crate::type_url;
 use crate::upcaster::UpcasterDispatch;
@@ -125,21 +124,6 @@ fn the_same_command_type_in_two_domains_is_accepted() {
 }
 
 #[test]
-fn ambiguous_compensates_entries_fail_the_build() {
-    let agg = aggregate("a", "order", &["test.Create"])
-        .on_rejected("test.Reserve", |_, _, _, _| {
-            Ok(pb::BusinessResponse::default())
-        })
-        .on_rejected("inventory:test.Reserve", |_, _, _, _| {
-            Ok(pb::BusinessResponse::default())
-        });
-    assert_eq!(
-        build_err(RouterBuilder::new().aggregate(agg)),
-        codes::AMBIGUOUS_COMPENSATION
-    );
-}
-
-#[test]
 fn commands_route_by_domain_and_type() {
     let router = RouterBuilder::new()
         .aggregate(aggregate("order-create", "order", &["test.Create"]))
@@ -161,35 +145,6 @@ fn commands_route_by_domain_and_type() {
         .dispatch_command(&command("payment", "test.Create"))
         .expect_err("no handler for (payment, Create)");
     assert_eq!(err.code, codes::NO_HANDLER_REGISTERED);
-}
-
-#[test]
-fn a_notification_reaches_the_aggregate_declaring_its_compensation() {
-    let declares = aggregate("declares", "order", &["test.Cancel"]).on_rejected(
-        "test.ReserveStock",
-        |_, _, _, _| {
-            Ok(pb::BusinessResponse {
-                result: Some(pb::business_response::Result::Events(pb::EventBook {
-                    pages: vec![event_page(any_of_type("compensated"))],
-                    ..Default::default()
-                })),
-            })
-        },
-    );
-    let router = RouterBuilder::new()
-        .aggregate(aggregate("first", "order", &["test.Create"]))
-        .aggregate(declares)
-        .build()
-        .expect("build");
-    let notification = match notification_page_for("test.ReserveStock").payload {
-        Some(pb::event_page::Payload::Event(any)) => any,
-        _ => unreachable!(),
-    };
-    let mut req = command("order", "test.Unused");
-    req.command.as_mut().unwrap().pages[0].payload =
-        Some(pb::command_page::Payload::Command(notification));
-    let resp = router.dispatch_command(&req).expect("dispatch");
-    assert_eq!(emitted_label(&resp), "compensated");
 }
 
 #[test]
@@ -420,166 +375,7 @@ fn a_router_refuses_dispatch_of_another_kind() {
     );
 }
 
-#[test]
-fn an_ambiguous_process_manager_fails_the_build() {
-    let pm = ProcessManagerDispatch::new("pm", "pm", ["inventory"], fresh_rebuilder())
-        .on_rejected("test.Reserve", |_, _, _| {
-            Ok(pb::ProcessManagerHandleResponse::default())
-        })
-        .on_rejected("inventory:test.Reserve", |_, _, _| {
-            Ok(pb::ProcessManagerHandleResponse::default())
-        });
-    assert_eq!(
-        build_err(RouterBuilder::new().process_manager(pm)),
-        codes::AMBIGUOUS_COMPENSATION
-    );
-}
-
 // --- every claimant of a notification runs (C-0042) -------------------------
-
-fn compensating(label: &'static str, events: usize) -> AggregateDispatch<TestState> {
-    AggregateDispatch::new(label, "payment", fresh_rebuilder()).on_rejected(
-        "test.ReserveStock",
-        move |_, _, _, _| {
-            Ok(pb::BusinessResponse {
-                result: Some(pb::business_response::Result::Events(pb::EventBook {
-                    pages: (0..events)
-                        .map(|_| event_page(any_of_type(label)))
-                        .collect(),
-                    ..Default::default()
-                })),
-            })
-        },
-    )
-}
-
-fn rejection_delivery(domain: &str, prior: u32) -> pb::ContextualCommand {
-    let notification = match notification_page_for("test.ReserveStock").payload {
-        Some(pb::event_page::Payload::Event(any)) => any,
-        _ => unreachable!(),
-    };
-    let mut req = command(domain, "test.Unused");
-    req.command.as_mut().unwrap().pages[0].payload =
-        Some(pb::command_page::Payload::Command(notification));
-    if prior > 0 {
-        req.events = Some(pb::EventBook {
-            pages: (0..prior)
-                .map(|seq| sequenced_event_page(seq, any_of_type("test.Prior")))
-                .collect(),
-            next_sequence: prior,
-            ..Default::default()
-        });
-    }
-    req
-}
-
-fn labels_and_sequences(resp: &pb::BusinessResponse) -> Vec<(String, u32)> {
-    let Some(pb::business_response::Result::Events(book)) = &resp.result else {
-        panic!("expected events, got {:?}", resp.result);
-    };
-    book.pages
-        .iter()
-        .map(|page| {
-            let label = match page.payload.as_ref() {
-                Some(pb::event_page::Payload::Event(any)) => {
-                    crate::type_name_from_url(&any.type_url).to_string()
-                }
-                _ => String::new(),
-            };
-            let seq = match page.header.as_ref().and_then(|h| h.sequence_type.as_ref()) {
-                Some(pb::page_header::SequenceType::Sequence(s)) => *s,
-                other => panic!("no sequence: {other:?}"),
-            };
-            (label, seq)
-        })
-        .collect()
-}
-
-#[test]
-fn every_aggregate_claiming_a_rejection_runs_in_registration_order() {
-    let router = RouterBuilder::new()
-        .aggregate(compensating("first", 1))
-        .aggregate(aggregate("bystander", "payment", &["test.Pay"]))
-        .aggregate(compensating("second", 2))
-        .aggregate(compensating("elsewhere", 1).on_command("test.Other", |_, _, _| Ok(None)))
-        .build()
-        .expect("build");
-    let resp = router
-        .dispatch_command(&rejection_delivery("payment", 7))
-        .expect("dispatch");
-    assert_eq!(
-        labels_and_sequences(&resp),
-        vec![
-            ("first".to_string(), 7),
-            ("second".to_string(), 8),
-            ("second".to_string(), 9),
-            ("elsewhere".to_string(), 10),
-        ],
-        "claimants run in registration order; sequences continue across them"
-    );
-}
-
-#[test]
-fn a_claimant_escalation_wins_over_merged_events() {
-    let escalating = AggregateDispatch::new("escalates", "payment", fresh_rebuilder()).on_rejected(
-        "test.ReserveStock",
-        |_, _, _, _| {
-            Ok(pb::BusinessResponse {
-                result: Some(pb::business_response::Result::Revocation(
-                    pb::RevocationResponse {
-                        reason: "escalated".to_string(),
-                        ..Default::default()
-                    },
-                )),
-            })
-        },
-    );
-    let router = RouterBuilder::new()
-        .aggregate(compensating("first", 1))
-        .aggregate(escalating)
-        .aggregate(compensating("third", 1))
-        .build()
-        .expect("build");
-    let resp = router
-        .dispatch_command(&rejection_delivery("payment", 0))
-        .expect("dispatch");
-    match resp.result {
-        Some(pb::business_response::Result::Revocation(r)) => assert_eq!(r.reason, "escalated"),
-        other => panic!("expected the escalation, got {other:?}"),
-    }
-}
-
-#[test]
-fn a_claimant_failure_fails_the_delivery() {
-    let failing = AggregateDispatch::new("fails", "payment", fresh_rebuilder())
-        .on_rejected("test.ReserveStock", |_, _, _, _| {
-            Err(crate::error::HandlerError::Other("boom".to_string()))
-        });
-    let router = RouterBuilder::new()
-        .aggregate(compensating("first", 1))
-        .aggregate(failing)
-        .build()
-        .expect("build");
-    assert_eq!(
-        router
-            .dispatch_command(&rejection_delivery("payment", 0))
-            .unwrap_err()
-            .code,
-        codes::UNHANDLED_HANDLER_ERROR
-    );
-}
-
-#[test]
-fn a_rejection_no_aggregate_claims_is_left_to_the_framework() {
-    let router = RouterBuilder::new()
-        .aggregate(aggregate("only", "payment", &["test.Pay"]))
-        .build()
-        .expect("build");
-    let resp = router
-        .dispatch_command(&rejection_delivery("payment", 0))
-        .expect("dispatch");
-    assert_eq!(resp.result, None, "DelegateToFramework");
-}
 
 // --- boxed components ------------------------------------------------------
 
@@ -648,19 +444,9 @@ fn boxed_components_build_routers() {
 
 #[test]
 fn a_boxed_aggregate_keeps_its_routing_view() {
-    let boxed: Box<dyn CommandHandler> = Box::new(
-        aggregate("boxed", "order", &["test.Create"])
-            .on_rejected("test.ReserveStock", |_, _, _, _| {
-                Ok(pb::BusinessResponse::default())
-            }),
-    );
+    let boxed: Box<dyn CommandHandler> = Box::new(aggregate("boxed", "order", &["test.Create"]));
     assert_eq!(boxed.domain(), "order");
     assert_eq!(boxed.command_types(), vec!["test.Create".to_string()]);
-    let notification = match notification_page_for("test.ReserveStock").payload {
-        Some(pb::event_page::Payload::Event(any)) => any,
-        _ => unreachable!(),
-    };
-    assert!(boxed.claims_notification(&notification));
 }
 
 // --- Replay ------------------------------------------------------------------
@@ -834,49 +620,6 @@ fn replay_on_a_router_without_stateful_components_is_refused() {
 
 // --- Compensate delivery across a shared domain ------------------------------
 
-fn compensate_delivery(domain: &str, command_type: &str) -> pb::ContextualCommand {
-    let compensate = pb::Compensate {
-        command_type: command_type.to_string(),
-        ..Default::default()
-    };
-    let notification = pb::Notification {
-        payload: Some(any_of(&compensate)),
-        ..Default::default()
-    };
-    let mut req = command(domain, "test.Unused");
-    req.command.as_mut().unwrap().pages[0].payload =
-        Some(pb::command_page::Payload::Command(any_of(&notification)));
-    req
-}
-
-#[test]
-fn a_compensate_reaches_only_the_aggregate_undoing_its_command() {
-    let counter: Box<dyn CommandHandler> =
-        Box::new(aggregate("counter", "inventory", &["test.Count"]));
-    let undoer: Box<dyn CommandHandler> = Box::new(
-        AggregateDispatch::new("undoer", "inventory", fresh_rebuilder()).on_undo(
-            "test.Reserve",
-            |_, _, _, _| {
-                Ok(pb::BusinessResponse {
-                    result: Some(pb::business_response::Result::Events(pb::EventBook {
-                        pages: vec![event_page(any_of_type("released"))],
-                        ..Default::default()
-                    })),
-                })
-            },
-        ),
-    );
-    let router = RouterBuilder::new()
-        .aggregate(counter)
-        .aggregate(undoer)
-        .build()
-        .expect("build");
-    let resp = router
-        .dispatch_command(&compensate_delivery("inventory", "test.Reserve"))
-        .expect("the undoing aggregate answers; the other never runs");
-    assert_eq!(emitted_label(&resp), "released");
-}
-
 // --- boxed and hand-written components ---------------------------------------
 
 #[test]
@@ -943,12 +686,6 @@ impl CommandHandler for Plain {
     fn command_types(&self) -> Vec<String> {
         vec!["test.Plain".to_string()]
     }
-    fn claims_notification(&self, _: &Any) -> bool {
-        false
-    }
-    fn validate(&self) -> Result<(), CodedError> {
-        Ok(())
-    }
     fn dispatch(&self, _: &pb::ContextualCommand) -> Result<pb::BusinessResponse, CodedError> {
         Ok(pb::BusinessResponse::default())
     }
@@ -973,9 +710,6 @@ impl ProcessManagerRoute for PlainPm {
 }
 
 impl ProcessManagerHandler for PlainPm {
-    fn validate(&self) -> Result<(), CodedError> {
-        Ok(())
-    }
     fn dispatch(
         &self,
         _: &pb::ProcessManagerHandleRequest,

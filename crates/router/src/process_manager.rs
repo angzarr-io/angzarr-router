@@ -10,24 +10,18 @@
 //! the PM's sources, or an undeclared event type, yields an empty response
 //! (spec C-0022), not an error. Emitted commands are deferred: the router
 //! stamps their `angzarr_deferred` provenance from the trigger (source cover,
-//! source_seq, command_index), never an explicit sequence (C-0181). A
-//! Notification trigger carrying a RejectionNotification routes to the
-//! compensators keyed by the rejected command's type, optionally qualified by
-//! the domain it was sent to (ordered, C-0042); their process events merge and
-//! the FIRST escalation Notification wins (response field 4). A Compensate
-//! payload has no handler on a process manager (undo is aggregate-only) and is
-//! answered NO_UNDO_HANDLER (UNIMPLEMENTED), never dropped.
+//! source_seq, command_index), never an explicit sequence (C-0181). There
+//! is no compensation input: a Notification-typed trigger is just an
+//! undeclared event type.
 
 use std::collections::HashMap;
 
-use prost::Message;
 use prost_types::Any;
 
 use crate::destinations::Destinations;
-use crate::error::{codes, extras, map_handler_error, messages, CodedError, HandlerError};
+use crate::error::{codes, map_handler_error, messages, CodedError, HandlerError};
 use crate::pb;
 use crate::rebuild::{pack_message_state, Rebuilder, StatePackFn};
-use crate::NotificationPayload;
 
 /// Handles the newest trigger event against rebuilt PM state, returning the
 /// full response (process events, commands, facts, optional escalation).
@@ -44,19 +38,6 @@ pub type EventFn<S> = Box<
         + Sync,
 >;
 
-/// Compensates a rejected PM-issued command against rebuilt state, returning
-/// a full response: process events, commands (deferred like any PM command),
-/// facts, and an optional escalation Notification (field 4).
-pub type RejectionFn<S> = Box<
-    dyn Fn(
-            &pb::Notification,
-            &pb::RejectionNotification,
-            &mut S,
-        ) -> Result<pb::ProcessManagerHandleResponse, HandlerError>
-        + Send
-        + Sync,
->;
-
 /// The dispatch table for one process-manager component.
 pub struct ProcessManagerDispatch<S> {
     name: String,
@@ -65,7 +46,6 @@ pub struct ProcessManagerDispatch<S> {
     rebuilder: Rebuilder<S>,
     /// input domain → fully-qualified event type → thunk.
     handlers: HashMap<String, HashMap<String, EventFn<S>>>,
-    rejections: HashMap<String, Vec<RejectionFn<S>>>,
     state_packer: Option<StatePackFn<S>>,
 }
 
@@ -85,7 +65,6 @@ impl<S> ProcessManagerDispatch<S> {
             targets: target_domains.into_iter().map(Into::into).collect(),
             rebuilder,
             handlers: HashMap::new(),
-            rejections: HashMap::new(),
             state_packer: None,
         }
     }
@@ -131,30 +110,6 @@ impl<S> ProcessManagerDispatch<S> {
         self
     }
 
-    /// Registers a compensation thunk under a `compensates` entry: the
-    /// rejected command's fully-qualified type (`"fq.Type"`, any target
-    /// domain) or `"domain:fq.Type"` (only rejections of commands sent to that
-    /// domain). Repeated registration for one entry appends, preserving order
-    /// (C-0042).
-    pub fn on_rejected(
-        mut self,
-        compensates: &str,
-        thunk: impl Fn(
-                &pb::Notification,
-                &pb::RejectionNotification,
-                &mut S,
-            ) -> Result<pb::ProcessManagerHandleResponse, HandlerError>
-            + Send
-            + Sync
-            + 'static,
-    ) -> Self {
-        self.rejections
-            .entry(compensates.to_string())
-            .or_default()
-            .push(Box::new(thunk));
-        self
-    }
-
     /// The PM's state after folding the base snapshot (when present) and
     /// then the events, in order — the process-manager counterpart of the
     /// aggregate's `Replay`.
@@ -167,12 +122,6 @@ impl<S> ProcessManagerDispatch<S> {
     pub fn packed_replay(&self, req: &pb::ReplayRequest) -> Result<pb::ReplayResponse, CodedError> {
         self.rebuilder
             .packed_replay(self.state_packer.as_ref(), &self.pm_domain, req)
-    }
-
-    /// Refuses a table whose `compensates` entries list one command type both
-    /// unqualified and domain-qualified (AMBIGUOUS_COMPENSATION).
-    pub fn validate(&self) -> Result<(), CodedError> {
-        crate::validate_compensation_keys(self.rejections.keys().map(String::as_str))
     }
 
     /// The component name.
@@ -205,8 +154,7 @@ impl<S> ProcessManagerDispatch<S> {
 
     /// Handles a trigger book against rebuilt PM state. Only the NEWEST page
     /// of the trigger fires; a trigger outside the PM's sources or of an
-    /// undeclared type yields an empty response (C-0022). A Notification page
-    /// routes to the compensation path.
+    /// undeclared type yields an empty response (C-0022).
     pub fn dispatch(
         &self,
         req: &pb::ProcessManagerHandleRequest,
@@ -232,18 +180,6 @@ impl<S> ProcessManagerDispatch<S> {
                 [],
             ));
         };
-
-        // Exact type-URL match only — suffix matching misroutes user types.
-        if crate::is_notification_type_url(&event_any.type_url) {
-            let mut resp = self.dispatch_rejection(event_any, req.process_state.as_ref())?;
-            crate::stamp_deferred(
-                &mut resp.commands,
-                trigger.cover.as_ref(),
-                crate::page_sequence(last),
-            );
-            self.address_process_events(&mut resp, trigger, req.process_state.as_ref());
-            return Ok(resp);
-        }
 
         let trigger_domain = trigger
             .cover
@@ -299,45 +235,6 @@ impl<S> ProcessManagerDispatch<S> {
             }
         }
     }
-
-    /// Routes a Notification trigger: a RejectionNotification goes to the
-    /// compensators matching the rejected command (ordered, C-0042; their
-    /// responses merge and the first escalation wins; their commands are
-    /// stamped deferred from the notification page), and an undeclared
-    /// rejection is the framework's to handle (DelegateToFramework) with an
-    /// empty response; a Compensate is NO_UNDO_HANDLER.
-    fn dispatch_rejection(
-        &self,
-        event_any: &Any,
-        process_state: Option<&pb::EventBook>,
-    ) -> Result<pb::ProcessManagerHandleResponse, CodedError> {
-        let (notification, payload) = crate::decode_notification(event_any)?;
-        let rejection = match payload {
-            NotificationPayload::Rejection(rejection) => rejection,
-            NotificationPayload::Compensate(compensate) => {
-                return Err(CodedError::invalid_argument(
-                    codes::NO_UNDO_HANDLER,
-                    messages::NO_UNDO_HANDLER,
-                    [(extras::COMMAND_TYPE.to_string(), compensate.command_type)],
-                ));
-            }
-        };
-
-        let (target_domain, fq_command) = crate::extract_rejection_key(&rejection);
-        let Some(thunks) =
-            crate::compensation_lookup(&self.rejections, &target_domain, &fq_command)
-        else {
-            return Ok(pb::ProcessManagerHandleResponse::default()); // DelegateToFramework
-        };
-
-        let (mut state, _info) = self.rebuilder.rebuild(process_state)?;
-        let mut out = pb::ProcessManagerHandleResponse::default();
-        for thunk in thunks {
-            let resp = thunk(&notification, &rejection, &mut state).map_err(map_handler_error)?;
-            merge_response(&mut out, resp);
-        }
-        Ok(out)
-    }
 }
 
 /// The routing view of one process-manager component: its identity and the
@@ -345,11 +242,9 @@ impl<S> ProcessManagerDispatch<S> {
 /// regardless of its state type, so co-resident PMs with different state types
 /// route through one selection.
 pub trait ProcessManagerRoute {
-    /// The registered component name (matched against
-    /// `AngzarrDeferredSequence.source_component`).
+    /// The registered component name.
     fn name(&self) -> &str;
-    /// The PM's own domain (matched against the process-state cover and the
-    /// rejection's source cover).
+    /// The PM's own domain (matched against the process-state cover).
     fn pm_domain(&self) -> &str;
     /// True when the PM declares a handler for some event of `domain`.
     fn consumes(&self, domain: &str) -> bool;
@@ -372,18 +267,10 @@ impl<S> ProcessManagerRoute for ProcessManagerDispatch<S> {
 /// Selects which of several co-resident process managers a request is
 /// addressed to, as indices into `pms` in registration order.
 ///
-/// A process-state book belongs to exactly one PM, and a rejection belongs to
-/// the PM that issued the rejected command, so identity routes first:
-///
-/// - Rejection Notification trigger: the PM named by the rejected command's
-///   `angzarr_deferred.source_component`; else the PM owning its
-///   `angzarr_deferred.source` domain; else the PM owning the trigger's cover
-///   domain (where the coordinator delivers a PM's rejections). An unaddressed
-///   rejection reaches a sole registered PM and otherwise no PM — it never
-///   fans out across every subscriber.
-/// - Event trigger: the PM owning the process-state cover domain; when the
-///   state carries no identity (a new workflow) or names no registered PM,
-///   every PM consuming the trigger's domain.
+/// A process-state book belongs to exactly one PM, so identity routes first:
+/// the PM owning the process-state cover domain; when the state carries no
+/// identity (a new workflow) or names no registered PM, every PM consuming the
+/// trigger's domain.
 ///
 /// A missing or page-less trigger selects nothing; the caller reports those
 /// shapes before routing.
@@ -394,9 +281,9 @@ pub fn select_process_managers(
     let Some(trigger) = req.trigger.as_ref() else {
         return Vec::new();
     };
-    let Some(newest) = trigger.pages.last() else {
+    if trigger.pages.is_empty() {
         return Vec::new();
-    };
+    }
     let trigger_domain = trigger.cover.as_ref().map_or("", |c| c.domain.as_str());
     let matching = |pred: &dyn Fn(&dyn ProcessManagerRoute) -> bool| -> Vec<usize> {
         pms.iter()
@@ -405,28 +292,6 @@ pub fn select_process_managers(
             .map(|(i, _)| i)
             .collect()
     };
-
-    let notification =
-        crate::page_event(newest).filter(|any| crate::is_notification_type_url(&any.type_url));
-    if let Some(any) = notification {
-        let (component, source_domain) = rejection_issuer(any);
-        if !component.is_empty() {
-            let named = matching(&|pm| pm.name() == component);
-            if !named.is_empty() {
-                return named;
-            }
-        }
-        for domain in [source_domain.as_str(), trigger_domain] {
-            if domain.is_empty() {
-                continue;
-            }
-            let owners = matching(&|pm| pm.pm_domain() == domain);
-            if !owners.is_empty() {
-                return owners;
-            }
-        }
-        return if pms.len() == 1 { vec![0] } else { Vec::new() };
-    }
 
     let state_domain = req
         .process_state
@@ -442,44 +307,8 @@ pub fn select_process_managers(
     matching(&|pm| pm.consumes(trigger_domain))
 }
 
-/// The issuing component name and source domain recorded on a rejection
-/// Notification's rejected command (`angzarr_deferred`), or empty strings when
-/// the notification carries no decodable provenance.
-fn rejection_issuer(notification_any: &Any) -> (String, String) {
-    let Ok(notification) = pb::Notification::decode(notification_any.value.as_slice()) else {
-        return (String::new(), String::new());
-    };
-    let Some(rejection) = notification
-        .payload
-        .as_ref()
-        .and_then(|p| pb::RejectionNotification::decode(p.value.as_slice()).ok())
-    else {
-        return (String::new(), String::new());
-    };
-    let deferred = rejection
-        .rejected_command
-        .as_ref()
-        .and_then(|cmd| cmd.pages.first())
-        .and_then(|page| page.header.as_ref())
-        .and_then(|h| match h.sequence_type.as_ref() {
-            Some(pb::page_header::SequenceType::AngzarrDeferred(d)) => Some(d),
-            _ => None,
-        });
-    match deferred {
-        Some(d) => (
-            d.source_component.clone(),
-            d.source
-                .as_ref()
-                .map(|c| c.domain.clone())
-                .unwrap_or_default(),
-        ),
-        None => (String::new(), String::new()),
-    }
-}
-
 /// Folds one co-resident PM's response into the merged response: process
-/// events, commands and facts concatenate in dispatch order; the first
-/// escalation Notification wins.
+/// events, commands and facts concatenate in dispatch order.
 pub fn merge_response(
     acc: &mut pb::ProcessManagerHandleResponse,
     resp: pb::ProcessManagerHandleResponse,
@@ -487,9 +316,6 @@ pub fn merge_response(
     acc.process_events.extend(resp.process_events);
     acc.commands.extend(resp.commands);
     acc.facts.extend(resp.facts);
-    if acc.notification.is_none() {
-        acc.notification = resp.notification;
-    }
 }
 
 #[cfg(test)]

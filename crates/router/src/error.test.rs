@@ -36,8 +36,6 @@ fn other_coded_client_errors_are_invalid_argument() {
         codes::MISSING_COMMAND_BOOK,
         codes::MISSING_COMMAND_PAGE,
         codes::MISSING_COMMAND_PAYLOAD,
-        codes::NOTIFICATION_DECODE_FAILED,
-        codes::REJECTION_NOTIFICATION_DECODE_FAILED,
     ] {
         let err = CodedError::invalid_argument(code, "x", []);
         assert_eq!(err.grpc, GrpcCode::InvalidArgument, "code {code}");
@@ -84,14 +82,4 @@ fn rejection_details_travel_as_extras() {
         [("input".to_string(), "0".to_string())],
     );
     assert_eq!(err.extras.get("input").map(String::as_str), Some("0"));
-}
-
-#[test]
-fn no_undo_handler_is_unimplemented() {
-    let err = CodedError::invalid_argument(codes::NO_UNDO_HANDLER, messages::NO_UNDO_HANDLER, []);
-    assert_eq!(
-        err.grpc,
-        GrpcCode::Unimplemented,
-        "the coordinator dead-letters an undeliverable Compensate on UNIMPLEMENTED"
-    );
 }

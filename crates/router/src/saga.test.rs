@@ -2,8 +2,7 @@
 //! stateless translator that walks EVERY source page, emits deferred
 //! commands (angzarr_deferred provenance from the triggering page, never an
 //! explicit sequence) and/or injected fact events for declared event types,
-//! skips undeclared events and Notification pages (sagas receive no
-//! rejections), and fills the source correlation id onto emitted commands
+//! skips undeclared events, and fills the source correlation id onto emitted commands
 //! fill-only.
 
 use std::sync::{Arc, Mutex};
@@ -13,12 +12,11 @@ use prost_types::Any;
 use crate::error::{codes, HandlerError};
 use crate::pb;
 use crate::saga::SagaDispatch;
-use crate::test_support::{event_page, notification_page_for};
+use crate::test_support::event_page;
 use crate::type_url;
 
 const FQ_ORDER_CREATED: &str = "test.OrderCreated";
 const FQ_STOCK_RESERVED: &str = "test.StockReserved";
-const FQ_RESERVE_STOCK: &str = "test.ReserveStock";
 
 // --- fixtures -------------------------------------------------------------
 
@@ -297,27 +295,6 @@ fn handler_observes_the_declared_output_domains() {
         *observed.lock().unwrap(),
         vec!["inventory".to_string(), "fulfillment".to_string()]
     );
-}
-
-#[test]
-fn a_notification_page_is_skipped() {
-    // Sagas receive no rejections: a Notification page is not a declared
-    // event and emits nothing, even alongside a declared one.
-    let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory"])
-        .on_event(FQ_ORDER_CREATED, |_e, _d, _c| {
-            Ok((vec![command_to("inventory")], vec![]))
-        });
-    let resp = saga
-        .dispatch(&request(Some(source_book(
-            "order",
-            vec![
-                notification_page_for(FQ_RESERVE_STOCK),
-                event_page_of(FQ_ORDER_CREATED),
-            ],
-        ))))
-        .expect("dispatch");
-    assert_eq!(resp.commands.len(), 1);
-    assert!(resp.events.is_empty());
 }
 
 // --- correlation (fill-only) ---------------------------------------------

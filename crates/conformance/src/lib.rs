@@ -373,23 +373,22 @@ pub fn order_pm() -> ProcessManagerDispatch<ProcessManagerState> {
         },
     );
 
-    ProcessManagerDispatch::new("order-pm", "order-pm", ["inventory"], rebuilder)
-        .on_event(
-            "counter",
-            "test.counter.Increased",
-            |_event, state: &mut ProcessManagerState, _dests, _cover| {
-                let cmd = reserve_command_to("inventory");
-                // Emit one fact per prior state event so the rebuild is
-                // observable in the response.
-                let facts = (0..state.count).map(|_| pm_process_event()).collect();
-                Ok(pb::ProcessManagerHandleResponse {
-                    process_events: vec![pm_process_event()],
-                    commands: vec![cmd],
-                    facts,
-                    ..Default::default()
-                })
-            },
-        )
+    ProcessManagerDispatch::new("order-pm", "order-pm", ["inventory"], rebuilder).on_event(
+        "counter",
+        "test.counter.Increased",
+        |_event, state: &mut ProcessManagerState, _dests, _cover| {
+            let cmd = reserve_command_to("inventory");
+            // Emit one fact per prior state event so the rebuild is
+            // observable in the response.
+            let facts = (0..state.count).map(|_| pm_process_event()).collect();
+            Ok(pb::ProcessManagerHandleResponse {
+                process_events: vec![pm_process_event()],
+                commands: vec![cmd],
+                facts,
+                ..Default::default()
+            })
+        },
+    )
 }
 
 /// The AuditProcessManager's own state: a different type from
