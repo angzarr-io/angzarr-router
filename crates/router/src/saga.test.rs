@@ -3,7 +3,7 @@
 //! a stateless translator that walks EVERY source page, emits commands
 //! (stamped from coordinator Destinations) and/or injected fact events for
 //! declared event types, skips undeclared events (DelegateToFramework), and
-//! fills the source correlation id onto emitted commands fill-only.
+//! leaves correlation to the coordinator.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -234,18 +234,15 @@ fn handler_observes_destination_sequences() {
     assert_eq!(observed.lock().unwrap().get("inventory"), Some(&5));
 }
 
-// --- correlation (fill-only) ---------------------------------------------
+// --- correlation (coordinator-owned) -----------------------------------
 
 #[test]
-fn correlation_fills_only_unset_command_covers() {
-    // The source correlation id flows onto emitted commands that did not set
-    // their own — a command that stamped its own correlation keeps it.
-    let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory", "fulfillment"])
+fn router_does_not_fill_command_correlation() {
+    // The coordinator stamps correlation; the router passes the handler's
+    // commands through untouched even when the source carries one.
+    let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory"])
         .on_event(FQ_ORDER_CREATED, |_e, _d, _c| {
-            let inherit = command_to("inventory");
-            let mut own = command_to("fulfillment");
-            own.cover.as_mut().unwrap().correlation_id = "own".to_string();
-            Ok((vec![inherit, own], vec![]))
+            Ok((vec![command_to("inventory")], vec![]))
         });
     let mut src = source_book("order", vec![event_page_of(FQ_ORDER_CREATED)]);
     src.cover.as_mut().unwrap().correlation_id = "corr-1".to_string();
@@ -256,17 +253,8 @@ fn correlation_fills_only_unset_command_covers() {
             .as_ref()
             .unwrap()
             .correlation_id,
-        "corr-1",
-        "unset cover inherits source correlation"
-    );
-    assert_eq!(
-        cmd_to(&resp, "fulfillment")
-            .cover
-            .as_ref()
-            .unwrap()
-            .correlation_id,
-        "own",
-        "fill-only: a handler-set correlation is preserved"
+        "",
+        "router must not fill correlation"
     );
 }
 

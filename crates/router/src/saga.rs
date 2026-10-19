@@ -6,7 +6,6 @@
 //! commands (stamped from the coordinator-supplied Destinations) and/or
 //! injected fact events; an undeclared event type is silently skipped
 //! (DelegateToFramework), not an error. There is no compensation input.
-//! Emitted commands inherit the source correlation id FILL-ONLY.
 
 use std::collections::HashMap;
 
@@ -98,8 +97,8 @@ impl SagaDispatch {
     }
 
     /// Walks EVERY page of the source book: declared event types emit;
-    /// undeclared types are skipped. Emitted commands inherit the source
-    /// correlation id fill-only. A nil source is MISSING_SAGA_SOURCE; a
+    /// undeclared types are skipped. Emitted commands pass through
+    /// unstamped (the coordinator stamps correlation). A nil source is MISSING_SAGA_SOURCE; a
     /// source with no pages is EMPTY_SAGA_SOURCE.
     pub fn dispatch(&self, req: &pb::SagaHandleRequest) -> Result<pb::SagaResponse, CodedError> {
         let Some(source) = req.source.as_ref() else {
@@ -137,22 +136,6 @@ impl SagaDispatch {
             resp.events.extend(events);
         }
 
-        // FILL-ONLY correlation propagation: emitted commands inherit the
-        // source book's correlation id unless the handler stamped one — the
-        // saga sibling of the aggregate's stampEmittedBook.
-        if let Some(corr) = source
-            .cover
-            .as_ref()
-            .map(|c| c.correlation_id.as_str())
-            .filter(|c| !c.is_empty())
-        {
-            for cmd in &mut resp.commands {
-                let cover = cmd.cover.get_or_insert_with(pb::Cover::default);
-                if cover.correlation_id.is_empty() {
-                    cover.correlation_id = corr.to_string();
-                }
-            }
-        }
         Ok(resp)
     }
 }
