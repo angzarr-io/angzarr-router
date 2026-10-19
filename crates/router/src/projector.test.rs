@@ -247,9 +247,12 @@ fn folds_observe_the_book_cover_and_page_sequence() {
 
 // --- the batched fold (router-owned projections across the C ABI) -----------
 
+/// Each batched fold call: its page sequences and cover domain.
+type FoldCalls = Arc<Mutex<Vec<(Vec<u64>, String)>>>;
+
 /// A projector whose batched fold records each call's page sequences and
 /// cover domain, and counts the pages folded.
-fn batched(calls: Arc<Mutex<Vec<(Vec<u64>, String)>>>) -> ProjectorDispatch<Folded> {
+fn batched(calls: FoldCalls) -> ProjectorDispatch<Folded> {
     ProjectorDispatch::new("write-model", Folded::default)
         .for_domains(["order"])
         .with_fold(move |p: &mut Folded, pages, cover| {
