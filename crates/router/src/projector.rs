@@ -26,12 +26,19 @@ pub type EventFn<P> =
 pub type FinishFn<P> =
     Box<dyn Fn(&mut P, &pb::EventBook) -> Result<pb::Projection, HandlerError> + Send + Sync>;
 
+/// Folds every page of a consumed book into the projection in one call: the
+/// batched alternative to per-type folds, for a projection the router holds
+/// on a host's behalf (router-owned projections across the C ABI).
+pub type BatchFoldFn<P> =
+    Box<dyn Fn(&mut P, &[pb::EventPage], &pb::Cover) -> Result<(), HandlerError> + Send + Sync>;
+
 /// The dispatch table for one projector component.
 pub struct ProjectorDispatch<P> {
     name: String,
     factory: Box<dyn Fn() -> P + Send + Sync>,
     domains: Option<HashSet<String>>,
     handlers: HashMap<String, EventFn<P>>,
+    fold: Option<BatchFoldFn<P>>,
     finish: Option<FinishFn<P>>,
 }
 
@@ -43,8 +50,23 @@ impl<P> ProjectorDispatch<P> {
             factory: Box::new(factory),
             domains: None,
             handlers: HashMap::new(),
+            fold: None,
             finish: None,
         }
+    }
+
+    /// Folds through one batched `fold` instead of the per-type folds: a
+    /// delivery whose domain the projector consumes hands it every page (and
+    /// the book's cover) in a single call, and none when there are none.
+    pub fn with_fold(
+        mut self,
+        fold: impl Fn(&mut P, &[pb::EventPage], &pb::Cover) -> Result<(), HandlerError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.fold = Some(Box::new(fold));
+        self
     }
 
     /// Restricts folding to books whose cover carries one of these domains;
@@ -111,7 +133,11 @@ impl<P> ProjectorDispatch<P> {
             None => true,
         };
 
-        if consumed {
+        if let (true, Some(fold)) = (consumed, self.fold.as_ref()) {
+            if !events.pages.is_empty() {
+                fold(&mut projection, &events.pages, cover).map_err(map_handler_error)?;
+            }
+        } else if consumed {
             for page in &events.pages {
                 let Some(event_any) = crate::page_event(page) else {
                     continue;

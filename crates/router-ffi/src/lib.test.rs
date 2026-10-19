@@ -46,8 +46,6 @@ const CB_FOLD: u64 = 1;
 const CB_INCREASE_BY: u64 = 2;
 const CB_FAIL_HARD: u64 = 3;
 const CB_RETURN_NOTHING: u64 = 6;
-const CB_PROJ_FOLD: u64 = 8;
-const CB_PROJ_FINISH: u64 = 9;
 const CB_SAGA_EVENT: u64 = 10;
 const CB_PM_EVENT: u64 = 12;
 const CB_PM2_EVENT: u64 = 14;
@@ -290,37 +288,12 @@ unsafe extern "C" fn host_cb(
             host_fill(out, &upcast.encode_to_vec());
             STATUS_OK
         }
-        CB_PROJ_FOLD => {
-            // Host folds one Increased event into its projection instance.
-            if Increased::decode(payload).is_err() {
-                return -3;
-            }
-            let paux = abi_pb::ProjectorEventAux::decode(aux).expect("projector aux");
-            with_session(key, |s| {
-                s.counter += 1;
-                s.observed_pages.push((paux.cover, paux.sequence));
-            });
-            STATUS_OK_EMPTY
-        }
         CB_PROJ_FOLD_REJECTS => {
             host_fill(
                 out,
                 &rejection_status(9, "PROJECTION_STALE", "projection is stale"),
             );
             -9
-        }
-        CB_PROJ_FINISH => {
-            // Pack the folded count into the wire Projection. The core hands
-            // the EventBook over as the payload so the host can carry cover.
-            let book = pb::EventBook::decode(payload).expect("finish EventBook");
-            let proj = pb::Projection {
-                cover: book.cover,
-                projector: "CounterProjector".to_string(),
-                next_sequence: u64::from(with_session(key, |s| s.counter)),
-                ..Default::default()
-            };
-            host_fill(out, &proj.encode_to_vec());
-            STATUS_OK
         }
         CB_SAGA_EVENT => {
             // Host translates the source event into one stamped command,
@@ -886,11 +859,8 @@ fn projector_descriptor_bytes() -> Vec<u8> {
     abi_pb::ProjectorDescriptor {
         name: "CounterProjector".to_string(),
         domains: vec!["counter".to_string()],
-        events: vec![abi_pb::CallbackEntry {
-            fq_type: FQ_INCREASED.to_string(),
-            callback_id: CB_PROJ_FOLD,
-        }],
-        finish_callback_id: Some(CB_PROJ_FINISH),
+        projection_type_url: STATE_TYPE.to_string(),
+        fold_callback_id: Some(CB_FOLD),
     }
     .encode_to_vec()
 }
@@ -940,11 +910,10 @@ fn book_in_domain(domain: &str, n: u32) -> pb::EventBook {
     book
 }
 
+// Router-owned projections (docs/design-handling.md): the router folds the
+// projection bytes through one stateless host fold and builds the Projection.
 #[test]
 fn projector_folds_every_page_through_the_abi() {
-    // The whole projector path across raw pointers: register a projector,
-    // dispatch an EventBook, and confirm the host folded every page into one
-    // projection whose finisher reports the count.
     let router = Router::with_projector();
     let session = next_session();
     let (ret, bytes) = router.dispatch_projector(session, &book_in_domain("counter", 3));
@@ -952,23 +921,56 @@ fn projector_folds_every_page_through_the_abi() {
     let proj = pb::Projection::decode(bytes.as_slice()).expect("Projection");
     assert_eq!(proj.projector, "CounterProjector");
     assert_eq!(
-        proj.next_sequence, 3,
-        "all three pages folded into one instance"
+        proj.cover.as_ref().map(|c| c.domain.as_str()),
+        Some("counter")
     );
-    assert_eq!(session_snapshot(session).counter, 3);
+    assert_eq!(
+        state_value(proj.projection.as_ref()),
+        3,
+        "every page folded"
+    );
+    assert_eq!(
+        proj.next_sequence, 3,
+        "the last projected page's sequence + 1"
+    );
+    assert_eq!(
+        session_snapshot(session).fold_calls,
+        vec![vec![0, 1, 2]],
+        "one batched call"
+    );
 }
 
 #[test]
 fn projector_undeclared_domain_folds_nothing_through_the_abi() {
-    // ForDomains("counter") with a book in another domain: no fold callback
-    // fires, but finish still runs and reports zero.
     let router = Router::with_projector();
     let session = next_session();
     let (ret, bytes) = router.dispatch_projector(session, &book_in_domain("inventory", 3));
     assert_eq!(ret, 0);
     let proj = pb::Projection::decode(bytes.as_slice()).expect("Projection");
-    assert_eq!(proj.next_sequence, 0, "undeclared domain folds nothing");
-    assert_eq!(session_snapshot(session).counter, 0);
+    assert_eq!(
+        proj.projection,
+        Some(Any {
+            type_url: format!("/{STATE_TYPE}"),
+            value: Vec::new(),
+        }),
+        "the projection type's default"
+    );
+    assert!(session_snapshot(session).fold_calls.is_empty());
+}
+
+#[test]
+fn an_empty_delivery_reports_the_books_next_sequence() {
+    let router = Router::with_projector();
+    let mut book = book_in_domain("counter", 0);
+    book.next_sequence = 7;
+    let (ret, bytes) = router.dispatch_projector(next_session(), &book);
+    assert_eq!(ret, 0);
+    assert_eq!(
+        pb::Projection::decode(bytes.as_slice())
+            .unwrap()
+            .next_sequence,
+        7
+    );
 }
 
 // --- saga ABI surface (per-kind entry points)
@@ -1397,11 +1399,8 @@ fn projector_fold_failure_keeps_the_host_status() {
     let desc = abi_pb::ProjectorDescriptor {
         name: "Rejecting".to_string(),
         domains: vec!["counter".to_string()],
-        events: vec![abi_pb::CallbackEntry {
-            fq_type: FQ_INCREASED.to_string(),
-            callback_id: CB_PROJ_FOLD_REJECTS,
-        }],
-        finish_callback_id: Some(CB_PROJ_FINISH),
+        projection_type_url: STATE_TYPE.to_string(),
+        fold_callback_id: Some(CB_PROJ_FOLD_REJECTS),
     }
     .encode_to_vec();
     assert_eq!(
@@ -1505,10 +1504,10 @@ fn a_fresh_aggregate_starts_from_the_registered_state_types_default() {
 }
 
 #[test]
-fn projector_fold_returning_status_ok_is_success() {
+fn projector_fold_returning_status_ok_empty_keeps_the_projection() {
     let mut desc =
         abi_pb::ProjectorDescriptor::decode(projector_descriptor_bytes().as_slice()).unwrap();
-    desc.events[0].callback_id = CB_OK_ZERO;
+    desc.fold_callback_id = Some(CB_OK_EMPTY);
     let bytes = desc.encode_to_vec();
     let r = angzarr_router_new();
     assert_eq!(
@@ -1516,8 +1515,17 @@ fn projector_fold_returning_status_ok_is_success() {
         0
     );
     let router = Router(r);
-    let (ret, _) = router.dispatch_projector(next_session(), &book_in_domain("counter", 2));
+    let (ret, bytes) = router.dispatch_projector(next_session(), &book_in_domain("counter", 2));
     assert_eq!(ret, 0);
+    assert_eq!(
+        state_value(
+            pb::Projection::decode(bytes.as_slice())
+                .unwrap()
+                .projection
+                .as_ref()
+        ),
+        0
+    );
 }
 
 fn saga_with(event: u64) -> Router {
@@ -1694,8 +1702,9 @@ fn projector_fold_sees_its_page_place_through_the_abi() {
     let (ret, _) = router.dispatch_projector(session, &book);
     assert_eq!(ret, 0);
     assert_eq!(
-        session_snapshot(session).observed_pages,
-        vec![(book.cover.clone(), 0), (book.cover.clone(), 9)]
+        session_snapshot(session).applied_pages,
+        vec![(book.cover.clone(), 0), (book.cover.clone(), 9)],
+        "the fold sees the book's cover and each page's sequence"
     );
 }
 

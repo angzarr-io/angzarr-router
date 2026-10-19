@@ -124,20 +124,33 @@ message FactRecord {
   repeated google.protobuf.Any flags = 2;
 }
 
-// Registration payload for one projector component. Folds cross the
-// callback (the host owns the projection instance); finish packs it into
-// the wire Projection. Empty `domains` consumes every domain.
+// Registration payload for one projector component. Router-owned like an
+// aggregate's state: each delivery starts from the projection message's
+// default (`Any { type_url: "/" + projection_type_url, value: [] }`), and a
+// book from a declared domain (empty `domains`: every domain) is folded
+// through ONE stateless fold call (payload a FoldCall whose `state` is the
+// projection; STATUS_OK answers the new projection as a serialized
+// google.protobuf.Any, STATUS_OK_EMPTY leaves it unchanged; a failure keeps
+// the host's status). The router answers the Projection itself: the book's
+// cover, the projector's name, the folded projection, and next_sequence =
+// the last page's sequence + 1 (the book's next_sequence when it has no
+// pages).
 message ProjectorDescriptor {
   string name = 1;
   repeated string domains = 2;
-  repeated CallbackEntry events = 3;
-  // Packs the folded projection into the wire Projection; absent → the core
-  // returns a default Projection (cover + name only).
-  optional uint64 finish_callback_id = 4;
+  // Fields 3 and 4 were `events` (per-type host folds into a session
+  // instance) and `finish_callback_id` (the router now builds the
+  // Projection).
+  reserved 3, 4;
+  reserved "events", "finish_callback_id";
   // Field 5 was `unknown_callback_id` (removed — events with no fold thunk
   // are skipped and the core logs a warn).
   reserved 5;
   reserved "unknown_callback_id";
+  // The projection message's fully-qualified name.
+  string projection_type_url = 6;
+  // The fold over the projection (see above).
+  optional uint64 fold_callback_id = 7;
 }
 
 // Registration payload for one saga component. A stateless translator:
@@ -234,11 +247,4 @@ message PmEventAux {
   reserved "destination_sequences";
   io.angzarr.v1.Cover trigger_cover = 2;
   google.protobuf.Any state = 3;
-}
-
-// aux payload for projector fold callbacks: where the folded event sits (its
-// book's cover and the page's sequence).
-message ProjectorEventAux {
-  io.angzarr.v1.Cover cover = 1;
-  uint64 sequence = 2;
 }

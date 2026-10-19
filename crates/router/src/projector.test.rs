@@ -244,3 +244,64 @@ fn folds_observe_the_book_cover_and_page_sequence() {
         vec![(Some(vec![9; 16]), 4), (Some(vec![9; 16]), 0)]
     );
 }
+
+// --- the batched fold (router-owned projections across the C ABI) -----------
+
+/// A projector whose batched fold records each call's page sequences and
+/// cover domain, and counts the pages folded.
+fn batched(calls: Arc<Mutex<Vec<(Vec<u64>, String)>>>) -> ProjectorDispatch<Folded> {
+    ProjectorDispatch::new("write-model", Folded::default)
+        .for_domains(["order"])
+        .with_fold(move |p: &mut Folded, pages, cover| {
+            calls.lock().unwrap().push((
+                pages.iter().map(|pg| pg.sequence).collect(),
+                cover.domain.clone(),
+            ));
+            p.entries.extend(pages.iter().map(|_| "folded".to_string()));
+            Ok(())
+        })
+        .finish(|p, events| {
+            Ok(pb::Projection {
+                cover: events.cover.clone(),
+                next_sequence: p.entries.len() as u64,
+                ..Default::default()
+            })
+        })
+}
+
+#[test]
+fn a_batched_fold_sees_every_page_of_a_consumed_book_in_one_call() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut events = book("order", cover_pages("order", 3));
+    for (seq, page) in events.pages.iter_mut().enumerate() {
+        page.sequence = seq as u64 + 4;
+    }
+    let proj = batched(calls.clone()).dispatch(&events).expect("dispatch");
+    assert_eq!(proj.next_sequence, 3, "all three pages folded");
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![(vec![4, 5, 6], "order".to_string())]
+    );
+}
+
+#[test]
+fn a_batched_fold_is_not_called_for_an_undeclared_domain_or_no_pages() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let d = batched(calls.clone());
+    let proj = d
+        .dispatch(&book("billing", cover_pages("billing", 2)))
+        .expect("dispatch");
+    assert_eq!(proj.next_sequence, 0, "finish still runs");
+    d.dispatch(&book("order", vec![])).expect("dispatch");
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_batched_fold_failure_fails_the_delivery() {
+    let d = ProjectorDispatch::new("write-model", Folded::default)
+        .with_fold(|_p, _pages, _c| Err(HandlerError::Other("boom".to_string())));
+    let err = d
+        .dispatch(&book("order", cover_pages("order", 1)))
+        .expect_err("the fold failed");
+    assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
+}

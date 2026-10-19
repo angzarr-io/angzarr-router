@@ -144,7 +144,7 @@ fn state_rebuilder(state_type_url: &str, fold: Option<u64>, cb: AngzarrCb) -> Re
 /// The registered tables behind an opaque router handle.
 pub struct FfiRouter {
     aggregates: CommandHandlers,
-    projectors: Vec<(String, ProjectorDispatch<()>)>,
+    projectors: Vec<(String, ProjectorDispatch<Any>)>,
     sagas: Vec<(String, SagaDispatch)>,
     process_managers: Vec<(String, ProcessManagerDispatch<Any>)>,
 }
@@ -294,9 +294,9 @@ impl FfiRouter {
         self.aggregates.push(Box::new(dispatch))
     }
 
-    /// Parses a ProjectorDescriptor and populates a core projector table
-    /// with callback-marshaling thunks. The host owns the projection
-    /// instance (parked in host_ctx); folds and finish cross the callback.
+    /// Parses a ProjectorDescriptor and populates a core projector table over
+    /// a router-owned projection (projection_type_url): one stateless fold
+    /// call per delivery, and the router builds the Projection.
     pub fn register_projector(
         &mut self,
         descriptor: &[u8],
@@ -319,41 +319,53 @@ impl FfiRouter {
             ));
         }
 
-        let mut dispatch = ProjectorDispatch::new(desc.name.clone(), || ());
+        let initial = Any {
+            type_url: angzarr_router::type_url(&desc.projection_type_url),
+            value: Vec::new(),
+        };
+        let mut dispatch = ProjectorDispatch::new(desc.name.clone(), move || initial.clone());
         if !desc.domains.is_empty() {
             dispatch = dispatch.for_domains(desc.domains.clone());
         }
-        for event in &desc.events {
-            let id = event.callback_id;
-            dispatch = dispatch.on_event(&event.fq_type, move |_, any, ctx| {
-                let aux = abi_pb::ProjectorEventAux {
-                    cover: ctx.cover.cloned(),
-                    sequence: ctx.sequence,
+        if let Some(id) = desc.fold_callback_id {
+            dispatch = dispatch.with_fold(move |projection: &mut Any, pages, cover| {
+                let call = abi_pb::FoldCall {
+                    state: Some(projection.clone()),
+                    pages: pages.to_vec(),
+                    cover: Some(cover.clone()),
                 }
                 .encode_to_vec();
-                let (ret, bytes) = invoke(cb, id, &any.type_url, &any.value, &aux);
-                if ret < 0 {
-                    return Err(host_error(ret, bytes));
-                }
-                Ok(())
-            });
-        }
-        if let Some(id) = desc.finish_callback_id {
-            dispatch = dispatch.finish(move |_, events| {
-                let book = events.encode_to_vec();
-                let (ret, bytes) = invoke(cb, id, "", &book, &[]);
+                let (ret, bytes) = invoke(cb, id, "", &call, &[]);
                 match ret {
-                    STATUS_OK | STATUS_OK_EMPTY => {
-                        pb::Projection::decode(bytes.unwrap_or_default().as_slice()).map_err(|_| {
-                            HandlerError::Other(
-                                "host finisher returned undecodable Projection bytes".to_string(),
-                            )
-                        })
+                    STATUS_OK => {
+                        *projection =
+                            Any::decode(bytes.unwrap_or_default().as_slice()).map_err(|_| {
+                                HandlerError::Other(
+                                    "host projector fold returned undecodable Any bytes"
+                                        .to_string(),
+                                )
+                            })?;
+                        Ok(())
                     }
+                    STATUS_OK_EMPTY => Ok(()),
                     _ => Err(host_error(ret, bytes)),
                 }
             });
         }
+        // The router answers the Projection itself (types.proto, Projection):
+        // the projector's position is the last projected page's sequence + 1.
+        let name = desc.name.clone();
+        dispatch = dispatch.finish(move |projection: &mut Any, events| {
+            Ok(pb::Projection {
+                cover: events.cover.clone(),
+                projector: name.clone(),
+                next_sequence: events
+                    .pages
+                    .last()
+                    .map_or(events.next_sequence, |page| page.sequence + 1),
+                projection: Some(projection.clone()),
+            })
+        });
 
         self.projectors.push((desc.name, dispatch));
         Ok(())
