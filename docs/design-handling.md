@@ -3,10 +3,9 @@
 **Status:**
 - **Implemented:** conflict resolution, command upcasting, the rules version
   on every response, and claims for upcaster source types at registration.
-- **Implemented:** router-owned state across the C ABI for aggregates and
-  process managers.
-- **In progress:** router-owned projectors, the retirement of `host_ctx`, and
-  the registration hello (`component_descriptor()`), per the owner rulings
+- **Implemented:** router-owned state across the C ABI for aggregates,
+  process managers and projectors, and the retirement of `host_ctx`.
+- **In progress:** the registration hello (`component_descriptor()`), per the owner rulings
   recorded under "Registration and projectors" below.
 - **Open:** how the rules version is sourced (the owner intends the binary's
   full build version, emitted by versionator).
@@ -17,7 +16,7 @@ at 4.
 
 ## Spec
 
-Source: angzarr-project `spec/20261019-draft` (6e32b1e).
+Source: angzarr-project `spec/20261019-draft` (b412af8).
 
 - **Protos:**
   - `command_handler.proto`: `CommandHandlerService.Handle`,

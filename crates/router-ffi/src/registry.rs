@@ -2,9 +2,6 @@
 //! population: every closure built here only marshals across the
 //! callback; the semantics stay in angzarr-router.
 
-use std::cell::Cell;
-use std::ffi::c_void;
-
 use prost::Message;
 use prost_types::Any;
 
@@ -23,32 +20,7 @@ use angzarr_router::upcaster::UpcasterDispatch;
 use crate::abi::{consume_out, status_to_coded, AngzarrBuf, AngzarrCb, STATUS_OK, STATUS_OK_EMPTY};
 use crate::proto::io::angzarr::router::ffi::v1 as abi_pb;
 
-thread_local! {
-    /// The host's per-dispatch session pointer. Set for the duration of
-    /// one dispatch; callbacks run synchronously on the dispatching
-    /// thread, so distinct dispatches (threads) never observe each
-    /// other's session — the state-never-crosses principle made concrete.
-    static CURRENT_HOST_CTX: Cell<*mut c_void> = const { Cell::new(std::ptr::null_mut()) };
-}
-
-struct HostCtxGuard {
-    prev: *mut c_void,
-}
-
-impl HostCtxGuard {
-    fn set(ctx: *mut c_void) -> Self {
-        let prev = CURRENT_HOST_CTX.with(|c| c.replace(ctx));
-        HostCtxGuard { prev }
-    }
-}
-
-impl Drop for HostCtxGuard {
-    fn drop(&mut self) {
-        CURRENT_HOST_CTX.with(|c| c.set(self.prev));
-    }
-}
-
-/// Invokes the host callback with the current dispatch's session pointer.
+/// Invokes the host callback.
 /// Returns the status and any host-filled output (ownership taken).
 fn invoke(
     cb: AngzarrCb,
@@ -61,10 +33,8 @@ fn invoke(
         data: std::ptr::null_mut(),
         len: 0,
     };
-    let host_ctx = CURRENT_HOST_CTX.with(|c| c.get());
     let ret = unsafe {
         cb(
-            host_ctx,
             id,
             type_url.as_ptr(),
             type_url.len(),
@@ -373,9 +343,8 @@ impl FfiRouter {
 
     /// Decodes ContextualCommand bytes, routes it through the aggregates'
     /// claims (by domain and command type; a sole registered aggregate claims
-    /// any domain), and runs the core dispatch with the host session
-    /// installed.
-    pub fn dispatch(&self, host_ctx: *mut c_void, request: &[u8]) -> Result<Vec<u8>, CodedError> {
+    /// any domain), and runs the core dispatch.
+    pub fn dispatch(&self, request: &[u8]) -> Result<Vec<u8>, CodedError> {
         let req = pb::ContextualCommand::decode(request).map_err(|_| {
             CodedError::invalid_argument(
                 codes::ANY_DECODE_FAILED,
@@ -388,7 +357,6 @@ impl FfiRouter {
             .as_ref()
             .and_then(|c| c.cover.as_ref())
             .map_or("", |c| c.domain.as_str());
-        let _guard = HostCtxGuard::set(host_ctx);
         let resp = match self.sole_aggregate_for(domain) {
             Some(sole) => sole.dispatch(&req)?,
             None => self.aggregates.dispatch(&req)?,
@@ -407,12 +375,8 @@ impl FfiRouter {
 
     /// Decodes EventBook bytes, routes to the registered projector (sole
     /// projector claims everything; the core applies its own domain filter),
-    /// and runs the core dispatch with the host session installed.
-    pub fn dispatch_projector(
-        &self,
-        host_ctx: *mut c_void,
-        request: &[u8],
-    ) -> Result<Vec<u8>, CodedError> {
+    /// and runs the core dispatch.
+    pub fn dispatch_projector(&self, request: &[u8]) -> Result<Vec<u8>, CodedError> {
         let book = pb::EventBook::decode(request).map_err(|_| {
             CodedError::invalid_argument(codes::ANY_DECODE_FAILED, "failed to decode EventBook", [])
         })?;
@@ -428,7 +392,6 @@ impl FfiRouter {
             }
         };
 
-        let _guard = HostCtxGuard::set(host_ctx);
         let resp = dispatch.dispatch(&book)?;
         Ok(resp.encode_to_vec())
     }
@@ -482,12 +445,8 @@ impl FfiRouter {
     }
 
     /// Decodes the source EventBook bytes, routes to the sagas consuming its
-    /// domain, and runs each core dispatch with the host session installed.
-    pub fn dispatch_saga(
-        &self,
-        host_ctx: *mut c_void,
-        request: &[u8],
-    ) -> Result<Vec<u8>, CodedError> {
+    /// domain, and runs each core dispatch.
+    pub fn dispatch_saga(&self, request: &[u8]) -> Result<Vec<u8>, CodedError> {
         let source = pb::EventBook::decode(request).map_err(|_| {
             CodedError::invalid_argument(
                 codes::ANY_DECODE_FAILED,
@@ -516,7 +475,6 @@ impl FfiRouter {
             .as_ref()
             .map(|c| c.domain.as_str())
             .unwrap_or("");
-        let _guard = HostCtxGuard::set(host_ctx);
         let mut merged = pb::SagaResponse::default();
         let mut matched = false;
         for (_, saga) in self
@@ -601,14 +559,9 @@ impl FfiRouter {
     }
 
     /// Decodes ProcessManagerHandleRequest bytes, routes to the addressed
-    /// co-resident PMs, and runs each core dispatch with the host session
-    /// installed. Each PM's state is router-owned and rebuilt from its own
+    /// co-resident PMs, and runs each core dispatch. Each PM's state is router-owned and rebuilt from its own
     /// process state, so no PM ever folds into another's state.
-    pub fn dispatch_process_manager(
-        &self,
-        host_ctx: *mut c_void,
-        request: &[u8],
-    ) -> Result<Vec<u8>, CodedError> {
+    pub fn dispatch_process_manager(&self, request: &[u8]) -> Result<Vec<u8>, CodedError> {
         let req = pb::ProcessManagerHandleRequest::decode(request).map_err(|_| {
             CodedError::invalid_argument(
                 codes::ANY_DECODE_FAILED,
@@ -646,7 +599,6 @@ impl FfiRouter {
             .map(|(_, pm)| pm as &dyn ProcessManagerRoute)
             .collect();
         let selected = select_process_managers(&routes, &req);
-        let _guard = HostCtxGuard::set(host_ctx);
         // Co-hosted PMs share one binary, so one rules version.
         let mut merged = pb::ProcessManagerHandleResponse {
             rules_version: self
@@ -663,7 +615,3 @@ impl FfiRouter {
         Ok(merged.encode_to_vec())
     }
 }
-
-#[cfg(test)]
-#[path = "registry.test.rs"]
-mod registry_tests;

@@ -37,12 +37,12 @@ conformance/proto (component declarations)
         ▼
 generated wiring  ── typed seam + Register<Component>(router, handler)
         │
-bindings/<lang>    ── registry of callback_id → typed invoker, one trampoline,
-        │             a per-dispatch session parked in host_ctx
+bindings/<lang>    ── registry of callback_id → typed invoker, one trampoline;
+        │             stateless (the router owns every state)
         │  C ABI (crates/router-ffi: 13 extern "C" fns)
         ▼
 crates/router-ffi  ── descriptor → core tables, component claims/routing,
-        │             host_ctx installed for the duration of one dispatch
+        │             router-held state and projections
         ▼
 crates/router      ── Rebuilder, AggregateDispatch, SagaDispatch,
                       ProcessManagerDispatch (+ co-resident selection),
@@ -66,7 +66,7 @@ process manager) (ABI version 4). The aggregate's `dispatch` takes a
 `CommandHandlerResponse`; the saga's takes the source `EventBook`. A component is registered from a serialized descriptor
 (`proto/io/angzarr/router/ffi/v1/abi.proto`) listing `(fq_type,
 callback_id)` entries; every callback goes through one host function
-`angzarr_cb(host_ctx, callback_id, type_url, payload, aux, out)`.
+`angzarr_cb(callback_id, type_url, payload, aux, out)`.
 
 The registry owns the component claims, which are mutation-tested with the
 core:
@@ -87,10 +87,9 @@ Go (cgo), Java (FFM), C# (P/Invoke), TypeScript (koffi),
 C++ (static link). **Parked:** every binding is still written against ABI 3
 and the pre-latest-spec protos; CI does not build them until each is ported
 to ABI 4. Each binding checks `angzarr_abi_version` against the
-version it was written for before first use. Aggregate and process-manager
-callbacks are stateless (the router owns their state); each dispatch still
-creates one session (the `host_ctx`) for a projector's projection instance,
-keyed by component, never by session alone.
+version it was written for before first use. Every callback is stateless: the
+router owns aggregate and process-manager state and projector projections,
+so a binding keeps no state of any kind.
 
 ## Engine semantics
 
@@ -105,7 +104,7 @@ keyed by component, never by session alone.
 | Conflicts | Handlers see the resolved `Handling` (`expected_sequence`, `conflict_resolution`). AGGREGATE_HANDLES hands the window and nonce in `CommandContext.conflict`; output without `resolve_conflicts(window, nonce)` on exactly that nonce is discarded: `CONFLICT_UNRESOLVED` (ABORTED). COMMUTATIVE runs in the router over the generated `changed()`: decide on the head, keep the events iff `changed(expected, head)` and `changed(head, head + events)` do not overlap, else `CONFLICT_OVERLAP` (ABORTED); none registered: `CONFLICT_RESOLUTION_UNSUPPORTED` |
 | Rules version | Every `CommandHandlerResponse` and `ProcessManagerHandleResponse` carries the binary's declared rules version, overwriting a handler's; co-hosted PMs share it. Snapshot selection is the coordinator's (decision 14.1) |
 | Process manager | The newest page of the trigger book dispatches; handlers receive the trigger cover; co-resident PMs are selected by identity first — a process state reaches the PM owning its cover domain — and otherwise every PM consuming the trigger domain; responses merge in registration order. Process events pass through as emitted (the coordinator addresses and stamps them) |
-| Projector | Folds every page into one projection instance, each fold seeing the book cover and the page's sequence; undeclared domains fold nothing (C-0032), and a projector declaring `"*"` consumes every domain; unmatched types are skipped with a WARN |
+| Projector | Folds every page into one projection instance, each fold seeing the book cover and the page's sequence; undeclared domains fold nothing (C-0032), and a projector declaring `"*"` consumes every domain; unmatched types are skipped with a WARN. Across the C ABI the projection is router-held (a serialized `Any` of the registered projection type, empty at first), folded by one stateless batched host fold call per delivery, and the router builds the `Projection` (cover, projector name, next sequence after the last page) |
 | Type URLs | Emitted type URLs use the bare `/` prefix; incoming ones match by the fully-qualified name after the last `/`, whatever the prefix |
 | Errors | One `map_handler_error` table: rejections keep their gRPC code, a command or fact type URL no handler claims → INVALID_ARGUMENT (`NO_HANDLER_REGISTERED` or `NO_FACT_HANDLER`, message `no handler for type URL <url>`), any other `NO_HANDLER_REGISTERED` (no component for the request) → UNIMPLEMENTED, `PERSISTED_EVENT_CORRUPT` → DATA_LOSS, `CONFLICT_UNRESOLVED` and `CONFLICT_OVERLAP` → ABORTED, other coded client errors → INVALID_ARGUMENT, unclassified → INTERNAL + `UNHANDLED_HANDLER_ERROR`. Codes ride a `google.rpc.ErrorInfo` detail (domain `angzarr.io`); assertions key on codes, never message substrings |
 

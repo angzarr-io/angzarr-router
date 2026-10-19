@@ -26,19 +26,19 @@
 //!   them with `angzarr_buf_release`.
 //!
 //! # Threading and panics
-//! Callbacks are invoked synchronously on the dispatching thread — one
-//! callback at a time per dispatch; dispatches on different host_ctx
-//! values may run concurrently. `host_ctx` is opaque to Rust and passed
-//! back on every callback.
+//! Callbacks are invoked synchronously on the dispatching thread, one
+//! callback at a time per dispatch; dispatches on different threads may run
+//! concurrently against one router.
 //!
 //! # State
-//! Aggregate and process-manager state is router-owned: the router holds it
-//! as a serialized `google.protobuf.Any` of the registered state type and
+//! All component state is router-owned: the router holds it as a serialized
+//! `google.protobuf.Any` of the registered state (or projection) type and
 //! hands it to every callback (fold, decide, fact, PM event), which are
-//! stateless; a delivered snapshot is the initial state. Only a projector's
-//! projection instance still lives in the host's per-dispatch session
-//! (`host_ctx`), keyed by component, never by session alone. Registration takes the router exclusively: it must not run
-//! concurrently with any other call on the same router.
+//! stateless; a delivered snapshot is the initial state. A binding keeps no
+//! state of any kind between or within dispatches, and nothing per-dispatch
+//! crosses the boundary but the callback's own buffers.
+//! Registration takes the router exclusively: it must not run concurrently
+//! with any other call on the same router.
 //! Every entry point wraps `catch_unwind`; a Rust panic surfaces as a
 //! coded UNHANDLED_HANDLER_ERROR failure — never an abort, never an
 //! unwind across the boundary.
@@ -163,7 +163,6 @@ pub unsafe extern "C" fn angzarr_router_register_projector(
 #[no_mangle]
 pub unsafe extern "C" fn angzarr_router_dispatch_projector(
     r: *mut c_void,
-    host_ctx: *mut c_void,
     request: *const u8,
     request_len: usize,
     out: *mut AngzarrBuf,
@@ -174,7 +173,7 @@ pub unsafe extern "C" fn angzarr_router_dispatch_projector(
         }
         let router = &*(r as *const FfiRouter);
         let bytes = slice_from(request, request_len);
-        router.dispatch_projector(host_ctx, bytes)
+        router.dispatch_projector(bytes)
     }));
     match flatten_panic(result) {
         Ok(response) => {
@@ -228,7 +227,6 @@ pub unsafe extern "C" fn angzarr_router_register_saga(
 #[no_mangle]
 pub unsafe extern "C" fn angzarr_router_dispatch_saga(
     r: *mut c_void,
-    host_ctx: *mut c_void,
     request: *const u8,
     request_len: usize,
     out: *mut AngzarrBuf,
@@ -239,7 +237,7 @@ pub unsafe extern "C" fn angzarr_router_dispatch_saga(
         }
         let router = &*(r as *const FfiRouter);
         let bytes = slice_from(request, request_len);
-        router.dispatch_saga(host_ctx, bytes)
+        router.dispatch_saga(bytes)
     }));
     match flatten_panic(result) {
         Ok(response) => {
@@ -294,7 +292,6 @@ pub unsafe extern "C" fn angzarr_router_register_process_manager(
 #[no_mangle]
 pub unsafe extern "C" fn angzarr_router_dispatch_process_manager(
     r: *mut c_void,
-    host_ctx: *mut c_void,
     request: *const u8,
     request_len: usize,
     out: *mut AngzarrBuf,
@@ -305,7 +302,7 @@ pub unsafe extern "C" fn angzarr_router_dispatch_process_manager(
         }
         let router = &*(r as *const FfiRouter);
         let bytes = slice_from(request, request_len);
-        router.dispatch_process_manager(host_ctx, bytes)
+        router.dispatch_process_manager(bytes)
     }));
     match flatten_panic(result) {
         Ok(response) => {
@@ -333,7 +330,6 @@ pub unsafe extern "C" fn angzarr_router_dispatch_process_manager(
 #[no_mangle]
 pub unsafe extern "C" fn angzarr_router_dispatch(
     r: *mut c_void,
-    host_ctx: *mut c_void,
     request: *const u8,
     request_len: usize,
     out: *mut AngzarrBuf,
@@ -344,7 +340,7 @@ pub unsafe extern "C" fn angzarr_router_dispatch(
         }
         let router = &*(r as *const FfiRouter);
         let bytes = slice_from(request, request_len);
-        router.dispatch(host_ctx, bytes)
+        router.dispatch(bytes)
     }));
     match flatten_panic(result) {
         Ok(response) => {

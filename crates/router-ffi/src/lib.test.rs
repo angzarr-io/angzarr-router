@@ -1,12 +1,10 @@
 //! The Rust-side ABI consumer test: drives the extern "C" surface through
 //! raw pointers exactly as a foreign binding would — the ABI is proven
 //! before any binding exists. The host side is a hand-rolled
-//! CounterAggregate (the conformance fixture's shape): sessions keyed by
-//! host_ctx, one C-visible gateway fn, callback ids selecting thunks.
+//! CounterAggregate (the conformance fixture's shape): stateless callbacks,
+//! one C-visible gateway fn, callback ids selecting thunks.
 
-use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::Mutex;
 
 use prost::Message;
 use prost_types::Any;
@@ -76,11 +74,10 @@ const FQ_ORDER_CREATED: &str = "test.order.OrderCreated";
 const FQ_RESERVE_STOCK: &str = "test.order.ReserveStock";
 const FQ_ORDER_SHIPPED: &str = "test.order.OrderShipped";
 
-// --- host-side session registry (state never crosses the boundary)
+// --- host-side observation (callbacks are stateless; state is router-owned)
 
 #[derive(Default, Clone)]
 struct Session {
-    counter: u32,
     observed_covers: Vec<Option<pb::Cover>>,
     observed_pages: Vec<(Option<pb::Cover>, u64)>,
     applied_pages: Vec<(Option<pb::Cover>, u64)>,
@@ -116,16 +113,23 @@ fn state_any(value: u32) -> Any {
     }
 }
 
-static SESSIONS: Mutex<Option<HashMap<usize, Session>>> = Mutex::new(None);
-
-fn with_session<R>(key: usize, f: impl FnOnce(&mut Session) -> R) -> R {
-    let mut guard = SESSIONS.lock().unwrap();
-    let sessions = guard.get_or_insert_with(HashMap::new);
-    f(sessions.entry(key).or_default())
+thread_local! {
+    /// What this thread's host callbacks observed. Callbacks run
+    /// synchronously on the dispatching thread and keep no state of their
+    /// own; this is the test's window onto what crossed the boundary.
+    static OBSERVED: std::cell::RefCell<Session> = std::cell::RefCell::default();
 }
 
-fn session_snapshot(key: usize) -> Session {
-    with_session(key, |s| s.clone())
+fn observe<R>(f: impl FnOnce(&mut Session) -> R) -> R {
+    OBSERVED.with(|o| f(&mut o.borrow_mut()))
+}
+
+fn reset_observations() {
+    observe(|s| *s = Session::default());
+}
+
+fn observations() -> Session {
+    observe(|s| s.clone())
 }
 
 // --- the host gateway: one C-visible fn, callback_id selects the thunk
@@ -174,7 +178,6 @@ fn increased_book(n: u32) -> pb::EventBook {
 }
 
 unsafe extern "C" fn host_cb(
-    host_ctx: *mut c_void,
     callback_id: u64,
     _type_url: *const u8,
     _type_url_len: usize,
@@ -184,7 +187,6 @@ unsafe extern "C" fn host_cb(
     aux_len: usize,
     out: *mut AngzarrBuf,
 ) -> i32 {
-    let key = host_ctx as usize;
     let payload = if payload_len > 0 {
         std::slice::from_raw_parts(payload, payload_len)
     } else {
@@ -212,11 +214,9 @@ unsafe extern "C" fn host_cb(
                     return -3;
                 }
                 value += 1;
-                with_session(key, |s| {
-                    s.applied_pages.push((call.cover.clone(), page.sequence))
-                });
+                observe(|s| s.applied_pages.push((call.cover.clone(), page.sequence)));
             }
-            with_session(key, |s| {
+            observe(|s| {
                 s.fold_calls
                     .push(call.pages.iter().map(|p| p.sequence).collect())
             });
@@ -225,7 +225,7 @@ unsafe extern "C" fn host_cb(
         }
         CB_INCREASE_BY | CB_INCREASE_IGNORES | CB_INCREASE_MADE_UP => {
             let cctx = abi_pb::CommandContextAux::decode(aux).expect("cctx aux");
-            with_session(key, |s| {
+            observe(|s| {
                 s.observed_state.push(state_value(cctx.state.as_ref()));
                 s.observed_state_type.push(
                     cctx.state
@@ -271,7 +271,7 @@ unsafe extern "C" fn host_cb(
                     .value
             };
             let (before, after) = (value(call.before), value(call.after));
-            with_session(key, |s| s.changed_calls.push((before, after)));
+            observe(|s| s.changed_calls.push((before, after)));
             let units = if callback_id == CB_CHANGED_VALUE && before != after {
                 vec!["value".to_string()]
             } else {
@@ -299,7 +299,7 @@ unsafe extern "C" fn host_cb(
             // Host translates the source event into one stamped command,
             // stamping from the coordinator-supplied destination sequences.
             let saux = abi_pb::SagaEventAux::decode(aux).expect("saga event aux");
-            with_session(key, |s| {
+            observe(|s| {
                 s.observed_pages.push((saux.source_cover, saux.source_seq));
             });
             let cmd = pb::CommandBook {
@@ -328,9 +328,7 @@ unsafe extern "C" fn host_cb(
             // Stateful PM: the host reacts to the newest trigger event and
             // emits one stamped command, returning the full PM response.
             let paux = abi_pb::PmEventAux::decode(aux).expect("pm event aux");
-            with_session(key, |s| {
-                s.observed_state.push(state_value(paux.state.as_ref()))
-            });
+            observe(|s| s.observed_state.push(state_value(paux.state.as_ref())));
             let cmd = pb::CommandBook {
                 cover: Some(pb::Cover {
                     domain: "inventory".to_string(),
@@ -438,7 +436,7 @@ fn descriptor_bytes() -> Vec<u8> {
 
 struct Router(*mut c_void);
 
-// The ABI contract: dispatches on different host_ctx values may run
+// The ABI contract: dispatches on different threads may run
 // concurrently against one router. The test wrapper asserts that.
 unsafe impl Send for Router {}
 unsafe impl Sync for Router {}
@@ -455,21 +453,13 @@ impl Router {
 
     /// Dispatches and copies out the response, releasing router memory —
     /// the full binding-side buffer discipline.
-    fn dispatch(&self, session: usize, req: &pb::ContextualCommand) -> (i32, Vec<u8>) {
+    fn dispatch(&self, req: &pb::ContextualCommand) -> (i32, Vec<u8>) {
         let bytes = req.encode_to_vec();
         let mut out = AngzarrBuf {
             data: std::ptr::null_mut(),
             len: 0,
         };
-        let ret = unsafe {
-            angzarr_router_dispatch(
-                self.0,
-                session as *mut c_void,
-                bytes.as_ptr(),
-                bytes.len(),
-                &mut out,
-            )
-        };
+        let ret = unsafe { angzarr_router_dispatch(self.0, bytes.as_ptr(), bytes.len(), &mut out) };
         let response = if out.data.is_null() {
             Vec::new()
         } else {
@@ -485,12 +475,6 @@ impl Drop for Router {
     fn drop(&mut self) {
         unsafe { angzarr_router_free(self.0) };
     }
-}
-
-fn next_session() -> usize {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static NEXT: AtomicUsize = AtomicUsize::new(1);
-    NEXT.fetch_add(1, Ordering::SeqCst)
 }
 
 fn command_req(fq: &str, payload: Vec<u8>, events: Option<pb::EventBook>) -> pb::ContextualCommand {
@@ -570,11 +554,12 @@ fn abi_version_is_four() {
 #[test]
 fn empty_history_command_emits_unstamped_events() {
     let router = Router::with_counter();
-    let session = next_session();
-    let (ret, bytes) = router.dispatch(
-        session,
-        &command_req(FQ_INCREASE_BY, IncreaseBy { n: 2 }.encode_to_vec(), None),
-    );
+    reset_observations();
+    let (ret, bytes) = router.dispatch(&command_req(
+        FQ_INCREASE_BY,
+        IncreaseBy { n: 2 }.encode_to_vec(),
+        None,
+    ));
     assert_eq!(ret, 0);
     let book = decode_events(&bytes);
     assert_eq!(
@@ -583,7 +568,7 @@ fn empty_history_command_emits_unstamped_events() {
         "the host's book crosses back as emitted: the coordinator stamps sequences"
     );
 
-    let s = session_snapshot(session);
+    let s = observations();
     assert_eq!(
         s.observed_cctx,
         vec![(0, false)],
@@ -596,17 +581,14 @@ fn empty_history_command_emits_unstamped_events() {
 #[test]
 fn prior_events_fold_through_one_host_fold_call() {
     let router = Router::with_counter();
-    let session = next_session();
-    let (ret, bytes) = router.dispatch(
-        session,
-        &command_req(
-            FQ_INCREASE_BY,
-            IncreaseBy { n: 1 }.encode_to_vec(),
-            Some(increased_history(2, 2)),
-        ),
-    );
+    reset_observations();
+    let (ret, bytes) = router.dispatch(&command_req(
+        FQ_INCREASE_BY,
+        IncreaseBy { n: 1 }.encode_to_vec(),
+        Some(increased_history(2, 2)),
+    ));
     assert_eq!(ret, 0);
-    let s = session_snapshot(session);
+    let s = observations();
     assert_eq!(
         s.fold_calls,
         vec![vec![0, 1]],
@@ -634,7 +616,7 @@ fn prior_events_fold_through_one_host_fold_call() {
 #[test]
 fn snapshot_loads_and_covered_pages_skip() {
     let router = Router::with_counter();
-    let session = next_session();
+    reset_observations();
 
     let mut history = pb::EventBook {
         snapshot: Some(pb::Snapshot {
@@ -655,16 +637,13 @@ fn snapshot_loads_and_covered_pages_skip() {
     };
     history.pages = vec![event(2), event(3)]; // 2 covered (inclusive), 3 applies
 
-    let (ret, _) = router.dispatch(
-        session,
-        &command_req(
-            FQ_INCREASE_BY,
-            IncreaseBy { n: 1 }.encode_to_vec(),
-            Some(history),
-        ),
-    );
+    let (ret, _) = router.dispatch(&command_req(
+        FQ_INCREASE_BY,
+        IncreaseBy { n: 1 }.encode_to_vec(),
+        Some(history),
+    ));
     assert_eq!(ret, 0);
-    let s = session_snapshot(session);
+    let s = observations();
     assert_eq!(
         s.fold_calls,
         vec![vec![3]],
@@ -681,10 +660,11 @@ fn snapshot_loads_and_covered_pages_skip() {
 #[test]
 fn rejection_crosses_as_status_with_error_info() {
     let router = Router::with_counter();
-    let (ret, bytes) = router.dispatch(
-        next_session(),
-        &command_req(FQ_INCREASE_BY, IncreaseBy { n: 0 }.encode_to_vec(), None),
-    );
+    let (ret, bytes) = router.dispatch(&command_req(
+        FQ_INCREASE_BY,
+        IncreaseBy { n: 0 }.encode_to_vec(),
+        None,
+    ));
     assert_eq!(ret, -9, "FAILED_PRECONDITION, negated");
     let (status, reason) = decode_status(&bytes);
     assert_eq!(status.code, 9);
@@ -695,7 +675,7 @@ fn rejection_crosses_as_status_with_error_info() {
 #[test]
 fn plain_handler_failure_is_internal() {
     let router = Router::with_counter();
-    let (ret, _) = router.dispatch(next_session(), &command_req(FQ_FAIL_HARD, Vec::new(), None));
+    let (ret, _) = router.dispatch(&command_req(FQ_FAIL_HARD, Vec::new(), None));
     assert_eq!(ret, -13, "unclassified host failure surfaces as INTERNAL");
 }
 
@@ -704,10 +684,7 @@ fn plain_handler_failure_is_internal() {
 #[test]
 fn unknown_command_is_invalid_argument_naming_its_type_url() {
     let router = Router::with_counter();
-    let (ret, bytes) = router.dispatch(
-        next_session(),
-        &command_req("test.counter.Undeclared", Vec::new(), None),
-    );
+    let (ret, bytes) = router.dispatch(&command_req("test.counter.Undeclared", Vec::new(), None));
     assert_eq!(ret, -3);
     let (status, reason) = decode_status(&bytes);
     assert_eq!(reason, "NO_HANDLER_REGISTERED");
@@ -737,14 +714,11 @@ fn corrupt_persisted_event_is_data_loss() {
         }),
         ..Default::default()
     }];
-    let (ret, bytes) = router.dispatch(
-        next_session(),
-        &command_req(
-            FQ_INCREASE_BY,
-            IncreaseBy { n: 1 }.encode_to_vec(),
-            Some(history),
-        ),
-    );
+    let (ret, bytes) = router.dispatch(&command_req(
+        FQ_INCREASE_BY,
+        IncreaseBy { n: 1 }.encode_to_vec(),
+        Some(history),
+    ));
     assert_eq!(ret, -15);
     let (_, reason) = decode_status(&bytes);
     assert_eq!(reason, "PERSISTED_EVENT_CORRUPT");
@@ -753,44 +727,36 @@ fn corrupt_persisted_event_is_data_loss() {
 #[test]
 fn handler_emitting_nothing_returns_empty_events() {
     let router = Router::with_counter();
-    let (ret, bytes) = router.dispatch(
-        next_session(),
-        &command_req(FQ_RETURN_NOTHING, Vec::new(), None),
-    );
+    let (ret, bytes) = router.dispatch(&command_req(FQ_RETURN_NOTHING, Vec::new(), None));
     assert_eq!(ret, 0);
     let book = decode_events(&bytes);
     assert!(book.pages.is_empty());
 }
 
 #[test]
-fn concurrent_dispatches_isolate_sessions() {
+fn concurrent_dispatches_fold_their_own_history() {
     let router = std::sync::Arc::new(Router::with_counter());
-    let sessions: Vec<usize> = (0..4).map(|_| next_session()).collect();
     std::thread::scope(|scope| {
-        for &session in &sessions {
+        for history in 1..=4u32 {
             let router = router.clone();
             scope.spawn(move || {
-                let (ret, _) = router.dispatch(
-                    session,
-                    &command_req(
-                        FQ_INCREASE_BY,
-                        IncreaseBy { n: 1 }.encode_to_vec(),
-                        Some(increased_history(3, 3)),
-                    ),
-                );
+                reset_observations();
+                let (ret, _) = router.dispatch(&command_req(
+                    FQ_INCREASE_BY,
+                    IncreaseBy { n: 1 }.encode_to_vec(),
+                    Some(increased_history(history, u64::from(history))),
+                ));
                 assert_eq!(ret, 0);
+                let seen = observations();
+                assert_eq!(
+                    seen.observed_state,
+                    vec![history],
+                    "each dispatch folded its own history"
+                );
+                assert_eq!(seen.observed_cctx, vec![(u64::from(history), true)]);
             });
         }
     });
-    for session in sessions {
-        let s = session_snapshot(session);
-        assert_eq!(
-            s.observed_state,
-            vec![3],
-            "each dispatch folded its own history"
-        );
-        assert_eq!(s.observed_cctx, vec![(3, true)]);
-    }
 }
 
 #[test]
@@ -814,15 +780,8 @@ fn null_router_pointer_is_a_coded_failure_not_a_crash() {
         data: std::ptr::null_mut(),
         len: 0,
     };
-    let ret = unsafe {
-        angzarr_router_dispatch(
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            0,
-            &mut out,
-        )
-    };
+    let ret =
+        unsafe { angzarr_router_dispatch(std::ptr::null_mut(), std::ptr::null(), 0, &mut out) };
     assert_eq!(ret, -13);
     if !out.data.is_null() {
         unsafe { angzarr_buf_release(out.data, out.len) };
@@ -837,15 +796,8 @@ fn garbage_request_bytes_are_coded_not_fatal() {
         data: std::ptr::null_mut(),
         len: 0,
     };
-    let ret = unsafe {
-        angzarr_router_dispatch(
-            router.0,
-            std::ptr::null_mut(),
-            garbage.as_ptr(),
-            garbage.len(),
-            &mut out,
-        )
-    };
+    let ret =
+        unsafe { angzarr_router_dispatch(router.0, garbage.as_ptr(), garbage.len(), &mut out) };
     assert_eq!(ret, -3);
     let copied = unsafe { std::slice::from_raw_parts(out.data, out.len) }.to_vec();
     unsafe { angzarr_buf_release(out.data, out.len) };
@@ -875,20 +827,14 @@ impl Router {
         Router(r)
     }
 
-    fn dispatch_projector(&self, session: usize, book: &pb::EventBook) -> (i32, Vec<u8>) {
+    fn dispatch_projector(&self, book: &pb::EventBook) -> (i32, Vec<u8>) {
         let bytes = book.encode_to_vec();
         let mut out = AngzarrBuf {
             data: std::ptr::null_mut(),
             len: 0,
         };
         let ret = unsafe {
-            angzarr_router_dispatch_projector(
-                self.0,
-                session as *mut c_void,
-                bytes.as_ptr(),
-                bytes.len(),
-                &mut out,
-            )
+            angzarr_router_dispatch_projector(self.0, bytes.as_ptr(), bytes.len(), &mut out)
         };
         let response = if out.data.is_null() {
             Vec::new()
@@ -915,8 +861,8 @@ fn book_in_domain(domain: &str, n: u32) -> pb::EventBook {
 #[test]
 fn projector_folds_every_page_through_the_abi() {
     let router = Router::with_projector();
-    let session = next_session();
-    let (ret, bytes) = router.dispatch_projector(session, &book_in_domain("counter", 3));
+    reset_observations();
+    let (ret, bytes) = router.dispatch_projector(&book_in_domain("counter", 3));
     assert_eq!(ret, 0);
     let proj = pb::Projection::decode(bytes.as_slice()).expect("Projection");
     assert_eq!(proj.projector, "CounterProjector");
@@ -934,7 +880,7 @@ fn projector_folds_every_page_through_the_abi() {
         "the last projected page's sequence + 1"
     );
     assert_eq!(
-        session_snapshot(session).fold_calls,
+        observations().fold_calls,
         vec![vec![0, 1, 2]],
         "one batched call"
     );
@@ -943,8 +889,8 @@ fn projector_folds_every_page_through_the_abi() {
 #[test]
 fn projector_undeclared_domain_folds_nothing_through_the_abi() {
     let router = Router::with_projector();
-    let session = next_session();
-    let (ret, bytes) = router.dispatch_projector(session, &book_in_domain("inventory", 3));
+    reset_observations();
+    let (ret, bytes) = router.dispatch_projector(&book_in_domain("inventory", 3));
     assert_eq!(ret, 0);
     let proj = pb::Projection::decode(bytes.as_slice()).expect("Projection");
     assert_eq!(
@@ -955,7 +901,7 @@ fn projector_undeclared_domain_folds_nothing_through_the_abi() {
         }),
         "the projection type's default"
     );
-    assert!(session_snapshot(session).fold_calls.is_empty());
+    assert!(observations().fold_calls.is_empty());
 }
 
 #[test]
@@ -963,7 +909,7 @@ fn an_empty_delivery_reports_the_books_next_sequence() {
     let router = Router::with_projector();
     let mut book = book_in_domain("counter", 0);
     book.next_sequence = 7;
-    let (ret, bytes) = router.dispatch_projector(next_session(), &book);
+    let (ret, bytes) = router.dispatch_projector(&book);
     assert_eq!(ret, 0);
     assert_eq!(
         pb::Projection::decode(bytes.as_slice())
@@ -997,21 +943,14 @@ impl Router {
         Router(r)
     }
 
-    fn dispatch_saga(&self, session: usize, req: &pb::EventBook) -> (i32, Vec<u8>) {
+    fn dispatch_saga(&self, req: &pb::EventBook) -> (i32, Vec<u8>) {
         let bytes = req.encode_to_vec();
         let mut out = AngzarrBuf {
             data: std::ptr::null_mut(),
             len: 0,
         };
-        let ret = unsafe {
-            angzarr_router_dispatch_saga(
-                self.0,
-                session as *mut c_void,
-                bytes.as_ptr(),
-                bytes.len(),
-                &mut out,
-            )
-        };
+        let ret =
+            unsafe { angzarr_router_dispatch_saga(self.0, bytes.as_ptr(), bytes.len(), &mut out) };
         let response = if out.data.is_null() {
             Vec::new()
         } else {
@@ -1054,7 +993,7 @@ fn saga_emits_its_command_through_the_abi() {
     let mut page = event_page_of(FQ_ORDER_CREATED);
     page.sequence = 7;
     let req = saga_request("order", vec![page]);
-    let (ret, bytes) = router.dispatch_saga(next_session(), &req);
+    let (ret, bytes) = router.dispatch_saga(&req);
     assert_eq!(ret, 0);
     let resp = pb::SagaResponse::decode(bytes.as_slice()).expect("SagaResponse");
     assert_eq!(resp.commands.len(), 1, "one command emitted");
@@ -1070,13 +1009,13 @@ fn saga_emits_its_command_through_the_abi() {
 #[test]
 fn a_saga_handler_receives_the_source_cover_and_sequence() {
     let router = Router::with_saga();
-    let session = next_session();
+    reset_observations();
     let mut first = event_page_of(FQ_ORDER_CREATED);
     first.sequence = 3;
     let req = saga_request("order", vec![first, event_page_of(FQ_ORDER_CREATED)]);
-    let (ret, _) = router.dispatch_saga(session, &req);
+    let (ret, _) = router.dispatch_saga(&req);
     assert_eq!(ret, 0);
-    let observed: Vec<(String, u64)> = session_snapshot(session)
+    let observed: Vec<(String, u64)> = observations()
         .observed_pages
         .into_iter()
         .map(|(cover, seq)| (cover.map(|c| c.domain).unwrap_or_default(), seq))
@@ -1093,8 +1032,8 @@ fn saga_empty_source_through_the_abi_is_empty_saga_source() {
     // A source book with no pages likewise validates before routing as
     // EMPTY_SAGA_SOURCE, regardless of which saga (if any) consumes its domain.
     let router = Router::with_saga();
-    let session = next_session();
-    let (ret, bytes) = router.dispatch_saga(session, &pb::EventBook::default());
+    reset_observations();
+    let (ret, bytes) = router.dispatch_saga(&pb::EventBook::default());
     assert_eq!(ret, -3, "invalid argument, negated");
     let (_, reason) = decode_status(&bytes);
     assert_eq!(reason, angzarr_router::error::codes::EMPTY_SAGA_SOURCE);
@@ -1130,24 +1069,14 @@ impl Router {
         Router(r)
     }
 
-    fn dispatch_process_manager(
-        &self,
-        session: usize,
-        req: &pb::ProcessManagerHandleRequest,
-    ) -> (i32, Vec<u8>) {
+    fn dispatch_process_manager(&self, req: &pb::ProcessManagerHandleRequest) -> (i32, Vec<u8>) {
         let bytes = req.encode_to_vec();
         let mut out = AngzarrBuf {
             data: std::ptr::null_mut(),
             len: 0,
         };
         let ret = unsafe {
-            angzarr_router_dispatch_process_manager(
-                self.0,
-                session as *mut c_void,
-                bytes.as_ptr(),
-                bytes.len(),
-                &mut out,
-            )
+            angzarr_router_dispatch_process_manager(self.0, bytes.as_ptr(), bytes.len(), &mut out)
         };
         let response = if out.data.is_null() {
             Vec::new()
@@ -1187,7 +1116,7 @@ fn pm_emits_its_command_through_the_abi() {
     req.trigger.as_mut().unwrap().cover.as_mut().unwrap().root = Some(pb::Uuid {
         value: vec![8; 16].into(),
     });
-    let (ret, bytes) = router.dispatch_process_manager(next_session(), &req);
+    let (ret, bytes) = router.dispatch_process_manager(&req);
     assert_eq!(ret, 0);
     let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
     assert_eq!(resp.commands.len(), 1);
@@ -1236,9 +1165,9 @@ fn two_process_managers_share_a_source_domain_route_by_type() {
         0,
     );
     let router = Router(r);
-    let session = next_session();
+    reset_observations();
     let req = pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)]);
-    let (ret, bytes) = router.dispatch_process_manager(session, &req);
+    let (ret, bytes) = router.dispatch_process_manager(&req);
     assert_eq!(ret, 0, "multi-PM routing should not report NO_HANDLER");
     let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
     assert_eq!(
@@ -1253,9 +1182,8 @@ fn pm_missing_trigger_through_the_abi_is_missing_pm_trigger() {
     // Trigger-shape validation precedes routing (mirrors the saga path): a nil
     // trigger reports MISSING_PM_TRIGGER, not NO_HANDLER from an empty domain.
     let router = Router::with_process_manager();
-    let session = next_session();
-    let (ret, bytes) =
-        router.dispatch_process_manager(session, &pb::ProcessManagerHandleRequest::default());
+    reset_observations();
+    let (ret, bytes) = router.dispatch_process_manager(&pb::ProcessManagerHandleRequest::default());
     assert_eq!(ret, -3, "invalid argument, negated");
     let (_, reason) = decode_status(&bytes);
     assert_eq!(reason, angzarr_router::error::codes::MISSING_PM_TRIGGER);
@@ -1265,12 +1193,12 @@ fn pm_missing_trigger_through_the_abi_is_missing_pm_trigger() {
 fn pm_empty_trigger_through_the_abi_is_empty_pm_trigger() {
     // A trigger book with no pages validates before routing as EMPTY_PM_TRIGGER.
     let router = Router::with_process_manager();
-    let session = next_session();
+    reset_observations();
     let req = pb::ProcessManagerHandleRequest {
         trigger: Some(pb::EventBook::default()),
         ..Default::default()
     };
-    let (ret, bytes) = router.dispatch_process_manager(session, &req);
+    let (ret, bytes) = router.dispatch_process_manager(&req);
     assert_eq!(ret, -3, "invalid argument, negated");
     let (_, reason) = decode_status(&bytes);
     assert_eq!(reason, angzarr_router::error::codes::EMPTY_PM_TRIGGER);
@@ -1331,7 +1259,7 @@ fn process_state_cover_routes_the_trigger_to_its_own_pm() {
         }),
         ..Default::default()
     });
-    let (ret, bytes) = router.dispatch_process_manager(next_session(), &req);
+    let (ret, bytes) = router.dispatch_process_manager(&req);
     assert_eq!(ret, 0);
     let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
     assert_eq!(command_domains(&resp), vec!["pm2-target".to_string()]);
@@ -1341,7 +1269,7 @@ fn process_state_cover_routes_the_trigger_to_its_own_pm() {
 fn uncovered_process_state_fans_the_trigger_out_in_registration_order() {
     let router = Router::with_two_process_managers();
     let req = pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)]);
-    let (ret, bytes) = router.dispatch_process_manager(next_session(), &req);
+    let (ret, bytes) = router.dispatch_process_manager(&req);
     assert_eq!(ret, 0);
     let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
     assert_eq!(
@@ -1364,10 +1292,11 @@ fn a_second_claim_of_a_domain_command_is_refused_at_registration() {
         "a duplicate (domain, command) claim is an invalid argument"
     );
     // The first registration still serves the domain.
-    let (ret, _) = router.dispatch(
-        next_session(),
-        &command_req(FQ_INCREASE_BY, IncreaseBy { n: 1 }.encode_to_vec(), None),
-    );
+    let (ret, _) = router.dispatch(&command_req(
+        FQ_INCREASE_BY,
+        IncreaseBy { n: 1 }.encode_to_vec(),
+        None,
+    ));
     assert_eq!(ret, 0);
 }
 
@@ -1389,7 +1318,7 @@ fn second_projector_is_refused_at_registration() {
     let ret =
         unsafe { angzarr_router_register_projector(router.0, desc.as_ptr(), desc.len(), host_cb) };
     assert_eq!(ret, -3, "one projector per router");
-    let (ret, _) = router.dispatch_projector(next_session(), &book_in_domain("counter", 2));
+    let (ret, _) = router.dispatch_projector(&book_in_domain("counter", 2));
     assert_eq!(ret, 0, "the registered projector still claims every book");
 }
 
@@ -1408,7 +1337,7 @@ fn projector_fold_failure_keeps_the_host_status() {
         0
     );
     let router = Router(r);
-    let (ret, bytes) = router.dispatch_projector(next_session(), &book_in_domain("counter", 1));
+    let (ret, bytes) = router.dispatch_projector(&book_in_domain("counter", 1));
     assert_eq!(ret, -9, "the host's gRPC code survives");
     let (_, reason) = decode_status(&bytes);
     assert_eq!(reason, "PROJECTION_STALE");
@@ -1451,10 +1380,10 @@ fn increase_one(events: Option<pb::EventBook>) -> pb::ContextualCommand {
 #[test]
 fn a_delivered_snapshot_is_the_initial_state_the_fold_continues() {
     let router = Router::with_counter();
-    let session = next_session();
-    let (ret, _) = router.dispatch(session, &increase_one(Some(snapshot_history_book())));
+    reset_observations();
+    let (ret, _) = router.dispatch(&increase_one(Some(snapshot_history_book())));
     assert_eq!(ret, 0);
-    let seen = session_snapshot(session);
+    let seen = observations();
     assert_eq!(seen.fold_calls, vec![vec![1]], "only the uncovered page");
     assert_eq!(seen.observed_state, vec![2], "snapshot 1 + one folded page");
 }
@@ -1462,17 +1391,16 @@ fn a_delivered_snapshot_is_the_initial_state_the_fold_continues() {
 #[test]
 fn a_fold_returning_status_ok_empty_keeps_the_state() {
     let router = counter_with(CB_OK_EMPTY);
-    let session = next_session();
-    let (ret, _) = router.dispatch(session, &increase_one(Some(snapshot_history_book())));
+    reset_observations();
+    let (ret, _) = router.dispatch(&increase_one(Some(snapshot_history_book())));
     assert_eq!(ret, 0);
-    assert_eq!(session_snapshot(session).observed_state, vec![1]);
+    assert_eq!(observations().observed_state, vec![1]);
 }
 
 #[test]
 fn a_failing_fold_is_data_loss() {
     let router = counter_with(CB_FAILS);
-    let (ret, bytes) =
-        router.dispatch(next_session(), &increase_one(Some(increased_history(2, 2))));
+    let (ret, bytes) = router.dispatch(&increase_one(Some(increased_history(2, 2))));
     assert_eq!(ret, -15);
     assert_eq!(
         decode_status(&bytes).1,
@@ -1483,17 +1411,17 @@ fn a_failing_fold_is_data_loss() {
 #[test]
 fn an_undecodable_fold_answer_is_an_unhandled_error() {
     let router = counter_with(CB_FACT_GARBAGE);
-    let (ret, _) = router.dispatch(next_session(), &increase_one(Some(increased_history(1, 1))));
+    let (ret, _) = router.dispatch(&increase_one(Some(increased_history(1, 1))));
     assert_eq!(ret, -13);
 }
 
 #[test]
 fn a_fresh_aggregate_starts_from_the_registered_state_types_default() {
     let router = Router::with_counter();
-    let session = next_session();
-    let (ret, _) = router.dispatch(session, &increase_one(None));
+    reset_observations();
+    let (ret, _) = router.dispatch(&increase_one(None));
     assert_eq!(ret, 0);
-    let seen = session_snapshot(session);
+    let seen = observations();
     assert!(seen.fold_calls.is_empty(), "nothing to fold");
     assert_eq!(seen.observed_state, vec![0]);
     assert_eq!(
@@ -1515,7 +1443,7 @@ fn projector_fold_returning_status_ok_empty_keeps_the_projection() {
         0
     );
     let router = Router(r);
-    let (ret, bytes) = router.dispatch_projector(next_session(), &book_in_domain("counter", 2));
+    let (ret, bytes) = router.dispatch_projector(&book_in_domain("counter", 2));
     assert_eq!(ret, 0);
     assert_eq!(
         state_value(
@@ -1544,7 +1472,7 @@ fn saga_with(event: u64) -> Router {
 fn saga_handler_emitting_nothing_is_an_empty_response() {
     let router = saga_with(CB_OK_EMPTY);
     let req = saga_request("order", vec![event_page_of(FQ_ORDER_CREATED)]);
-    let (ret, bytes) = router.dispatch_saga(next_session(), &req);
+    let (ret, bytes) = router.dispatch_saga(&req);
     assert_eq!(ret, 0);
     assert_eq!(
         pb::SagaResponse::decode(bytes.as_slice()).unwrap(),
@@ -1576,11 +1504,10 @@ fn pm_over_state(state: pb::EventBook) -> pb::ProcessManagerHandleRequest {
 #[test]
 fn a_pm_handler_receives_its_router_owned_state() {
     let router = pm_with(CB_FOLD, CB_PM_EVENT);
-    let session = next_session();
-    let (ret, _) =
-        router.dispatch_process_manager(session, &pm_over_state(snapshot_history_book()));
+    reset_observations();
+    let (ret, _) = router.dispatch_process_manager(&pm_over_state(snapshot_history_book()));
     assert_eq!(ret, 0);
-    let seen = session_snapshot(session);
+    let seen = observations();
     assert_eq!(seen.fold_calls, vec![vec![1]]);
     assert_eq!(seen.observed_state, vec![2]);
 }
@@ -1589,8 +1516,7 @@ fn a_pm_handler_receives_its_router_owned_state() {
 fn pm_fold_and_handler_succeed_on_either_ok_status() {
     for ok in [CB_OK_ZERO, CB_OK_EMPTY] {
         let router = pm_with(CB_OK_EMPTY, ok);
-        let (ret, bytes) = router
-            .dispatch_process_manager(next_session(), &pm_over_state(snapshot_history_book()));
+        let (ret, bytes) = router.dispatch_process_manager(&pm_over_state(snapshot_history_book()));
         assert_eq!(ret, 0, "callback status {ok} is success");
         assert_eq!(
             pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).unwrap(),
@@ -1603,8 +1529,7 @@ fn pm_fold_and_handler_succeed_on_either_ok_status() {
 #[test]
 fn failing_pm_fold_is_data_loss() {
     let router = pm_with(CB_FAILS, CB_OK_EMPTY);
-    let (ret, bytes) =
-        router.dispatch_process_manager(next_session(), &pm_over_state(increased_book(1)));
+    let (ret, bytes) = router.dispatch_process_manager(&pm_over_state(increased_book(1)));
     assert_eq!(ret, -15);
     assert_eq!(
         decode_status(&bytes).1,
@@ -1645,10 +1570,10 @@ fn emitted_pages(bytes: &[u8]) -> usize {
 #[test]
 fn commands_route_to_the_aggregate_owning_their_domain() {
     let router = two_aggregates();
-    let (ret, bytes) = router.dispatch(next_session(), &increase_in("counter"));
+    let (ret, bytes) = router.dispatch(&increase_in("counter"));
     assert_eq!(ret, 0);
     assert_eq!(emitted_pages(&bytes), 1, "the counter aggregate handled it");
-    let (ret, bytes) = router.dispatch(next_session(), &increase_in("other"));
+    let (ret, bytes) = router.dispatch(&increase_in("other"));
     assert_eq!(ret, 0);
     assert_eq!(emitted_pages(&bytes), 0, "the other aggregate handled it");
 }
@@ -1656,7 +1581,7 @@ fn commands_route_to_the_aggregate_owning_their_domain() {
 #[test]
 fn unclaimed_domain_with_several_aggregates_is_no_handler() {
     let router = two_aggregates();
-    let (ret, bytes) = router.dispatch(next_session(), &increase_in("nobody"));
+    let (ret, bytes) = router.dispatch(&increase_in("nobody"));
     assert_eq!(ret, -3, "a type no handler claims is INVALID_ARGUMENT");
     assert_eq!(
         decode_status(&bytes).1,
@@ -1667,7 +1592,7 @@ fn unclaimed_domain_with_several_aggregates_is_no_handler() {
 #[test]
 fn a_sole_aggregate_claims_any_domain() {
     let router = Router::with_counter();
-    let (ret, bytes) = router.dispatch(next_session(), &increase_in("nobody"));
+    let (ret, bytes) = router.dispatch(&increase_in("nobody"));
     assert_eq!(ret, 0);
     assert_eq!(emitted_pages(&bytes), 1);
 }
@@ -1677,15 +1602,15 @@ fn a_sole_aggregate_claims_any_domain() {
 #[test]
 fn command_handler_sees_its_cover_through_the_abi() {
     let router = Router::with_counter();
-    let session = next_session();
+    reset_observations();
     let mut req = command_req(FQ_INCREASE_BY, IncreaseBy { n: 1 }.encode_to_vec(), None);
     req.command.as_mut().unwrap().cover.as_mut().unwrap().root = Some(pb::Uuid {
         value: vec![4; 16].into(),
     });
-    let (ret, _) = router.dispatch(session, &req);
+    let (ret, _) = router.dispatch(&req);
     assert_eq!(ret, 0);
     assert_eq!(
-        session_snapshot(session).observed_covers,
+        observations().observed_covers,
         vec![req.command.unwrap().cover]
     );
 }
@@ -1693,16 +1618,16 @@ fn command_handler_sees_its_cover_through_the_abi() {
 #[test]
 fn projector_fold_sees_its_page_place_through_the_abi() {
     let router = Router::with_projector();
-    let session = next_session();
+    reset_observations();
     let mut book = book_in_domain("counter", 2);
     book.cover.as_mut().unwrap().root = Some(pb::Uuid {
         value: vec![6; 16].into(),
     });
     book.pages[1].sequence = 9;
-    let (ret, _) = router.dispatch_projector(session, &book);
+    let (ret, _) = router.dispatch_projector(&book);
     assert_eq!(ret, 0);
     assert_eq!(
-        session_snapshot(session).applied_pages,
+        observations().applied_pages,
         vec![(book.cover.clone(), 0), (book.cover.clone(), 9)],
         "the fold sees the book's cover and each page's sequence"
     );
@@ -1713,7 +1638,7 @@ fn projector_fold_sees_its_page_place_through_the_abi() {
 #[test]
 fn appliers_see_their_page_place_through_the_abi() {
     let router = Router::with_counter();
-    let session = next_session();
+    reset_observations();
     let mut history = increased_history(2, 2);
     history.cover = Some(pb::Cover {
         domain: "counter".to_string(),
@@ -1724,17 +1649,14 @@ fn appliers_see_their_page_place_through_the_abi() {
     });
     history.pages[0].sequence = 0;
     history.pages[1].sequence = 1;
-    let (ret, _) = router.dispatch(
-        session,
-        &command_req(
-            FQ_INCREASE_BY,
-            IncreaseBy { n: 1 }.encode_to_vec(),
-            Some(history.clone()),
-        ),
-    );
+    let (ret, _) = router.dispatch(&command_req(
+        FQ_INCREASE_BY,
+        IncreaseBy { n: 1 }.encode_to_vec(),
+        Some(history.clone()),
+    ));
     assert_eq!(ret, 0);
     assert_eq!(
-        session_snapshot(session).applied_pages,
+        observations().applied_pages,
         vec![(history.cover.clone(), 0), (history.cover.clone(), 1)]
     );
 }
@@ -1763,14 +1685,14 @@ fn counter_and_auditor() -> Router {
 #[test]
 fn aggregates_sharing_a_domain_route_commands_by_type() {
     let router = counter_and_auditor();
-    let (ret, bytes) = router.dispatch(next_session(), &increase_in("counter"));
+    let (ret, bytes) = router.dispatch(&increase_in("counter"));
     assert_eq!(ret, 0);
     assert_eq!(
         emitted_pages(&bytes),
         1,
         "the counter aggregate handled IncreaseBy"
     );
-    let (ret, bytes) = router.dispatch(next_session(), &command_req(FQ_AUDIT, Vec::new(), None));
+    let (ret, bytes) = router.dispatch(&command_req(FQ_AUDIT, Vec::new(), None));
     assert_eq!(ret, 0);
     assert_eq!(emitted_pages(&bytes), 0, "the auditor handled Audit");
 }
@@ -1809,10 +1731,11 @@ fn recorded(book: &pb::EventBook) -> Vec<(String, Option<u32>)> {
 #[test]
 fn a_fact_is_annotated_against_folded_state_through_the_abi() {
     let router = counter_with_fact_handler(CB_FACT_ANNOTATE);
-    let (ret, bytes) = router.dispatch(
-        next_session(),
-        &fact_req("counter", FQ_INCREASED, Some(increased_history(3, 3))),
-    );
+    let (ret, bytes) = router.dispatch(&fact_req(
+        "counter",
+        FQ_INCREASED,
+        Some(increased_history(3, 3)),
+    ));
     assert_eq!(ret, 0);
     let book = decode_events(&bytes);
     assert_eq!(
@@ -1847,14 +1770,14 @@ fn facts_route_by_their_cover_domain_through_the_abi() {
     }];
     assert_eq!(register_aggregate_desc(r, other), 0);
     let router = Router(r);
-    let (ret, bytes) = router.dispatch(next_session(), &fact_req("other", FQ_INCREASED, None));
+    let (ret, bytes) = router.dispatch(&fact_req("other", FQ_INCREASED, None));
     assert_eq!(ret, 0);
     assert_eq!(
         recorded(&decode_events(&bytes))[0].0,
         "test.counter.CounterState",
         "other's fact handler ran"
     );
-    let (ret, bytes) = router.dispatch(next_session(), &fact_req("counter", FQ_INCREASED, None));
+    let (ret, bytes) = router.dispatch(&fact_req("counter", FQ_INCREASED, None));
     assert_eq!(ret, -3, "counter records no fact: INVALID_ARGUMENT");
     assert_eq!(
         decode_status(&bytes).1,
@@ -1866,8 +1789,7 @@ fn facts_route_by_their_cover_domain_through_the_abi() {
 fn a_fact_handler_returning_nothing_records_the_fact_as_received() {
     for callback_id in [CB_OK_EMPTY, CB_FACT_KEEP] {
         let router = counter_with_fact_handler(callback_id);
-        let (ret, bytes) =
-            router.dispatch(next_session(), &fact_req("counter", FQ_INCREASED, None));
+        let (ret, bytes) = router.dispatch(&fact_req("counter", FQ_INCREASED, None));
         assert_eq!(ret, 0);
         assert_eq!(
             recorded(&decode_events(&bytes)),
@@ -1880,7 +1802,7 @@ fn a_fact_handler_returning_nothing_records_the_fact_as_received() {
 #[test]
 fn an_undecodable_fact_record_is_an_unhandled_error() {
     let router = counter_with_fact_handler(CB_FACT_GARBAGE);
-    let (ret, bytes) = router.dispatch(next_session(), &fact_req("counter", FQ_INCREASED, None));
+    let (ret, bytes) = router.dispatch(&fact_req("counter", FQ_INCREASED, None));
     assert_eq!(ret, -13, "INTERNAL");
     assert_eq!(
         decode_status(&bytes).1,
@@ -1893,18 +1815,15 @@ fn an_unregistered_fact_never_reaches_the_host() {
     let router = counter_with_fact_handler(CB_FACT_ANNOTATE);
     // FQ_RESERVE is no fact; FQ_INCREASE_BY is a command, not a fact.
     for fq in [FQ_RESERVE, FQ_INCREASE_BY] {
-        let session = next_session();
-        let (ret, bytes) = router.dispatch(
-            session,
-            &fact_req("counter", fq, Some(increased_history(2, 2))),
-        );
+        reset_observations();
+        let (ret, bytes) = router.dispatch(&fact_req("counter", fq, Some(increased_history(2, 2))));
         assert_eq!(ret, -3, "INVALID_ARGUMENT");
         assert_eq!(
             decode_status(&bytes).1,
             angzarr_router::error::codes::NO_FACT_HANDLER
         );
-        let seen = session_snapshot(session);
-        assert_eq!(seen.counter, 0, "refused before any applier ran");
+        let seen = observations();
+        assert!(seen.fold_calls.is_empty(), "refused before any fold ran");
         assert!(seen.observed_cctx.is_empty(), "no command handler ran");
     }
 }
@@ -1950,14 +1869,11 @@ fn counter_resolving(command: u64, changed: Option<u64>) -> Router {
 #[test]
 fn strict_hands_the_host_its_handling_and_no_window_through_the_abi() {
     let router = Router::with_counter();
-    let session = next_session();
-    let (ret, _) = router.dispatch(
-        session,
-        &handled_req(2, 2, pb::ConflictResolution::Strict, &[]),
-    );
+    reset_observations();
+    let (ret, _) = router.dispatch(&handled_req(2, 2, pb::ConflictResolution::Strict, &[]));
     assert_eq!(ret, 0);
     assert_eq!(
-        session_snapshot(session).observed_handling,
+        observations().observed_handling,
         vec![(2, pb::ConflictResolution::Strict as i32, vec![], vec![])]
     );
 }
@@ -1965,15 +1881,17 @@ fn strict_hands_the_host_its_handling_and_no_window_through_the_abi() {
 #[test]
 fn aggregate_handles_crosses_the_window_and_nonce_and_keeps_resolved_output() {
     let router = Router::with_counter();
-    let session = next_session();
-    let (ret, bytes) = router.dispatch(
-        session,
-        &handled_req(3, 1, pb::ConflictResolution::AggregateHandles, b"n-1"),
-    );
+    reset_observations();
+    let (ret, bytes) = router.dispatch(&handled_req(
+        3,
+        1,
+        pb::ConflictResolution::AggregateHandles,
+        b"n-1",
+    ));
     assert_eq!(ret, 0);
     assert_eq!(decode_events(&bytes), increased_book(1));
     assert_eq!(
-        session_snapshot(session).observed_handling,
+        observations().observed_handling,
         vec![(
             1,
             pb::ConflictResolution::AggregateHandles as i32,
@@ -1987,10 +1905,12 @@ fn aggregate_handles_crosses_the_window_and_nonce_and_keeps_resolved_output() {
 fn aggregate_handles_unresolved_or_made_up_is_aborted_through_the_abi() {
     for command in [CB_INCREASE_IGNORES, CB_INCREASE_MADE_UP] {
         let router = counter_resolving(command, None);
-        let (ret, bytes) = router.dispatch(
-            next_session(),
-            &handled_req(1, 0, pb::ConflictResolution::AggregateHandles, b"n-1"),
-        );
+        let (ret, bytes) = router.dispatch(&handled_req(
+            1,
+            0,
+            pb::ConflictResolution::AggregateHandles,
+            b"n-1",
+        ));
         assert_eq!(ret, -10, "callback {command}: ABORTED");
         assert_eq!(
             decode_status(&bytes).1,
@@ -2003,14 +1923,16 @@ fn aggregate_handles_unresolved_or_made_up_is_aborted_through_the_abi() {
 fn commutative_runs_the_resolver_over_host_state_through_the_abi() {
     // History 0..1, expected 1: expected = 1, head = 2, after = 3.
     let router = counter_resolving(CB_INCREASE_BY, Some(CB_CHANGED_NONE));
-    let session = next_session();
-    let (ret, bytes) = router.dispatch(
-        session,
-        &handled_req(2, 1, pb::ConflictResolution::Commutative, b"n-1"),
-    );
+    reset_observations();
+    let (ret, bytes) = router.dispatch(&handled_req(
+        2,
+        1,
+        pb::ConflictResolution::Commutative,
+        b"n-1",
+    ));
     assert_eq!(ret, 0, "disjoint: kept");
     assert_eq!(decode_events(&bytes), increased_book(1));
-    let seen = session_snapshot(session);
+    let seen = observations();
     assert_eq!(seen.changed_calls, vec![(1, 2), (2, 3)]);
     assert_eq!(
         seen.observed_handling[0].3,
@@ -2022,10 +1944,12 @@ fn commutative_runs_the_resolver_over_host_state_through_the_abi() {
 #[test]
 fn commutative_overlap_is_aborted_through_the_abi() {
     let router = counter_resolving(CB_INCREASE_BY, Some(CB_CHANGED_VALUE));
-    let (ret, bytes) = router.dispatch(
-        next_session(),
-        &handled_req(2, 1, pb::ConflictResolution::Commutative, b"n-1"),
-    );
+    let (ret, bytes) = router.dispatch(&handled_req(
+        2,
+        1,
+        pb::ConflictResolution::Commutative,
+        b"n-1",
+    ));
     assert_eq!(ret, -10);
     let (status, reason) = decode_status(&bytes);
     assert_eq!(reason, angzarr_router::error::codes::CONFLICT_OVERLAP);
@@ -2035,10 +1959,12 @@ fn commutative_overlap_is_aborted_through_the_abi() {
 #[test]
 fn commutative_without_changed_is_unsupported_through_the_abi() {
     let router = Router::with_counter();
-    let (ret, bytes) = router.dispatch(
-        next_session(),
-        &handled_req(1, 0, pb::ConflictResolution::Commutative, b"n-1"),
-    );
+    let (ret, bytes) = router.dispatch(&handled_req(
+        1,
+        0,
+        pb::ConflictResolution::Commutative,
+        b"n-1",
+    ));
     assert_eq!(ret, -3);
     assert_eq!(
         decode_status(&bytes).1,
@@ -2056,10 +1982,11 @@ fn a_command_upcaster_runs_before_dispatch_through_the_abi() {
     let r = angzarr_router_new();
     assert_eq!(register_aggregate_desc(r, desc), 0);
     let router = Router(r);
-    let (ret, bytes) = router.dispatch(
-        next_session(),
-        &command_req(FQ_INCREASE_BY_V1, IncreaseBy { n: 2 }.encode_to_vec(), None),
-    );
+    let (ret, bytes) = router.dispatch(&command_req(
+        FQ_INCREASE_BY_V1,
+        IncreaseBy { n: 2 }.encode_to_vec(),
+        None,
+    ));
     assert_eq!(ret, 0, "IncreaseByV1 upcast to IncreaseBy");
     assert_eq!(decode_events(&bytes), increased_book(2));
 }
@@ -2073,10 +2000,11 @@ fn every_response_reports_the_registered_rules_version_through_the_abi() {
     let r = angzarr_router_new();
     assert_eq!(register_aggregate_desc(r, desc), 0);
     let router = Router(r);
-    let (ret, bytes) = router.dispatch(
-        next_session(),
-        &command_req(FQ_INCREASE_BY, IncreaseBy { n: 1 }.encode_to_vec(), None),
-    );
+    let (ret, bytes) = router.dispatch(&command_req(
+        FQ_INCREASE_BY,
+        IncreaseBy { n: 1 }.encode_to_vec(),
+        None,
+    ));
     assert_eq!(ret, 0);
     assert_eq!(decode_response(&bytes).rules_version, "1.4.2+build.7");
 
@@ -2090,10 +2018,8 @@ fn every_response_reports_the_registered_rules_version_through_the_abi() {
         0
     );
     let router = Router(r);
-    let (ret, bytes) = router.dispatch_process_manager(
-        next_session(),
-        &pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)]),
-    );
+    let (ret, bytes) = router
+        .dispatch_process_manager(&pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)]));
     assert_eq!(ret, 0);
     assert_eq!(
         pb::ProcessManagerHandleResponse::decode(bytes.as_slice())
@@ -2101,10 +2027,10 @@ fn every_response_reports_the_registered_rules_version_through_the_abi() {
             .rules_version,
         "2.0.0"
     );
-    let (ret, bytes) = router.dispatch_process_manager(
-        next_session(),
-        &pm_request("billing", vec![event_page_of(FQ_ORDER_SHIPPED)]),
-    );
+    let (ret, bytes) = router.dispatch_process_manager(&pm_request(
+        "billing",
+        vec![event_page_of(FQ_ORDER_SHIPPED)],
+    ));
     assert_eq!(ret, 0);
     assert_eq!(
         pb::ProcessManagerHandleResponse::decode(bytes.as_slice())

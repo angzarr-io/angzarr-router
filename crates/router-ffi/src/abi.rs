@@ -25,7 +25,6 @@ pub struct AngzarrBuf {
 /// The single host callback signature; `callback_id` selects the host
 /// thunk (the binding's registration API assigns ids).
 pub type AngzarrCb = unsafe extern "C" fn(
-    host_ctx: *mut std::ffi::c_void,
     callback_id: u64,
     type_url: *const u8,
     type_url_len: usize,
