@@ -101,7 +101,7 @@ impl<S> Rebuilder<S> {
             let Some(event) = crate::page_event(page) else {
                 continue;
             };
-            if covered_through > 0 && crate::page_sequence(page) <= covered_through {
+            if covered_through > 0 && persisted_sequence(page) <= covered_through {
                 continue;
             }
             let Some(thunk) = self
@@ -116,6 +116,15 @@ impl<S> Rebuilder<S> {
             info.applied_count += 1;
         }
         Ok((state, info))
+    }
+}
+
+/// The sequence the store recorded on a persisted page, or 0 when absent.
+/// Read only for snapshot coverage; the router never writes page headers.
+fn persisted_sequence(page: &pb::EventPage) -> u32 {
+    match page.header.as_ref().and_then(|h| h.sequence_type.as_ref()) {
+        Some(pb::page_header::SequenceType::Sequence(seq)) => *seq,
+        _ => 0,
     }
 }
 

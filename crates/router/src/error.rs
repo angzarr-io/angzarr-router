@@ -23,7 +23,6 @@ pub enum GrpcCode {
 /// Cross-language error codes (the slice's subset of the 47-code inventory).
 pub mod codes {
     pub const ANY_DECODE_FAILED: &str = "ANY_DECODE_FAILED";
-    pub const VALUE_NOT_POSITIVE: &str = "VALUE_NOT_POSITIVE";
     pub const NO_HANDLER_REGISTERED: &str = "NO_HANDLER_REGISTERED";
     pub const MISSING_COMMAND_BOOK: &str = "MISSING_COMMAND_BOOK";
     pub const MISSING_COMMAND_PAGE: &str = "MISSING_COMMAND_PAGE";

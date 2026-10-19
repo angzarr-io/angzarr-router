@@ -53,14 +53,6 @@ pub fn page_event(page: &pb::EventPage) -> Option<&Any> {
     }
 }
 
-/// The explicit sequence of a page header, or 0 when absent.
-pub fn page_sequence(page: &pb::EventPage) -> u32 {
-    match page.header.as_ref().and_then(|h| h.sequence_type.as_ref()) {
-        Some(pb::page_header::SequenceType::Sequence(seq)) => *seq,
-        _ => 0,
-    }
-}
-
 /// The command payload of a command page, when the page carries one.
 pub fn command_payload(page: &pb::CommandPage) -> Option<&Any> {
     match &page.payload {

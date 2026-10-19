@@ -34,6 +34,10 @@ const SKEL_UNHANDLED: &str = include_str!("../../../conformance/fixtures/command
 const SKEL_INCREASED_EVENT: &str =
     include_str!("../../../conformance/fixtures/event_increased.txtpb");
 
+/// The CounterAggregate's business rejection code (`IncreaseBy { n: 0 }`).
+/// A fixture code, not a router code.
+pub const VALUE_NOT_POSITIVE: &str = "VALUE_NOT_POSITIVE";
+
 const CONTEXTUAL_COMMAND: &str = "io.angzarr.v1.ContextualCommand";
 const EVENT_PAGE: &str = "io.angzarr.v1.EventPage";
 
@@ -115,7 +119,7 @@ pub fn counter_aggregate(observed: ObservedSink) -> AggregateDispatch<CounterSta
                 .map_err(|e| HandlerError::Other(format!("decode IncreaseBy: {e}")))?;
             if cmd.n == 0 {
                 return Err(HandlerError::Coded(CodedError::rejection_invalid_argument(
-                    "VALUE_NOT_POSITIVE",
+                    VALUE_NOT_POSITIVE,
                     "increase amount must be positive",
                     [],
                 )));
