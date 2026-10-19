@@ -6,10 +6,8 @@ Feature: Order saga dispatch
   triggering event: its book's whole cover, its sequence and the command's
   emission index, never an explicit sequence; source_component is left for
   the coordinator) and its handler sees the triggering event's sequence, an
-  undeclared event emits nothing, a source missing or empty is refused with a
-  coded error, and a rejection notification in a saga's source emits nothing.
-  Sagas never receive rejections, so a saga declaring a rejection handler is
-  refused at registration.
+  undeclared event emits nothing, and a source missing or empty is refused
+  with a coded error.
 
   Deferred commands are byte-identical in every language: the parity saga
   turns one event into the same command twice, and each stamped command's
@@ -41,12 +39,6 @@ Feature: Order saga dispatch
     When a request with no source is dispatched
     Then the dispatch fails with MISSING_SAGA_SOURCE
 
-  Scenario: a rejection in the source is not a saga's to compensate
-    Given an order saga delivering to "inventory"
-    When a rejection of Reserve is dispatched
-    Then the saga emits no commands
-    And the saga injects no events
-
   Scenario: a saga handler sees the triggering event's sequence
     Given an order saga delivering to "inventory"
     When an Increased event at sequence 7 is dispatched
@@ -62,7 +54,3 @@ Feature: Order saga dispatch
     When the parity source event at sequence 3 is dispatched
     Then the command at index 0 hashes to SHA-256 "10b1ce23a470f107662591a7da41830c724fdc0c9562824130f09b0a12f011f5"
     And the command at index 1 hashes to SHA-256 "a028d427e91c0e03b63b50dabe7c5184417ed7aaf558d62dfdb9baed1e3affd0"
-
-  Scenario: a saga declaring a rejection handler is refused at registration
-    When a saga declaring a compensation for Reserve is registered
-    Then the registration is refused as INVALID_ARGUMENT

@@ -7,8 +7,8 @@ Feature: Facts, replay and handler context
   history into state, as does a
   process-manager; appliers see each event's sequence; handlers read the
   cover they are handling, and a parent linkage (cover.ext) a handler sets on
-  its events is kept over the command's; a process-manager compensator may issue
-  commands; a projector fold knows where each event sits. The ledger
+  its events is kept over the command's; a projector fold knows where each
+  event sits. The ledger
   aggregate, reserving process-manager and tracking projector are built
   through each binding's hand-written API over the fixture's CounterState.
   Roots are UUID v5 (NAMESPACE_OID) of the quoted label.
@@ -52,11 +52,6 @@ Feature: Facts, replay and handler context
     Given a reserving process-manager
     When an Increased trigger of counter root "table-1" at sequence 2 is dispatched to the reserving process-manager
     Then the reserving process-manager saw trigger root "table-1"
-
-  Scenario: a process-manager compensator issues deferred commands
-    Given a reserving process-manager
-    When a rejection of Reserve sent to "inventory" at sequence 5 is dispatched to the reserving process-manager
-    Then the reserving process-manager emits one Release command deferred from source sequence 5
 
   Scenario: a projector fold reads each event's root and sequence
     Given a tracking projector

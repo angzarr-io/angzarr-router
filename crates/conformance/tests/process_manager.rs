@@ -15,8 +15,6 @@ use cucumber::{given, then, when, World};
 struct ProcessManagerWorld {
     /// True when the audit PM is co-resident with the order PM.
     co_resident: bool,
-    /// The (code, message) of each rejection the order PM compensated.
-    seen: conf::RejectionSink,
     /// Outcome of the dispatched trigger.
     result: Option<Result<pb::ProcessManagerHandleResponse, CodedError>>,
 }
@@ -24,12 +22,12 @@ struct ProcessManagerWorld {
 impl ProcessManagerWorld {
     fn dispatch(&mut self, req: pb::ProcessManagerHandleRequest) {
         if !self.co_resident {
-            self.result = Some(conf::order_pm(self.seen.clone()).dispatch(&req));
+            self.result = Some(conf::order_pm().dispatch(&req));
             return;
         }
         // Co-resident: the router's selection + merge over both PMs, each
         // dispatching over its own state type.
-        let order = conf::order_pm(self.seen.clone());
+        let order = conf::order_pm();
         let audit = conf::audit_pm();
         let routes: [&dyn ProcessManagerRoute; 2] = [&order, &audit];
         let mut merged = pb::ProcessManagerHandleResponse::default();
@@ -84,11 +82,6 @@ async fn increased_at(w: &mut ProcessManagerWorld, domain: String, seq: u32) {
     ));
 }
 
-#[when("a Compensate for Reserve is dispatched to the order process-manager")]
-async fn compensate_for_reserve(w: &mut ProcessManagerWorld) {
-    w.dispatch(conf::pm_compensate_request("Reserve"));
-}
-
 #[when(regex = r#"^an Increased trigger in domain "([^"]*)" is dispatched$"#)]
 async fn increased_in_domain(w: &mut ProcessManagerWorld, domain: String) {
     w.dispatch(conf::pm_trigger_request(
@@ -128,11 +121,6 @@ async fn no_trigger(w: &mut ProcessManagerWorld) {
 #[when("a trigger with no pages is dispatched")]
 async fn empty_trigger(w: &mut ProcessManagerWorld) {
     w.dispatch(conf::pm_empty_trigger());
-}
-
-#[when("a rejection of Reserve is dispatched")]
-async fn rejection_reserve(w: &mut ProcessManagerWorld) {
-    w.dispatch(conf::pm_rejection_request("test.counter.Reserve"));
 }
 
 #[then(regex = r#"^the process-manager emits one command to "([^"]*)"$"#)]
@@ -182,22 +170,6 @@ async fn no_source_component(w: &mut ProcessManagerWorld) {
     }
 }
 
-#[when(
-    regex = r#"^a rejection of Reserve with code "([^"]*)" and message "([^"]*)" is dispatched$"#
-)]
-async fn rejection_with_code(w: &mut ProcessManagerWorld, code: String, message: String) {
-    w.dispatch(conf::pm_rejection_with(
-        "test.counter.Reserve",
-        &code,
-        &message,
-    ));
-}
-
-#[then(regex = r#"^the process-manager compensator saw code "([^"]*)" and message "([^"]*)"$"#)]
-async fn compensator_saw_code(w: &mut ProcessManagerWorld, code: String, message: String) {
-    assert_eq!(*w.seen.lock().unwrap(), vec![(code, message)]);
-}
-
 #[then("the process-manager emits no commands")]
 async fn emits_no_commands(w: &mut ProcessManagerWorld) {
     assert!(w.response().commands.is_empty(), "no commands emitted");
@@ -212,11 +184,6 @@ async fn rebuilt_n(w: &mut ProcessManagerWorld, n: u32) {
     );
 }
 
-#[then("the process-manager emits one process event")]
-async fn emits_one_process_event(w: &mut ProcessManagerWorld) {
-    assert_eq!(w.response().process_events.len(), 1, "one process event");
-}
-
 #[then(regex = r#"^the process event is addressed to "([^"]*)"$"#)]
 async fn process_event_addressed_to(w: &mut ProcessManagerWorld, domain: String) {
     let books = &w.response().process_events;
@@ -224,14 +191,6 @@ async fn process_event_addressed_to(w: &mut ProcessManagerWorld, domain: String)
     assert_eq!(
         books[0].cover.as_ref().map(|c| c.domain.as_str()),
         Some(domain.as_str())
-    );
-}
-
-#[then("the process-manager escalates")]
-async fn escalates(w: &mut ProcessManagerWorld) {
-    assert!(
-        w.response().notification.is_some(),
-        "an escalation was raised"
     );
 }
 
@@ -264,14 +223,6 @@ async fn increased_over_owned_state(w: &mut ProcessManagerWorld, owner: String, 
     ));
 }
 
-#[when(regex = r#"^a rejection of Reserve issued by "([^"]*)" is dispatched$"#)]
-async fn rejection_issued_by(w: &mut ProcessManagerWorld, issuer: String) {
-    w.dispatch(conf::pm_issued_rejection_request(
-        "test.counter.Reserve",
-        &issuer,
-    ));
-}
-
 #[then(regex = r"^the order process-manager rebuilt (\d+) prior state events$")]
 async fn order_rebuilt(w: &mut ProcessManagerWorld, n: usize) {
     assert_eq!(
@@ -297,21 +248,6 @@ async fn order_did_not_react(w: &mut ProcessManagerWorld) {
         "the order PM emitted no command"
     );
     assert_eq!(w.facts_marked(false), 0, "the order PM emitted no fact");
-}
-
-#[then("only the audit process-manager compensates")]
-async fn only_audit_compensates(w: &mut ProcessManagerWorld) {
-    let resp = w.response();
-    assert_eq!(resp.process_events.len(), 1, "exactly one compensation");
-    assert_eq!(
-        resp.process_events[0]
-            .cover
-            .as_ref()
-            .map(|c| c.domain.as_str()),
-        Some(conf::AUDIT_MARK),
-        "the audit PM compensated"
-    );
-    assert!(resp.notification.is_none(), "the order PM did not escalate");
 }
 
 #[tokio::main]

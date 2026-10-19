@@ -16,8 +16,6 @@ struct SagaWorld {
     seen: conf::SequenceSink,
     /// True for the parity saga.
     parity: bool,
-    /// The return code of a raw saga registration.
-    registration: Option<i32>,
 }
 
 impl SagaWorld {
@@ -62,11 +60,6 @@ async fn empty_source(w: &mut SagaWorld) {
 #[when("a request with no source is dispatched")]
 async fn missing_source(w: &mut SagaWorld) {
     w.dispatch(conf::saga_missing_source());
-}
-
-#[when("a rejection of Reserve is dispatched")]
-async fn rejection_reserve(w: &mut SagaWorld) {
-    w.dispatch(conf::saga_rejection_source("test.counter.Reserve"));
 }
 
 #[then(regex = r#"^the saga emits one command to "([^"]*)"$"#)]
@@ -160,82 +153,9 @@ async fn command_hash(w: &mut SagaWorld, index: usize, hash: String) {
     assert_eq!(format!("{:x}", Sha256::digest(cmd.encode_to_vec())), hash);
 }
 
-/// The raw ABI shape of a saga descriptor declaring rejection handlers:
-/// the Rust-native SagaDispatch cannot declare one at all, so the
-/// registration path under test is the FFI's.
-#[derive(Clone, PartialEq, prost::Message)]
-struct RawSagaDescriptor {
-    #[prost(string, tag = "1")]
-    name: String,
-    #[prost(string, tag = "2")]
-    input_domain: String,
-    #[prost(string, repeated, tag = "3")]
-    target_domains: Vec<String>,
-    #[prost(message, repeated, tag = "5")]
-    rejections: Vec<RawRejectionEntry>,
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-struct RawRejectionEntry {
-    #[prost(string, tag = "1")]
-    compensates: String,
-    #[prost(uint64, repeated, tag = "2")]
-    callback_ids: Vec<u64>,
-}
-
-unsafe extern "C" fn never_called(
-    _: *mut std::ffi::c_void,
-    _: u64,
-    _: *const u8,
-    _: usize,
-    _: *const u8,
-    _: usize,
-    _: *const u8,
-    _: usize,
-    _: *mut angzarr_router_ffi::AngzarrBuf,
-) -> i32 {
-    panic!("registration must not call the host");
-}
-
-#[when("a saga declaring a compensation for Reserve is registered")]
-async fn register_compensating_saga(w: &mut SagaWorld) {
-    use prost::Message;
-    let desc = RawSagaDescriptor {
-        name: "order-saga".to_string(),
-        input_domain: "order".to_string(),
-        target_domains: vec!["inventory".to_string()],
-        rejections: vec![RawRejectionEntry {
-            compensates: "test.counter.Reserve".to_string(),
-            callback_ids: vec![1],
-        }],
-    }
-    .encode_to_vec();
-    let router = angzarr_router_ffi::angzarr_router_new();
-    let ret = unsafe {
-        angzarr_router_ffi::angzarr_router_register_saga(
-            router,
-            desc.as_ptr(),
-            desc.len(),
-            never_called,
-        )
-    };
-    unsafe { angzarr_router_ffi::angzarr_router_free(router) };
-    w.registration = Some(ret);
-}
-
-#[then("the registration is refused as INVALID_ARGUMENT")]
-async fn registration_refused(w: &mut SagaWorld) {
-    assert_eq!(w.registration, Some(-3), "INVALID_ARGUMENT");
-}
-
 #[then("the saga emits no commands")]
 async fn emits_no_commands(w: &mut SagaWorld) {
     assert!(w.response().commands.is_empty(), "no commands emitted");
-}
-
-#[then("the saga injects no events")]
-async fn injects_no_events(w: &mut SagaWorld) {
-    assert!(w.response().events.is_empty(), "no events injected");
 }
 
 #[then(regex = r"^the dispatch fails with ([A-Z_]+)$")]

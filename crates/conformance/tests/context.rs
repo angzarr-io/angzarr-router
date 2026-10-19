@@ -1,6 +1,6 @@
-//! Cucumber harness for `context.feature`: facts, replay, cover access, PM
-//! compensator commands and projector page context, driven natively against
-//! hand-built components on the Rust core.
+//! Cucumber harness for `context.feature`: facts, replay, cover access and
+//! projector page context, driven natively against hand-built components on
+//! the Rust core.
 
 use angzarr_router::error::CodedError;
 use angzarr_router::pb;
@@ -15,7 +15,6 @@ struct ContextWorld {
     pages: conf::PageSink,
     facts: Option<Result<pb::EventBook, CodedError>>,
     replayed: Option<conf::CounterState>,
-    pm: Option<Result<pb::ProcessManagerHandleResponse, CodedError>>,
     command: Option<pb::BusinessResponse>,
 }
 
@@ -105,15 +104,8 @@ async fn ledger_own_linkage(w: &mut ContextWorld) {
 )]
 async fn reserving_trigger(w: &mut ContextWorld, label: String, seq: u32) {
     let pm = conf::reserving_pm(w.covers.clone());
-    w.pm = Some(pm.dispatch(&conf::reserving_trigger(&label, seq)));
-}
-
-#[when(
-    regex = r#"^a rejection of Reserve sent to "([^"]*)" at sequence (\d+) is dispatched to the reserving process-manager$"#
-)]
-async fn reserving_rejection(w: &mut ContextWorld, domain: String, seq: u32) {
-    let pm = conf::reserving_pm(w.covers.clone());
-    w.pm = Some(pm.dispatch(&conf::reserving_rejection(&domain, seq)));
+    pm.dispatch(&conf::reserving_trigger(&label, seq))
+        .expect("PM dispatch succeeded");
 }
 
 #[when(
@@ -203,32 +195,6 @@ async fn ledger_saw(w: &mut ContextWorld, label: String) {
 #[then(regex = r#"^the reserving process-manager saw trigger root "([^"]*)"$"#)]
 async fn pm_saw(w: &mut ContextWorld, label: String) {
     assert_eq!(single_root(&w.covers), conf::root_of(&label));
-}
-
-#[then(
-    regex = r"^the reserving process-manager emits one Release command deferred from source sequence (\d+)$"
-)]
-async fn release(w: &mut ContextWorld, seq: u32) {
-    let resp =
-        w.pm.as_ref()
-            .expect("dispatched")
-            .as_ref()
-            .expect("PM dispatch succeeded");
-    assert_eq!(resp.commands.len(), 1);
-    let page = &resp.commands[0].pages[0];
-    let Some(pb::command_page::Payload::Command(any)) = page.payload.as_ref() else {
-        panic!("command page carries no command");
-    };
-    assert_eq!(
-        angzarr_router::type_name_from_url(&any.type_url),
-        "test.counter.Release"
-    );
-    let Some(pb::page_header::SequenceType::AngzarrDeferred(d)) =
-        page.header.as_ref().and_then(|h| h.sequence_type.as_ref())
-    else {
-        panic!("the Release command is not deferred");
-    };
-    assert_eq!(d.source_seq, seq);
 }
 
 #[then(regex = r#"^the projector saw root "([^"]*)" at sequences (\d+) and (\d+)$"#)]

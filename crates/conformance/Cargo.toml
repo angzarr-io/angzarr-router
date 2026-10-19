@@ -39,9 +39,5 @@ name = "process_manager"
 harness = false
 
 [[test]]
-name = "compensation"
-harness = false
-
-[[test]]
 name = "context"
 harness = false

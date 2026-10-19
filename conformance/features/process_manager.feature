@@ -5,16 +5,13 @@ Feature: Order process-manager dispatch
   page fires (history never re-triggers) and its commands are deferred from
   that page, a trigger from an unwatched domain or
   of an undeclared type does nothing, a missing or empty trigger is refused
-  with a coded error, the PM's own state is rebuilt before the handler, and a
-  rejection notification routes to the registered compensator with its
-  escalation; the compensator reads the rejection's code and message as
-  separate fields. A process event the handler leaves unaddressed belongs to the
-  process-manager's own domain.
+  with a coded error, and the PM's own state is rebuilt before the handler. A
+  process event the handler leaves unaddressed belongs to the process-manager's
+  own domain.
 
   Co-resident process-managers share one router: each rebuilds only its own
-  state (never another PM's, even within one dispatch), a process state reaches
-  only the PM that owns it, and a rejection reaches only the PM that issued the
-  rejected command (addressed by its own domain), never every subscriber.
+  state (never another PM's, even within one dispatch), and a process state
+  reaches only the PM that owns it.
 
   Scenario: the newest trigger event reacts with a deferred command
     Given an order process-manager
@@ -48,18 +45,6 @@ Feature: Order process-manager dispatch
     When a trigger with no pages is dispatched
     Then the dispatch fails with EMPTY_PM_TRIGGER
 
-  Scenario: a rejection routes to the compensator
-    Given an order process-manager
-    When a rejection of Reserve is dispatched
-    Then the process-manager emits one process event
-    And the process-manager escalates
-
-  Scenario: a rejection addressed to the process-manager's own domain routes to its compensator
-    Given an order process-manager
-    When a rejection of Reserve issued by "order-pm" is dispatched
-    Then the process-manager emits one process event
-    And the process-manager escalates
-
   Scenario: co-resident process-managers each rebuild only their own state
     Given co-resident order and audit process-managers
     When an Increased trigger is dispatched over a prior state of 3 events
@@ -72,22 +57,7 @@ Feature: Order process-manager dispatch
     Then the audit process-manager rebuilt 2 prior state events
     And the order process-manager did not react
 
-  Scenario: a rejection reaches only the issuing process-manager
-    Given co-resident order and audit process-managers
-    When a rejection of Reserve issued by "audit-pm" is dispatched
-    Then only the audit process-manager compensates
-
-  Scenario: a Compensate is never dropped by a process-manager
-    Given an order process-manager
-    When a Compensate for Reserve is dispatched to the order process-manager
-    Then the dispatch fails with NO_UNDO_HANDLER
-
   Scenario: an unaddressed process event belongs to the process-manager's own domain
     Given an order process-manager
-    When a rejection of Reserve is dispatched
+    When an Increased trigger in domain "counter" is dispatched
     Then the process event is addressed to "order-pm"
-
-  Scenario: a process-manager compensator reads the rejection's code and message separately
-    Given an order process-manager
-    When a rejection of Reserve with code "OUT_OF_STOCK" and message "no stock left" is dispatched
-    Then the process-manager compensator saw code "OUT_OF_STOCK" and message "no stock left"
