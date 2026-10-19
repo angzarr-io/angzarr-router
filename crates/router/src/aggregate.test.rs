@@ -102,6 +102,12 @@ fn an_unknown_type_is_invalid_argument_naming_its_type_url() {
         .expect_err("an unknown command type");
     assert_eq!(err.grpc, GrpcCode::InvalidArgument);
     assert_eq!(err.message, format!("no handler for type URL {url}"));
+    // upcaster.proto (VC-1): the ErrorInfo metadata key upcast_type_url
+    // holds the type the chain ended at, the sent one when none applies.
+    assert_eq!(
+        err.extras.get("upcast_type_url").map(String::as_str),
+        Some(url.as_str())
+    );
 
     let err = d
         .dispatch(&contextual(fact_page(unknown)))

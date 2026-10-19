@@ -144,18 +144,30 @@ impl CodedError {
 
     /// A command or fact whose type URL reaches no registered handler
     /// (`code` NO_HANDLER_REGISTERED or NO_FACT_HANDLER): INVALID_ARGUMENT,
-    /// with the type URL in the message and in `extras` (command_handler.proto,
-    /// CommandHandlerService.Handle step 2; decision 12.11). The one
-    /// framework message that is not static.
+    /// the message naming the type URL as sent (command_handler.proto,
+    /// CommandHandlerService.Handle step 2; decision 12.11; the one framework
+    /// message that is not static), the extras — rendered as the status's
+    /// google.rpc.ErrorInfo metadata — carrying it as `type_url` and the type
+    /// the upcaster chain ended at as `upcast_type_url` (upcaster.proto, VC-1:
+    /// the sent one when no upcaster applies).
     pub fn unknown_type(
         code: &str,
         type_url: &str,
+        upcast_type_url: &str,
         extras: impl IntoIterator<Item = (String, String)>,
     ) -> Self {
         Self::coded(
             code,
             &format!("no handler for type URL {type_url}"),
-            std::iter::once((extras::TYPE_URL.to_string(), type_url.to_string())).chain(extras),
+            [
+                (extras::TYPE_URL.to_string(), type_url.to_string()),
+                (
+                    extras::UPCAST_TYPE_URL.to_string(),
+                    upcast_type_url.to_string(),
+                ),
+            ]
+            .into_iter()
+            .chain(extras),
             GrpcCode::InvalidArgument,
         )
     }

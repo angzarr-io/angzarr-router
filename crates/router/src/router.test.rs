@@ -146,6 +146,11 @@ fn commands_route_by_domain_and_type() {
         .dispatch_command(&command("payment", "test.Create"))
         .expect_err("no handler for (payment, Create)");
     assert_eq!(err.code, codes::NO_HANDLER_REGISTERED);
+    assert_eq!(
+        err.extras.get("upcast_type_url").map(String::as_str),
+        Some(type_url("test.Create").as_str()),
+        "no chain ran: the sent type"
+    );
     // command_handler.proto, Handle step 2: INVALID_ARGUMENT naming the type
     // URL (decision 12.11, backlog VC-1).
     assert_eq!(err.grpc, crate::error::GrpcCode::InvalidArgument);

@@ -742,6 +742,12 @@ fn unknown_command_is_invalid_argument_naming_its_type_url() {
         status.message,
         "no handler for type URL type.googleapis.com/test.counter.Undeclared"
     );
+    // upcaster.proto (VC-1): ErrorInfo metadata upcast_type_url.
+    let info = rpc_pb::ErrorInfo::decode(status.details[0].value.as_slice()).expect("ErrorInfo");
+    assert_eq!(
+        info.metadata.get("upcast_type_url").map(String::as_str),
+        Some("type.googleapis.com/test.counter.Undeclared")
+    );
 }
 
 #[test]

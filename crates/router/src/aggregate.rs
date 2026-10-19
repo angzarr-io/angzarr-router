@@ -332,8 +332,8 @@ impl<S> AggregateDispatch<S> {
     /// (none: NO_HANDLER_REGISTERED), a Fact its fact handler (none:
     /// NO_FACT_HANDLER, so a fact never reaches a command handler or the
     /// reverse) — before rebuild (a corrupt persisted event fails the
-    /// command). A refusal names the type URL the client sent, and with an
-    /// upcaster chain its extras carry the last type URL the chain produced.
+    /// command). A refusal names the type URL the client sent; its extras
+    /// carry the type the chains ended at as `upcast_type_url`.
     /// A command is then decided under its resolved conflict resolution
     /// ([`Self::decide`]). The emitted book passes through as the handler
     /// returned it: the coordinator stamps the cover, sequences and meta. A
@@ -421,13 +421,11 @@ impl<S> AggregateDispatch<S> {
         Ok(current)
     }
 
-    /// The refusal of a type no handler of the arm's kind claims: the message
-    /// names the type URL the client sent; with an upcaster chain, the extras
-    /// also carry the last type URL the chain produced.
+    /// The refusal of a type no handler of the arm's kind claims: the
+    /// message names the type URL the client sent, the extras the type the
+    /// upcaster chains ended at (`upcast_type_url`).
     fn unknown(&self, code: &str, sent: &Any, upcast: &Any) -> CodedError {
-        let produced = (!self.upcasters.is_empty())
-            .then(|| (extras::UPCAST_TYPE_URL.to_string(), upcast.type_url.clone()));
-        CodedError::unknown_type(code, &sent.type_url, produced)
+        CodedError::unknown_type(code, &sent.type_url, &upcast.type_url, [])
     }
 
     /// Runs a command's handler under its resolved conflict resolution

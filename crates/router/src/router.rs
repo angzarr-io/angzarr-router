@@ -379,6 +379,7 @@ impl CommandHandlers {
                 None => Err(CodedError::unknown_type(
                     codes::NO_HANDLER_REGISTERED,
                     &any.type_url,
+                    &any.type_url,
                     [(extras::DOMAIN.to_string(), key.0)],
                 )),
             };
@@ -392,6 +393,7 @@ impl CommandHandlers {
                 Some(handler) => handler.dispatch(req),
                 None => Err(CodedError::unknown_type(
                     codes::NO_FACT_HANDLER,
+                    &any.type_url,
                     &any.type_url,
                     [(extras::DOMAIN.to_string(), domain.to_string())],
                 )),

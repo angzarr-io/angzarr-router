@@ -181,12 +181,16 @@ async fn message_names(w: &mut HandlingWorld, url: String) {
     );
 }
 
-#[then(regex = r#"^the refusal details name the type URL "([^"]*)"$"#)]
-async fn details_name(w: &mut HandlingWorld, url: String) {
-    assert!(
-        w.refusal().extras.values().any(|v| *v == url),
-        "{url} among {:?}",
-        w.refusal().extras
+// The extras render as the status's google.rpc.ErrorInfo metadata (see
+// crates/router-ffi/src/abi.rs, coded_to_status_bytes).
+#[then(regex = r#"^the refusal's error info carries upcast_type_url "([^"]*)"$"#)]
+async fn carries_upcast(w: &mut HandlingWorld, url: String) {
+    assert_eq!(
+        w.refusal()
+            .extras
+            .get("upcast_type_url")
+            .map(String::as_str),
+        Some(url.as_str())
     );
 }
 
@@ -274,6 +278,7 @@ async fn main() {
         "/../../angzarr-project/features/handler-contract/handling.feature"
     );
     HandlingWorld::cucumber()
+        .fail_on_skipped()
         .filter_run_and_exit(feature, |_, _, scenario| {
             !scenario.tags.iter().any(|t| UNBOUND.contains(&t.as_str()))
         })
