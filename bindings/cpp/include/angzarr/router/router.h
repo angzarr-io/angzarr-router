@@ -278,13 +278,24 @@ class Router {
     return any;
   }
 
+  // ParseOrThrow decodes an ABI aux/payload buffer, coding a malformed buffer
+  // as an error the trampoline firewall converts to a status. protobuf C++
+  // ParseFromString returns false rather than throwing, so the result must be
+  // checked explicitly — mirrors ParseResponse for response decodes.
+  template <class T>
+  static void ParseOrThrow(T& msg, const std::string& bytes, const char* what) {
+    if (!msg.ParseFromString(bytes)) {
+      throw CodedError::Unhandled(std::string("unmarshal ") + what);
+    }
+  }
+
   // --- invoker adapters (the lone TState cast lives in EnsureState) --------
   // Each stateful adapter captures its component's key and reaches only that
   // component's state in the session.
 
   static PageContext PageOf(const std::string& aux) {
     abi::ProjectorEventAux pax;
-    pax.ParseFromString(aux);
+    ParseOrThrow(pax, aux, "ProjectorEventAux");
     return PageContext{pax.cover(), pax.sequence()};
   }
 
@@ -313,7 +324,7 @@ class Router {
     return [key, fn](Session& s, const std::string& tu, const std::string& payload,
                      const std::string& aux) {
       abi::CommandContextAux cax;
-      cax.ParseFromString(aux);
+      ParseOrThrow(cax, aux, "CommandContextAux");
       auto book = fn(AnyOf(tu, payload), s.EnsureState<TState>(key), ContextOf(cax));
       if (!book) return InvokerResult{"", ffi::kStatusOkEmpty, false};
       return InvokerResult{book->SerializeAsString(), ffi::kStatusOk, true};
@@ -325,11 +336,11 @@ class Router {
                                   typename AggregateDispatch<TState>::RejectionFn fn) {
     return [key, fn](Session& s, const std::string&, const std::string&, const std::string& aux) {
       abi::RejectionAux rax;
-      rax.ParseFromString(aux);
+      ParseOrThrow(rax, aux, "RejectionAux");
       pb::Notification n;
-      n.ParseFromString(rax.notification());
+      ParseOrThrow(n, rax.notification(), "Notification");
       pb::RejectionNotification rej;
-      rej.ParseFromString(rax.rejection());
+      ParseOrThrow(rej, rax.rejection(), "RejectionNotification");
       auto resp = fn(n, rej, s.EnsureState<TState>(key), ContextOf(rax.cctx()));
       if (!resp) return InvokerResult{"", ffi::kStatusOkEmpty, false};
       return InvokerResult{resp->SerializeAsString(), ffi::kStatusOk, true};
@@ -340,11 +351,11 @@ class Router {
   static Invoker UndoInvoker(ComponentKey key, typename AggregateDispatch<TState>::UndoFn fn) {
     return [key, fn](Session& s, const std::string&, const std::string&, const std::string& aux) {
       abi::UndoAux uax;
-      uax.ParseFromString(aux);
+      ParseOrThrow(uax, aux, "UndoAux");
       pb::Notification n;
-      n.ParseFromString(uax.notification());
+      ParseOrThrow(n, uax.notification(), "Notification");
       pb::Compensate compensate;
-      compensate.ParseFromString(uax.compensate());
+      ParseOrThrow(compensate, uax.compensate(), "Compensate");
       auto resp = fn(n, compensate, s.EnsureState<TState>(key), ContextOf(uax.cctx()));
       if (!resp) return InvokerResult{"", ffi::kStatusOkEmpty, false};
       return InvokerResult{resp->SerializeAsString(), ffi::kStatusOk, true};
@@ -390,7 +401,7 @@ class Router {
     return
         [key, fn](Session& s, const std::string&, const std::string& payload, const std::string&) {
           pb::EventBook book;
-          book.ParseFromString(payload);
+          ParseOrThrow(book, payload, "EventBook");
           auto proj = fn(s.EnsureState<TState>(key), book);
           return InvokerResult{proj.SerializeAsString(), ffi::kStatusOk, true};
         };
@@ -409,7 +420,7 @@ class Router {
         [dests = Destinations(std::move(targets)), fn](
             Session&, const std::string& tu, const std::string& payload, const std::string& aux) {
           abi::SagaEventAux sax;
-          sax.ParseFromString(aux);
+          ParseOrThrow(sax, aux, "SagaEventAux");
           auto emission =
               fn(AnyOf(tu, payload), dests, PageContext{sax.source_cover(), sax.source_seq()});
           pb::SagaResponse resp;
@@ -426,7 +437,7 @@ class Router {
                                                                const std::string& payload,
                                                                const std::string& aux) {
       abi::PmEventAux pax;
-      pax.ParseFromString(aux);
+      ParseOrThrow(pax, aux, "PmEventAux");
       auto resp = fn(AnyOf(tu, payload), s.EnsureState<TState>(key), dests, pax.trigger_cover());
       return InvokerResult{resp.SerializeAsString(), ffi::kStatusOk, true};
     };
@@ -437,11 +448,11 @@ class Router {
       ComponentKey key, typename ProcessManagerDispatch<TState>::RejectionResponseFn fn) {
     return [key, fn](Session& s, const std::string&, const std::string&, const std::string& aux) {
       abi::RejectionAux rax;
-      rax.ParseFromString(aux);
+      ParseOrThrow(rax, aux, "RejectionAux");
       pb::Notification n;
-      n.ParseFromString(rax.notification());
+      ParseOrThrow(n, rax.notification(), "Notification");
       pb::RejectionNotification rej;
-      rej.ParseFromString(rax.rejection());
+      ParseOrThrow(rej, rax.rejection(), "RejectionNotification");
       auto resp = fn(n, rej, s.EnsureState<TState>(key));
       return InvokerResult{resp.SerializeAsString(), ffi::kStatusOk, true};
     };
