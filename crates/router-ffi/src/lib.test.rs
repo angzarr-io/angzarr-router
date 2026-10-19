@@ -70,6 +70,8 @@ const CB_UPCAST_V1: u64 = 31;
 
 /// A fold that fails whenever it is handed more than one page.
 const CB_FOLD_BATCH_FAILS: u64 = 32;
+/// A counting fold that fails on any page that would take the count past 2.
+const CB_FOLD_CAPPED: u64 = 33;
 
 const FQ_INCREASE_BY_V1: &str = "test.counter.IncreaseByV1";
 
@@ -399,6 +401,15 @@ unsafe extern "C" fn host_cb(
         }
         CB_FACT_GARBAGE => {
             host_fill(out, &[0xFF, 0xFF, 0xFF]);
+            STATUS_OK
+        }
+        CB_FOLD_CAPPED => {
+            let call = abi_pb::FoldCall::decode(payload).expect("FoldCall");
+            let value = state_value(call.state.as_ref()) + call.pages.len() as u32;
+            if value > 2 {
+                return -13;
+            }
+            host_fill(out, &state_any(value).encode_to_vec());
             STATUS_OK
         }
         CB_FOLD_BATCH_FAILS => {
@@ -1441,6 +1452,18 @@ fn a_fold_returning_status_ok_empty_keeps_the_state() {
 }
 
 #[test]
+fn locating_a_fold_failure_carries_the_state_page_to_page() {
+    let router = counter_with(CB_FOLD_CAPPED);
+    let (ret, bytes) = router.dispatch(&increase_one(Some(increased_history(4, 4))));
+    assert_fold_failed(
+        ret,
+        &bytes,
+        2,
+        &format!("type.googleapis.com/{FQ_INCREASED}"),
+    );
+}
+
+#[test]
 fn a_failing_fold_is_internal_naming_the_first_event_it_fails_on() {
     let router = counter_with(CB_FAILS);
     let (ret, bytes) = router.dispatch(&increase_one(Some(increased_history(2, 2))));
@@ -2297,4 +2320,28 @@ fn a_router_hosting_nothing_has_no_registration_hellos() {
 fn registration_hellos_of_a_null_router_are_a_coded_failure() {
     let (ret, _) = component_descriptors(std::ptr::null_mut());
     assert_eq!(ret, -13);
+}
+
+#[test]
+fn a_refused_registration_has_no_registration_hello() {
+    let r = angzarr_router_new();
+    let mut counter = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
+    counter.rules_version = "1".to_string();
+    assert_eq!(register_aggregate_desc(r, counter.clone()), 0);
+    counter.name = "Duplicate".to_string();
+    assert_ne!(
+        register_aggregate_desc(r, counter),
+        0,
+        "a second claim is refused"
+    );
+    let router = Router(r);
+    let (ret, bytes) = component_descriptors(router.0);
+    assert_eq!(ret, 0);
+    let names: Vec<String> = abi_pb::ComponentDescriptors::decode(bytes.as_slice())
+        .expect("ComponentDescriptors")
+        .components
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+    assert_eq!(names, vec!["Counter".to_string()]);
 }
