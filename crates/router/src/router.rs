@@ -350,26 +350,27 @@ impl CommandHandlers {
             );
             return match self.claims.get(&key) {
                 Some(&index) => self.handlers[index].dispatch(req),
-                None => Err(CodedError::invalid_argument(
+                None => Err(CodedError::unknown_type(
                     codes::NO_HANDLER_REGISTERED,
-                    messages::UNKNOWN_COMMAND,
-                    [
-                        (extras::DOMAIN.to_string(), key.0),
-                        (extras::TYPE_URL.to_string(), any.type_url.clone()),
-                    ],
+                    &any.type_url,
+                    [(extras::DOMAIN.to_string(), key.0)],
                 )),
             };
         }
-        let fact_type = page
-            .and_then(crate::fact_payload)
-            .map(|any| crate::type_name_from_url(&any.type_url).to_string());
-        let recorder = fact_type.and_then(|fq| {
+        let fact = page.and_then(crate::fact_payload);
+        let recorder = fact.and_then(|any| {
+            let fq = crate::type_name_from_url(&any.type_url).to_string();
             self.in_domain(domain)
                 .find(|h| h.fact_types().contains(&fq))
         });
-        match recorder.or_else(|| self.in_domain(domain).next()) {
-            Some(handler) => handler.dispatch(req),
-            None => Err(Self::no_handler(domain)),
+        match (recorder.or_else(|| self.in_domain(domain).next()), fact) {
+            (Some(handler), _) => handler.dispatch(req),
+            (None, Some(any)) => Err(CodedError::unknown_type(
+                codes::NO_FACT_HANDLER,
+                &any.type_url,
+                [(extras::DOMAIN.to_string(), domain.to_string())],
+            )),
+            (None, None) => Err(Self::no_handler(domain)),
         }
     }
 }

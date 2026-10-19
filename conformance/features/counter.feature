@@ -35,10 +35,14 @@ Feature: Counter aggregate dispatch
     When the operator triggers a hard failure
     Then the command fails with UNHANDLED_HANDLER_ERROR
 
+  # command_handler.proto, CommandHandlerService.Handle step 2: a type URL
+  # that reaches no registered handler is refused INVALID_ARGUMENT, naming the
+  # type URL (decision 12.11; backlog VC-1).
   Scenario: an unknown command is reported before any rebuild
     Given a new counter
     When an unhandled command is dispatched
     Then the command fails with NO_HANDLER_REGISTERED
+    And the refusal is INVALID_ARGUMENT naming the type URL "type.googleapis.com/test.counter.Reserve"
 
   Scenario: a command carrying no command book is refused
     When a command with no command book is dispatched

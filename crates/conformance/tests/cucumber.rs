@@ -181,6 +181,18 @@ fn recorded_book(w: &CounterWorld) -> &pb::EventBook {
     resp.events.as_ref().expect("an events response")
 }
 
+#[then(regex = r#"^the refusal is INVALID_ARGUMENT naming the type URL "([^"]*)"$"#)]
+async fn refused_naming(w: &mut CounterWorld, url: String) {
+    let err = w
+        .result
+        .as_ref()
+        .expect("a command was dispatched")
+        .as_ref()
+        .expect_err("expected a refusal");
+    assert_eq!(err.grpc, angzarr_router::error::GrpcCode::InvalidArgument);
+    assert_eq!(err.message, format!("no handler for type URL {url}"));
+}
+
 fn assert_failed_with(w: &CounterWorld, code: &str) {
     let err = w
         .result

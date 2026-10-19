@@ -86,6 +86,31 @@ fn unknown_command_coded_before_rebuild() {
     );
 }
 
+// Spec: command_handler.proto, CommandHandlerService.Handle step 2 ("A type
+// URL that reaches no registered handler is refused INVALID_ARGUMENT, naming
+// the type URL"); decision 12.11; backlog VC-1.
+#[test]
+fn an_unknown_type_is_invalid_argument_naming_its_type_url() {
+    let (d, _) = test_agg_dispatch();
+    let url = type_url("test.Unknown");
+    let unknown = Any {
+        type_url: url.clone(),
+        value: Vec::new(),
+    };
+    let err = d
+        .dispatch(&command_for(unknown.clone()))
+        .expect_err("an unknown command type");
+    assert_eq!(err.grpc, GrpcCode::InvalidArgument);
+    assert_eq!(err.message, format!("no handler for type URL {url}"));
+
+    let err = d
+        .dispatch(&contextual(fact_page(unknown)))
+        .expect_err("an unknown fact type");
+    assert_eq!(err.code, codes::NO_FACT_HANDLER);
+    assert_eq!(err.grpc, GrpcCode::InvalidArgument);
+    assert_eq!(err.message, format!("no handler for type URL {url}"));
+}
+
 #[test]
 fn corrupt_prior_event_fails_command() {
     let (d, _) = test_agg_dispatch();

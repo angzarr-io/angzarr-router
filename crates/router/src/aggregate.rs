@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use prost_types::Any;
 
-use crate::error::{codes, extras, map_handler_error, messages, CodedError, HandlerError};
+use crate::error::{codes, map_handler_error, messages, CodedError, HandlerError};
 use crate::pb;
 use crate::rebuild::Rebuilder;
 
@@ -165,10 +165,10 @@ impl<S> AggregateDispatch<S> {
                 let any = non_empty_payload(command.payload.as_ref())?;
                 let Some(thunk) = self.handlers.get(crate::type_name_from_url(&any.type_url))
                 else {
-                    return Err(CodedError::invalid_argument(
+                    return Err(CodedError::unknown_type(
                         codes::NO_HANDLER_REGISTERED,
-                        messages::UNKNOWN_COMMAND,
-                        [(extras::TYPE_URL.to_string(), any.type_url.clone())],
+                        &any.type_url,
+                        [],
                     ));
                 };
                 let (mut state, info) = self.rebuilder.rebuild(req.events.as_ref())?;
@@ -184,10 +184,10 @@ impl<S> AggregateDispatch<S> {
             Some(pb::command_page::Body::Fact(fact)) => {
                 let any = non_empty_payload(fact.payload.as_ref())?;
                 let Some(thunk) = self.facts.get(crate::type_name_from_url(&any.type_url)) else {
-                    return Err(CodedError::invalid_argument(
+                    return Err(CodedError::unknown_type(
                         codes::NO_FACT_HANDLER,
-                        messages::NO_FACT_HANDLER,
-                        [(extras::TYPE_URL.to_string(), any.type_url.clone())],
+                        &any.type_url,
+                        [],
                     ));
                 };
                 let (state, _) = self.rebuilder.rebuild(req.events.as_ref())?;

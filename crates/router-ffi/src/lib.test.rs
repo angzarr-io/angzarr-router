@@ -613,16 +613,22 @@ fn plain_handler_failure_is_internal() {
     assert_eq!(ret, -13, "unclassified host failure surfaces as INTERNAL");
 }
 
+// command_handler.proto, CommandHandlerService.Handle step 2: an unknown type
+// URL is refused INVALID_ARGUMENT, naming it (decision 12.11, backlog VC-1).
 #[test]
-fn unknown_command_is_unimplemented() {
+fn unknown_command_is_invalid_argument_naming_its_type_url() {
     let router = Router::with_counter();
     let (ret, bytes) = router.dispatch(
         next_session(),
         &command_req("test.counter.Undeclared", Vec::new(), None),
     );
-    assert_eq!(ret, -12);
-    let (_, reason) = decode_status(&bytes);
+    assert_eq!(ret, -3);
+    let (status, reason) = decode_status(&bytes);
     assert_eq!(reason, "NO_HANDLER_REGISTERED");
+    assert_eq!(
+        status.message,
+        "no handler for type URL type.googleapis.com/test.counter.Undeclared"
+    );
 }
 
 #[test]
@@ -1490,7 +1496,7 @@ fn commands_route_to_the_aggregate_owning_their_domain() {
 fn unclaimed_domain_with_several_aggregates_is_no_handler() {
     let router = two_aggregates();
     let (ret, bytes) = router.dispatch(next_session(), &increase_in("nobody"));
-    assert_eq!(ret, -12, "NO_HANDLER_REGISTERED is UNIMPLEMENTED");
+    assert_eq!(ret, -3, "a type no handler claims is INVALID_ARGUMENT");
     assert_eq!(
         decode_status(&bytes).1,
         angzarr_router::error::codes::NO_HANDLER_REGISTERED

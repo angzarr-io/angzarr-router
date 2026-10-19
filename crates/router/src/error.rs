@@ -56,7 +56,6 @@ pub mod messages {
     pub const DUPLICATE_COMMAND_HANDLER: &str =
         "two command handlers claim the same (domain, command type)";
     pub const NO_COMPONENT_OF_KIND: &str = "the router hosts no component of this kind";
-    pub const NO_FACT_HANDLER: &str = "no fact handler for the fact type";
 }
 
 /// Cross-language detail-key constants.
@@ -113,8 +112,9 @@ impl CodedError {
     }
 
     /// A coded client error. The gRPC code is resolved from the single
-    /// mapping table: NO_HANDLER_REGISTERED → UNIMPLEMENTED (misrouted /
-    /// stale deployment), PERSISTED_EVENT_CORRUPT → DATA_LOSS
+    /// mapping table: NO_HANDLER_REGISTERED → UNIMPLEMENTED (a request this
+    /// router hosts no component for; an unknown type URL is
+    /// [`Self::unknown_type`] instead), PERSISTED_EVENT_CORRUPT → DATA_LOSS
     /// (store-sourced, unrecoverable by retry), everything else →
     /// INVALID_ARGUMENT.
     pub fn invalid_argument(
@@ -128,6 +128,24 @@ impl CodedError {
             _ => GrpcCode::InvalidArgument,
         };
         Self::coded(code, message, extras, grpc)
+    }
+
+    /// A command or fact whose type URL reaches no registered handler
+    /// (`code` NO_HANDLER_REGISTERED or NO_FACT_HANDLER): INVALID_ARGUMENT,
+    /// with the type URL in the message and in `extras` (command_handler.proto,
+    /// CommandHandlerService.Handle step 2; decision 12.11). The one
+    /// framework message that is not static.
+    pub fn unknown_type(
+        code: &str,
+        type_url: &str,
+        extras: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        Self::coded(
+            code,
+            &format!("no handler for type URL {type_url}"),
+            std::iter::once((extras::TYPE_URL.to_string(), type_url.to_string())).chain(extras),
+            GrpcCode::InvalidArgument,
+        )
     }
 
     /// Classifies a store-sourced decode failure (DATA_LOSS on the wire).

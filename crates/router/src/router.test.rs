@@ -146,6 +146,18 @@ fn commands_route_by_domain_and_type() {
         .dispatch_command(&command("payment", "test.Create"))
         .expect_err("no handler for (payment, Create)");
     assert_eq!(err.code, codes::NO_HANDLER_REGISTERED);
+    // command_handler.proto, Handle step 2: INVALID_ARGUMENT naming the type
+    // URL (decision 12.11, backlog VC-1).
+    assert_eq!(err.grpc, crate::error::GrpcCode::InvalidArgument);
+    assert_eq!(
+        err.message,
+        format!("no handler for type URL {}", type_url("test.Create"))
+    );
+    let err = router
+        .dispatch_command(&fact("payment", "test.Paid"))
+        .expect_err("no aggregate records Paid");
+    assert_eq!(err.code, codes::NO_FACT_HANDLER);
+    assert_eq!(err.grpc, crate::error::GrpcCode::InvalidArgument);
 }
 
 /// An aggregate in `domain` recording `fq` facts as `label` events.
@@ -178,7 +190,8 @@ fn facts_route_by_domain_and_fact_type() {
     let err = router
         .dispatch_command(&fact("billing", "test.Paid"))
         .expect_err("no aggregate for billing");
-    assert_eq!(err.code, codes::NO_HANDLER_REGISTERED);
+    assert_eq!(err.code, codes::NO_FACT_HANDLER);
+    assert_eq!(err.grpc, crate::error::GrpcCode::InvalidArgument);
 }
 
 #[test]
