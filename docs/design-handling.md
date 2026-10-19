@@ -7,8 +7,9 @@
   process managers and projectors, the retirement of `host_ctx`, and the
   registration hello (`component_descriptor()`), per the owner rulings
   recorded under "Registration and projectors" below; C-0535 is bound.
-- **Implemented:** a failing host fold is INTERNAL, naming the failing event
-  (owner ruling, 2026-10-19; see "Router-owned state across the C ABI").
+- **In progress:** fold failures everywhere are INTERNAL and typed, and the
+  native `Router` gathers registration hellos, per the owner rulings recorded
+  under "Fold failures and the native Router" below.
 - **Open:** how the rules version is sourced (the owner intends the binary's
   full build version, emitted by versionator).
 
@@ -105,14 +106,8 @@ message, and its type URL is registered. Every host callback is stateless.
   - Output: the new state, as a serialized `Any`.
   - The router sends one call per rebuild, carrying every uncovered page.
   - `STATUS_OK_EMPTY` means the state is unchanged.
-  - A failure is a handler bug: `UNHANDLED_HANDLER_ERROR` (INTERNAL), never
-    `PERSISTED_EVENT_CORRUPT`, because the same apply logic accepted those
-    events (owner ruling, 2026-10-19). The ErrorInfo metadata names the
-    failing event's `sequence` and `type_url` and the `state_type_url`. To
-    find the event, the router refolds the failed batch one page at a time
-    from the same starting state (the fold is stateless, so this is safe);
-    the first page that fails alone is named, or the batch's last page when
-    every page folds alone.
+  - A failure answers a typed `FoldFailure` (see "Fold failures and the
+    native Router" below); the router never calls the fold again.
   - An undecodable answer is INTERNAL too.
 - **decide** (one callback per command type): the payload is the command; the
   aux is `CommandContextAux`, which now carries `state = 8`. The callback
@@ -200,9 +195,8 @@ language. Hosts only send it.
     - an aggregate: none, because it consumes commands and no events.
   - `rules_version`.
   - `state`: set for aggregates and process managers only.
-    - `type_url` is `"/" + S::full_name()` for a native state type `S:
-      prost::Name`, so nobody declares the string by hand. Across the C ABI it
-      is the registered `state_type_url`.
+    - `type_url` is the state type the component's `Rebuilder` declares (see
+      "Fold failures and the native Router": the rebuilder now owns it).
     - `options.conflict_resolutions` is the full resolved list in enum-number
       order. The base is STRICT and AGGREGATE_HANDLES; COMMUTATIVE is added
       first when a `changed()` is registered (`with_commutative`).
@@ -211,14 +205,9 @@ language. Hosts only send it.
   The ErrorInfo metadata names the `component`.
   Every kind needs one, so sagas and projectors gain `with_rules_version`
   too.
-- **Rust API.**
-  - `AggregateDispatch::component_descriptor()` and
-    `ProcessManagerDispatch::component_descriptor()`, both with
-    `S: prost::Name`.
-  - `..._with_state(state_full_name)` for state held as `Any`, which the C
-    ABI uses; the name is the state message's fully-qualified name.
-  - `SagaDispatch::component_descriptor()` and
-    `ProjectorDispatch::component_descriptor()`.
+- **Rust API.** `component_descriptor()` on every dispatch table (superseded
+  in part below: the state type now comes from the rebuilder, so the
+  `S: prost::Name` bound and the `_with_state` variants are gone).
 - **C ABI.**
   - New entry point: `angzarr_router_component_descriptors(r, out)`. It fills
     `out` with a serialized `ComponentDescriptors { repeated
@@ -271,22 +260,91 @@ keep no state of any kind.
 | `ComponentDescriptors` | new message | none |
 | `ProjectorEventAux` | none | the whole message, which nothing uses any more |
 
+## Fold failures and the native Router
+
+Owner rulings of 2026-10-19 (round 6). They replace the refold-per-page
+search of round 5, which is deleted.
+
+### Every failing fold is a handler bug
+
+Any fold of events that fails answers `UNHANDLED_HANDLER_ERROR` (INTERNAL):
+the native per-event appliers, the C-ABI aggregate and process-manager folds,
+and the C-ABI projector fold (which no longer passes the host's status
+through), and the native projector's per-event folds.
+
+- **Message.** `the state fold failed on an event it had accepted` for
+  persisted events (a rebuild, a COMMUTATIVE window). COMMUTATIVE's fold of
+  the command's own new events, not yet persisted, says `the state fold
+  failed on an event this command emitted`.
+- **ErrorInfo metadata.**
+  - When the failing page is known: `sequence` and `type_url` of that page.
+  - When it is not (no failure output, or an index outside the batch):
+    `first_sequence` and `last_sequence` of the batch.
+  - Always `state_type_url` (for a projector, its projection type), empty
+    when the component declared none.
+  - `fold_message`, when the fold gave one (a native applier's error text,
+    or `FoldFailure.message`).
+- **`PERSISTED_EVENT_CORRUPT`** keeps one producer: a snapshot whose state
+  the native snapshot loader cannot load. That is not a fold of events, so
+  the code stays (DATA_LOSS) for it alone.
+
+### The typed failure across the C ABI
+
+`abi.proto` gains `FoldFailure { optional uint32 page_index = 1; string
+message = 2; }`. A fold callback (aggregate, process manager, projector)
+that fails fills `out` with it: `page_index` is the failing page's index
+within the batch the router sent, filled by the host's fold loop from the
+one batched call. `page_index` is `optional` so that index 0 is
+distinguishable from an empty output. The router maps the index to that
+page; missing output, undecodable output or an index outside the batch
+reports the batch's sequence range. The router never calls the fold again.
+
+### The state type lives on the rebuilder
+
+The fold metadata needs the state type at rebuild time, and the
+registration hello needs it too, so the `Rebuilder` owns it:
+
+- `Rebuilder::of_message()` (for `S: prost::Name + Default`) starts from
+  `S::default()` and takes the type from the prost name, so nobody declares
+  the string by hand;
+- `Rebuilder::with_state_type(full_name)` declares it for state held as an
+  `Any` (the C ABI);
+- `Rebuilder::new(factory)` declares none.
+
+A batched fold (`Rebuilder::with_fold`, `ProjectorDispatch::with_fold`)
+returns `Result<(), FoldFailure>` (core type: `page_index: Option<usize>`,
+`message`), and the rebuilder or projector turns it into the coded error.
+`ProjectorDispatch::with_projection_type(full_name)` declares a projector's
+projection type.
+
+`component_descriptor()` on aggregates and process managers takes the state
+type from the rebuilder; a component that declared none is refused
+`MISSING_STATE_TYPE` (INVALID_ARGUMENT, metadata `component`), since the
+spec sets `StateDescriptor` for both kinds.
+
+### `Router::component_descriptors()`
+
+`CommandHandler`, `ProcessManagerHandler` and `ProjectorHandler` gain
+`component_descriptor()`, implemented by each dispatch table (sagas are held
+as `SagaDispatch` and use its own). `Router::component_descriptors()` returns
+every component's hello in registration order, the same shape as the C ABI's
+`angzarr_router_component_descriptors`, refusing with the first component
+whose hello fails. An upcaster router has none.
+
+### `abi.proto` changes in round 6
+
+| Message | Added | Removed |
+|---|---|---|
+| `FoldFailure` | new message: `optional uint32 page_index = 1`, `string message = 2` | none |
+
 ## Open
 
-Nothing is open from the earlier rounds. C-0535 and the C-ABI projectors are
-settled above.
+Choices no ruling covers, reported for sign-off:
 
-Choices this round made that no ruling covers (reported for sign-off):
-
-- **Locating the failing event.** The host fold is batched, so the router
-  learns the batch failed, not which event. It refolds the batch one page
-  at a time to name it; a batch whose pages all fold alone names its last
-  page.
-- **Scope of the fold ruling.** It covers host fold callbacks (aggregate and
-  process-manager state across the C ABI) only. A native Rust applier that
-  fails still answers `PERSISTED_EVENT_CORRUPT` (DATA_LOSS), and a C-ABI
-  projector's failing fold still keeps the host's status.
-- **Native `Router`.** `component_descriptor()` lives on each dispatch table;
-  the native `Router` (several components behind trait objects) does not
-  gather them, because its `CommandHandler` trait has no state type to
-  name.
+- **`fold_message`.** The fold's own text rides in ErrorInfo metadata
+  `fold_message`; the coded message stays the fixed cross-language text.
+- **Range keys.** `first_sequence` and `last_sequence`.
+- **`MISSING_STATE_TYPE`.** A native aggregate or process manager whose
+  rebuilder declares no state type cannot build its hello.
+- **Snapshot loads.** A snapshot the native loader cannot load stays
+  `PERSISTED_EVENT_CORRUPT` (DATA_LOSS); it is not a fold of events.
