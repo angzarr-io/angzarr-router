@@ -286,9 +286,8 @@ impl FfiRouter {
     }
 
     /// Parses a SagaDescriptor and populates a core saga table with
-    /// callback-marshaling thunks. Event thunks pass the coordinator-supplied
-    /// destination sequences to the host (which stamps and returns a
-    /// SagaResponse).
+    /// callback-marshaling thunks. Event thunks pass the source cover to the
+    /// host, which returns a SagaResponse; only its commands are taken.
     pub fn register_saga(&mut self, descriptor: &[u8], cb: AngzarrCb) -> Result<(), CodedError> {
         let desc = abi_pb::SagaDescriptor::decode(descriptor).map_err(|_| {
             CodedError::invalid_argument(
@@ -306,14 +305,8 @@ impl FfiRouter {
 
         for event in &desc.events {
             let id = event.callback_id;
-            dispatch = dispatch.on_event(&event.fq_type, move |any, dests, source_cover| {
-                let destination_sequences = dests
-                    .domains()
-                    .into_iter()
-                    .filter_map(|d| dests.sequence_for(&d).map(|s| (d, s)))
-                    .collect();
+            dispatch = dispatch.on_event(&event.fq_type, move |any, source_cover| {
                 let aux = abi_pb::SagaEventAux {
-                    destination_sequences,
                     source_cover: source_cover.cloned(),
                 }
                 .encode_to_vec();
@@ -327,9 +320,9 @@ impl FfiRouter {
                                     .to_string(),
                             )
                         })?;
-                        Ok((resp.commands, resp.events))
+                        Ok(resp.commands)
                     }
-                    STATUS_OK_EMPTY => Ok((Vec::new(), Vec::new())),
+                    STATUS_OK_EMPTY => Ok(Vec::new()),
                     _ => Err(host_error(ret, bytes)),
                 }
             });
@@ -390,7 +383,6 @@ impl FfiRouter {
             |dispatch| dispatch.dispatch(&req),
             |acc: &mut pb::SagaResponse, resp| {
                 acc.commands.extend(resp.commands);
-                acc.events.extend(resp.events);
             },
         )?;
         // Saga tail: a source domain no saga consumes is NO_HANDLER_REGISTERED.
@@ -407,8 +399,8 @@ impl FfiRouter {
 
     /// Parses a ProcessManagerDescriptor and populates a core PM table.
     /// Stateful: appliers/snapshot rebuild the PM's own state across the
-    /// callback (host owns the instance); event thunks pass destination
-    /// sequences to the host and return a ProcessManagerHandleResponse.
+    /// callback (host owns the instance); event thunks pass no aux and return
+    /// a ProcessManagerHandleResponse.
     pub fn register_process_manager(
         &mut self,
         descriptor: &[u8],
@@ -448,17 +440,8 @@ impl FfiRouter {
 
         for event in &desc.events {
             let id = event.callback_id;
-            dispatch = dispatch.on_event(&event.input_domain, &event.fq_type, move |any, _state, dests| {
-                let destination_sequences = dests
-                    .domains()
-                    .into_iter()
-                    .filter_map(|d| dests.sequence_for(&d).map(|s| (d, s)))
-                    .collect();
-                let aux = abi_pb::PmEventAux {
-                    destination_sequences,
-                }
-                .encode_to_vec();
-                let (ret, bytes) = invoke(cb, id, &any.type_url, &any.value, &aux);
+            dispatch = dispatch.on_event(&event.input_domain, &event.fq_type, move |any, _state| {
+                let (ret, bytes) = invoke(cb, id, &any.type_url, &any.value, &[]);
                 match ret {
                     STATUS_OK => pb::ProcessManagerHandleResponse::decode(
                         bytes.unwrap_or_default().as_slice(),

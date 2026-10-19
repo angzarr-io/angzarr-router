@@ -8,9 +8,9 @@ Feature: Order process-manager dispatch
 
   Scenario: the newest trigger event reacts
     Given an order process-manager
-    When an Increased trigger in domain "counter" is dispatched with destination inventory sequence 4
+    When an Increased trigger in domain "counter" is dispatched
     Then the process-manager emits one command to "inventory"
-    And the command carries destination sequence 4
+    And the command carries no router-stamped sequence
 
   Scenario: history does not re-trigger
     Given an order process-manager

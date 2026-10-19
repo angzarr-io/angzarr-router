@@ -218,17 +218,12 @@ pub fn delivery_without_cover(n: u32) -> pb::EventBook {
 // ---------------------------------------------------------------------------
 
 /// Build the OrderSaga dispatch table: it translates each Increased source
-/// event into one Reserve command for "inventory" (stamped from the
-/// coordinator-supplied destination sequence when present). Undeclared events
-/// are silently skipped (DelegateToFramework).
+/// event into one Reserve command for "inventory" (the coordinator stamps its
+/// sequence). Undeclared events are silently skipped (DelegateToFramework).
 pub fn order_saga() -> SagaDispatch {
     SagaDispatch::new("order-saga", "order", ["inventory"])
-        .on_event("test.counter.Increased", |_any, dests, _c| {
-            let mut cmd = reserve_command_to("inventory");
-            if dests.has("inventory") {
-                dests.stamp_command(&mut cmd, "inventory")?;
-            }
-            Ok((vec![cmd], Vec::new()))
+        .on_event("test.counter.Increased", |_any, _c| {
+            Ok(vec![reserve_command_to("inventory")])
         })
 }
 
@@ -249,8 +244,8 @@ fn reserve_command_to(domain: &str) -> pb::CommandBook {
 }
 
 /// A SagaHandleRequest whose source carries one event of `event_fq` in the
-/// "order" domain, plus the coordinator's destination-sequence map.
-pub fn saga_event_source(event_fq: &str, dest: &[(&str, u32)]) -> pb::SagaHandleRequest {
+/// "order" domain.
+pub fn saga_event_source(event_fq: &str) -> pb::SagaHandleRequest {
     pb::SagaHandleRequest {
         source: Some(pb::EventBook {
             cover: Some(pb::Cover {
@@ -266,7 +261,6 @@ pub fn saga_event_source(event_fq: &str, dest: &[(&str, u32)]) -> pb::SagaHandle
             }],
             ..Default::default()
         }),
-        destination_sequences: dest.iter().map(|(d, s)| (d.to_string(), *s)).collect(),
         ..Default::default()
     }
 }
@@ -300,9 +294,9 @@ pub struct ProcessManagerState {
 
 /// Build the OrderProcessManager dispatch table: over the "counter" domain it
 /// reacts to the NEWEST Increased trigger by emitting one Reserve command for
-/// "inventory" (stamped from the destination sequence when present) plus a
-/// process event. Its own state counts prior Increased process events, so a
-/// rebuild is observable.
+/// "inventory" (the coordinator stamps its sequence) plus a process event.
+/// Its own state counts prior Increased process events, so a rebuild is
+/// observable.
 pub fn order_pm() -> ProcessManagerDispatch<ProcessManagerState> {
     let rebuilder = Rebuilder::new(ProcessManagerState::default).apply(
         "test.counter.Increased",
@@ -317,11 +311,8 @@ pub fn order_pm() -> ProcessManagerDispatch<ProcessManagerState> {
         .on_event(
             "counter",
             "test.counter.Increased",
-            |_event, state: &mut ProcessManagerState, dests| {
-                let mut cmd = reserve_command_to("inventory");
-                if dests.has("inventory") {
-                    dests.stamp_command(&mut cmd, "inventory")?;
-                }
+            |_event, state: &mut ProcessManagerState| {
+                let cmd = reserve_command_to("inventory");
                 // Emit one fact per prior state event so the rebuild is
                 // observable in the response.
                 let facts = (0..state.count).map(|_| pm_process_event()).collect();
@@ -341,13 +332,12 @@ fn pm_process_event() -> pb::EventBook {
     }
 }
 
-/// A PM request whose trigger carries the given event pages in `domain`, plus
-/// the destination-sequence map. `process_state` is the PM's prior state book.
+/// A PM request whose trigger carries the given event pages in `domain`.
+/// `process_state` is the PM's prior state book.
 pub fn pm_trigger_request(
     domain: &str,
     event_fqs: &[&str],
     process_state: Option<pb::EventBook>,
-    dest: &[(&str, u32)],
 ) -> pb::ProcessManagerHandleRequest {
     let pages = event_fqs
         .iter()
@@ -369,7 +359,7 @@ pub fn pm_trigger_request(
             ..Default::default()
         }),
         process_state,
-        destination_sequences: dest.iter().map(|(d, s)| (d.to_string(), *s)).collect(),
+        ..Default::default()
     }
 }
 

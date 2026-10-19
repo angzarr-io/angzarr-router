@@ -88,7 +88,11 @@ async fn missing_payload(w: &mut CounterWorld) {
 
 #[then(regex = r"^(\d+) increases are recorded$")]
 async fn recorded(w: &mut CounterWorld, count: u32) {
-    assert_eq!(recorded_book(w).pages.len() as u32, count, "recorded event count");
+    assert_eq!(
+        recorded_book(w).pages.len() as u32,
+        count,
+        "recorded event count"
+    );
 }
 
 #[then("the recorded events carry no router-stamped sequence")]
@@ -96,7 +100,10 @@ async fn recorded_unstamped(w: &mut CounterWorld) {
     // The coordinator stamps sequences; the router passes the handler's
     // pages through untouched.
     for (i, page) in recorded_book(w).pages.iter().enumerate() {
-        assert!(page.header.is_none(), "recorded event {i} carries a page header");
+        assert!(
+            page.header.is_none(),
+            "recorded event {i} carries a page header"
+        );
     }
 }
 

@@ -49,9 +49,8 @@ message ProjectorDescriptor {
 }
 
 // Registration payload for one saga component. A stateless translator:
-// declared events emit commands (the host stamps them from the supplied
-// destination sequences) and/or injected fact events. Empty
-// `target_domains` is allowed.
+// declared events emit commands (the coordinator stamps their sequences and
+// correlation). Empty `target_domains` is allowed.
 message SagaDescriptor {
   string name = 1;
   string input_domain = 2;
@@ -68,16 +67,18 @@ message CommandContextAux {
   bool had_prior_events = 2;
 }
 
-// aux payload for saga event callbacks: the coordinator-supplied
-// destination next-sequences the host stamps emitted commands from, plus the
-// source event's cover passed through whole (serialized angzarr Cover) so the
-// saga can route emitted commands by the trigger's identity (root, ext). The
-// host returns a SagaResponse (commands + injected fact events).
+// aux payload for saga event callbacks: the source book's cover passed
+// through whole (serialized angzarr Cover). The callback's payload is one
+// event page; this carries the rest of the saga's input (the source
+// EventBook's identity: domain, root, correlation). The host returns a
+// SagaResponse whose `commands` are taken; the router emits no fact events.
 message SagaEventAux {
-  map<string, uint32> destination_sequences = 1;
+  // Field 1 was `destination_sequences` (removed — the coordinator stamps
+  // emitted command sequences).
+  reserved 1;
+  reserved "destination_sequences";
   // The source book's cover, passed through whole and typed (Rust owns the
-  // deserialization) so the saga can route emitted commands by the trigger's
-  // identity (root, ext).
+  // deserialization).
   io.angzarr.v1.Cover source_cover = 2;
 }
 
@@ -104,9 +105,7 @@ message PmEventEntry {
   uint64 callback_id = 3;
 }
 
-// aux payload for process-manager event callbacks: the coordinator-supplied
-// destination next-sequences the host stamps emitted commands from. The host
-// returns a ProcessManagerHandleResponse.
-message PmEventAux {
-  map<string, uint32> destination_sequences = 1;
-}
+// Process-manager event callbacks carry no aux payload (the former
+// `PmEventAux { destination_sequences = 1 }` was removed — the coordinator
+// stamps emitted command sequences). The host returns a
+// ProcessManagerHandleResponse.

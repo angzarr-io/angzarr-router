@@ -1,31 +1,24 @@
-//! SagaDispatch — the stateless source-event → commands+events translator.
+//! SagaDispatch — the stateless source-event → commands translator.
 //!
 //! Transliterated from client-go's `engine.go` SagaDispatch.Dispatch +
 //! `features/saga.go`. A saga holds NO state and rebuilds nothing: every
 //! page of the source book is a fresh trigger. Declared event types emit
-//! commands (stamped from the coordinator-supplied Destinations) and/or
-//! injected fact events; an undeclared event type is silently skipped
+//! commands (the coordinator stamps their sequences and correlation); an
+//! undeclared event type is silently skipped
 //! (DelegateToFramework), not an error. There is no compensation input.
 
 use std::collections::HashMap;
 
 use prost_types::Any;
 
-use crate::destinations::Destinations;
 use crate::error::{codes, map_handler_error, messages, CodedError, HandlerError};
 use crate::pb;
 
-/// Translates one source event into commands and/or injected fact events.
-/// Generated thunks unmarshal to the typed event, call the typed business
-/// method, and stamp emitted commands via the supplied Destinations.
+/// Translates one source event (with the source book's cover) into
+/// commands. Generated thunks unmarshal to the typed event and call the
+/// typed business method.
 pub type EventFn = Box<
-    dyn Fn(
-            &Any,
-            &Destinations,
-            Option<&pb::Cover>,
-        ) -> Result<(Vec<pb::CommandBook>, Vec<pb::EventBook>), HandlerError>
-        + Send
-        + Sync,
+    dyn Fn(&Any, Option<&pb::Cover>) -> Result<Vec<pb::CommandBook>, HandlerError> + Send + Sync,
 >;
 
 /// The dispatch table for one saga component.
@@ -56,11 +49,7 @@ impl SagaDispatch {
     pub fn on_event(
         mut self,
         full_name: &str,
-        thunk: impl Fn(
-                &Any,
-                &Destinations,
-                Option<&pb::Cover>,
-            ) -> Result<(Vec<pb::CommandBook>, Vec<pb::EventBook>), HandlerError>
+        thunk: impl Fn(&Any, Option<&pb::Cover>) -> Result<Vec<pb::CommandBook>, HandlerError>
             + Send
             + Sync
             + 'static,
@@ -98,8 +87,8 @@ impl SagaDispatch {
 
     /// Walks EVERY page of the source book: declared event types emit;
     /// undeclared types are skipped. Emitted commands pass through
-    /// unstamped (the coordinator stamps correlation). A nil source is MISSING_SAGA_SOURCE; a
-    /// source with no pages is EMPTY_SAGA_SOURCE.
+    /// unstamped (the coordinator stamps correlation). A nil source is
+    /// MISSING_SAGA_SOURCE; a source with no pages is EMPTY_SAGA_SOURCE.
     pub fn dispatch(&self, req: &pb::SagaHandleRequest) -> Result<pb::SagaResponse, CodedError> {
         let Some(source) = req.source.as_ref() else {
             return Err(CodedError::invalid_argument(
@@ -116,7 +105,6 @@ impl SagaDispatch {
             ));
         }
 
-        let dests = Destinations::new(req.destination_sequences.clone());
         let mut resp = pb::SagaResponse::default();
 
         for page in &source.pages {
@@ -130,10 +118,8 @@ impl SagaDispatch {
             else {
                 continue; // saga only reacts to declared types (spec C-0051)
             };
-            let (commands, events) =
-                thunk(event_any, &dests, source.cover.as_ref()).map_err(map_handler_error)?;
+            let commands = thunk(event_any, source.cover.as_ref()).map_err(map_handler_error)?;
             resp.commands.extend(commands);
-            resp.events.extend(events);
         }
 
         Ok(resp)

@@ -7,7 +7,6 @@
 //! duplicate them into generated output, bindings, or component adapters.
 
 pub mod aggregate;
-pub mod destinations;
 pub mod error;
 pub mod process_manager;
 pub mod projector;

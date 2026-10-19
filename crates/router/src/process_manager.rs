@@ -14,7 +14,6 @@ use std::collections::HashMap;
 
 use prost_types::Any;
 
-use crate::destinations::Destinations;
 use crate::error::{codes, map_handler_error, messages, CodedError, HandlerError};
 use crate::pb;
 use crate::rebuild::Rebuilder;
@@ -24,9 +23,7 @@ use crate::rebuild::Rebuilder;
 /// Generated thunks unmarshal to the typed event and call the typed business
 /// method.
 pub type EventFn<S> = Box<
-    dyn Fn(&Any, &mut S, &Destinations) -> Result<pb::ProcessManagerHandleResponse, HandlerError>
-        + Send
-        + Sync,
+    dyn Fn(&Any, &mut S) -> Result<pb::ProcessManagerHandleResponse, HandlerError> + Send + Sync,
 >;
 
 /// The dispatch table for one process-manager component.
@@ -59,11 +56,7 @@ impl<S> ProcessManagerDispatch<S> {
         mut self,
         input_domain: &str,
         full_name: &str,
-        thunk: impl Fn(
-                &Any,
-                &mut S,
-                &Destinations,
-            ) -> Result<pb::ProcessManagerHandleResponse, HandlerError>
+        thunk: impl Fn(&Any, &mut S) -> Result<pb::ProcessManagerHandleResponse, HandlerError>
             + Send
             + Sync
             + 'static,
@@ -140,8 +133,7 @@ impl<S> ProcessManagerDispatch<S> {
         };
 
         let (mut state, _info) = self.rebuilder.rebuild(req.process_state.as_ref())?;
-        let dests = Destinations::new(req.destination_sequences.clone());
-        thunk(event_any, &mut state, &dests).map_err(map_handler_error)
+        thunk(event_any, &mut state).map_err(map_handler_error)
     }
 }
 

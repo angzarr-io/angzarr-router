@@ -23,17 +23,15 @@ const FQ_OTHER: &str = "test.OrderCancelled";
 
 // --- fixtures -------------------------------------------------------------
 
-/// A PM request over an optional trigger / process-state and a destination
-/// map.
+/// A PM request over an optional trigger and process-state.
 fn request(
     trigger: Option<pb::EventBook>,
     process_state: Option<pb::EventBook>,
-    dest: &[(&str, u32)],
 ) -> pb::ProcessManagerHandleRequest {
     pb::ProcessManagerHandleRequest {
         trigger,
         process_state,
-        destination_sequences: dest.iter().map(|(d, s)| (d.to_string(), *s)).collect(),
+        ..Default::default()
     }
 }
 
@@ -92,19 +90,12 @@ fn pm_emitting_one() -> ProcessManagerDispatch<TestState> {
         "fulfillment",
         cover_applier(fresh_rebuilder()),
     )
-    .on_event(IN_DOMAIN, FQ_SHIPPED, |_e, _s, _d| {
+    .on_event(IN_DOMAIN, FQ_SHIPPED, |_e, _s| {
         Ok(pb::ProcessManagerHandleResponse {
             commands: vec![command_to("inventory")],
             ..Default::default()
         })
     })
-}
-
-fn cmd_page_seq(page: &pb::CommandPage) -> Option<u32> {
-    match page.header.as_ref().and_then(|h| h.sequence_type.as_ref()) {
-        Some(pb::page_header::SequenceType::Sequence(s)) => Some(*s),
-        _ => None,
-    }
 }
 
 fn book_domains(books: &[pb::EventBook]) -> Vec<String> {
@@ -128,7 +119,6 @@ fn newest_declared_event_runs_handler() {
         .dispatch(&request(
             Some(trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED)])),
             None,
-            &[],
         ))
         .expect("dispatch");
     assert_eq!(resp.commands.len(), 1);
@@ -144,7 +134,6 @@ fn only_the_newest_page_fires() {
         .dispatch(&request(
             Some(trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED), ev(FQ_OTHER)])),
             None,
-            &[],
         ))
         .expect("dispatch");
     assert!(resp.commands.is_empty(), "history must not re-trigger");
@@ -158,7 +147,6 @@ fn newest_page_fires_even_after_undeclared_history() {
         .dispatch(&request(
             Some(trigger(IN_DOMAIN, vec![ev(FQ_OTHER), ev(FQ_SHIPPED)])),
             None,
-            &[],
         ))
         .expect("dispatch");
     assert_eq!(resp.commands.len(), 1, "newest page triggers");
@@ -171,7 +159,6 @@ fn trigger_outside_sources_is_empty() {
         .dispatch(&request(
             Some(trigger("unrelated", vec![ev(FQ_SHIPPED)])),
             None,
-            &[],
         ))
         .expect("dispatch");
     assert!(
@@ -184,16 +171,12 @@ fn trigger_outside_sources_is_empty() {
 fn undeclared_event_type_is_empty() {
     let d = pm_emitting_one();
     let resp = d
-        .dispatch(&request(
-            Some(trigger(IN_DOMAIN, vec![ev(FQ_OTHER)])),
-            None,
-            &[],
-        ))
+        .dispatch(&request(Some(trigger(IN_DOMAIN, vec![ev(FQ_OTHER)])), None))
         .expect("dispatch");
     assert!(resp.commands.is_empty(), "undeclared type → empty");
 }
 
-// --- stateful rebuild + destinations --------------------------------------
+// --- stateful rebuild -----------------------------------------------------
 
 #[test]
 fn handler_sees_rebuilt_state() {
@@ -204,7 +187,7 @@ fn handler_sees_rebuilt_state() {
         "fulfillment",
         cover_applier(fresh_rebuilder()),
     )
-    .on_event(IN_DOMAIN, FQ_SHIPPED, |_e, state: &mut TestState, _d| {
+    .on_event(IN_DOMAIN, FQ_SHIPPED, |_e, state: &mut TestState| {
         let n = state.applied.len();
         Ok(pb::ProcessManagerHandleResponse {
             commands: (0..n).map(|_| command_to("inventory")).collect(),
@@ -216,35 +199,9 @@ fn handler_sees_rebuilt_state() {
         .dispatch(&request(
             Some(trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED)])),
             Some(state_book),
-            &[],
         ))
         .expect("dispatch");
     assert_eq!(resp.commands.len(), 3, "three prior state events rebuilt");
-}
-
-#[test]
-fn handler_stamps_from_destinations() {
-    let d = ProcessManagerDispatch::new(
-        "fulfillment-pm",
-        "fulfillment",
-        cover_applier(fresh_rebuilder()),
-    )
-    .on_event(IN_DOMAIN, FQ_SHIPPED, |_e, _s, dests| {
-        let mut cmd = command_to("inventory");
-        dests.stamp_command(&mut cmd, "inventory")?;
-        Ok(pb::ProcessManagerHandleResponse {
-            commands: vec![cmd],
-            ..Default::default()
-        })
-    });
-    let resp = d
-        .dispatch(&request(
-            Some(trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED)])),
-            None,
-            &[("inventory", 9)],
-        ))
-        .expect("dispatch");
-    assert_eq!(cmd_page_seq(&resp.commands[0].pages[0]), Some(9));
 }
 
 #[test]
@@ -254,7 +211,7 @@ fn handler_can_emit_process_events_and_facts() {
         "fulfillment",
         cover_applier(fresh_rebuilder()),
     )
-    .on_event(IN_DOMAIN, FQ_SHIPPED, |_e, _s, _d| {
+    .on_event(IN_DOMAIN, FQ_SHIPPED, |_e, _s| {
         Ok(pb::ProcessManagerHandleResponse {
             process_events: vec![tagged_book("pe")],
             facts: vec![tagged_book("fact")],
@@ -265,7 +222,6 @@ fn handler_can_emit_process_events_and_facts() {
         .dispatch(&request(
             Some(trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED)])),
             None,
-            &[],
         ))
         .expect("dispatch");
     assert_eq!(book_domains(&resp.process_events), vec!["pe".to_string()]);
@@ -278,7 +234,7 @@ fn handler_can_emit_process_events_and_facts() {
 fn nil_trigger_is_missing_pm_trigger() {
     let d = pm_emitting_one();
     let err = d
-        .dispatch(&request(None, None, &[]))
+        .dispatch(&request(None, None))
         .expect_err("nil trigger must fail");
     assert_eq!(err.code, codes::MISSING_PM_TRIGGER);
 }
@@ -287,7 +243,7 @@ fn nil_trigger_is_missing_pm_trigger() {
 fn empty_trigger_is_empty_pm_trigger() {
     let d = pm_emitting_one();
     let err = d
-        .dispatch(&request(Some(trigger(IN_DOMAIN, vec![])), None, &[]))
+        .dispatch(&request(Some(trigger(IN_DOMAIN, vec![])), None))
         .expect_err("empty trigger must fail");
     assert_eq!(err.code, codes::EMPTY_PM_TRIGGER);
 }
@@ -299,7 +255,6 @@ fn trigger_last_page_without_payload_is_coded() {
         .dispatch(&request(
             Some(trigger(IN_DOMAIN, vec![pb::EventPage::default()])),
             None,
-            &[],
         ))
         .expect_err("payload-less trigger must fail");
     assert_eq!(err.code, codes::MISSING_PM_EVENT_PAYLOAD);
@@ -317,7 +272,6 @@ fn corrupt_process_state_is_data_loss() {
         .dispatch(&request(
             Some(trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED)])),
             Some(state),
-            &[],
         ))
         .expect_err("corrupt state must fail");
     assert_eq!(err.code, codes::PERSISTED_EVENT_CORRUPT);
@@ -330,14 +284,13 @@ fn handler_error_propagates_as_unhandled() {
         "fulfillment",
         cover_applier(fresh_rebuilder()),
     )
-    .on_event(IN_DOMAIN, FQ_SHIPPED, |_e, _s, _d| {
+    .on_event(IN_DOMAIN, FQ_SHIPPED, |_e, _s| {
         Err(HandlerError::Other("boom".to_string()))
     });
     let err = d
         .dispatch(&request(
             Some(trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED)])),
             None,
-            &[],
         ))
         .expect_err("handler error must fail dispatch");
     assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
@@ -349,10 +302,10 @@ fn handler_error_propagates_as_unhandled() {
 fn accessors_report_name_domain_and_sources() {
     let rebuilder: Rebuilder<TestState> = fresh_rebuilder();
     let d = ProcessManagerDispatch::new("fulfillment-pm", "fulfillment", rebuilder)
-        .on_event(IN_DOMAIN, FQ_SHIPPED, |_e, _s, _d| {
+        .on_event(IN_DOMAIN, FQ_SHIPPED, |_e, _s| {
             Ok(pb::ProcessManagerHandleResponse::default())
         })
-        .on_event("billing", "test.Invoiced", |_e, _s, _d| {
+        .on_event("billing", "test.Invoiced", |_e, _s| {
             Ok(pb::ProcessManagerHandleResponse::default())
         });
     assert_eq!(d.name(), "fulfillment-pm");

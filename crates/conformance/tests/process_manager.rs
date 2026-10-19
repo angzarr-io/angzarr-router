@@ -33,23 +33,12 @@ async fn an_order_pm(_w: &mut ProcessManagerWorld) {
     // Each dispatch builds a fresh PM; nothing to seed.
 }
 
-#[when(regex = r#"^an Increased trigger in domain "([^"]*)" is dispatched with destination inventory sequence (\d+)$"#)]
-async fn increased_with_destination(w: &mut ProcessManagerWorld, domain: String, seq: u32) {
-    w.dispatch(conf::pm_trigger_request(
-        &domain,
-        &["test.counter.Increased"],
-        None,
-        &[("inventory", seq)],
-    ));
-}
-
 #[when(regex = r#"^an Increased trigger in domain "([^"]*)" is dispatched$"#)]
 async fn increased_in_domain(w: &mut ProcessManagerWorld, domain: String) {
     w.dispatch(conf::pm_trigger_request(
         &domain,
         &["test.counter.Increased"],
         None,
-        &[],
     ));
 }
 
@@ -60,7 +49,6 @@ async fn newest_undeclared(w: &mut ProcessManagerWorld) {
         "counter",
         &["test.counter.Increased", "test.counter.Unwatched"],
         None,
-        &[],
     ));
 }
 
@@ -70,7 +58,6 @@ async fn increased_over_state(w: &mut ProcessManagerWorld, n: u32) {
         "counter",
         &["test.counter.Increased"],
         Some(conf::pm_state_of(n)),
-        &[],
     ));
 }
 
@@ -91,14 +78,11 @@ async fn emits_one_command(w: &mut ProcessManagerWorld, target: String) {
     assert_eq!(resp.commands[0].cover.as_ref().expect("cover").domain, target);
 }
 
-#[then(regex = r"^the command carries destination sequence (\d+)$")]
-async fn command_carries_sequence(w: &mut ProcessManagerWorld, seq: u32) {
+#[then("the command carries no router-stamped sequence")]
+async fn command_unstamped(w: &mut ProcessManagerWorld) {
+    // The coordinator stamps command sequences; the router does not.
     let cmd = &w.response().commands[0];
-    let got = match cmd.pages[0].header.as_ref().and_then(|h| h.sequence_type.as_ref()) {
-        Some(pb::page_header::SequenceType::Sequence(s)) => *s,
-        _ => panic!("command page carries no explicit sequence"),
-    };
-    assert_eq!(got, seq);
+    assert!(cmd.pages[0].header.is_none(), "command page carries a header");
 }
 
 #[then("the process-manager emits no commands")]

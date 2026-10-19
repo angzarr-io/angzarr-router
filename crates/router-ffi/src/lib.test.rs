@@ -194,12 +194,14 @@ unsafe extern "C" fn host_cb(
             STATUS_OK
         }
         CB_SAGA_EVENT => {
-            // Host translates the source event into one stamped command,
-            // stamping from the coordinator-supplied destination sequences.
+            // Host translates the source event into one command addressed
+            // to the source root (proving the source cover crosses in aux),
+            // and also returns a fact event the router must drop.
             let saux = abi_pb::SagaEventAux::decode(aux).expect("saga event aux");
-            let mut cmd = pb::CommandBook {
+            let cmd = pb::CommandBook {
                 cover: Some(pb::Cover {
                     domain: "inventory".to_string(),
+                    root: saux.source_cover.and_then(|c| c.root),
                     ..Default::default()
                 }),
                 pages: vec![pb::CommandPage {
@@ -210,26 +212,20 @@ unsafe extern "C" fn host_cb(
                     ..Default::default()
                 }],
             };
-            if let Some(&seq) = saux.destination_sequences.get("inventory") {
-                for page in &mut cmd.pages {
-                    page.header = Some(pb::PageHeader {
-                        sequence_type: Some(pb::page_header::SequenceType::Sequence(seq)),
-                        ..Default::default()
-                    });
-                }
-            }
             let resp = pb::SagaResponse {
                 commands: vec![cmd],
-                events: Vec::new(),
+                events: vec![pb::EventBook::default()],
             };
             host_fill(out, &resp.encode_to_vec());
             STATUS_OK
         }
         CB_PM_EVENT => {
             // Stateful PM: the host reacts to the newest trigger event and
-            // emits one stamped command, returning the full PM response.
-            let paux = abi_pb::PmEventAux::decode(aux).expect("pm event aux");
-            let mut cmd = pb::CommandBook {
+            // emits one command, returning the full PM response. No aux.
+            if !aux.is_empty() {
+                return -13; // PM event callbacks carry no aux
+            }
+            let cmd = pb::CommandBook {
                 cover: Some(pb::Cover {
                     domain: "inventory".to_string(),
                     ..Default::default()
@@ -242,14 +238,6 @@ unsafe extern "C" fn host_cb(
                     ..Default::default()
                 }],
             };
-            if let Some(&seq) = paux.destination_sequences.get("inventory") {
-                for page in &mut cmd.pages {
-                    page.header = Some(pb::PageHeader {
-                        sequence_type: Some(pb::page_header::SequenceType::Sequence(seq)),
-                        ..Default::default()
-                    });
-                }
-            }
             let resp = pb::ProcessManagerHandleResponse {
                 commands: vec![cmd],
                 ..Default::default()
@@ -393,8 +381,8 @@ fn increased_history(n: u32, next_sequence: u32) -> pb::EventBook {
 }
 
 #[test]
-fn abi_version_is_two() {
-    assert_eq!(angzarr_abi_version(), 2);
+fn abi_version_is_three() {
+    assert_eq!(angzarr_abi_version(), 3);
 }
 
 #[test]
@@ -792,23 +780,21 @@ impl Router {
     }
 }
 
-/// A SagaHandleRequest over a source book in `domain` carrying the given
-/// event pages, plus a destination-sequence map.
-fn saga_request(
-    domain: &str,
-    pages: Vec<pb::EventPage>,
-    dest: &[(&str, u32)],
-) -> pb::SagaHandleRequest {
+/// A SagaHandleRequest over a source book in `domain` (root `root`)
+/// carrying the given event pages.
+fn saga_request(domain: &str, root: &[u8], pages: Vec<pb::EventPage>) -> pb::SagaHandleRequest {
     pb::SagaHandleRequest {
         source: Some(pb::EventBook {
             cover: Some(pb::Cover {
                 domain: domain.to_string(),
+                root: Some(pb::Uuid {
+                    value: root.to_vec(),
+                }),
                 ..Default::default()
             }),
             pages,
             ..Default::default()
         }),
-        destination_sequences: dest.iter().map(|(d, s)| (d.to_string(), *s)).collect(),
         ..Default::default()
     }
 }
@@ -824,32 +810,27 @@ fn event_page_of(fq: &str) -> pb::EventPage {
 }
 
 #[test]
-fn saga_emits_stamped_command_through_the_abi() {
+fn saga_emits_command_through_the_abi() {
     // The whole saga path across raw pointers: register a saga, dispatch a
-    // source book, and confirm the host emitted one command stamped with the
-    // coordinator-supplied destination sequence.
+    // source book, and confirm the host saw the source cover (aux) and its
+    // command came back unstamped, with the host's fact event dropped.
     let router = Router::with_saga();
     let session = next_session();
-    let req = saga_request(
-        "order",
-        vec![event_page_of(FQ_ORDER_CREATED)],
-        &[("inventory", 7)],
-    );
+    let req = saga_request("order", b"root-1", vec![event_page_of(FQ_ORDER_CREATED)]);
     let (ret, bytes) = router.dispatch_saga(session, &req);
     assert_eq!(ret, 0);
     let resp = pb::SagaResponse::decode(bytes.as_slice()).expect("SagaResponse");
     assert_eq!(resp.commands.len(), 1, "one command emitted");
     let cmd = &resp.commands[0];
-    assert_eq!(cmd.cover.as_ref().unwrap().domain, "inventory");
-    let seq = match cmd.pages[0]
-        .header
-        .as_ref()
-        .and_then(|h| h.sequence_type.as_ref())
-    {
-        Some(pb::page_header::SequenceType::Sequence(s)) => *s,
-        _ => panic!("command page not stamped"),
-    };
-    assert_eq!(seq, 7, "host stamped the destination sequence over the ABI");
+    let cover = cmd.cover.as_ref().unwrap();
+    assert_eq!(cover.domain, "inventory");
+    assert_eq!(
+        cover.root.as_ref().map(|r| r.value.as_slice()),
+        Some(&b"root-1"[..]),
+        "source cover crossed the ABI in SagaEventAux"
+    );
+    assert!(cmd.pages[0].header.is_none(), "router stamps no sequence");
+    assert!(resp.events.is_empty(), "saga fact events are not emitted");
 }
 
 #[test]
@@ -939,7 +920,7 @@ impl Router {
 }
 
 /// A PM request over a trigger book in `domain` carrying the given pages.
-fn pm_request(domain: &str, pages: Vec<pb::EventPage>, dest: &[(&str, u32)]) -> pb::ProcessManagerHandleRequest {
+fn pm_request(domain: &str, pages: Vec<pb::EventPage>) -> pb::ProcessManagerHandleRequest {
     pb::ProcessManagerHandleRequest {
         trigger: Some(pb::EventBook {
             cover: Some(pb::Cover {
@@ -950,27 +931,23 @@ fn pm_request(domain: &str, pages: Vec<pb::EventPage>, dest: &[(&str, u32)]) -> 
             ..Default::default()
         }),
         process_state: None,
-        destination_sequences: dest.iter().map(|(d, s)| (d.to_string(), *s)).collect(),
+        ..Default::default()
     }
 }
 
 #[test]
-fn pm_emits_stamped_command_through_the_abi() {
+fn pm_emits_command_through_the_abi() {
     // The whole PM path across raw pointers: register a PM, dispatch a trigger
-    // whose newest page is the declared event, and confirm the host emitted
-    // one command stamped with the destination sequence.
+    // whose newest page is the declared event, and confirm the host's one
+    // command comes back unstamped.
     let router = Router::with_process_manager();
     let session = next_session();
-    let req = pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)], &[("inventory", 4)]);
+    let req = pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)]);
     let (ret, bytes) = router.dispatch_process_manager(session, &req);
     assert_eq!(ret, 0);
     let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
     assert_eq!(resp.commands.len(), 1);
-    let seq = match resp.commands[0].pages[0].header.as_ref().and_then(|h| h.sequence_type.as_ref()) {
-        Some(pb::page_header::SequenceType::Sequence(s)) => *s,
-        _ => panic!("command not stamped"),
-    };
-    assert_eq!(seq, 4, "host stamped the destination sequence over the ABI");
+    assert!(resp.commands[0].pages[0].header.is_none(), "router stamps no sequence");
 }
 
 #[test]
@@ -1002,7 +979,7 @@ fn two_process_managers_share_a_source_domain_route_by_type() {
     );
     let router = Router(r);
     let session = next_session();
-    let req = pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)], &[("inventory", 4)]);
+    let req = pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)]);
     let (ret, bytes) = router.dispatch_process_manager(session, &req);
     assert_eq!(ret, 0, "multi-PM routing should not report NO_HANDLER");
     let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");

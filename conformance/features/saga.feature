@@ -2,15 +2,15 @@ Feature: Order saga dispatch
 
   The OrderSaga proves the translation-side dispatch mechanisms the shared
   router must implement identically in every language: a declared source
-  event emits a command stamped with the coordinator-supplied destination
-  sequence, an undeclared event emits nothing, a source missing or empty is
-  refused with a coded error.
+  event emits a command (unstamped — the coordinator stamps sequences), an
+  undeclared event emits nothing, a source missing or empty is refused with a
+  coded error.
 
-  Scenario: a declared event emits a stamped command
+  Scenario: a declared event emits a command
     Given an order saga delivering to "inventory"
-    When an Increased event is dispatched with destination inventory sequence 7
+    When an Increased event is dispatched
     Then the saga emits one command to "inventory"
-    And the command carries destination sequence 7
+    And the command carries no router-stamped sequence
 
   Scenario: an undeclared event emits nothing
     Given an order saga delivering to "inventory"
