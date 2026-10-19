@@ -4,9 +4,11 @@
 - **Implemented:** conflict resolution, command upcasting, the rules version
   on every response, and claims for upcaster source types at registration.
 - **Implemented:** router-owned state across the C ABI for aggregates,
-  process managers and projectors, and the retirement of `host_ctx`.
-- **In progress:** the registration hello (`component_descriptor()`), per the owner rulings
-  recorded under "Registration and projectors" below.
+  process managers and projectors, the retirement of `host_ctx`, and the
+  registration hello (`component_descriptor()`), per the owner rulings
+  recorded under "Registration and projectors" below; C-0535 is bound.
+- **Implemented:** a failing host fold is INTERNAL, naming the failing event
+  (owner ruling, 2026-10-19; see "Router-owned state across the C ABI").
 - **Open:** how the rules version is sourced (the owner intends the binary's
   full build version, emitted by versionator).
 
@@ -206,21 +208,24 @@ language. Hosts only send it.
       first when a `changed()` is registered (`with_commutative`).
 - **Refusal.** A descriptor with an empty `rules_version` is refused
   `INVALID_ARGUMENT` (`MISSING_RULES_VERSION`), mirroring the coordinator.
+  The ErrorInfo metadata names the `component`.
   Every kind needs one, so sagas and projectors gain `with_rules_version`
   too.
 - **Rust API.**
   - `AggregateDispatch::component_descriptor()` and
     `ProcessManagerDispatch::component_descriptor()`, both with
     `S: prost::Name`.
-  - `..._with_state(state_type_url)` for state held as `Any`, which the C ABI
-    uses.
+  - `..._with_state(state_full_name)` for state held as `Any`, which the C
+    ABI uses; the name is the state message's fully-qualified name.
   - `SagaDispatch::component_descriptor()` and
     `ProjectorDispatch::component_descriptor()`.
 - **C ABI.**
   - New entry point: `angzarr_router_component_descriptors(r, out)`. It fills
     `out` with a serialized `ComponentDescriptors { repeated
     io.angzarr.v1.ComponentDescriptor components = 1; }` in registration
-    order, or with a status: the first refusal.
+    order, or with a status: the first refusal. Each hello is built when its
+    component registers (a registered table never changes), so a component
+    a registration refused has no hello.
   - The saga and projector descriptors gain `rules_version`.
 - **Binding.** C-0535 binds against the native order aggregate.
 
@@ -270,3 +275,18 @@ keep no state of any kind.
 
 Nothing is open from the earlier rounds. C-0535 and the C-ABI projectors are
 settled above.
+
+Choices this round made that no ruling covers (reported for sign-off):
+
+- **Locating the failing event.** The host fold is batched, so the router
+  learns the batch failed, not which event. It refolds the batch one page
+  at a time to name it; a batch whose pages all fold alone names its last
+  page.
+- **Scope of the fold ruling.** It covers host fold callbacks (aggregate and
+  process-manager state across the C ABI) only. A native Rust applier that
+  fails still answers `PERSISTED_EVENT_CORRUPT` (DATA_LOSS), and a C-ABI
+  projector's failing fold still keeps the host's status.
+- **Native `Router`.** `component_descriptor()` lives on each dispatch table;
+  the native `Router` (several components behind trait objects) does not
+  gather them, because its `CommandHandler` trait has no state type to
+  name.

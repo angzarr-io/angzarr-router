@@ -65,8 +65,8 @@ historical-state evidence the framework supplies.
 
 `crates/conformance/tests/handling.rs` binds angzarr-project's
 handler-contract tier (`features/handler-contract/handling.feature`,
-C-0533..C-0550) straight from the submodule; C-0535 (registration) is not
-bound yet. The fixtures are built by hand over the plain messages of
+C-0533..C-0550) straight from the submodule, C-0535 (registration) through
+the order aggregate's `component_descriptor()`. The fixtures are built by hand over the plain messages of
 `conformance/proto/orders/v1/order.proto`: `OrderState` keeps a quantity per
 item (conflict unit `items[<item>]`), a shipping address (its own unit) and
 unmarked notes (the wildcard `*notes`), with `changed()` hand-written to what

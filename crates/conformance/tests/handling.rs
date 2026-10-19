@@ -3,18 +3,11 @@
 //! the source, read from the submodule) to the Rust core: the order
 //! aggregate and the Fulfillment process manager built by hand over the
 //! orders.v1 fixture messages.
-//!
-//! C-0535 ("Registration announces the same build version") is not bound:
-//! the router produces no ComponentDescriptor (open in
-//! docs/design-handling.md).
 
 use angzarr_router::error::{CodedError, GrpcCode};
 use angzarr_router::pb;
 use angzarr_router_conformance as conf;
 use cucumber::{given, then, when, World};
-
-/// Scenarios this suite does not bind yet.
-const UNBOUND: &[&str] = &["C-0535"];
 
 #[derive(Debug, Default, World)]
 struct HandlingWorld {
@@ -25,6 +18,7 @@ struct HandlingWorld {
     snapshot: Option<pb::Snapshot>,
     result: Option<Result<pb::CommandHandlerResponse, CodedError>>,
     pm_result: Option<Result<pb::ProcessManagerHandleResponse, CodedError>>,
+    registration: Option<pb::ComponentDescriptor>,
 }
 
 impl HandlingWorld {
@@ -112,6 +106,30 @@ async fn reports(w: &mut HandlingWorld, version: String) {
         (None, None) => panic!("nothing was handled"),
     };
     assert_eq!(reported, version);
+}
+
+// The registration hello (types.proto ComponentDescriptor): the router builds
+// it from the aggregate's own table.
+#[when(r#"the "order" business binary registers with its coordinator"#)]
+async fn registers(w: &mut HandlingWorld) {
+    let order = conf::order_aggregate(&w.rules_version, w.settle.clone(), w.seen.clone());
+    w.registration = Some(order.component_descriptor().expect("a registration hello"));
+}
+
+#[then(regex = r#"^the registration carries rules version "([^"]*)"$"#)]
+async fn registration_version(w: &mut HandlingWorld, version: String) {
+    let hello = w.registration.as_ref().expect("the binary registered");
+    assert_eq!(hello.rules_version, version);
+}
+
+#[then("the registration carries the order state type")]
+async fn registration_state(w: &mut HandlingWorld) {
+    let hello = w.registration.as_ref().expect("the binary registered");
+    assert_eq!(hello.kind(), pb::ComponentKind::Aggregate);
+    assert_eq!(
+        hello.state.as_ref().map(|s| s.type_url.as_str()),
+        Some("/orders.v1.OrderState")
+    );
 }
 
 #[given(
@@ -279,8 +297,6 @@ async fn main() {
     );
     HandlingWorld::cucumber()
         .fail_on_skipped()
-        .filter_run_and_exit(feature, |_, _, scenario| {
-            !scenario.tags.iter().any(|t| UNBOUND.contains(&t.as_str()))
-        })
+        .run_and_exit(feature)
         .await;
 }
