@@ -376,3 +376,19 @@ fn a_batched_fold_failure_names_its_page_or_the_batchs_range() {
         "/test.Board",
     );
 }
+
+// types.proto Projection: without a finish step the router still answers the
+// projector's position: the last page's sequence + 1, or the book's
+// next_sequence when it has no pages (as the C ABI does).
+#[test]
+fn without_a_finish_the_projection_reports_its_next_sequence() {
+    let d = ProjectorDispatch::new("write-model", Folded::default);
+    let mut events = book("order", cover_pages("order", 2));
+    events.pages[0].sequence = 4;
+    events.pages[1].sequence = 5;
+    events.next_sequence = 9;
+    assert_eq!(d.dispatch(&events).expect("dispatch").next_sequence, 6);
+    let mut empty = book("order", vec![]);
+    empty.next_sequence = 9;
+    assert_eq!(d.dispatch(&empty).expect("dispatch").next_sequence, 9);
+}

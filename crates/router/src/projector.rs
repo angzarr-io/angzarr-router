@@ -2,7 +2,9 @@
 //!
 //! One projection instance per delivery folds every declared event page in
 //! order (the instance is reused across pages — spec C-0086), then an
-//! optional Finish packs it into the wire Projection. Unlike the aggregate
+//! optional Finish packs it into the wire Projection (without one, the
+//! Projection carries the cover, the projector's name and its next
+//! sequence). Unlike the aggregate
 //! there is no prior-state rebuild, no snapshot, and no rejection path: an
 //! event with no registered handler is skipped with a warn; events whose book cover carries an undeclared domain
 //! never fold, though Finish still runs.
@@ -219,10 +221,21 @@ impl<P> ProjectorDispatch<P> {
             None => Ok(pb::Projection {
                 cover: Some(cover.clone()),
                 projector: self.name.clone(),
+                next_sequence: next_sequence_after(events),
                 ..Default::default()
             }),
         }
     }
+}
+
+/// The projector's position after `events` (types.proto, Projection): the
+/// last page's sequence + 1, or the book's next_sequence when it has no
+/// pages.
+pub fn next_sequence_after(events: &pb::EventBook) -> u64 {
+    events
+        .pages
+        .last()
+        .map_or(events.next_sequence, |page| page.sequence + 1)
 }
 
 /// A handler error's text, for a failing fold's `fold_message`.

@@ -354,10 +354,7 @@ impl FfiRouter {
             Ok(pb::Projection {
                 cover: events.cover.clone(),
                 projector: name.clone(),
-                next_sequence: events
-                    .pages
-                    .last()
-                    .map_or(events.next_sequence, |page| page.sequence + 1),
+                next_sequence: angzarr_router::projector::next_sequence_after(events),
                 projection: Some(projection.clone()),
             })
         });
