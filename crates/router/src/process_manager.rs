@@ -201,11 +201,10 @@ impl<S> ProcessManagerDispatch<S> {
         let (mut state, _info) = self.rebuilder.rebuild(req.process_state.as_ref())?;
         let mut resp =
             thunk(event_any, &mut state, trigger.cover.as_ref()).map_err(map_handler_error)?;
-        // The post-handle snapshot, on every answer the PM handles (owner
-        // ruling): its state after its own process events, on its last
-        // process-event book (a book of its own when it emitted none; an
-        // empty cover is the PM's own stream). The coordinator stamps its
-        // sequence and rules version.
+        // The post-reaction state, on every answer the PM handles
+        // (process_manager.proto, process_state; decision 14.14): its state
+        // after its own process events, which stay payloads only. The
+        // coordinator stamps its sequence and rules version.
         let cover = req.process_state.as_ref().and_then(|b| b.cover.as_ref());
         let mut next = crate::next_sequence(req.process_state.as_ref());
         for book in &resp.process_events {
@@ -213,17 +212,13 @@ impl<S> ProcessManagerDispatch<S> {
                 .apply_emitted(&mut state, &book.pages, cover, next)?;
             next += book.pages.len() as u64;
         }
-        if let Some(image) = self.rebuilder.state_image(&state) {
-            if resp.process_events.is_empty() {
-                resp.process_events.push(pb::EventBook::default());
-            }
-            if let Some(last) = resp.process_events.last_mut() {
-                last.snapshot = Some(pb::Snapshot {
-                    state: Some(image),
-                    ..Default::default()
-                });
-            }
-        }
+        resp.process_state = self
+            .rebuilder
+            .state_image(&state)
+            .map(|image| pb::Snapshot {
+                state: Some(image),
+                ..Default::default()
+            });
         Ok(resp)
     }
 }
@@ -298,16 +293,31 @@ pub fn select_process_managers(
     matching(&|pm| pm.consumes(trigger_domain))
 }
 
-/// Folds one co-resident PM's response into the merged response: process
-/// events and commands concatenate in dispatch order. Co-hosted PMs share one
-/// binary and so one rules version: the merged response carries it.
-pub fn merge_response(
-    acc: &mut pb::ProcessManagerHandleResponse,
-    resp: pb::ProcessManagerHandleResponse,
-) {
-    acc.process_events.extend(resp.process_events);
-    acc.commands.extend(resp.commands);
-    acc.rules_version = resp.rules_version;
+/// Merges co-resident PMs' responses: process events and commands
+/// concatenate in dispatch order. Co-hosted PMs share one binary and so one
+/// rules version (`rules_version`), reported even when no PM answered. The
+/// process state is that of the one PM that handled the trigger.
+pub fn merge_responses(
+    rules_version: &str,
+    responses: impl IntoIterator<Item = pb::ProcessManagerHandleResponse>,
+) -> pb::ProcessManagerHandleResponse {
+    let mut merged = pb::ProcessManagerHandleResponse {
+        rules_version: rules_version.to_string(),
+        ..Default::default()
+    };
+    let mut states = Vec::new();
+    for resp in responses {
+        merged.process_events.extend(resp.process_events);
+        merged.commands.extend(resp.commands);
+        states.extend(resp.process_state);
+    }
+    // Only a PM that handled the trigger answers a state. Several handling
+    // one trigger is not settled by the spec (one process_state field):
+    // the merged answer then carries none, pending a ruling.
+    if states.len() == 1 {
+        merged.process_state = states.pop();
+    }
+    merged
 }
 
 #[cfg(test)]

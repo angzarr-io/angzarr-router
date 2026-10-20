@@ -19,7 +19,7 @@ at 4.
 
 ## Spec
 
-Source: angzarr-project `spec/20261019-draft` (b50d29b).
+Source: angzarr-project `spec/20261019-draft` (eb09fbd).
 
 - **Protos:**
   - `command_handler.proto`: `CommandHandlerService.Handle`,
@@ -350,10 +350,15 @@ Business code never decides when, and there is no request flag.
   state. A rejection is a gRPC error status with no response body
   (command_handler.proto), so it carries none.
 - **Process managers.** On every trigger the PM handles, its state after its
-  process events rides on its last process-event book, or on a book of its
-  own (no pages, empty cover: the PM's own stream) when it emitted none. A
-  trigger the PM does not handle (outside its sources, or an undeclared
-  type) answers nothing, as before.
+  process events is `ProcessManagerHandleResponse.process_state.state`
+  (field 5; decision 14.14, C-0571, spec eb09fbd); the process-event books
+  carry payloads only. A trigger the PM does not handle (outside its sources,
+  or an undeclared type) answers nothing, as before.
+- **Co-resident PMs** (`merge_responses`): process events and commands
+  concatenate; the process state is that of the one PM that handled the
+  trigger. **Pending a ruling:** when several co-resident PMs handle one
+  trigger, the spec has one `process_state` field and does not say whose
+  state it carries; the merged answer then carries none.
 - **Unset:** `snapshot.sequence` and `snapshot.rules_version`, which the
   coordinator stamps.
 - **The image.** Native state: the prost-encoded message

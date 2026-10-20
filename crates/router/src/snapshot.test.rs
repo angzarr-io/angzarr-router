@@ -1,7 +1,7 @@
 //! The post-command snapshot (owner ruling, round 7): the router fills
 //! `events.snapshot.state` with the state after the emitted events on every
 //! aggregate answer, and a process manager's state after its process events
-//! on every answer it handles. Business code never decides when; the
+//! in `process_state` on every answer it handles. Business code never decides when; the
 //! coordinator stamps the snapshot's sequence and rules version.
 
 use std::collections::BTreeMap;
@@ -282,8 +282,10 @@ fn trigger(fq: &str, state: &[&str]) -> pb::ProcessManagerHandleRequest {
     }
 }
 
+// process_manager.proto, process_state (decision 14.14, C-0571): the
+// post-reaction state has its own field; process events carry payloads only.
 #[test]
-fn a_process_manager_answers_its_state_after_its_process_events_on_its_last_book() {
+fn a_process_manager_answers_its_state_after_its_process_events_in_process_state() {
     let books = vec![
         pb::EventBook {
             pages: vec![event_page(cover_any("p"))],
@@ -298,27 +300,24 @@ fn a_process_manager_answers_its_state_after_its_process_events_on_its_last_book
         .dispatch(&trigger("test.Placed", &["a"]))
         .expect("handled");
     assert_eq!(resp.process_events.len(), 2);
-    assert!(resp.process_events[0].snapshot.is_none());
-    let snapshot = resp.process_events[1].snapshot.clone().expect("snapshot");
-    assert_eq!(snapshot.state, Some(image(&[("a", 1), ("p", 1), ("q", 1)])));
-    assert_eq!(snapshot.sequence, 0);
-    assert_eq!(snapshot.rules_version, "");
+    assert!(
+        resp.process_events.iter().all(|b| b.snapshot.is_none()),
+        "process events carry payloads only"
+    );
+    let state = resp.process_state.expect("the post-reaction state");
+    assert_eq!(state.state, Some(image(&[("a", 1), ("p", 1), ("q", 1)])));
+    assert_eq!(state.sequence, 0);
+    assert_eq!(state.rules_version, "");
 }
 
 #[test]
-fn a_process_manager_emitting_no_process_events_answers_its_state_in_a_book_of_its_own() {
+fn a_process_manager_emitting_no_process_events_still_answers_its_state() {
     let resp = pm(Vec::new())
         .dispatch(&trigger("test.Placed", &["a"]))
         .expect("handled");
-    assert_eq!(resp.process_events.len(), 1);
-    let book = &resp.process_events[0];
-    assert!(book.pages.is_empty());
-    assert!(
-        book.cover.is_none(),
-        "an empty cover is the PM's own stream"
-    );
+    assert!(resp.process_events.is_empty(), "no book of its own");
     assert_eq!(
-        book.snapshot.as_ref().and_then(|s| s.state.clone()),
+        resp.process_state.and_then(|s| s.state),
         Some(image(&[("a", 1)]))
     );
 }
@@ -329,6 +328,7 @@ fn a_trigger_the_process_manager_does_not_handle_answers_nothing() {
         .dispatch(&trigger("test.Other", &["a"]))
         .expect("not handled");
     assert_eq!(resp.process_events, Vec::new());
+    assert!(resp.process_state.is_none());
 }
 
 // The snapshot must equal what a rebuild would fold once the events are

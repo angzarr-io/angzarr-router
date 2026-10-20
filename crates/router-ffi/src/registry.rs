@@ -9,7 +9,7 @@ use angzarr_router::aggregate::{AggregateDispatch, CommandContext, FactRecord};
 use angzarr_router::error::{codes, messages, CodedError, HandlerError};
 use angzarr_router::pb;
 use angzarr_router::process_manager::{
-    merge_response, select_process_managers, ProcessManagerDispatch, ProcessManagerRoute,
+    merge_responses, select_process_managers, ProcessManagerDispatch, ProcessManagerRoute,
 };
 use angzarr_router::projector::ProjectorDispatch;
 use angzarr_router::rebuild::{FoldFailure, Rebuilder};
@@ -618,7 +618,7 @@ impl FfiRouter {
         // a process-state book belongs to one PM; a new
         // workflow's trigger reaches every PM consuming its domain, each
         // no-opping on event types it does not declare (C-0022). Responses
-        // merge in registration order (merge_response).
+        // merge in registration order (merge_responses).
         let routes: Vec<&dyn ProcessManagerRoute> = self
             .process_managers
             .iter()
@@ -626,18 +626,15 @@ impl FfiRouter {
             .collect();
         let selected = select_process_managers(&routes, &req);
         // Co-hosted PMs share one binary, so one rules version.
-        let mut merged = pb::ProcessManagerHandleResponse {
-            rules_version: self
-                .process_managers
-                .first()
-                .map(|(_, pm)| pm.rules_version().to_string())
-                .unwrap_or_default(),
-            ..Default::default()
-        };
-        for index in selected {
-            merge_response(&mut merged, self.process_managers[index].1.dispatch(&req)?);
-        }
+        let rules_version = self
+            .process_managers
+            .first()
+            .map_or("", |(_, pm)| pm.rules_version());
+        let responses = selected
+            .into_iter()
+            .map(|index| self.process_managers[index].1.dispatch(&req))
+            .collect::<Result<Vec<_>, _>>()?;
         // PM tail: an unconsumed trigger domain is a no-op (C-0022), not an error.
-        Ok(merged.encode_to_vec())
+        Ok(merge_responses(rules_version, responses).encode_to_vec())
     }
 }

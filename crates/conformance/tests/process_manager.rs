@@ -6,7 +6,7 @@
 use angzarr_router::error::CodedError;
 use angzarr_router::pb;
 use angzarr_router::process_manager::{
-    merge_response, select_process_managers, ProcessManagerRoute,
+    merge_responses, select_process_managers, ProcessManagerRoute,
 };
 use angzarr_router_conformance as conf;
 use cucumber::{given, then, when, World};
@@ -30,21 +30,14 @@ impl ProcessManagerWorld {
         let order = conf::order_pm();
         let audit = conf::audit_pm();
         let routes: [&dyn ProcessManagerRoute; 2] = [&order, &audit];
-        let mut merged = pb::ProcessManagerHandleResponse::default();
-        for index in select_process_managers(&routes, &req) {
-            let resp = match index {
+        let responses = select_process_managers(&routes, &req)
+            .into_iter()
+            .map(|index| match index {
                 0 => order.dispatch(&req),
                 _ => audit.dispatch(&req),
-            };
-            match resp {
-                Ok(resp) => merge_response(&mut merged, resp),
-                Err(err) => {
-                    self.result = Some(Err(err));
-                    return;
-                }
-            }
-        }
-        self.result = Some(Ok(merged));
+            })
+            .collect::<Result<Vec<_>, _>>();
+        self.result = Some(responses.map(|responses| merge_responses("", responses)));
     }
 
     /// The counts the order PM's process events recorded (one per reaction).

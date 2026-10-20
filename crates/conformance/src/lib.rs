@@ -929,6 +929,14 @@ pub fn order_aggregate(
             },
         )
         .apply(
+            "orders.v1.ItemDelivered",
+            |state: &mut orders::v1::OrderState, event| {
+                let item = orders::v1::ItemDelivered::decode(event.value.as_slice())?.item;
+                state.delivered.push(item);
+                Ok(())
+            },
+        )
+        .apply(
             "orders.v1.OrderNoteAdded",
             |state: &mut orders::v1::OrderState, event| {
                 state.notes = orders::v1::OrderNoteAdded::decode(event.value.as_slice())?.note;
@@ -984,6 +992,8 @@ pub fn order_aggregate(
                 ..Default::default()
             }))
         })
+        // Acknowledge: business code answers with no events.
+        .on_command("orders.v1.Acknowledge", |_cmd, _state, _cctx| Ok(None))
         .on_fact("orders.v1.ItemDelivered", move |fact, state| {
             let item = orders::v1::ItemDelivered::decode(fact.value.as_slice())
                 .map_err(|e| HandlerError::Other(format!("decode ItemDelivered: {e}")))?
@@ -1108,16 +1118,57 @@ pub fn order_snapshot(items: &[&str], rules_version: &str) -> pb::Snapshot {
 /// The Fulfillment process manager at `rules_version`: it reacts to
 /// OrderPlaced from "order" with nothing.
 pub fn fulfillment_pm(rules_version: &str) -> ProcessManagerDispatch<orders::v1::FulfillmentState> {
-    ProcessManagerDispatch::new(
-        "Fulfillment",
-        "fulfillment",
-        ["shipping"],
-        Rebuilder::of_message(),
-    )
-    .with_rules_version(rules_version)
-    .on_event("order", "orders.v1.OrderPlaced", |_e, _s, _c| {
-        Ok(pb::ProcessManagerHandleResponse::default())
-    })
+    fulfillment_pm_writing(rules_version, false)
+}
+
+/// [`fulfillment_pm`] that, when `writes`, reacts to OrderPlaced with one
+/// FulfillmentStarted process event, which counts into its state's `placed`.
+pub fn fulfillment_pm_writing(
+    rules_version: &str,
+    writes: bool,
+) -> ProcessManagerDispatch<orders::v1::FulfillmentState> {
+    let rebuilder = Rebuilder::of_message().apply(
+        "orders.v1.FulfillmentStarted",
+        |state: &mut orders::v1::FulfillmentState, _event| {
+            state.placed += 1;
+            Ok(())
+        },
+    );
+    ProcessManagerDispatch::new("Fulfillment", "fulfillment", ["shipping"], rebuilder)
+        .with_rules_version(rules_version)
+        .on_event("order", "orders.v1.OrderPlaced", move |_e, _s, _c| {
+            let process_events = if writes {
+                vec![pb::EventBook {
+                    pages: vec![pb::EventPage {
+                        payload: Some(orders_any(&orders::v1::FulfillmentStarted {})),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }]
+            } else {
+                Vec::new()
+            };
+            Ok(pb::ProcessManagerHandleResponse {
+                process_events,
+                ..Default::default()
+            })
+        })
+}
+
+/// The Fulfillment process manager's state with `placed`, as its process
+/// state image.
+pub fn fulfillment_state(placed: u32) -> prost_types::Any {
+    orders_any(&orders::v1::FulfillmentState { placed })
+}
+
+/// An order state image read back: its type URL, its items (sorted) with
+/// their quantities, and its delivered items in order. (Map encoding order
+/// is unspecified, so images compare decoded.)
+pub fn read_order_state(image: &prost_types::Any) -> (String, Vec<(String, u32)>, Vec<String>) {
+    let state = orders::v1::OrderState::decode(image.value.as_slice()).expect("OrderState");
+    let mut items: Vec<(String, u32)> = state.items.into_iter().collect();
+    items.sort();
+    (image.type_url.clone(), items, state.delivered)
 }
 
 /// An OrderPlaced trigger from "order".

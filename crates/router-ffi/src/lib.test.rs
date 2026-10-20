@@ -1627,12 +1627,9 @@ fn pm_fold_and_handler_succeed_on_either_ok_status() {
         assert_eq!(ret, 0, "callback status {ok} is success");
         let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).unwrap();
         assert!(resp.commands.is_empty());
-        assert_eq!(
-            resp.process_events
-                .iter()
-                .map(|b| b.pages.len())
-                .collect::<Vec<_>>(),
-            vec![0],
+        assert!(resp.process_events.is_empty());
+        assert!(
+            resp.process_state.is_some(),
             "a handler emitting nothing answers only its state"
         );
     }
@@ -2458,12 +2455,9 @@ fn a_pm_answer_carries_its_router_held_state() {
     let (ret, bytes) = router.dispatch_process_manager(&pm_over_state(snapshot_history_book()));
     assert_eq!(ret, 0);
     let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).unwrap();
-    assert_eq!(resp.process_events.len(), 1, "a book of its own");
-    assert_eq!(
-        resp.process_events[0]
-            .snapshot
-            .as_ref()
-            .and_then(|s| s.state.clone()),
-        Some(state_any(2))
+    assert!(
+        resp.process_events.is_empty(),
+        "process events carry payloads only"
     );
+    assert_eq!(resp.process_state.and_then(|s| s.state), Some(state_any(2)));
 }

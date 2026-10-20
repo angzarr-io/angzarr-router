@@ -370,9 +370,9 @@ fn accessors_report_name_domain_and_sources() {
     );
 }
 
-// --- co-resident routing (select_process_managers / merge_response) --------
+// --- co-resident routing (select_process_managers / merge_responses) -------
 
-use crate::process_manager::{merge_response, select_process_managers, ProcessManagerRoute};
+use crate::process_manager::{merge_responses, select_process_managers, ProcessManagerRoute};
 
 /// A PM named `name` owning `pm_domain`, consuming FQ_SHIPPED from `source`.
 fn routed_pm(name: &str, pm_domain: &str, source: &str) -> ProcessManagerDispatch<TestState> {
@@ -463,41 +463,64 @@ fn route_view_reports_identity_and_consumption() {
 
 #[test]
 fn merge_concatenates_in_order() {
-    let mut acc = pb::ProcessManagerHandleResponse::default();
-    merge_response(
-        &mut acc,
-        pb::ProcessManagerHandleResponse {
-            process_events: vec![tagged_book("p1")],
-            commands: vec![command_to("c1")],
-            ..Default::default()
-        },
+    let merged = merge_responses(
+        "v1",
+        vec![
+            pb::ProcessManagerHandleResponse {
+                process_events: vec![tagged_book("p1")],
+                commands: vec![command_to("c1")],
+                ..Default::default()
+            },
+            pb::ProcessManagerHandleResponse {
+                process_events: vec![tagged_book("p2")],
+                commands: vec![command_to("c2")],
+                rules_version: "v2".to_string(),
+                ..Default::default()
+            },
+        ],
     );
-    merge_response(
-        &mut acc,
-        pb::ProcessManagerHandleResponse {
-            process_events: vec![tagged_book("p2")],
-            commands: vec![command_to("c2")],
-            rules_version: "v2".to_string(),
-        },
-    );
-    merge_response(
-        &mut acc,
-        pb::ProcessManagerHandleResponse {
-            rules_version: "v3".to_string(),
-            ..Default::default()
-        },
-    );
-    assert_eq!(book_domains(&acc.process_events), vec!["p1", "p2"]);
-    let cmd_domains: Vec<_> = acc
+    assert_eq!(book_domains(&merged.process_events), vec!["p1", "p2"]);
+    let cmd_domains: Vec<_> = merged
         .commands
         .iter()
         .map(|c| c.cover.as_ref().unwrap().domain.clone())
         .collect();
     assert_eq!(cmd_domains, vec!["c1", "c2"]);
     assert_eq!(
-        acc.rules_version, "v3",
-        "co-hosted PMs share one version: the last stands"
+        merged.rules_version, "v1",
+        "co-hosted PMs share one binary, so one version"
     );
+}
+
+/// A response carrying process state `label`.
+fn with_state(label: &str) -> pb::ProcessManagerHandleResponse {
+    pb::ProcessManagerHandleResponse {
+        process_state: Some(pb::Snapshot {
+            state: Some(crate::test_support::cover_any(label)),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+// process_manager.proto, process_state (decision 14.14): the PM that handled
+// the trigger answers its state; PMs the trigger reached but that did not
+// handle it answer nothing, so their (absent) state never displaces it.
+#[test]
+fn merge_keeps_the_process_state_of_the_one_pm_that_handled_the_trigger() {
+    let merged = merge_responses(
+        "v",
+        vec![
+            pb::ProcessManagerHandleResponse::default(),
+            with_state("handled"),
+            pb::ProcessManagerHandleResponse::default(),
+        ],
+    );
+    assert_eq!(
+        merged.process_state.and_then(|s| s.state),
+        Some(crate::test_support::cover_any("handled"))
+    );
+    assert!(merge_responses("v", Vec::new()).process_state.is_none());
 }
 
 // The handler reads the trigger's cover (e.g. to address the trigger's root).

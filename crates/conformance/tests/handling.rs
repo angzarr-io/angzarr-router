@@ -1,5 +1,5 @@
 //! Binds angzarr-project's handler-contract tier
-//! (features/handler-contract/handling.feature, C-0533..C-0550 and C-0565; the spec is
+//! (features/handler-contract/handling.feature, C-0533..C-0550, C-0565, C-0570 and C-0571; the spec is
 //! the source, read from the submodule) to the Rust core: the order
 //! aggregate and the Fulfillment process manager built by hand over the
 //! orders.v1 fixture messages.
@@ -19,6 +19,7 @@ struct HandlingWorld {
     result: Option<Result<pb::CommandHandlerResponse, CodedError>>,
     pm_result: Option<Result<pb::ProcessManagerHandleResponse, CodedError>>,
     saga: Option<(String, String)>,
+    pm_placed: u32,
     described: Vec<pb::ComponentDescriptor>,
 }
 
@@ -210,6 +211,93 @@ async fn handled(w: &mut HandlingWorld, command: String, item: String) {
 #[when(regex = r#"^a fact (\w+) "([^"]*)" is handled over no prior events$"#)]
 async fn fact_handled(w: &mut HandlingWorld, fact: String, item: String) {
     w.dispatch(conf::order_fact(&fact, &item));
+}
+
+// --- the state on every answer (C-0570, C-0571; decisions 14.12, 14.14) -------
+
+#[given("business code that never mentions snapshots")]
+async fn never_mentions_snapshots(_w: &mut HandlingWorld) {}
+
+#[when(regex = r#"^(.+) is handled over ItemAdded "([^"]*)"$"#)]
+async fn delivery_over(w: &mut HandlingWorld, delivery: String, prior: String) {
+    let history = [("ItemAdded".to_string(), prior)];
+    let quoted = |text: &str| text.split('"').nth(1).unwrap_or_default().to_string();
+    let req = if delivery == "a command that business code answers with no events" {
+        conf::order_command("Acknowledge", "", &history, None, None)
+    } else if let Some(fact) = delivery.strip_prefix("a fact ") {
+        let mut req = conf::order_fact(fact.split(' ').next().unwrap(), &quoted(fact));
+        req.events = conf::order_command("AddItem", "", &history, None, None).events;
+        req
+    } else {
+        let command = delivery.split(' ').next().unwrap().to_string();
+        conf::order_command(&command, &quoted(&delivery), &history, None, None)
+    };
+    w.dispatch(req);
+}
+
+#[then(regex = r#"^the answer carries the order state with (.+) as its snapshot state$"#)]
+async fn answer_carries_state(w: &mut HandlingWorld, described: String) {
+    // `items "pear" and "apple"`, `item "pear"`, or `item "pear" and "apple"
+    // delivered` (the last quoted item delivered).
+    let quoted: Vec<&str> = described.split('"').skip(1).step_by(2).collect();
+    let (items, delivered) = if described.ends_with("delivered") {
+        quoted.split_at(quoted.len() - 1)
+    } else {
+        (quoted.as_slice(), &[][..])
+    };
+    let snapshot = w
+        .accepted()
+        .events
+        .as_ref()
+        .and_then(|b| b.snapshot.clone())
+        .expect("the answer's snapshot");
+    let mut expected: Vec<(String, u32)> = items.iter().map(|i| (i.to_string(), 1)).collect();
+    expected.sort();
+    assert_eq!(
+        conf::read_order_state(&snapshot.state.expect("a state")),
+        (
+            "/orders.v1.OrderState".to_string(),
+            expected,
+            delivered.iter().map(|d| d.to_string()).collect()
+        )
+    );
+}
+
+#[when(
+    regex = r"^the process manager handles an OrderPlaced event (and writes a FulfillmentStarted event|without writing a process event)$"
+)]
+async fn pm_handles_writing(w: &mut HandlingWorld, writing: String) {
+    let writes = writing.starts_with("and writes");
+    w.pm_placed = u32::from(writes);
+    let pm = conf::fulfillment_pm_writing(&w.pm_rules_version, writes);
+    w.pm_result = Some(pm.dispatch(&conf::order_placed_trigger()));
+}
+
+fn pm_answer(w: &HandlingWorld) -> &pb::ProcessManagerHandleResponse {
+    w.pm_result
+        .as_ref()
+        .expect("the PM handled")
+        .as_ref()
+        .expect("the PM answered")
+}
+
+#[then("the answer's process state is the process manager's state after the reaction")]
+async fn pm_process_state(w: &mut HandlingWorld) {
+    assert_eq!(
+        pm_answer(w)
+            .process_state
+            .as_ref()
+            .and_then(|s| s.state.clone()),
+        Some(conf::fulfillment_state(w.pm_placed))
+    );
+}
+
+#[then("none of the answer's process events carry a state")]
+async fn pm_events_carry_no_state(w: &mut HandlingWorld) {
+    assert!(pm_answer(w)
+        .process_events
+        .iter()
+        .all(|b| b.snapshot.is_none()));
 }
 
 #[then("the command is accepted")]

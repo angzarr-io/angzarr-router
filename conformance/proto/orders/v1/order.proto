@@ -35,6 +35,14 @@ message OrderNoteAdded {
 }
 message OrderPlaced {}
 
+// Acknowledge is a command business code answers with no events.
+message Acknowledge {
+  string item = 1;
+}
+
+// The Fulfillment process manager's process event: it started fulfilling.
+message FulfillmentStarted {}
+
 // Facts. ItemDeliveredV1 is ItemDelivered's old name.
 message ItemDelivered {
   string item = 1;
@@ -50,6 +58,8 @@ message OrderState {
   map<string, uint32> items = 1;
   string shipping_address = 2;
   string notes = 3;
+  // The items delivered (the ItemDelivered facts recorded), in order.
+  repeated string delivered = 4;
 }
 
 // The Fulfillment process manager's state.

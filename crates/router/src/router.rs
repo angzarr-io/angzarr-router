@@ -25,7 +25,7 @@ use crate::aggregate::AggregateDispatch;
 use crate::error::{codes, extras, messages, CodedError};
 use crate::pb;
 use crate::process_manager::{
-    merge_response, select_process_managers, ProcessManagerDispatch, ProcessManagerRoute,
+    merge_responses, select_process_managers, ProcessManagerDispatch, ProcessManagerRoute,
 };
 use crate::projector::ProjectorDispatch;
 use crate::saga::SagaDispatch;
@@ -531,17 +531,12 @@ impl Router {
             .collect();
         // Co-hosted PMs share one binary, so one rules version: reported even
         // when no PM consumed the trigger.
-        let mut merged = pb::ProcessManagerHandleResponse {
-            rules_version: pms
-                .first()
-                .map(|pm| pm.rules_version().to_string())
-                .unwrap_or_default(),
-            ..Default::default()
-        };
-        for index in select_process_managers(&routes, req) {
-            merge_response(&mut merged, pms[index].dispatch(req)?);
-        }
-        Ok(merged)
+        let rules_version = pms.first().map_or("", |pm| pm.rules_version());
+        let responses = select_process_managers(&routes, req)
+            .into_iter()
+            .map(|index| pms[index].dispatch(req))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(merge_responses(rules_version, responses))
     }
 
     /// Runs every projector over the book, one Projection each, in
