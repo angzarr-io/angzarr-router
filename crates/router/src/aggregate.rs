@@ -375,7 +375,8 @@ impl<S> AggregateDispatch<S> {
                 [],
             ));
         };
-        let events = match &page.body {
+        let cover = req.events.as_ref().and_then(|b| b.cover.as_ref());
+        let (mut events, state) = match &page.body {
             Some(pb::command_page::Body::Command(command)) => {
                 let sent = non_empty_payload(command.payload.as_ref())?;
                 let any = self.upcast(sent)?;
@@ -391,9 +392,9 @@ impl<S> AggregateDispatch<S> {
                 let Some(thunk) = self.facts.get(crate::type_name_from_url(&any.type_url)) else {
                     return Err(self.unknown(codes::NO_FACT_HANDLER, sent, &any));
                 };
-                let (state, _) = self.rebuilder.rebuild(req.events.as_ref())?;
+                let (mut state, _) = self.rebuilder.rebuild(req.events.as_ref())?;
                 let record = thunk(&any, &state).map_err(map_handler_error)?;
-                pb::EventBook {
+                let recorded = pb::EventBook {
                     pages: std::iter::once(record.fact)
                         .chain(record.flags)
                         .map(|payload| pb::EventPage {
@@ -402,7 +403,14 @@ impl<S> AggregateDispatch<S> {
                         })
                         .collect(),
                     ..Default::default()
-                }
+                };
+                self.rebuilder.apply_emitted(
+                    &mut state,
+                    &recorded.pages,
+                    cover,
+                    crate::next_sequence(req.events.as_ref()),
+                )?;
+                (recorded, state)
             }
             None => {
                 return Err(CodedError::invalid_argument(
@@ -412,6 +420,14 @@ impl<S> AggregateDispatch<S> {
                 ));
             }
         };
+        // The post-command snapshot, on every answer (owner ruling): the
+        // coordinator stamps its sequence and rules version.
+        if let Some(image) = self.rebuilder.state_image(&state) {
+            events.snapshot = Some(pb::Snapshot {
+                state: Some(image),
+                ..Default::default()
+            });
+        }
         Ok(pb::CommandHandlerResponse {
             events: Some(events),
             rules_version: self.rules_version.clone(),
@@ -456,15 +472,23 @@ impl<S> AggregateDispatch<S> {
     ///   decides on the head and keeps the events iff the window's units and
     ///   the command's do not overlap (else CONFLICT_OVERLAP); with none
     ///   registered, CONFLICT_RESOLUTION_UNSUPPORTED, before rebuild.
+    ///
+    /// Answers decide's events and the state after them: the head with the
+    /// events folded in (origin Emitted).
     fn decide(
         &self,
         req: &pb::ContextualCommand,
         command_book: &pb::CommandBook,
         any: &Any,
         thunk: &CommandFn<S>,
-    ) -> Result<pb::EventBook, CodedError> {
+    ) -> Result<(pb::EventBook, S), CodedError> {
         let events = req.events.as_ref();
         let next_sequence = crate::next_sequence(events);
+        let cover = events.and_then(|b| b.cover.as_ref());
+        let fold_emitted = |state: &mut S, out: &pb::EventBook| {
+            self.rebuilder
+                .apply_emitted(state, &out.pages, cover, next_sequence)
+        };
         let handling = command_book.handling.unwrap_or_default();
         let expected_sequence = handling.expected_sequence.unwrap_or(next_sequence);
         let conflict_resolution = pb::ConflictResolution::try_from(handling.conflict_resolution)
@@ -500,7 +524,8 @@ impl<S> AggregateDispatch<S> {
                         [],
                     ));
                 }
-                Ok(out)
+                fold_emitted(&mut state, &out)?;
+                Ok((out, state))
             }
             pb::ConflictResolution::Commutative => {
                 let Some(resolver) = self.commutative.as_ref() else {
@@ -512,7 +537,6 @@ impl<S> AggregateDispatch<S> {
                 };
                 let had_prior_events =
                     events.is_some_and(|b| !b.pages.is_empty() || b.snapshot.is_some());
-                let cover = events.and_then(|b| b.cover.as_ref());
                 let (prefix, window) = split_at_expected(events, expected_sequence);
                 let (mut state, _) = self.rebuilder.rebuild(Some(&prefix))?;
                 let resolved = resolver.resolve(
@@ -522,10 +546,7 @@ impl<S> AggregateDispatch<S> {
                             .apply_pages(state, &window, cover, PageOrigin::Persisted)
                     },
                     &mut |state| run(state, context(had_prior_events, None)),
-                    &mut |state, book| {
-                        self.rebuilder
-                            .apply_pages(state, &book.pages, cover, PageOrigin::Emitted)
-                    },
+                    &mut |state, book| fold_emitted(state, book),
                 )?;
                 if crate::conflict::overlap(&resolved.window, &resolved.mine) {
                     return Err(CodedError::stale(
@@ -537,11 +558,15 @@ impl<S> AggregateDispatch<S> {
                         ],
                     ));
                 }
-                Ok(resolved.events)
+                // The resolver leaves the state at the head plus the
+                // command's events.
+                Ok((resolved.events, state))
             }
             _ => {
                 let (mut state, info) = self.rebuilder.rebuild(events)?;
-                run(&mut state, context(info.had_prior_events, None))
+                let out = run(&mut state, context(info.had_prior_events, None))?;
+                fold_emitted(&mut state, &out)?;
+                Ok((out, state))
             }
         }
     }

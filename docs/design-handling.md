@@ -337,6 +337,34 @@ whose hello fails. An upcaster router has none.
 |---|---|---|
 | `FoldFailure` | new message: `optional uint32 page_index = 1`, `string message = 2` | none |
 
+## The post-command snapshot (round 7)
+
+Owner ruling: the router answers the component's state with EVERY response.
+Business code never decides when, and there is no request flag.
+
+- **Aggregates.** `CommandHandlerResponse.events.snapshot.state` is the state
+  after the answer's events: the head with the emitted events (or a fact's
+  record) folded in. A command emitting nothing still answers the current
+  state. A rejection is a gRPC error status with no response body
+  (command_handler.proto), so it carries none.
+- **Process managers.** On every trigger the PM handles, its state after its
+  process events rides on its last process-event book, or on a book of its
+  own (no pages, empty cover: the PM's own stream) when it emitted none. A
+  trigger the PM does not handle (outside its sources, or an undeclared
+  type) answers nothing, as before.
+- **Unset:** `snapshot.sequence` and `snapshot.rules_version`, which the
+  coordinator stamps.
+- **The image.** Native state: the prost-encoded message
+  (`Rebuilder::of_message`); `Rebuilder::with_state_image` declares another.
+  Across the C ABI: the state bytes the router holds. A rebuilder with no
+  image (`Rebuilder::new` alone) answers no snapshot.
+- **Emitted events fold at the sequences they will get.** The fold sees each
+  emitted page at the head's next sequence onward, so the snapshot equals
+  what a rebuild folds once the coordinator stamps them; the answered pages
+  stay unstamped. Across the C ABI this is one more host fold call per
+  answer. A failing fold of an emitted event is INTERNAL with the "emitted"
+  message, as COMMUTATIVE's already was.
+
 ## Open
 
 Choices no ruling covers, reported for sign-off:

@@ -112,3 +112,7 @@ mod lib_tests;
 #[cfg(test)]
 #[path = "handling.test.rs"]
 mod handling_tests;
+
+#[cfg(test)]
+#[path = "snapshot.test.rs"]
+mod snapshot_tests;

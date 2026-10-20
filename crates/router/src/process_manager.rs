@@ -199,7 +199,32 @@ impl<S> ProcessManagerDispatch<S> {
         };
 
         let (mut state, _info) = self.rebuilder.rebuild(req.process_state.as_ref())?;
-        thunk(event_any, &mut state, trigger.cover.as_ref()).map_err(map_handler_error)
+        let mut resp =
+            thunk(event_any, &mut state, trigger.cover.as_ref()).map_err(map_handler_error)?;
+        // The post-handle snapshot, on every answer the PM handles (owner
+        // ruling): its state after its own process events, on its last
+        // process-event book (a book of its own when it emitted none; an
+        // empty cover is the PM's own stream). The coordinator stamps its
+        // sequence and rules version.
+        let cover = req.process_state.as_ref().and_then(|b| b.cover.as_ref());
+        let mut next = crate::next_sequence(req.process_state.as_ref());
+        for book in &resp.process_events {
+            self.rebuilder
+                .apply_emitted(&mut state, &book.pages, cover, next)?;
+            next += book.pages.len() as u64;
+        }
+        if let Some(image) = self.rebuilder.state_image(&state) {
+            if resp.process_events.is_empty() {
+                resp.process_events.push(pb::EventBook::default());
+            }
+            if let Some(last) = resp.process_events.last_mut() {
+                last.snapshot = Some(pb::Snapshot {
+                    state: Some(image),
+                    ..Default::default()
+                });
+            }
+        }
+        Ok(resp)
     }
 }
 

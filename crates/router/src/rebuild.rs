@@ -52,7 +52,12 @@ pub struct Rebuilder<S> {
     fold: Option<FoldFn<S>>,
     /// The state message's type URL ("" when undeclared).
     state_type_url: String,
+    /// The state's snapshot image (none when undeclared).
+    image: Option<ImageFn<S>>,
 }
+
+/// A state's snapshot image: the serialized state message as an `Any`.
+pub type ImageFn<S> = Box<dyn Fn(&S) -> Any + Send + Sync>;
 
 /// How a batched fold failed: the index of the failing page within the
 /// batch it was handed, when it knows, and its own text.
@@ -145,16 +150,35 @@ impl<S> Rebuilder<S> {
             appliers: HashMap::new(),
             fold: None,
             state_type_url: String::new(),
+            image: None,
         }
     }
 
     /// A Rebuilder starting from `S::default()` whose state type comes from
     /// `S`'s prost name: nobody declares the string by hand.
+    /// Its snapshot image is the prost-encoded state.
     pub fn of_message() -> Self
     where
         S: prost::Name + Default + 'static,
     {
-        Rebuilder::new(S::default).with_state_type(&S::full_name())
+        Rebuilder::new(S::default)
+            .with_state_type(&S::full_name())
+            .with_state_image(|state: &S| Any {
+                type_url: crate::type_url(&S::full_name()),
+                value: prost::Message::encode_to_vec(state),
+            })
+    }
+
+    /// Declares how the state becomes a snapshot image (an `Any` of the state
+    /// message), for state held as something other than its own message.
+    pub fn with_state_image(mut self, image: impl Fn(&S) -> Any + Send + Sync + 'static) -> Self {
+        self.image = Some(Box::new(image));
+        self
+    }
+
+    /// The snapshot image of `state`, when the rebuilder declares one.
+    pub fn state_image(&self, state: &S) -> Option<Any> {
+        self.image.as_ref().map(|image| image(state))
     }
 
     /// Declares the state message's fully-qualified name, for state held as
@@ -335,6 +359,29 @@ impl<S> Rebuilder<S> {
             self.fold_page(state, page, cover, origin)?;
         }
         Ok(())
+    }
+
+    /// Folds `pages` a handler emitted (not yet persisted) into `state`,
+    /// each seen at the sequence it will be given: `next_sequence` onward,
+    /// in order (the pages themselves stay unstamped). A failure is a
+    /// handler bug naming the command's own event
+    /// ([`PageOrigin::Emitted`]).
+    pub fn apply_emitted(
+        &self,
+        state: &mut S,
+        pages: &[pb::EventPage],
+        cover: Option<&pb::Cover>,
+        next_sequence: u64,
+    ) -> Result<(), CodedError> {
+        let numbered: Vec<pb::EventPage> = pages
+            .iter()
+            .zip(next_sequence..)
+            .map(|(page, sequence)| pb::EventPage {
+                sequence,
+                ..page.clone()
+            })
+            .collect();
+        self.apply_pages(state, &numbered, cover, PageOrigin::Emitted)
     }
 
     /// Folds one persisted page of a book with `cover` into `state` through

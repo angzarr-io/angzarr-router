@@ -592,8 +592,8 @@ fn empty_history_command_emits_unstamped_events() {
     assert_eq!(ret, 0);
     let book = decode_events(&bytes);
     assert_eq!(
-        book,
-        increased_book(2),
+        book.pages,
+        increased_book(2).pages,
         "the host's book crosses back as emitted: the coordinator stamps sequences"
     );
 
@@ -603,7 +603,11 @@ fn empty_history_command_emits_unstamped_events() {
         vec![(0, false)],
         "fresh aggregate evidence"
     );
-    assert!(s.fold_calls.is_empty(), "no history: the fold must not run");
+    assert_eq!(
+        s.fold_calls,
+        vec![vec![0, 1]],
+        "no history to fold: only the emitted events"
+    );
     assert_eq!(s.observed_state, vec![0]);
 }
 
@@ -620,8 +624,8 @@ fn prior_events_fold_through_one_host_fold_call() {
     let s = observations();
     assert_eq!(
         s.fold_calls,
-        vec![vec![0, 1]],
-        "one batched call over both pages"
+        vec![vec![0, 1], vec![2]],
+        "one batched call over both pages, then one over the emitted event"
     );
     assert_eq!(
         s.observed_state,
@@ -636,8 +640,8 @@ fn prior_events_fold_through_one_host_fold_call() {
 
     let book = decode_events(&bytes);
     assert_eq!(
-        book,
-        increased_book(1),
+        book.pages,
+        increased_book(1).pages,
         "the emitted book crosses back unstamped"
     );
 }
@@ -675,8 +679,8 @@ fn snapshot_loads_and_covered_pages_skip() {
     let s = observations();
     assert_eq!(
         s.fold_calls,
-        vec![vec![3]],
-        "the covered page never reaches the fold"
+        vec![vec![3], vec![4]],
+        "the covered page never reaches the fold (then the emitted event)"
     );
     assert_eq!(
         s.observed_state,
@@ -1479,7 +1483,11 @@ fn a_delivered_snapshot_is_the_initial_state_the_fold_continues() {
     let (ret, _) = router.dispatch(&increase_one(Some(snapshot_history_book())));
     assert_eq!(ret, 0);
     let seen = observations();
-    assert_eq!(seen.fold_calls, vec![vec![1]], "only the uncovered page");
+    assert_eq!(
+        seen.fold_calls,
+        vec![vec![1], vec![2]],
+        "only the uncovered page, then the emitted event at its coming sequence"
+    );
     assert_eq!(seen.observed_state, vec![2], "snapshot 1 + one folded page");
 }
 
@@ -1517,7 +1525,11 @@ fn a_fresh_aggregate_starts_from_the_registered_state_types_default() {
     let (ret, _) = router.dispatch(&increase_one(None));
     assert_eq!(ret, 0);
     let seen = observations();
-    assert!(seen.fold_calls.is_empty(), "nothing to fold");
+    assert_eq!(
+        seen.fold_calls,
+        vec![vec![0]],
+        "no history to fold; only the emitted event"
+    );
     assert_eq!(seen.observed_state, vec![0]);
     assert_eq!(
         seen.observed_state_type,
@@ -1613,10 +1625,15 @@ fn pm_fold_and_handler_succeed_on_either_ok_status() {
         let router = pm_with(CB_OK_EMPTY, ok);
         let (ret, bytes) = router.dispatch_process_manager(&pm_over_state(snapshot_history_book()));
         assert_eq!(ret, 0, "callback status {ok} is success");
+        let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).unwrap();
+        assert!(resp.commands.is_empty());
         assert_eq!(
-            pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).unwrap(),
-            pb::ProcessManagerHandleResponse::default(),
-            "a handler emitting nothing is an empty response"
+            resp.process_events
+                .iter()
+                .map(|b| b.pages.len())
+                .collect::<Vec<_>>(),
+            vec![0],
+            "a handler emitting nothing answers only its state"
         );
     }
 }
@@ -1755,7 +1772,12 @@ fn appliers_see_their_page_place_through_the_abi() {
     assert_eq!(ret, 0);
     assert_eq!(
         observations().applied_pages,
-        vec![(history.cover.clone(), 0), (history.cover.clone(), 1)]
+        vec![
+            (history.cover.clone(), 0),
+            (history.cover.clone(), 1),
+            (history.cover.clone(), 2),
+        ],
+        "the history, then the emitted event under the same cover at its coming sequence"
     );
 }
 
@@ -1987,7 +2009,7 @@ fn aggregate_handles_crosses_the_window_and_nonce_and_keeps_resolved_output() {
         b"n-1",
     ));
     assert_eq!(ret, 0);
-    assert_eq!(decode_events(&bytes), increased_book(1));
+    assert_eq!(decode_events(&bytes).pages, increased_book(1).pages);
     assert_eq!(
         observations().observed_handling,
         vec![(
@@ -2029,7 +2051,7 @@ fn commutative_runs_the_resolver_over_host_state_through_the_abi() {
         b"n-1",
     ));
     assert_eq!(ret, 0, "disjoint: kept");
-    assert_eq!(decode_events(&bytes), increased_book(1));
+    assert_eq!(decode_events(&bytes).pages, increased_book(1).pages);
     let seen = observations();
     assert_eq!(seen.changed_calls, vec![(1, 2), (2, 3)]);
     assert_eq!(
@@ -2086,7 +2108,7 @@ fn a_command_upcaster_runs_before_dispatch_through_the_abi() {
         None,
     ));
     assert_eq!(ret, 0, "IncreaseByV1 upcast to IncreaseBy");
-    assert_eq!(decode_events(&bytes), increased_book(2));
+    assert_eq!(decode_events(&bytes).pages, increased_book(2).pages);
 }
 
 // CommandHandlerResponse / ProcessManagerHandleResponse.rules_version:
@@ -2389,5 +2411,59 @@ fn an_aggregate_registered_without_a_state_type_refuses_its_hello() {
     assert_eq!(
         decode_status(&bytes).1,
         angzarr_router::error::codes::MISSING_STATE_TYPE
+    );
+}
+
+// --- the post-command snapshot (owner ruling, round 7) ----------------------
+
+#[test]
+fn every_command_answer_carries_the_router_held_state_after_its_events() {
+    let router = Router::with_counter();
+    reset_observations();
+    let (ret, bytes) = router.dispatch(&command_req(
+        FQ_INCREASE_BY,
+        IncreaseBy { n: 3 }.encode_to_vec(),
+        Some(increased_history(2, 2)),
+    ));
+    assert_eq!(ret, 0);
+    let book = decode_events(&bytes);
+    let snapshot = book.snapshot.expect("the post-command snapshot");
+    assert_eq!(snapshot.state, Some(state_any(5)));
+    assert_eq!(snapshot.sequence, 0, "the coordinator stamps it");
+    assert_eq!(snapshot.rules_version, "");
+    assert_eq!(
+        observations().fold_calls,
+        vec![vec![0, 1], vec![2, 3, 4]],
+        "the rebuild, then the emitted events at the sequences they will get"
+    );
+}
+
+#[test]
+fn a_command_emitting_nothing_answers_the_current_state() {
+    let router = Router::with_counter();
+    let (ret, bytes) = router.dispatch(&command_req(
+        FQ_RETURN_NOTHING,
+        Vec::new(),
+        Some(increased_history(1, 1)),
+    ));
+    assert_eq!(ret, 0);
+    let book = decode_events(&bytes);
+    assert!(book.pages.is_empty());
+    assert_eq!(book.snapshot.and_then(|s| s.state), Some(state_any(1)));
+}
+
+#[test]
+fn a_pm_answer_carries_its_router_held_state() {
+    let router = pm_with(CB_FOLD, CB_PM_EVENT);
+    let (ret, bytes) = router.dispatch_process_manager(&pm_over_state(snapshot_history_book()));
+    assert_eq!(ret, 0);
+    let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).unwrap();
+    assert_eq!(resp.process_events.len(), 1, "a book of its own");
+    assert_eq!(
+        resp.process_events[0]
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.state.clone()),
+        Some(state_any(2))
     );
 }

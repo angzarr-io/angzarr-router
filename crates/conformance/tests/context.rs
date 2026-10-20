@@ -32,9 +32,13 @@ async fn fact_handled(w: &mut ContextWorld, fact: String, prior: String) {
     w.fact = Some(ledger.dispatch(&conf::ledger_fact(&fact, prior)));
 }
 
-#[then(regex = r"^the ledger applied Increased events at sequences (\d+) and (\d+)$")]
-async fn applied_at(w: &mut ContextWorld, first: u64, second: u64) {
-    assert_eq!(*w.applied.lock().unwrap(), vec![first, second]);
+// The router folds the command's own event too, at the sequence it will be
+// given, for the snapshot it answers with.
+#[then(
+    regex = r"^the ledger applied Increased events at sequences (\d+) and (\d+), then its emitted event at (\d+)$"
+)]
+async fn applied_at(w: &mut ContextWorld, first: u64, second: u64, emitted: u64) {
+    assert_eq!(*w.applied.lock().unwrap(), vec![first, second, emitted]);
 }
 
 #[when(regex = r#"^an IncreaseBy command for ledger root "([^"]*)" is dispatched$"#)]

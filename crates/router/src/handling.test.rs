@@ -311,7 +311,7 @@ fn commutative_folding_an_emitted_event_that_fails_says_the_command_emitted_it()
         &err,
         crate::error::messages::FOLD_FAILED_EMITTED,
         &[
-            (crate::error::extras::SEQUENCE, "9"),
+            (crate::error::extras::SEQUENCE, "1"),
             (crate::error::extras::TYPE_URL, type_url.as_str()),
         ],
         "",

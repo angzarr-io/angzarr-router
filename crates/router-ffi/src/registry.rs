@@ -126,6 +126,7 @@ fn state_rebuilder(state_type_url: &str, fold: Option<u64>, cb: AngzarrCb) -> Re
     };
     let mut rebuilder = Rebuilder::new(move || initial.clone())
         .with_state_type(state_type_url)
+        .with_state_image(|state: &Any| state.clone())
         .with_snapshot(|state, snapshot| {
             *state = snapshot.clone();
             Ok(())

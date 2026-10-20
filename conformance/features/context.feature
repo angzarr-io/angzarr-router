@@ -29,7 +29,7 @@ Feature: Facts and handler context
   Scenario: an applier reads each event's sequence
     Given a ledger aggregate
     When an IncreaseBy command for ledger root "ledger-1" is dispatched over Increased events at sequences 2 and 3
-    Then the ledger applied Increased events at sequences 2 and 3
+    Then the ledger applied Increased events at sequences 2 and 3, then its emitted event at 4
 
   Scenario: a command handler reads its own cover
     Given a ledger aggregate
