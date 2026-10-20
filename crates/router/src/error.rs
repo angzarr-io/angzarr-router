@@ -35,7 +35,6 @@ pub mod codes {
     pub const MISSING_PM_TRIGGER: &str = "MISSING_PM_TRIGGER";
     pub const DUPLICATE_REGISTRATION: &str = "DUPLICATE_REGISTRATION";
     pub const NO_HANDLERS_REGISTERED: &str = "NO_HANDLERS_REGISTERED";
-    pub const MIXED_HANDLER_KINDS: &str = "MIXED_HANDLER_KINDS";
     pub const DUPLICATE_COMMAND_HANDLER: &str = "DUPLICATE_COMMAND_HANDLER";
     pub const EMPTY_PM_TRIGGER: &str = "EMPTY_PM_TRIGGER";
     pub const MISSING_PM_EVENT_PAYLOAD: &str = "MISSING_PM_EVENT_PAYLOAD";
@@ -58,9 +57,8 @@ pub mod messages {
     pub const EMPTY_PM_TRIGGER: &str = "empty PM trigger";
     pub const MISSING_PM_EVENT_PAYLOAD: &str = "missing event payload on PM trigger";
     pub const NO_HANDLERS_REGISTERED: &str = "no handlers registered";
-    pub const MIXED_HANDLER_KINDS: &str = "a router hosts components of one kind";
     pub const DUPLICATE_COMMAND_HANDLER: &str =
-        "two command handlers claim the same (domain, command type)";
+        "an old type the aggregate's upcaster chain accepts is also one of its command types";
     pub const NO_COMPONENT_OF_KIND: &str = "the router hosts no component of this kind";
     pub const CONFLICT_UNRESOLVED: &str =
         "the handler did not resolve the conflict window with the delivered nonce";

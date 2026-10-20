@@ -1,10 +1,10 @@
 //! angzarr-router-ffi — the C ABI over the core. Dispatch semantics live in
-//! the core; this layer owns the marshaling plus the registry's component
-//! claims: routing a command to its aggregate through the core's
-//! CommandHandlers (by domain and command type; a sole aggregate claims
-//! every domain), one projector per router, sagas by source domain, and
-//! co-resident PMs through the core's selection. Those rules are
-//! mutation-tested with the core.
+//! the core; this layer owns the marshaling. A router hosts exactly ONE
+//! component (owner ruling: one coordinator, one component, one business
+//! process): one aggregate, saga, process manager or projector, held as the
+//! core's `Router`. Registering a second component of any kind is refused
+//! DUPLICATE_REGISTRATION; dispatching a kind the router does not host is
+//! NO_HANDLER_REGISTERED.
 //!
 //! # Status codes
 //! Every entry point and host callback returns `i32`:
@@ -188,21 +188,20 @@ pub unsafe extern "C" fn angzarr_router_dispatch_projector(
     }
 }
 
-/// Fills `out` with the registration hellos of every registered component:
-/// a serialized `io.angzarr.v1.ComponentDescriptors` (the spec's
-/// `ComponentService.Describe` answer), each an
-/// `io.angzarr.v1.ComponentDescriptor` the router built from its own tables,
-/// in registration order. The host only sends them to its coordinator. A
-/// component registered without a rules version refuses the call
-/// (`MISSING_RULES_VERSION`, INVALID_ARGUMENT, naming the first such
-/// component): returns the negated gRPC code and fills `out` with
+/// Fills `out` with the registered component's registration hello: a
+/// serialized `io.angzarr.v1.ComponentDescriptor` (the spec's
+/// `ComponentService.Describe` answer) the router built from its own table.
+/// The host only sends it to its coordinator. A component that cannot build
+/// one (`MISSING_RULES_VERSION` or `MISSING_STATE_TYPE`, INVALID_ARGUMENT,
+/// naming it) or a router with no component yet (`NO_HANDLERS_REGISTERED`)
+/// refuses the call: returns the negated gRPC code and fills `out` with
 /// `google.rpc.Status` bytes. Either way the host releases `out` with
 /// `angzarr_buf_release`.
 ///
 /// # Safety
 /// `r` must be a live router; `out` must point to a writable `AngzarrBuf`.
 #[no_mangle]
-pub unsafe extern "C" fn angzarr_router_component_descriptors(
+pub unsafe extern "C" fn angzarr_router_component_descriptor(
     r: *mut c_void,
     out: *mut AngzarrBuf,
 ) -> i32 {
@@ -211,7 +210,7 @@ pub unsafe extern "C" fn angzarr_router_component_descriptors(
             return Err(invalid_pointer("router"));
         }
         let router = &*(r as *const FfiRouter);
-        router.component_descriptors()
+        router.component_descriptor()
     }));
     match flatten_panic(result) {
         Ok(response) => {

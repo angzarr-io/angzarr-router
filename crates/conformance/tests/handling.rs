@@ -18,7 +18,6 @@ struct HandlingWorld {
     snapshot: Option<pb::Snapshot>,
     result: Option<Result<pb::CommandHandlerResponse, CodedError>>,
     pm_result: Option<Result<pb::ProcessManagerHandleResponse, CodedError>>,
-    saga: Option<(String, String)>,
     pm_placed: u32,
     described: Vec<pb::ComponentDescriptor>,
 }
@@ -110,27 +109,18 @@ async fn reports(w: &mut HandlingWorld, version: String) {
     assert_eq!(reported, version);
 }
 
-// Describing the process (component.proto, ComponentService.Describe): each
-// component's ComponentDescriptor, built by the router from its own table, in
-// the order the process hosts them. The native Router hosts one kind, so a
-// process hosting an aggregate and a saga gathers each table's description.
-#[given(
-    regex = r#"^the "order" business binary also hosts the "([^"]*)" saga reacting to "([^"]*)"$"#
-)]
-async fn hosts_saga(w: &mut HandlingWorld, name: String, domain: String) {
-    w.saga = Some((name, domain));
-}
-
-#[when(r#"the coordinator asks the "order" business binary to describe its components"#)]
+// Describing the process (component.proto, ComponentService.Describe): its
+// one component's ComponentDescriptor, built by the router from the
+// component's own table (owner ruling: one coordinator, one component, one
+// business process).
+#[when(r#"the coordinator asks the "order" business binary to describe its component"#)]
 async fn describe(w: &mut HandlingWorld) {
     let order = conf::order_aggregate(&w.rules_version, w.settle.clone(), w.seen.clone());
-    let mut described = vec![order.component_descriptor().expect("the order aggregate")];
-    if let Some((name, domain)) = w.saga.clone() {
-        let saga = angzarr_router::saga::SagaDispatch::new(name, domain, Vec::<String>::new())
-            .with_rules_version(&w.rules_version);
-        described.push(saga.component_descriptor().expect("the saga"));
-    }
-    w.described = described;
+    let router = angzarr_router::router::RouterBuilder::new()
+        .aggregate(order)
+        .build()
+        .expect("one component");
+    w.described = vec![router.component_descriptor().expect("its description")];
 }
 
 fn described<'a>(w: &'a HandlingWorld, name: &str) -> &'a pb::ComponentDescriptor {
@@ -158,7 +148,7 @@ async fn described_state(w: &mut HandlingWorld) {
     );
 }
 
-#[then("the answer describes exactly these components:")]
+#[then("the answer describes one component:")]
 async fn describes_exactly(w: &mut HandlingWorld, step: &cucumber::gherkin::Step) {
     let table = step.table.as_ref().expect("a table");
     let expected: Vec<Vec<String>> = table.rows.iter().skip(1).cloned().collect();

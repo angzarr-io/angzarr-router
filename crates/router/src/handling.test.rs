@@ -667,10 +667,10 @@ fn a_process_manager_handlers_rules_version_is_overwritten() {
     );
 }
 
-// Co-hosted PMs share one binary and so one version: a router reports it
-// even when no PM consumed the trigger.
+// A router answers its PM's version even for a trigger the PM does not
+// consume.
 #[test]
-fn a_router_of_process_managers_reports_the_version_with_no_pm_selected() {
+fn a_router_of_a_process_manager_reports_the_version_for_an_unconsumed_trigger() {
     let router = crate::router::RouterBuilder::new()
         .process_manager(
             ProcessManagerDispatch::new("pm", "pm", ["inventory"], fresh_rebuilder())

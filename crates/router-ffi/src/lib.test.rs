@@ -46,7 +46,6 @@ const CB_FAIL_HARD: u64 = 3;
 const CB_RETURN_NOTHING: u64 = 6;
 const CB_SAGA_EVENT: u64 = 10;
 const CB_PM_EVENT: u64 = 12;
-const CB_PM2_EVENT: u64 = 14;
 const CB_PROJ_FOLD_REJECTS: u64 = 16;
 /// Succeeds with STATUS_OK and no output (an applier/fold that returns 0).
 const CB_OK_ZERO: u64 = 17;
@@ -368,21 +367,6 @@ unsafe extern "C" fn host_cb(
             cmd.cover.as_mut().unwrap().root = paux.trigger_cover.and_then(|c| c.root);
             let resp = pb::ProcessManagerHandleResponse {
                 commands: vec![cmd],
-                ..Default::default()
-            };
-            host_fill(out, &resp.encode_to_vec());
-            STATUS_OK
-        }
-        CB_PM2_EVENT => {
-            // The second PM reacts with one command to "pm2-target".
-            let resp = pb::ProcessManagerHandleResponse {
-                commands: vec![pb::CommandBook {
-                    cover: Some(pb::Cover {
-                        domain: "pm2-target".to_string(),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }],
                 ..Default::default()
             };
             host_fill(out, &resp.encode_to_vec());
@@ -1232,48 +1216,6 @@ fn pm_emits_its_command_through_the_abi() {
 }
 
 #[test]
-fn two_process_managers_share_a_source_domain_route_by_type() {
-    // Two PMs subscribe to the SAME source domain (`orders`) for different event
-    // types. A trigger routes to the PM that declares its type; the other no-ops.
-    // Before multi-PM routing, registering two PMs returned NO_HANDLER_REGISTERED.
-    let r = angzarr_router_new();
-    let pm1 = pm_descriptor_bytes(); // OrderPM: orders/OrderShipped -> CB_PM_EVENT
-    let pm2 = abi_pb::ProcessManagerDescriptor {
-        name: "OtherPM".to_string(),
-        pm_domain: "other-pm".to_string(),
-        state_type_url: STATE_TYPE.to_string(),
-        fold_callback_id: Some(CB_FOLD),
-        events: vec![abi_pb::PmEventEntry {
-            input_domain: "orders".to_string(),
-            fq_type: FQ_ORDER_CREATED.to_string(),
-            callback_id: CB_PM_EVENT,
-        }],
-        target_domains: vec!["inventory".to_string()],
-        rules_version: String::new(),
-    }
-    .encode_to_vec();
-    assert_eq!(
-        unsafe { angzarr_router_register_process_manager(r, pm1.as_ptr(), pm1.len(), host_cb) },
-        0,
-    );
-    assert_eq!(
-        unsafe { angzarr_router_register_process_manager(r, pm2.as_ptr(), pm2.len(), host_cb) },
-        0,
-    );
-    let router = Router(r);
-    reset_observations();
-    let req = pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)]);
-    let (ret, bytes) = router.dispatch_process_manager(&req);
-    assert_eq!(ret, 0, "multi-PM routing should not report NO_HANDLER");
-    let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
-    assert_eq!(
-        resp.commands.len(),
-        1,
-        "routed to the PM declaring OrderShipped; the OrderCreated PM no-opped",
-    );
-}
-
-#[test]
 fn pm_missing_trigger_through_the_abi_is_missing_pm_trigger() {
     // Trigger-shape validation precedes routing (mirrors the saga path): a nil
     // trigger reports MISSING_PM_TRIGGER, not NO_HANDLER from an empty domain.
@@ -1300,112 +1242,7 @@ fn pm_empty_trigger_through_the_abi_is_empty_pm_trigger() {
     assert_eq!(reason, angzarr_router::error::codes::EMPTY_PM_TRIGGER);
 }
 
-/// A second PM ("pm2", domain "other-pm") consuming the same `orders`
-/// OrderShipped trigger.
-fn pm2_descriptor_bytes() -> Vec<u8> {
-    abi_pb::ProcessManagerDescriptor {
-        name: "Pm2".to_string(),
-        pm_domain: "other-pm".to_string(),
-        state_type_url: STATE_TYPE.to_string(),
-        fold_callback_id: Some(CB_FOLD),
-        events: vec![abi_pb::PmEventEntry {
-            input_domain: "orders".to_string(),
-            fq_type: FQ_ORDER_SHIPPED.to_string(),
-            callback_id: CB_PM2_EVENT,
-        }],
-        target_domains: vec!["inventory".to_string()],
-        rules_version: String::new(),
-    }
-    .encode_to_vec()
-}
-
-impl Router {
-    fn with_two_process_managers() -> Self {
-        let r = angzarr_router_new();
-        for desc in [pm_descriptor_bytes(), pm2_descriptor_bytes()] {
-            let ret = unsafe {
-                angzarr_router_register_process_manager(r, desc.as_ptr(), desc.len(), host_cb)
-            };
-            assert_eq!(ret, 0, "process-manager registration failed");
-        }
-        Router(r)
-    }
-}
-
-fn command_domains(resp: &pb::ProcessManagerHandleResponse) -> Vec<String> {
-    resp.commands
-        .iter()
-        .map(|c| {
-            c.cover
-                .as_ref()
-                .map(|c| c.domain.clone())
-                .unwrap_or_default()
-        })
-        .collect()
-}
-
-#[test]
-fn process_state_cover_routes_the_trigger_to_its_own_pm() {
-    let router = Router::with_two_process_managers();
-    let mut req = pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)]);
-    req.process_state = Some(pb::EventBook {
-        cover: Some(pb::Cover {
-            domain: "other-pm".to_string(),
-            ..Default::default()
-        }),
-        ..Default::default()
-    });
-    let (ret, bytes) = router.dispatch_process_manager(&req);
-    assert_eq!(ret, 0);
-    let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
-    assert_eq!(command_domains(&resp), vec!["pm2-target".to_string()]);
-}
-
-#[test]
-fn uncovered_process_state_fans_the_trigger_out_in_registration_order() {
-    let router = Router::with_two_process_managers();
-    let req = pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)]);
-    let (ret, bytes) = router.dispatch_process_manager(&req);
-    assert_eq!(ret, 0);
-    let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
-    assert_eq!(
-        command_domains(&resp),
-        vec!["inventory".to_string(), "pm2-target".to_string()]
-    );
-}
-
-// --- registration-time claims + host fold status
-
-#[test]
-fn a_second_claim_of_a_domain_command_is_refused_at_registration() {
-    let router = Router::with_counter();
-    let mut desc = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
-    desc.name = "Rival".to_string();
-    desc.commands.truncate(1);
-    assert_eq!(
-        register_aggregate_desc(router.0, desc),
-        -3,
-        "a duplicate (domain, command) claim is an invalid argument"
-    );
-    // The first registration still serves the domain.
-    let (ret, _) = router.dispatch(&command_req(
-        FQ_INCREASE_BY,
-        IncreaseBy { n: 1 }.encode_to_vec(),
-        None,
-    ));
-    assert_eq!(ret, 0);
-}
-
-#[test]
-fn aggregates_for_distinct_domains_both_register() {
-    let router = Router::with_counter();
-    let mut other = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
-    other.domain = "other".to_string();
-    let desc = other.encode_to_vec();
-    let ret =
-        unsafe { angzarr_router_register_aggregate(router.0, desc.as_ptr(), desc.len(), host_cb) };
-    assert_eq!(ret, 0);
-}
+// --- one component per router (owner ruling) + host fold status
 
 #[test]
 fn second_projector_is_refused_at_registration() {
@@ -1649,66 +1486,6 @@ fn failing_pm_fold_is_internal_naming_the_event() {
     );
 }
 
-// --- aggregate routing by command domain
-
-/// Two aggregates: "counter" (IncreaseBy emits events) and "other", whose
-/// IncreaseBy handler emits nothing.
-fn two_aggregates() -> Router {
-    let r = angzarr_router_new();
-    assert_eq!(
-        register_aggregate_desc(
-            r,
-            abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap()
-        ),
-        0
-    );
-    let mut other = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
-    other.domain = "other".to_string();
-    other.commands[0].callback_id = CB_OK_EMPTY;
-    assert_eq!(register_aggregate_desc(r, other), 0);
-    Router(r)
-}
-
-fn increase_in(domain: &str) -> pb::ContextualCommand {
-    let mut req = increase_one(None);
-    req.command.as_mut().unwrap().cover.as_mut().unwrap().domain = domain.to_string();
-    req
-}
-
-fn emitted_pages(bytes: &[u8]) -> usize {
-    decode_events(bytes).pages.len()
-}
-
-#[test]
-fn commands_route_to_the_aggregate_owning_their_domain() {
-    let router = two_aggregates();
-    let (ret, bytes) = router.dispatch(&increase_in("counter"));
-    assert_eq!(ret, 0);
-    assert_eq!(emitted_pages(&bytes), 1, "the counter aggregate handled it");
-    let (ret, bytes) = router.dispatch(&increase_in("other"));
-    assert_eq!(ret, 0);
-    assert_eq!(emitted_pages(&bytes), 0, "the other aggregate handled it");
-}
-
-#[test]
-fn unclaimed_domain_with_several_aggregates_is_no_handler() {
-    let router = two_aggregates();
-    let (ret, bytes) = router.dispatch(&increase_in("nobody"));
-    assert_eq!(ret, -3, "a type no handler claims is INVALID_ARGUMENT");
-    assert_eq!(
-        decode_status(&bytes).1,
-        angzarr_router::error::codes::NO_HANDLER_REGISTERED
-    );
-}
-
-#[test]
-fn a_sole_aggregate_claims_any_domain() {
-    let router = Router::with_counter();
-    let (ret, bytes) = router.dispatch(&increase_in("nobody"));
-    assert_eq!(ret, 0);
-    assert_eq!(emitted_pages(&bytes), 1);
-}
-
 // --- context aux
 
 #[test]
@@ -1778,42 +1555,6 @@ fn appliers_see_their_page_place_through_the_abi() {
     );
 }
 
-// --- several aggregates in one domain (C-0010, C-0042) ----------------------
-
-const FQ_AUDIT: &str = "test.counter.Audit";
-
-/// The counter aggregate plus a second "counter" aggregate handling Audit
-/// (empty reply).
-fn counter_and_auditor() -> Router {
-    let router = Router::with_counter();
-    let auditor = abi_pb::AggregateDescriptor {
-        name: "Auditor".to_string(),
-        domain: "counter".to_string(),
-        commands: vec![abi_pb::CallbackEntry {
-            fq_type: FQ_AUDIT.to_string(),
-            callback_id: CB_OK_EMPTY,
-        }],
-        ..Default::default()
-    };
-    assert_eq!(register_aggregate_desc(router.0, auditor), 0);
-    router
-}
-
-#[test]
-fn aggregates_sharing_a_domain_route_commands_by_type() {
-    let router = counter_and_auditor();
-    let (ret, bytes) = router.dispatch(&increase_in("counter"));
-    assert_eq!(ret, 0);
-    assert_eq!(
-        emitted_pages(&bytes),
-        1,
-        "the counter aggregate handled IncreaseBy"
-    );
-    let (ret, bytes) = router.dispatch(&command_req(FQ_AUDIT, Vec::new(), None));
-    assert_eq!(ret, 0);
-    assert_eq!(emitted_pages(&bytes), 0, "the auditor handled Audit");
-}
-
 // --- facts: the Fact arm of the command page ---------------------------------
 
 fn counter_with_fact_handler(callback_id: u64) -> Router {
@@ -1866,39 +1607,6 @@ fn a_fact_is_annotated_against_folded_state_through_the_abi() {
     assert_eq!(
         book.cover, None,
         "payloads only: the coordinator supplies the cover"
-    );
-}
-
-#[test]
-fn facts_route_by_their_cover_domain_through_the_abi() {
-    let r = angzarr_router_new();
-    assert_eq!(
-        register_aggregate_desc(
-            r,
-            abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap()
-        ),
-        0
-    );
-    let mut other = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
-    other.domain = "other".to_string();
-    other.facts = vec![abi_pb::CallbackEntry {
-        fq_type: FQ_INCREASED.to_string(),
-        callback_id: CB_FACT_ANNOTATE,
-    }];
-    assert_eq!(register_aggregate_desc(r, other), 0);
-    let router = Router(r);
-    let (ret, bytes) = router.dispatch(&fact_req("other", FQ_INCREASED, None));
-    assert_eq!(ret, 0);
-    assert_eq!(
-        recorded(&decode_events(&bytes))[0].0,
-        "test.counter.CounterState",
-        "other's fact handler ran"
-    );
-    let (ret, bytes) = router.dispatch(&fact_req("counter", FQ_INCREASED, None));
-    assert_eq!(ret, -3, "counter records no fact: INVALID_ARGUMENT");
-    assert_eq!(
-        decode_status(&bytes).1,
-        angzarr_router::error::codes::NO_FACT_HANDLER
     );
 }
 
@@ -2158,47 +1866,16 @@ fn every_response_reports_the_registered_rules_version_through_the_abi() {
     );
 }
 
-// Registration carries the upcasters' source types, claimed like command
-// types: a second aggregate accepting the same old type is refused.
-#[test]
-fn an_upcaster_source_type_claimed_twice_is_refused_at_registration() {
-    let upcasting = |name: &str, command: &str| {
-        let mut desc = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
-        desc.name = name.to_string();
-        desc.commands = vec![abi_pb::CallbackEntry {
-            fq_type: command.to_string(),
-            callback_id: CB_INCREASE_BY,
-        }];
-        desc.command_upcasters = vec![abi_pb::CallbackEntry {
-            fq_type: FQ_INCREASE_BY_V1.to_string(),
-            callback_id: CB_UPCAST_V1,
-        }];
-        desc
-    };
-    let r = angzarr_router_new();
-    let router = Router(r);
-    assert_eq!(
-        register_aggregate_desc(r, upcasting("first", FQ_INCREASE_BY)),
-        0
-    );
-    assert_eq!(
-        register_aggregate_desc(r, upcasting("second", "test.counter.Other")),
-        -3,
-        "IncreaseByV1 is already claimed"
-    );
-    drop(router);
-}
-
 // --- the registration hello (types.proto ComponentDescriptor; C-0535) ------
 
-/// Calls angzarr_router_component_descriptors, copying out and releasing
+/// Calls angzarr_router_component_descriptor, copying out and releasing
 /// the router's buffer.
-fn component_descriptors(r: *mut c_void) -> (i32, Vec<u8>) {
+fn component_descriptor(r: *mut c_void) -> (i32, Vec<u8>) {
     let mut out = AngzarrBuf {
         data: std::ptr::null_mut(),
         len: 0,
     };
-    let ret = unsafe { angzarr_router_component_descriptors(r, &mut out) };
+    let ret = unsafe { angzarr_router_component_descriptor(r, &mut out) };
     let bytes = if out.data.is_null() {
         Vec::new()
     } else {
@@ -2209,190 +1886,10 @@ fn component_descriptors(r: *mut c_void) -> (i32, Vec<u8>) {
     (ret, bytes)
 }
 
-/// A router hosting one component of every kind, each with `version`,
-/// registered aggregate, saga, process manager, projector.
-fn every_kind(version: &str) -> Router {
-    let r = angzarr_router_new();
-    let mut aggregate = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
-    aggregate.rules_version = version.to_string();
-    aggregate.changed_callback_id = Some(CB_CHANGED_VALUE);
-    assert_eq!(register_aggregate_desc(r, aggregate), 0);
-    let mut saga = abi_pb::SagaDescriptor::decode(saga_descriptor_bytes().as_slice()).unwrap();
-    saga.rules_version = version.to_string();
-    let saga = saga.encode_to_vec();
-    assert_eq!(
-        unsafe { angzarr_router_register_saga(r, saga.as_ptr(), saga.len(), host_cb) },
-        0
-    );
-    let mut pm =
-        abi_pb::ProcessManagerDescriptor::decode(pm_descriptor_bytes().as_slice()).unwrap();
-    pm.rules_version = version.to_string();
-    let pm = pm.encode_to_vec();
-    assert_eq!(
-        unsafe { angzarr_router_register_process_manager(r, pm.as_ptr(), pm.len(), host_cb) },
-        0
-    );
-    let mut projector =
-        abi_pb::ProjectorDescriptor::decode(projector_descriptor_bytes().as_slice()).unwrap();
-    projector.rules_version = version.to_string();
-    let projector = projector.encode_to_vec();
-    assert_eq!(
-        unsafe {
-            angzarr_router_register_projector(r, projector.as_ptr(), projector.len(), host_cb)
-        },
-        0
-    );
-    Router(r)
-}
-
 #[test]
-fn the_router_builds_every_components_registration_hello_in_order() {
-    let router = every_kind("1.4.2+build.7");
-    let (ret, bytes) = component_descriptors(router.0);
-    assert_eq!(ret, 0);
-    let hellos = pb::ComponentDescriptors::decode(bytes.as_slice())
-        .expect("ComponentDescriptors")
-        .components;
-    let summary: Vec<(String, pb::ComponentKind, Vec<String>, Option<String>)> = hellos
-        .iter()
-        .map(|d| {
-            (
-                d.name.clone(),
-                d.kind(),
-                d.inputs.iter().map(|t| t.domain.clone()).collect(),
-                d.state.as_ref().map(|s| s.type_url.clone()),
-            )
-        })
-        .collect();
-    let state = Some(format!("/{STATE_TYPE}"));
-    assert_eq!(
-        summary,
-        vec![
-            (
-                "Counter".into(),
-                pb::ComponentKind::Aggregate,
-                vec![],
-                state.clone()
-            ),
-            (
-                "OrderFulfillment".into(),
-                pb::ComponentKind::Saga,
-                vec!["order".into()],
-                None
-            ),
-            (
-                "OrderPM".into(),
-                pb::ComponentKind::ProcessManager,
-                vec!["orders".into()],
-                state
-            ),
-            (
-                "CounterProjector".into(),
-                pb::ComponentKind::Projector,
-                vec!["counter".into()],
-                None
-            ),
-        ]
-    );
-    assert!(hellos.iter().all(|d| d.rules_version == "1.4.2+build.7"));
-    let resolutions = |d: &pb::ComponentDescriptor| -> Vec<pb::ConflictResolution> {
-        d.state
-            .as_ref()
-            .and_then(|s| s.options.as_ref())
-            .map(|o| o.conflict_resolutions().collect())
-            .unwrap_or_default()
-    };
-    assert_eq!(
-        resolutions(&hellos[0]),
-        vec![
-            pb::ConflictResolution::Commutative,
-            pb::ConflictResolution::Strict,
-            pb::ConflictResolution::AggregateHandles
-        ],
-        "an aggregate with changed() supports COMMUTATIVE"
-    );
-    assert_eq!(
-        resolutions(&hellos[2]),
-        vec![
-            pb::ConflictResolution::Strict,
-            pb::ConflictResolution::AggregateHandles
-        ]
-    );
-}
-
-#[test]
-fn a_component_without_a_rules_version_refuses_the_registration_hello() {
-    let router = every_kind("");
-    let (ret, bytes) = component_descriptors(router.0);
-    assert_eq!(ret, -3, "INVALID_ARGUMENT");
-    assert_eq!(
-        decode_status(&bytes).1,
-        angzarr_router::error::codes::MISSING_RULES_VERSION
-    );
-}
-
-#[test]
-fn the_first_component_missing_a_rules_version_is_the_one_refused() {
-    let r = angzarr_router_new();
-    let mut versioned = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
-    versioned.rules_version = "1".to_string();
-    assert_eq!(register_aggregate_desc(r, versioned), 0);
-    let saga = saga_descriptor_bytes();
-    assert_eq!(
-        unsafe { angzarr_router_register_saga(r, saga.as_ptr(), saga.len(), host_cb) },
-        0
-    );
-    let router = Router(r);
-    let (ret, bytes) = component_descriptors(router.0);
-    assert_eq!(ret, -3);
-    let (status, reason) = decode_status(&bytes);
-    assert_eq!(reason, angzarr_router::error::codes::MISSING_RULES_VERSION);
-    let info = rpc_pb::ErrorInfo::decode(status.details[0].value.as_slice()).expect("ErrorInfo");
-    assert_eq!(
-        info.metadata.get("component").map(String::as_str),
-        Some("OrderFulfillment")
-    );
-}
-
-#[test]
-fn a_router_hosting_nothing_has_no_registration_hellos() {
-    let router = Router(angzarr_router_new());
-    let (ret, bytes) = component_descriptors(router.0);
-    assert_eq!(ret, 0);
-    assert!(pb::ComponentDescriptors::decode(bytes.as_slice())
-        .expect("ComponentDescriptors")
-        .components
-        .is_empty());
-}
-
-#[test]
-fn registration_hellos_of_a_null_router_are_a_coded_failure() {
-    let (ret, _) = component_descriptors(std::ptr::null_mut());
+fn the_registration_hello_of_a_null_router_is_a_coded_failure() {
+    let (ret, _) = component_descriptor(std::ptr::null_mut());
     assert_eq!(ret, -13);
-}
-
-#[test]
-fn a_refused_registration_has_no_registration_hello() {
-    let r = angzarr_router_new();
-    let mut counter = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
-    counter.rules_version = "1".to_string();
-    assert_eq!(register_aggregate_desc(r, counter.clone()), 0);
-    counter.name = "Duplicate".to_string();
-    assert_ne!(
-        register_aggregate_desc(r, counter),
-        0,
-        "a second claim is refused"
-    );
-    let router = Router(r);
-    let (ret, bytes) = component_descriptors(router.0);
-    assert_eq!(ret, 0);
-    let names: Vec<String> = pb::ComponentDescriptors::decode(bytes.as_slice())
-        .expect("ComponentDescriptors")
-        .components
-        .into_iter()
-        .map(|d| d.name)
-        .collect();
-    assert_eq!(names, vec!["Counter".to_string()]);
 }
 
 #[test]
@@ -2403,11 +1900,211 @@ fn an_aggregate_registered_without_a_state_type_refuses_its_hello() {
     counter.state_type_url = String::new();
     assert_eq!(register_aggregate_desc(r, counter), 0);
     let router = Router(r);
-    let (ret, bytes) = component_descriptors(router.0);
+    let (ret, bytes) = component_descriptor(router.0);
     assert_eq!(ret, -3);
     assert_eq!(
         decode_status(&bytes).1,
         angzarr_router::error::codes::MISSING_STATE_TYPE
+    );
+}
+
+/// Registers one component of `kind`, at rules version "1.4.2+build.7",
+/// returning the registration's status.
+fn register_kind(r: *mut c_void, kind: &str) -> i32 {
+    const VERSION: &str = "1.4.2+build.7";
+    match kind {
+        "aggregate" => {
+            let mut desc =
+                abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
+            desc.rules_version = VERSION.to_string();
+            desc.changed_callback_id = Some(CB_CHANGED_VALUE);
+            register_aggregate_desc(r, desc)
+        }
+        "saga" => {
+            let mut desc =
+                abi_pb::SagaDescriptor::decode(saga_descriptor_bytes().as_slice()).unwrap();
+            desc.rules_version = VERSION.to_string();
+            let bytes = desc.encode_to_vec();
+            unsafe { angzarr_router_register_saga(r, bytes.as_ptr(), bytes.len(), host_cb) }
+        }
+        "process manager" => {
+            let mut desc =
+                abi_pb::ProcessManagerDescriptor::decode(pm_descriptor_bytes().as_slice()).unwrap();
+            desc.rules_version = VERSION.to_string();
+            let bytes = desc.encode_to_vec();
+            unsafe {
+                angzarr_router_register_process_manager(r, bytes.as_ptr(), bytes.len(), host_cb)
+            }
+        }
+        _ => {
+            let mut desc =
+                abi_pb::ProjectorDescriptor::decode(projector_descriptor_bytes().as_slice())
+                    .unwrap();
+            desc.rules_version = VERSION.to_string();
+            let bytes = desc.encode_to_vec();
+            unsafe { angzarr_router_register_projector(r, bytes.as_ptr(), bytes.len(), host_cb) }
+        }
+    }
+}
+
+const KINDS: [&str; 4] = ["aggregate", "saga", "process manager", "projector"];
+
+// Owner ruling: one coordinator, one component, one business process. A
+// second component of any kind is refused at registration, and the first
+// keeps its hello.
+#[test]
+fn a_second_component_of_any_kind_is_refused_at_registration() {
+    for first in KINDS {
+        for second in KINDS {
+            let router = Router(angzarr_router_new());
+            assert_eq!(register_kind(router.0, first), 0, "{first}");
+            assert_eq!(
+                register_kind(router.0, second),
+                -3,
+                "a {second} after a {first}: DUPLICATE_REGISTRATION"
+            );
+            let (ret, bytes) = component_descriptor(router.0);
+            assert_eq!(ret, 0);
+            let kind = pb::ComponentDescriptor::decode(bytes.as_slice())
+                .expect("ComponentDescriptor")
+                .kind();
+            let expected = match first {
+                "aggregate" => pb::ComponentKind::Aggregate,
+                "saga" => pb::ComponentKind::Saga,
+                "process manager" => pb::ComponentKind::ProcessManager,
+                _ => pb::ComponentKind::Projector,
+            };
+            assert_eq!(kind, expected, "the first component stands");
+        }
+    }
+}
+
+#[test]
+fn the_router_builds_its_components_registration_hello() {
+    let summary = |kind: &str| {
+        let router = Router(angzarr_router_new());
+        assert_eq!(register_kind(router.0, kind), 0);
+        let (ret, bytes) = component_descriptor(router.0);
+        assert_eq!(ret, 0);
+        let d = pb::ComponentDescriptor::decode(bytes.as_slice()).expect("ComponentDescriptor");
+        let resolutions: Vec<pb::ConflictResolution> = d
+            .state
+            .as_ref()
+            .and_then(|s| s.options.as_ref())
+            .map(|o| o.conflict_resolutions().collect())
+            .unwrap_or_default();
+        (
+            d.name.clone(),
+            d.kind(),
+            d.inputs
+                .iter()
+                .map(|t| t.domain.clone())
+                .collect::<Vec<_>>(),
+            d.state.as_ref().map(|s| s.type_url.clone()),
+            d.rules_version.clone(),
+            resolutions,
+        )
+    };
+    let state = Some(format!("/{STATE_TYPE}"));
+    let version = "1.4.2+build.7".to_string();
+    assert_eq!(
+        summary("aggregate"),
+        (
+            "Counter".into(),
+            pb::ComponentKind::Aggregate,
+            vec![],
+            state.clone(),
+            version.clone(),
+            vec![
+                pb::ConflictResolution::Commutative,
+                pb::ConflictResolution::Strict,
+                pb::ConflictResolution::AggregateHandles
+            ]
+        )
+    );
+    assert_eq!(
+        summary("saga"),
+        (
+            "OrderFulfillment".into(),
+            pb::ComponentKind::Saga,
+            vec!["order".to_string()],
+            None,
+            version.clone(),
+            vec![]
+        )
+    );
+    assert_eq!(
+        summary("process manager"),
+        (
+            "OrderPM".into(),
+            pb::ComponentKind::ProcessManager,
+            vec!["orders".to_string()],
+            state,
+            version.clone(),
+            vec![
+                pb::ConflictResolution::Strict,
+                pb::ConflictResolution::AggregateHandles
+            ]
+        )
+    );
+    assert_eq!(
+        summary("projector"),
+        (
+            "CounterProjector".into(),
+            pb::ComponentKind::Projector,
+            vec!["counter".to_string()],
+            None,
+            version,
+            vec![]
+        )
+    );
+}
+
+#[test]
+fn a_component_without_a_rules_version_refuses_its_hello() {
+    let router = Router::with_counter();
+    let (ret, bytes) = component_descriptor(router.0);
+    assert_eq!(ret, -3, "INVALID_ARGUMENT");
+    let (status, reason) = decode_status(&bytes);
+    assert_eq!(reason, angzarr_router::error::codes::MISSING_RULES_VERSION);
+    let info = rpc_pb::ErrorInfo::decode(status.details[0].value.as_slice()).expect("ErrorInfo");
+    assert_eq!(
+        info.metadata.get("component").map(String::as_str),
+        Some("Counter")
+    );
+}
+
+#[test]
+fn a_router_hosting_nothing_refuses_the_registration_hello() {
+    let router = Router(angzarr_router_new());
+    let (ret, bytes) = component_descriptor(router.0);
+    assert_eq!(ret, -3);
+    assert_eq!(
+        decode_status(&bytes).1,
+        angzarr_router::error::codes::NO_HANDLERS_REGISTERED
+    );
+}
+
+#[test]
+fn a_refused_registration_hosts_nothing() {
+    // An aggregate whose upcaster chain accepts one of its own command types
+    // is refused, and the router still hosts nothing.
+    let router = Router(angzarr_router_new());
+    let mut desc = abi_pb::AggregateDescriptor::decode(descriptor_bytes().as_slice()).unwrap();
+    desc.command_upcasters = vec![abi_pb::CallbackEntry {
+        fq_type: FQ_INCREASE_BY.to_string(),
+        callback_id: CB_UPCAST_V1,
+    }];
+    assert_eq!(register_aggregate_desc(router.0, desc), -3);
+    assert_eq!(
+        component_descriptor(router.0).0,
+        -3,
+        "nothing hosted: NO_HANDLERS_REGISTERED"
+    );
+    assert_eq!(
+        register_kind(router.0, "saga"),
+        0,
+        "the router is still free"
     );
 }
 

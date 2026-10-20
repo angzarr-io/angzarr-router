@@ -328,49 +328,6 @@ pub fn order_pm() -> ProcessManagerDispatch<ProcessManagerState> {
     )
 }
 
-/// The AuditProcessManager's own state: a different type from
-/// [`ProcessManagerState`], so a PM folding into another's state is detectable.
-#[derive(Default)]
-pub struct AuditState {
-    pub seen: Vec<String>,
-}
-
-/// Build the AuditProcessManager dispatch table (domain "audit-pm"): co-resident
-/// with the order PM over the same "counter" Increased trigger, but over its
-/// own state type. It reacts with one unaddressed process event recording what
-/// its rebuilt state saw (an `AuditProcessManagerState`, a different type from
-/// the order PM's) and no commands.
-pub fn audit_pm() -> ProcessManagerDispatch<AuditState> {
-    let rebuilder = Rebuilder::new(AuditState::default).apply(
-        "test.counter.Increased",
-        |state: &mut AuditState, event| {
-            counter::Increased::decode(event.value.as_slice())?;
-            state.seen.push("Increased".to_string());
-            Ok(())
-        },
-    );
-
-    ProcessManagerDispatch::new(
-        "AuditProcessManager",
-        "audit-pm",
-        Vec::<String>::new(),
-        rebuilder,
-    )
-    .on_event(
-        "counter",
-        "test.counter.Increased",
-        |_event, state: &mut AuditState, _cover| {
-            let seen = counter::AuditProcessManagerState {
-                seen: state.seen.clone(),
-            };
-            Ok(pb::ProcessManagerHandleResponse {
-                process_events: vec![process_event(&seen)],
-                ..Default::default()
-            })
-        },
-    )
-}
-
 /// One unaddressed process-event book whose single page carries `state`
 /// (payload only: the coordinator addresses and stamps it).
 fn process_event<M: prost::Message + prost::Name>(state: &M) -> pb::EventBook {
@@ -398,17 +355,6 @@ pub fn recorded_states<M: prost::Message + prost::Name + Default>(
         .filter(|any| angzarr_router::type_name_from_url(&any.type_url) == M::full_name())
         .map(|any| M::decode(any.value.as_slice()).expect("a recorded PM state"))
         .collect()
-}
-
-/// A PM process-state book of `n` Increased events owned by `pm_domain` (its
-/// cover addresses the owning PM).
-pub fn pm_state_in(pm_domain: &str, n: u32) -> pb::EventBook {
-    let mut book = pm_state_of(n);
-    book.cover = Some(pb::Cover {
-        domain: pm_domain.to_string(),
-        ..Default::default()
-    });
-    book
 }
 
 /// A PM request whose trigger carries the given event pages in `domain`, the

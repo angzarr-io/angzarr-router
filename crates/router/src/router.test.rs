@@ -1,20 +1,21 @@
-//! RouterBuilder / Router: build-time validation (C-0060, C-0062..C-0064)
-//! and dispatch across composed components of one kind.
+//! RouterBuilder / Router: one router hosts ONE component (owner ruling: one
+//! coordinator, one component, one business process), whose upcaster chain is
+//! part of it. Build-time validation (C-0060) and dispatch to that component.
 
 use prost_types::Any;
 
 use crate::aggregate::AggregateDispatch;
 use crate::error::{codes, CodedError};
 use crate::pb;
-use crate::process_manager::{ProcessManagerDispatch, ProcessManagerRoute};
+use crate::process_manager::ProcessManagerDispatch;
 use crate::projector::ProjectorDispatch;
 use crate::rebuild::Rebuilder;
 use crate::router::{
-    CommandHandler, CommandHandlers, ProcessManagerHandler, ProjectorHandler, Router, RouterBuilder,
+    CommandHandler, ProcessManagerHandler, ProjectorHandler, Router, RouterBuilder,
 };
 use crate::saga::SagaDispatch;
 use crate::test_support::{
-    command_page, cover_applier, event_page, fact_page, fresh_rebuilder, LedgerState, TestState,
+    command_page, event_page, fact_page, fresh_rebuilder, LedgerState, TestState,
 };
 use crate::type_url;
 use crate::upcaster::UpcasterDispatch;
@@ -88,276 +89,209 @@ fn an_empty_configuration_fails_to_build() {
     );
 }
 
-#[test]
-fn mixed_handler_kinds_are_rejected() {
-    let builder = RouterBuilder::new()
-        .aggregate(aggregate("order", "order", &["test.Create"]))
-        .saga(SagaDispatch::new(
-            "OrderFulfillment",
-            "order",
+/// A builder holding one component of `kind`.
+fn with_one(builder: RouterBuilder, kind: &str) -> RouterBuilder {
+    match kind {
+        "aggregate" => builder.aggregate(aggregate("a", "order", &["test.Create"])),
+        "saga" => builder.saga(SagaDispatch::new("s", "order", ["inventory"])),
+        "process manager" => builder.process_manager(ProcessManagerDispatch::new(
+            "pm",
+            "pm",
             ["inventory"],
-        ));
-    assert_eq!(build_err(builder), codes::MIXED_HANDLER_KINDS, "C-0063");
+            fresh_rebuilder(),
+        )),
+        _ => builder.projector(ProjectorDispatch::new("p", || ())),
+    }
+}
+
+const KINDS: [&str; 4] = ["aggregate", "saga", "process manager", "projector"];
+
+#[test]
+fn a_router_hosts_one_component_and_refuses_a_second_of_any_kind() {
+    for first in KINDS {
+        assert!(
+            with_one(RouterBuilder::new(), first).build().is_ok(),
+            "one {first} builds"
+        );
+        for second in KINDS {
+            assert_eq!(
+                build_err(with_one(with_one(RouterBuilder::new(), first), second)),
+                codes::DUPLICATE_REGISTRATION,
+                "a {second} after a {first}"
+            );
+        }
+    }
 }
 
 #[test]
-fn duplicate_domain_command_pairs_are_rejected() {
-    let builder = RouterBuilder::new()
-        .aggregate(aggregate("alpha", "order", &["test.Create"]))
-        .aggregate(aggregate("beta", "order", &["test.Create"]));
-    assert_eq!(
-        build_err(builder),
-        codes::DUPLICATE_COMMAND_HANDLER,
-        "C-0064"
-    );
-}
-
-#[test]
-fn the_same_command_type_in_two_domains_is_accepted() {
-    let router = RouterBuilder::new()
-        .aggregate(aggregate("a", "order-a", &["test.Create"]))
-        .aggregate(aggregate("b", "order-b", &["test.Create"]))
+fn an_upcaster_chain_is_part_of_its_component() {
+    let chain = UpcasterDispatch::new("v1-v3", "order")
+        .on_event("test.V1", |_| Ok(any_of_type("test.V2")))
+        .on_event("test.V2", |_| Ok(any_of_type("test.V3")));
+    let router = with_one(RouterBuilder::new(), "projector")
+        .upcaster(chain)
         .build()
-        .expect("C-0011");
-    let resp = router
-        .dispatch_command(&command("order-b", "test.Create"))
-        .expect("dispatch");
-    assert_eq!(emitted_label(&resp), "b");
-}
-
-#[test]
-fn commands_route_by_domain_and_type() {
-    let router = RouterBuilder::new()
-        .aggregate(aggregate("order-create", "order", &["test.Create"]))
-        .aggregate(aggregate("order-cancel", "order", &["test.Cancel"]))
-        .aggregate(aggregate("payment", "payment", &["test.Pay"]))
-        .build()
-        .expect("C-0062");
-    for (domain, fq, label) in [
-        ("order", "test.Create", "order-create"),
-        ("order", "test.Cancel", "order-cancel"),
-        ("payment", "test.Pay", "payment"),
-    ] {
+        .expect("build");
+    let upcast = |domain: &str| {
         let resp = router
-            .dispatch_command(&command(domain, fq))
-            .expect("dispatch");
-        assert_eq!(emitted_label(&resp), label);
-    }
-    let err = router
-        .dispatch_command(&command("payment", "test.Create"))
-        .expect_err("no handler for (payment, Create)");
-    assert_eq!(err.code, codes::NO_HANDLER_REGISTERED);
-    assert_eq!(
-        err.extras.get("upcast_type_url").map(String::as_str),
-        Some(type_url("test.Create").as_str()),
-        "no chain ran: the sent type"
-    );
-    // command_handler.proto, Handle step 2: INVALID_ARGUMENT naming the type
-    // URL (decision 12.11, backlog VC-1).
-    assert_eq!(err.grpc, crate::error::GrpcCode::InvalidArgument);
-    assert_eq!(
-        err.message,
-        format!("no handler for type URL {}", type_url("test.Create"))
-    );
-    let err = router
-        .dispatch_command(&fact("payment", "test.Paid"))
-        .expect_err("no aggregate records Paid");
-    assert_eq!(err.code, codes::NO_FACT_HANDLER);
-    assert_eq!(err.grpc, crate::error::GrpcCode::InvalidArgument);
-}
-
-/// An aggregate in `domain` recording `fq` facts as `label` events.
-fn recorder(label: &'static str, domain: &str, fq: &str) -> AggregateDispatch<TestState> {
-    AggregateDispatch::new(label, domain, fresh_rebuilder()).on_fact(fq, move |_, _| {
-        Ok(crate::aggregate::FactRecord::from(any_of_type(label)))
-    })
-}
-
-#[test]
-fn facts_route_by_domain_and_fact_type() {
-    let router = RouterBuilder::new()
-        .aggregate(aggregate("order", "order", &["test.Create"]))
-        .aggregate(recorder("paid", "order", "test.Paid"))
-        .aggregate(recorder("shipped", "order", "test.Shipped"))
-        .build()
-        .expect("build");
-    for (fq, label) in [("test.Paid", "paid"), ("test.Shipped", "shipped")] {
-        let resp = router.dispatch_command(&fact("order", fq)).expect("fact");
-        assert_eq!(emitted_label(&resp), label, "the aggregate recording {fq}");
-    }
-    let err = router
-        .dispatch_command(&fact("order", "test.Unknown"))
-        .expect_err("no aggregate records Unknown");
-    assert_eq!(
-        err.code,
-        codes::NO_FACT_HANDLER,
-        "the domain's first refuses it"
-    );
-    let err = router
-        .dispatch_command(&fact("billing", "test.Paid"))
-        .expect_err("no aggregate for billing");
-    assert_eq!(err.code, codes::NO_FACT_HANDLER);
-    assert_eq!(err.grpc, crate::error::GrpcCode::InvalidArgument);
-}
-
-#[test]
-fn sagas_fan_out_and_merge_in_registration_order() {
-    let saga = |label: &'static str| {
-        SagaDispatch::new(label, "order", ["inventory"]).on_event("test.Created", move |_, _| {
-            Ok(vec![pb::CommandBook {
-                cover: Some(pb::Cover {
-                    domain: label.to_string(),
-                    ..Default::default()
-                }),
-                page: Some(pb::CommandPage::default()),
-                ..Default::default()
-            }])
-        })
+            .upcast(&pb::UpcastRequest {
+                domain: domain.to_string(),
+                events: vec![event_page(any_of_type("test.V1"))],
+            })
+            .expect("upcast");
+        let any = resp.events[0].payload.clone().expect("an event");
+        crate::type_name_from_url(&any.type_url).to_string()
     };
-    let router = RouterBuilder::new()
-        .saga(saga("first"))
-        .saga(saga("second"))
+    assert_eq!(upcast("order"), "test.V3", "C-0136");
+    assert_eq!(
+        upcast("billing"),
+        "test.V1",
+        "another domain passes through"
+    );
+}
+
+#[test]
+fn a_component_without_an_upcaster_chain_passes_events_through() {
+    let router = with_one(RouterBuilder::new(), "saga")
         .build()
         .expect("build");
-    let req = pb::EventBook {
-        cover: Some(pb::Cover {
+    let events = vec![event_page(any_of_type("test.V1"))];
+    let resp = router
+        .upcast(&pb::UpcastRequest {
             domain: "order".to_string(),
+            events: events.clone(),
+        })
+        .expect("upcast");
+    assert_eq!(resp.events, events);
+}
+
+#[test]
+fn a_component_has_one_upcaster_chain_and_a_chain_alone_is_no_component() {
+    assert_eq!(
+        build_err(
+            with_one(RouterBuilder::new(), "aggregate")
+                .upcaster(UpcasterDispatch::new("one", "order"))
+                .upcaster(UpcasterDispatch::new("two", "order"))
+        ),
+        codes::DUPLICATE_REGISTRATION
+    );
+    assert_eq!(
+        build_err(RouterBuilder::new().upcaster(UpcasterDispatch::new("one", "order"))),
+        codes::NO_HANDLERS_REGISTERED
+    );
+}
+
+#[test]
+fn a_router_dispatches_commands_and_facts_to_its_aggregate() {
+    let router = RouterBuilder::new()
+        .aggregate(
+            aggregate("created", "order", &["test.Create"]).on_fact("test.Paid", |_, _| {
+                Ok(crate::aggregate::FactRecord::from(any_of_type("paid")))
+            }),
+        )
+        .build()
+        .expect("build");
+    let resp = router
+        .dispatch_command(&command("order", "test.Create"))
+        .expect("command");
+    assert_eq!(emitted_label(&resp), "created");
+    let resp = router
+        .dispatch_command(&fact("order", "test.Paid"))
+        .expect("fact");
+    assert_eq!(emitted_label(&resp), "paid");
+    let err = router
+        .dispatch_command(&command("order", "test.Unknown"))
+        .unwrap_err();
+    assert_eq!(err.code, codes::NO_HANDLER_REGISTERED);
+    assert_eq!(err.grpc, crate::error::GrpcCode::InvalidArgument);
+    let err = router
+        .dispatch_command(&fact("order", "test.Unrecorded"))
+        .unwrap_err();
+    assert_eq!(err.code, codes::NO_FACT_HANDLER);
+}
+
+fn source(domain: &str) -> pb::EventBook {
+    pb::EventBook {
+        cover: Some(pb::Cover {
+            domain: domain.to_string(),
             ..Default::default()
         }),
         pages: vec![event_page(any_of_type("test.Created"))],
         ..Default::default()
-    };
-    let resp = router.dispatch_saga(&req).expect("dispatch");
-    let order: Vec<_> = resp
-        .commands
-        .iter()
-        .map(|c| c.cover.as_ref().unwrap().domain.clone())
-        .collect();
-    assert_eq!(order, vec!["first", "second"], "C-0013");
-    let mut other = req.clone();
-    other.cover.as_mut().unwrap().domain = "billing".to_string();
-    assert_eq!(
-        router.dispatch_saga(&other).unwrap_err().code,
-        codes::NO_HANDLER_REGISTERED
-    );
+    }
 }
 
 #[test]
-fn process_managers_route_through_selection() {
-    let pm = |name: &'static str| {
-        ProcessManagerDispatch::new(name, format!("{name}-pm"), ["inventory"], fresh_rebuilder())
-            .on_event("order", "test.Created", move |_, _, _| {
-                Ok(pb::ProcessManagerHandleResponse {
-                    process_events: vec![pb::EventBook {
-                        cover: Some(pb::Cover {
-                            domain: name.to_string(),
-                            ..Default::default()
-                        }),
+fn a_router_runs_its_saga() {
+    let router = RouterBuilder::new()
+        .saga(
+            SagaDispatch::new("s", "order", ["inventory"]).on_event("test.Created", |_, _| {
+                Ok(vec![pb::CommandBook {
+                    cover: Some(pb::Cover {
+                        domain: "inventory".to_string(),
                         ..Default::default()
-                    }],
+                    }),
                     ..Default::default()
-                })
-            })
-    };
-    let router = RouterBuilder::new()
-        .process_manager(pm("a"))
-        .process_manager(pm("b"))
-        .build()
-        .expect("build");
-    let mut req = pb::ProcessManagerHandleRequest {
-        trigger: Some(pb::EventBook {
-            cover: Some(pb::Cover {
-                domain: "order".to_string(),
-                ..Default::default()
+                }])
             }),
-            pages: vec![event_page(any_of_type("test.Created"))],
-            ..Default::default()
-        }),
-        process_state: None,
-    };
-    let reactions = |resp: pb::ProcessManagerHandleResponse| -> Vec<String> {
-        resp.process_events
-            .into_iter()
-            .map(|f| f.cover.unwrap().domain)
-            .collect()
-    };
-    assert_eq!(
-        reactions(router.dispatch_process_manager(&req).unwrap()),
-        vec!["a", "b"]
-    );
-    req.process_state = Some(pb::EventBook {
-        cover: Some(pb::Cover {
-            domain: "b-pm".to_string(),
-            ..Default::default()
-        }),
-        ..Default::default()
-    });
-    assert_eq!(
-        reactions(router.dispatch_process_manager(&req).unwrap()),
-        vec!["b"]
-    );
-}
-
-#[test]
-fn projectors_each_produce_a_projection() {
-    let router = RouterBuilder::new()
-        .projector(ProjectorDispatch::new("p1", || ()))
-        .projector(ProjectorDispatch::new("p2", || ()))
+        )
         .build()
         .expect("build");
-    let book = pb::EventBook {
-        cover: Some(pb::Cover {
-            domain: "order".to_string(),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    let names: Vec<_> = router
-        .dispatch_projectors(&book)
-        .expect("dispatch")
-        .into_iter()
-        .map(|p| p.projector)
-        .collect();
-    assert_eq!(names, vec!["p1", "p2"], "C-0015");
+    assert_eq!(
+        router
+            .dispatch_saga(&source("order"))
+            .expect("saga")
+            .commands
+            .len(),
+        1
+    );
+    assert_eq!(
+        router.dispatch_saga(&source("billing")).unwrap_err().code,
+        codes::NO_HANDLER_REGISTERED,
+        "a source outside the saga's input domain"
+    );
 }
 
 #[test]
-fn upcasters_chain_across_components_for_their_domain() {
+fn a_router_runs_its_process_manager() {
     let router = RouterBuilder::new()
-        .upcaster(
-            UpcasterDispatch::new("v1-v2", "order")
-                .on_event("test.V1", |_| Ok(any_of_type("test.V2"))),
-        )
-        .upcaster(
-            UpcasterDispatch::new("v2-v3", "order")
-                .on_event("test.V2", |_| Ok(any_of_type("test.V3"))),
-        )
-        .upcaster(
-            UpcasterDispatch::new("billing", "billing")
-                .on_event("test.V3", |_| Ok(any_of_type("test.X"))),
+        .process_manager(
+            ProcessManagerDispatch::new("pm", "pm", ["inventory"], fresh_rebuilder())
+                .with_rules_version("9")
+                .on_event("order", "test.Created", |_, _, _| {
+                    Ok(pb::ProcessManagerHandleResponse {
+                        commands: vec![pb::CommandBook::default()],
+                        ..Default::default()
+                    })
+                }),
         )
         .build()
         .expect("build");
     let resp = router
-        .upcast(&pb::UpcastRequest {
-            domain: "order".to_string(),
-            events: vec![event_page(any_of_type("test.V1"))],
+        .dispatch_process_manager(&pb::ProcessManagerHandleRequest {
+            trigger: Some(source("order")),
+            process_state: None,
         })
-        .expect("upcast");
-    let Some(any) = resp.events[0].payload.as_ref() else {
-        panic!("no event");
-    };
-    assert_eq!(
-        crate::type_name_from_url(&any.type_url),
-        "test.V3",
-        "C-0136"
-    );
+        .expect("pm");
+    assert_eq!(resp.commands.len(), 1);
+    assert_eq!(resp.rules_version, "9");
+}
+
+#[test]
+fn a_router_answers_its_projectors_projection() {
+    let router = RouterBuilder::new()
+        .projector(ProjectorDispatch::new("p1", || ()))
+        .build()
+        .expect("build");
+    let projection = router
+        .dispatch_projector(&source("order"))
+        .expect("projection");
+    assert_eq!(projection.projector, "p1");
 }
 
 #[test]
 fn a_router_refuses_dispatch_of_another_kind() {
-    let router: Router = RouterBuilder::new()
-        .saga(SagaDispatch::new("s", "order", ["inventory"]))
+    let router: Router = with_one(RouterBuilder::new(), "saga")
         .build()
         .expect("build");
     assert_eq!(
@@ -369,18 +303,36 @@ fn a_router_refuses_dispatch_of_another_kind() {
     );
     assert_eq!(
         router
-            .upcast(&pb::UpcastRequest::default())
+            .dispatch_projector(&source("order"))
+            .unwrap_err()
+            .code,
+        codes::NO_HANDLER_REGISTERED
+    );
+    assert_eq!(
+        router
+            .dispatch_process_manager(&pb::ProcessManagerHandleRequest::default())
+            .unwrap_err()
+            .code,
+        codes::NO_HANDLER_REGISTERED
+    );
+    let aggregate_router = with_one(RouterBuilder::new(), "aggregate")
+        .build()
+        .expect("build");
+    assert_eq!(
+        aggregate_router
+            .dispatch_saga(&source("order"))
             .unwrap_err()
             .code,
         codes::NO_HANDLER_REGISTERED
     );
 }
 
-// --- boxed components ------------------------------------------------------
+// --- boxed and hand-written components ---------------------------------------
 
 #[test]
 fn boxed_components_build_routers() {
     let boxed: Box<dyn CommandHandler> = Box::new(aggregate("boxed", "order", &["test.Create"]));
+    assert_eq!(boxed.command_types(), vec!["test.Create".to_string()]);
     let router = RouterBuilder::new()
         .aggregate(boxed)
         .build()
@@ -408,14 +360,7 @@ fn boxed_components_build_routers() {
         .expect("build");
     let resp = router
         .dispatch_process_manager(&pb::ProcessManagerHandleRequest {
-            trigger: Some(pb::EventBook {
-                cover: Some(pb::Cover {
-                    domain: "order".to_string(),
-                    ..Default::default()
-                }),
-                pages: vec![event_page(any_of_type("test.Created"))],
-                ..Default::default()
-            }),
+            trigger: Some(source("order")),
             process_state: None,
         })
         .expect("dispatch");
@@ -432,60 +377,19 @@ fn boxed_components_build_routers() {
         .projector(projector)
         .build()
         .expect("build");
-    let projections = router
-        .dispatch_projectors(&pb::EventBook {
+    let projection = router
+        .dispatch_projector(&pb::EventBook {
             cover: Some(pb::Cover::default()),
             ..Default::default()
         })
         .expect("dispatch");
-    assert_eq!(projections[0].projector, "boxed");
+    assert_eq!(projection.projector, "boxed");
 }
 
-#[test]
-fn a_boxed_aggregate_keeps_its_routing_view() {
-    let boxed: Box<dyn CommandHandler> = Box::new(aggregate("boxed", "order", &["test.Create"]));
-    assert_eq!(boxed.domain(), "order");
-    assert_eq!(boxed.command_types(), vec!["test.Create".to_string()]);
-}
-
-// --- Compensate delivery across a shared domain ------------------------------
-
-// --- boxed and hand-written components ---------------------------------------
-
-#[test]
-fn a_boxed_aggregate_handles_facts() {
-    let boxed: Box<dyn CommandHandler> = Box::new(recorder("paid", "order", "test.Paid"));
-    assert_eq!(boxed.fact_types(), vec!["test.Paid".to_string()]);
-    let resp = boxed.dispatch(&fact("order", "test.Paid")).expect("fact");
-    assert_eq!(emitted_label(&resp), "paid");
-}
-
-#[test]
-fn a_boxed_process_manager_keeps_its_routing_view() {
-    let boxed: Box<dyn ProcessManagerHandler> = Box::new(
-        ProcessManagerDispatch::new(
-            "fulfil",
-            "fulfil-pm",
-            ["inventory"],
-            cover_applier(fresh_rebuilder()),
-        )
-        .on_event("order", "test.Created", |_, _, _| {
-            Ok(pb::ProcessManagerHandleResponse::default())
-        }),
-    );
-    assert_eq!(boxed.name(), "fulfil");
-    assert_eq!(boxed.pm_domain(), "fulfil-pm");
-    assert!(boxed.consumes("order"));
-    assert!(!boxed.consumes("billing"));
-}
-
-/// A hand-written aggregate that records no facts.
+/// A hand-written aggregate.
 struct Plain;
 
 impl CommandHandler for Plain {
-    fn domain(&self) -> &str {
-        "plain"
-    }
     fn command_types(&self) -> Vec<String> {
         vec!["test.Plain".to_string()]
     }
@@ -504,8 +408,11 @@ impl CommandHandler for Plain {
 }
 
 #[test]
-fn a_hand_written_aggregate_records_no_facts_by_default() {
-    assert!(Plain.fact_types().is_empty());
+fn a_hand_written_aggregate_builds_a_router() {
+    assert!(
+        Plain.upcast_types().is_empty(),
+        "no upcaster chain by default"
+    );
     let router = RouterBuilder::new()
         .aggregate(Plain)
         .build()
@@ -516,82 +423,10 @@ fn a_hand_written_aggregate_records_no_facts_by_default() {
             .expect("dispatch"),
         pb::CommandHandlerResponse::default()
     );
+    assert_eq!(router.component_descriptor().expect("hello").name, "plain");
 }
 
-// --- CommandHandlers ---------------------------------------------------------
-
-#[test]
-fn command_handlers_report_the_domains_they_serve_and_a_sole_handler() {
-    let mut handlers = CommandHandlers::new();
-    assert!(handlers.sole().is_none(), "no handler");
-    assert!(!handlers.serves("order"));
-    handlers
-        .push(Box::new(aggregate("order", "order", &["test.Create"])))
-        .expect("push");
-    assert_eq!(handlers.sole().map(|h| h.domain()), Some("order"));
-    assert!(handlers.serves("order"));
-    assert!(!handlers.serves("billing"));
-    handlers
-        .push(Box::new(aggregate("billing", "billing", &["test.Bill"])))
-        .expect("push");
-    assert!(handlers.sole().is_none(), "two handlers");
-    assert!(handlers.serves("billing"));
-}
-
-#[test]
-fn a_refused_push_leaves_the_table_unchanged() {
-    let mut handlers = CommandHandlers::new();
-    handlers
-        .push(Box::new(aggregate("first", "order", &["test.Create"])))
-        .expect("push");
-    let err = handlers
-        .push(Box::new(aggregate(
-            "rival",
-            "order",
-            &["test.Ship", "test.Create"],
-        )))
-        .unwrap_err();
-    assert_eq!(err.code, codes::DUPLICATE_COMMAND_HANDLER);
-    assert_eq!(
-        err.extras.get("command_type").map(String::as_str),
-        Some("test.Create")
-    );
-    assert!(handlers.sole().is_some(), "the rival was not added");
-    let err = handlers
-        .dispatch(&command("order", "test.Ship"))
-        .unwrap_err();
-    assert_eq!(
-        err.code,
-        codes::NO_HANDLER_REGISTERED,
-        "no claim of Ship survived"
-    );
-}
-
-// An old type no aggregate claims as sent routes to the aggregate whose
-// upcaster chain brings it to a type it claims (upcaster.proto; VC-1).
-#[test]
-fn an_old_command_type_routes_to_the_aggregate_its_upcaster_chain_serves() {
-    let upcaster = UpcasterDispatch::new("rename", "order").on_event("test.ShipV1", |any| {
-        Ok(Any {
-            type_url: type_url("test.Ship"),
-            value: any.value.clone(),
-        })
-    });
-    let router = RouterBuilder::new()
-        .aggregate(aggregate("create", "order", &["test.Create"]))
-        .aggregate(aggregate("ship", "order", &["test.Ship"]).with_command_upcaster(upcaster))
-        .build()
-        .expect("build");
-    let resp = router
-        .dispatch_command(&command("order", "test.ShipV1"))
-        .expect("upcast and routed");
-    assert_eq!(emitted_label(&resp), "ship");
-    let err = router
-        .dispatch_command(&command("order", "test.Unknown"))
-        .expect_err("no path to a handler");
-    assert_eq!(err.code, codes::NO_HANDLER_REGISTERED);
-    assert_eq!(err.grpc, crate::error::GrpcCode::InvalidArgument);
-}
+// --- the aggregate's own upcaster chain ---------------------------------------
 
 /// A chain renaming `from` to `to`, for the domain "order".
 fn renaming(from: &str, to: &'static str) -> UpcasterDispatch {
@@ -603,59 +438,22 @@ fn renaming(from: &str, to: &'static str) -> UpcasterDispatch {
     })
 }
 
-// Upcaster source types are claimed at registration like command types
-// (owner ruling): two aggregates accepting one old type, or an old type
-// colliding with a current one, fail the build.
+// An old type its chain accepts must not also be one of the aggregate's
+// current types (owner ruling): the build fails.
 #[test]
-fn upcaster_source_types_are_claimed_at_registration() {
-    let err = build_err(
-        RouterBuilder::new()
-            .aggregate(
-                aggregate("a", "order", &["test.Ship"])
-                    .with_command_upcaster(renaming("test.ShipV1", "test.Ship")),
-            )
-            .aggregate(
-                aggregate("b", "order", &["test.Send"])
-                    .with_command_upcaster(renaming("test.ShipV1", "test.Send")),
-            ),
-    );
-    assert_eq!(
-        err,
-        codes::DUPLICATE_COMMAND_HANDLER,
-        "one old type, two claimants"
-    );
-
-    let err = build_err(
-        RouterBuilder::new()
-            .aggregate(aggregate("a", "order", &["test.Create"]))
-            .aggregate(
-                aggregate("b", "order", &["test.Ship"])
-                    .with_command_upcaster(renaming("test.Create", "test.Ship")),
-            ),
-    );
-    assert_eq!(
-        err,
-        codes::DUPLICATE_COMMAND_HANDLER,
-        "an old type that is a current one"
-    );
-
+fn an_old_type_colliding_with_a_current_one_fails_the_build() {
     let err = build_err(
         RouterBuilder::new().aggregate(
             aggregate("a", "order", &["test.Ship", "test.ShipV1"])
                 .with_command_upcaster(renaming("test.ShipV1", "test.Ship")),
         ),
     );
-    assert_eq!(
-        err,
-        codes::DUPLICATE_COMMAND_HANDLER,
-        "within one aggregate too"
-    );
+    assert_eq!(err, codes::DUPLICATE_COMMAND_HANDLER);
 }
 
 #[test]
-fn a_claimed_old_type_that_upcasts_to_nothing_is_refused_by_its_claimant() {
+fn an_old_type_that_upcasts_to_nothing_is_refused_naming_where_it_ended() {
     let router = RouterBuilder::new()
-        .aggregate(aggregate("create", "order", &["test.Create"]))
         .aggregate(
             aggregate("ship", "order", &["test.Ship"])
                 .with_command_upcaster(renaming("test.ShipOld", "test.ShipLost")),
@@ -669,30 +467,14 @@ fn a_claimed_old_type_that_upcasts_to_nothing_is_refused_by_its_claimant() {
     assert_eq!(
         err.extras.get("upcast_type_url").map(String::as_str),
         Some(type_url("test.ShipLost").as_str()),
-        "the claimant's chain ran"
+        "the chain ran"
     );
-}
-
-#[test]
-fn an_old_fact_type_routes_to_the_aggregate_whose_chain_claims_it() {
-    let router = RouterBuilder::new()
-        .aggregate(recorder("paid", "order", "test.Paid"))
-        .aggregate(
-            recorder("shipped", "order", "test.Shipped")
-                .with_command_upcaster(renaming("test.ShippedV1", "test.Shipped")),
-        )
-        .build()
-        .expect("build");
-    let resp = router
-        .dispatch_command(&fact("order", "test.ShippedV1"))
-        .expect("upcast and routed");
-    assert_eq!(emitted_label(&resp), "shipped");
 }
 
 // One aggregate's chains may name a source type more than once (rules on
 // one type compose in order, C-0136): its own claims never collide.
 #[test]
-fn an_aggregate_naming_a_source_type_twice_claims_it_once() {
+fn an_aggregate_naming_a_source_type_twice_builds() {
     let chain = renaming("test.ShipV1", "test.ShipV1").on_event("test.ShipV1", |any| {
         Ok(Any {
             type_url: type_url("test.Ship"),
@@ -709,152 +491,65 @@ fn an_aggregate_naming_a_source_type_twice_claims_it_once() {
     assert_eq!(emitted_label(&resp), "ship");
 }
 
-// --- the registration hellos (types.proto ComponentDescriptor) --------------
+// --- the registration hello (types.proto ComponentDescriptor) ----------------
 
-/// The (name, kind) of each hello `router` answers.
-fn hellos(router: &Router) -> Vec<(String, pb::ComponentKind)> {
-    router
-        .component_descriptors()
-        .expect("hellos")
-        .into_iter()
-        .map(|d| {
-            let kind = d.kind();
-            (d.name, kind)
-        })
-        .collect()
-}
-
-fn ledger(name: &str, domain: &str, version: &str) -> AggregateDispatch<LedgerState> {
-    AggregateDispatch::new(name, domain, Rebuilder::of_message())
+fn ledger(version: &str) -> AggregateDispatch<LedgerState> {
+    AggregateDispatch::new("Ledger", "ledger", Rebuilder::of_message())
         .with_rules_version(version)
-        .on_command(&format!("test.{name}"), |_, _, _| Ok(None))
+        .on_command("test.Ledger", |_, _, _| Ok(None))
 }
 
 #[test]
-fn a_router_answers_its_aggregates_hellos_in_registration_order() {
-    let router = RouterBuilder::new()
-        .aggregate(ledger("Second", "b", "1"))
-        .aggregate(Box::new(ledger("First", "a", "1")) as Box<dyn CommandHandler>)
-        .aggregate(Plain)
-        .build()
-        .expect("build");
+fn a_router_answers_its_components_hello() {
+    let kind = |router: Router| router.component_descriptor().expect("hello").kind();
     assert_eq!(
-        hellos(&router),
-        vec![
-            ("Second".to_string(), pb::ComponentKind::Aggregate),
-            ("First".to_string(), pb::ComponentKind::Aggregate),
-            ("plain".to_string(), pb::ComponentKind::Unspecified),
-        ]
+        kind(RouterBuilder::new().aggregate(ledger("1")).build().unwrap()),
+        pb::ComponentKind::Aggregate
     );
-    let first = &router.component_descriptors().unwrap()[0];
     assert_eq!(
-        first.state.as_ref().expect("state").type_url,
-        "/test.ledger.LedgerState"
+        kind(
+            RouterBuilder::new()
+                .saga(SagaDispatch::new("s", "order", ["x"]).with_rules_version("1"))
+                .build()
+                .unwrap()
+        ),
+        pb::ComponentKind::Saga
     );
-}
-
-#[test]
-fn a_router_answers_every_kinds_hellos() {
-    let sagas = RouterBuilder::new()
-        .saga(SagaDispatch::new("s1", "order", ["x"]).with_rules_version("1"))
-        .saga(SagaDispatch::new("s2", "order", ["x"]).with_rules_version("1"))
-        .build()
-        .expect("build");
     assert_eq!(
-        hellos(&sagas),
-        vec![
-            ("s1".to_string(), pb::ComponentKind::Saga),
-            ("s2".to_string(), pb::ComponentKind::Saga),
-        ]
+        kind(
+            RouterBuilder::new()
+                .process_manager(
+                    ProcessManagerDispatch::new(
+                        "p",
+                        "pm",
+                        ["x"],
+                        Rebuilder::<LedgerState>::of_message()
+                    )
+                    .with_rules_version("1")
+                )
+                .build()
+                .unwrap()
+        ),
+        pb::ComponentKind::ProcessManager
     );
-    let pm = |name: &str| {
-        ProcessManagerDispatch::new(name, "pm", ["x"], Rebuilder::<LedgerState>::of_message())
-            .with_rules_version("1")
-    };
-    let pms = RouterBuilder::new()
-        .process_manager(pm("p1"))
-        .process_manager(Box::new(pm("p2")) as Box<dyn ProcessManagerHandler>)
-        .build()
-        .expect("build");
     assert_eq!(
-        hellos(&pms),
-        vec![
-            ("p1".to_string(), pb::ComponentKind::ProcessManager),
-            ("p2".to_string(), pb::ComponentKind::ProcessManager),
-        ]
-    );
-    let projectors = RouterBuilder::new()
-        .projector(ProjectorDispatch::new("v1", || ()).with_rules_version("1"))
-        .projector(
-            Box::new(ProjectorDispatch::new("v2", || ()).with_rules_version("1"))
-                as Box<dyn ProjectorHandler>,
-        )
-        .build()
-        .expect("build");
-    assert_eq!(
-        hellos(&projectors),
-        vec![
-            ("v1".to_string(), pb::ComponentKind::Projector),
-            ("v2".to_string(), pb::ComponentKind::Projector),
-        ]
+        kind(
+            RouterBuilder::new()
+                .projector(ProjectorDispatch::new("v", || ()).with_rules_version("1"))
+                .build()
+                .unwrap()
+        ),
+        pb::ComponentKind::Projector
     );
 }
 
 #[test]
-fn an_upcaster_router_has_no_hellos() {
-    let router = RouterBuilder::new()
-        .upcaster(UpcasterDispatch::new("v1-v2", "order"))
+fn a_router_refuses_its_components_hello_without_a_rules_version() {
+    let err = RouterBuilder::new()
+        .aggregate(ledger(""))
         .build()
-        .expect("build");
-    assert!(router.component_descriptors().expect("none").is_empty());
-}
-
-#[test]
-fn a_router_refuses_with_its_first_components_refusal() {
-    let check = |router: Router, refused: &str| {
-        let err = router.component_descriptors().expect_err("refused");
-        assert_eq!(err.code, codes::MISSING_RULES_VERSION);
-        assert_eq!(
-            err.extras
-                .get(crate::error::extras::COMPONENT)
-                .map(String::as_str),
-            Some(refused)
-        );
-    };
-    check(
-        RouterBuilder::new()
-            .aggregate(ledger("Fine", "a", "1"))
-            .aggregate(ledger("Bad", "b", ""))
-            .aggregate(ledger("Worse", "c", ""))
-            .build()
-            .expect("build"),
-        "Bad",
-    );
-    check(
-        RouterBuilder::new()
-            .saga(SagaDispatch::new("ok", "order", ["x"]).with_rules_version("1"))
-            .saga(SagaDispatch::new("bad", "order", ["x"]))
-            .build()
-            .expect("build"),
-        "bad",
-    );
-    check(
-        RouterBuilder::new()
-            .process_manager(ProcessManagerDispatch::new(
-                "bad",
-                "pm",
-                ["x"],
-                Rebuilder::<LedgerState>::of_message(),
-            ))
-            .build()
-            .expect("build"),
-        "bad",
-    );
-    check(
-        RouterBuilder::new()
-            .projector(ProjectorDispatch::new("bad", || ()))
-            .build()
-            .expect("build"),
-        "bad",
-    );
+        .unwrap()
+        .component_descriptor()
+        .expect_err("refused");
+    assert_eq!(err.code, codes::MISSING_RULES_VERSION);
 }

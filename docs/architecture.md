@@ -18,8 +18,8 @@ router.
 - **client-rust** dispatches through `crates/router`'s Rust-native API (no
   FFI) and has no engine of its own. That API (`Rebuilder`,
   `AggregateDispatch` with commands and facts, `SagaDispatch`,
-  `ProcessManagerDispatch` with `select_process_managers`/`merge_responses`,
-  `ProjectorDispatch`, `RouterBuilder`/`Router`/`CommandHandlers`,
+  `ProcessManagerDispatch`, `ProjectorDispatch`, `RouterBuilder`/`Router`
+  (one component per router),
   `CodedError`, and the wire types re-exported as `pb`) is
   therefore a public contract, documented on each item; components may be
   registered boxed (`Box<dyn CommandHandler>` and so on).
@@ -41,11 +41,11 @@ bindings/<lang>    ── registry of callback_id → typed invoker, one trampol
         │             stateless (the router owns every state)
         │  C ABI (crates/router-ffi: 14 extern "C" fns)
         ▼
-crates/router-ffi  ── descriptor → core tables, component claims/routing,
+crates/router-ffi  ── descriptor → the one component's core table,
         │             router-held state and projections
         ▼
 crates/router      ── Rebuilder, AggregateDispatch, SagaDispatch,
-                      ProcessManagerDispatch (+ co-resident selection),
+                      ProcessManagerDispatch, Router (one component),
                       ProjectorDispatch, CodedError
 ```
 
@@ -61,28 +61,22 @@ The exported surface (see `crates/router-ffi/src/lib.rs`):
 `angzarr_abi_version`, `angzarr_buf_alloc`, `angzarr_buf_release`,
 `angzarr_router_new`, `angzarr_router_free`, per component kind a
 `register_*` and a `dispatch*` entry point (aggregate, projector, saga,
-process manager), and `angzarr_router_component_descriptors`, which
-answers every registered component's registration hello (the spec's
-`ComponentDescriptor`, built by the router; the host only sends it) (ABI
-version 4). The aggregate's `dispatch` takes a
+process manager), and `angzarr_router_component_descriptor`, which
+answers the component's registration hello (the spec's
+`ComponentDescriptor`, the one `ComponentService.Describe` answers, built by
+the router; the host only sends it) (ABI version 4). The aggregate's `dispatch` takes a
 `ContextualCommand` whose page carries a command or a fact and answers a
 `CommandHandlerResponse`; the saga's takes the source `EventBook`. A component is registered from a serialized descriptor
 (`proto/io/angzarr/router/ffi/v1/abi.proto`) listing `(fq_type,
 callback_id)` entries; every callback goes through one host function
 `angzarr_cb(callback_id, type_url, payload, aux, out)`.
 
-The registry owns the component claims, which are mutation-tested with the
-core:
-
-- aggregates register into the core's `CommandHandlers`, the same table
-  the Rust-native `Router` uses: a command routes by (cover domain, command
-  type), several aggregates may share a domain, and a second claim of one
-  (domain, command type) is refused at registration
-  (`DUPLICATE_COMMAND_HANDLER`); a sole aggregate claims every domain;
-- a router hosts at most one projector (one `Projection` per `EventBook`);
-- a saga source routes to every saga whose input domain matches;
-- a process-manager request routes through the core's
-  `select_process_managers`.
+A router hosts exactly one component (owner ruling: one coordinator, one
+component, one business process), held as the core's `Router`: registering a
+second component of any kind is refused (`DUPLICATE_REGISTRATION`), and
+dispatching a kind the router does not host is `NO_HANDLER_REGISTERED`. An
+aggregate whose upcaster chain accepts one of its own command types is
+refused at registration (`DUPLICATE_COMMAND_HANDLER`).
 
 ### bindings/<language>
 
@@ -103,12 +97,13 @@ so a binding keeps no state of any kind.
 | Reaction commands | Saga and process-manager commands pass through as the handler emitted them: the coordinator stamps their identity, causation and correlation. A saga handler sees the triggering page's cover and sequence; a process-manager handler sees the trigger cover |
 | Saga dispatch | EVERY page of the source book dispatches; undeclared types are skipped (C-0051) |
 | Facts | A fact arrives in the Fact arm of the command page and runs the fact handler registered for its type; a type with none (a command type included: the arm must match the handler's kind) is `NO_FACT_HANDLER` (INVALID_ARGUMENT) before any rebuild, so nothing is recorded. Otherwise the handler sees the rebuilt state and returns the fact to record (it may annotate it, never refuse it) followed by events that flag it; they come back as the response's events, payloads only. Facts route by (cover domain, fact type), else to the domain's first aggregate, which refuses them. There is no Replay |
+| Event upcasting | `Router::upcast` runs an `UpcastRequest` for the chain's domain through the component's own upcaster chain (part of the component, never a component of its own; C-0136); other requests, or a component with no chain, pass through unchanged |
 | Command upcasting | Command and fact payloads run through the aggregate's upcaster chains before dispatch; a refusal names the sent type URL, its extras the chain's last (`upcast_type_url`); routing tries the sent type, then the aggregate of the domain whose chain serves it (docs/design-handling.md) |
 | Conflicts | Handlers see the resolved `Handling` (`expected_sequence`, `conflict_resolution`). AGGREGATE_HANDLES hands the window and nonce in `CommandContext.conflict`; output without `resolve_conflicts(window, nonce)` on exactly that nonce is discarded: `CONFLICT_UNRESOLVED` (ABORTED). COMMUTATIVE runs in the router over the generated `changed()`: decide on the head, keep the events iff `changed(expected, head)` and `changed(head, head + events)` do not overlap, else `CONFLICT_OVERLAP` (ABORTED); none registered: `CONFLICT_RESOLUTION_UNSUPPORTED` |
 | Rules version | Every `CommandHandlerResponse` and `ProcessManagerHandleResponse` carries the binary's declared rules version, overwriting a handler's; co-hosted PMs share it. Snapshot selection is the coordinator's (decision 14.1) |
-| Process manager | The newest page of the trigger book dispatches; handlers receive the trigger cover; co-resident PMs are selected by identity first — a process state reaches the PM owning its cover domain — and otherwise every PM consuming the trigger domain; responses merge in registration order. Process events pass through as emitted (the coordinator addresses and stamps them) |
+| Process manager | The newest page of the trigger book dispatches; handlers receive the trigger cover; a trigger outside its sources or of an undeclared type answers an empty response (C-0022). Process events pass through as emitted (the coordinator addresses and stamps them) |
 | Projector | Folds every page into one projection instance, each fold seeing the book cover and the page's sequence; undeclared domains fold nothing (C-0032), and a projector declaring `"*"` consumes every domain; unmatched types are skipped with a WARN; without a finish step the `Projection` carries the cover, the projector's name and its next sequence (the last page's sequence + 1, or the book's `next_sequence` with no pages); a failing fold is a handler bug (INTERNAL), named as a failing state fold is, with the projection type (`with_projection_type`) as `state_type_url`. Across the C ABI the projection is router-held (a serialized `Any` of the registered projection type, empty at first), folded by one stateless batched host fold call per delivery, and the router builds the `Projection` (cover, projector name, next sequence after the last page) |
-| Registration hello | Every component builds the spec's `ComponentDescriptor` from its own table (`component_descriptor()`): name, kind, inputs (a saga's input domain, a PM's sources, a projector's domains or `*`, none for an aggregate), the rules version, and for aggregates and PMs the state type the rebuilder declares with its resolutions (STRICT, AGGREGATE_HANDLES, plus COMMUTATIVE first with `changed()`). `Router::component_descriptors()` and the C ABI's `angzarr_router_component_descriptors` answer every component's, in registration order; an empty rules version is `MISSING_RULES_VERSION`, an undeclared state type `MISSING_STATE_TYPE` (both INVALID_ARGUMENT, naming the `component`) |
+| Registration hello | Every component builds the spec's `ComponentDescriptor` from its own table (`component_descriptor()`): name, kind, inputs (a saga's input domain, a PM's sources, a projector's domains or `*`, none for an aggregate), the rules version, and for aggregates and PMs the state type the rebuilder declares with its resolutions (STRICT, AGGREGATE_HANDLES, plus COMMUTATIVE first with `changed()`). `Router::component_descriptor()` and the C ABI's `angzarr_router_component_descriptor` answer the one component's (`ComponentService.Describe`); an empty rules version is `MISSING_RULES_VERSION`, an undeclared state type `MISSING_STATE_TYPE` (both INVALID_ARGUMENT, naming the `component`) |
 | Snapshot | Every aggregate answer carries `events.snapshot.state`, the state after its events (the emitted events, or a fact's record, folded at the sequences they will get); every handled PM trigger carries its state after its process events in `process_state` (process events stay payloads only; co-resident PMs merge the state of the one PM that handled the trigger). Sequence and rules version stay unset for the coordinator; a rejection has no body |
 | Type URLs | Emitted type URLs use the bare `/` prefix; incoming ones match by the fully-qualified name after the last `/`, whatever the prefix |
 | Errors | One `map_handler_error` table: rejections keep their gRPC code, a command or fact type URL no handler claims → INVALID_ARGUMENT (`NO_HANDLER_REGISTERED` or `NO_FACT_HANDLER`, message `no handler for type URL <url>`), any other `NO_HANDLER_REGISTERED` (no component for the request) → UNIMPLEMENTED, `PERSISTED_EVENT_CORRUPT` (an unloadable snapshot) → DATA_LOSS, `CONFLICT_UNRESOLVED` and `CONFLICT_OVERLAP` → ABORTED, other coded client errors → INVALID_ARGUMENT, unclassified → INTERNAL + `UNHANDLED_HANDLER_ERROR`. Codes ride a `google.rpc.ErrorInfo` detail (domain `angzarr.io`); assertions key on codes, never message substrings |

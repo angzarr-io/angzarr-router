@@ -5,39 +5,18 @@
 
 use angzarr_router::error::CodedError;
 use angzarr_router::pb;
-use angzarr_router::process_manager::{
-    merge_responses, select_process_managers, ProcessManagerRoute,
-};
 use angzarr_router_conformance as conf;
 use cucumber::{given, then, when, World};
 
 #[derive(Debug, Default, World)]
 struct ProcessManagerWorld {
-    /// True when the audit PM is co-resident with the order PM.
-    co_resident: bool,
     /// Outcome of the dispatched trigger.
     result: Option<Result<pb::ProcessManagerHandleResponse, CodedError>>,
 }
 
 impl ProcessManagerWorld {
     fn dispatch(&mut self, req: pb::ProcessManagerHandleRequest) {
-        if !self.co_resident {
-            self.result = Some(conf::order_pm().dispatch(&req));
-            return;
-        }
-        // Co-resident: the router's selection + merge over both PMs, each
-        // dispatching over its own state type.
-        let order = conf::order_pm();
-        let audit = conf::audit_pm();
-        let routes: [&dyn ProcessManagerRoute; 2] = [&order, &audit];
-        let responses = select_process_managers(&routes, &req)
-            .into_iter()
-            .map(|index| match index {
-                0 => order.dispatch(&req),
-                _ => audit.dispatch(&req),
-            })
-            .collect::<Result<Vec<_>, _>>();
-        self.result = Some(responses.map(|responses| merge_responses("", responses)));
+        self.result = Some(conf::order_pm().dispatch(&req));
     }
 
     /// The counts the order PM's process events recorded (one per reaction).
@@ -45,15 +24,6 @@ impl ProcessManagerWorld {
         conf::recorded_states::<conf::counter::OrderProcessManagerState>(self.response())
             .into_iter()
             .map(|s| s.count)
-            .collect()
-    }
-
-    /// How many events the audit PM's process events recorded it had seen
-    /// (one entry per reaction).
-    fn audit_counts(&self) -> Vec<u32> {
-        conf::recorded_states::<conf::counter::AuditProcessManagerState>(self.response())
-            .into_iter()
-            .map(|s| s.seen.len() as u32)
             .collect()
     }
 
@@ -183,42 +153,6 @@ async fn fails_with(w: &mut ProcessManagerWorld, code: String) {
         .err()
         .unwrap_or_else(|| panic!("expected failure {code}, got a success"));
     assert_eq!(err.code, code, "coded-error reason");
-}
-
-#[given("co-resident order and audit process-managers")]
-async fn co_resident_pms(w: &mut ProcessManagerWorld) {
-    w.co_resident = true;
-}
-
-#[when(
-    regex = r#"^an Increased trigger is dispatched over a prior "([^"]*)" state of (\d+) events$"#
-)]
-async fn increased_over_owned_state(w: &mut ProcessManagerWorld, owner: String, n: u32) {
-    w.dispatch(conf::pm_trigger_request(
-        "counter",
-        &["test.counter.Increased"],
-        Some(conf::pm_state_in(&owner, n)),
-        None,
-    ));
-}
-
-#[then(regex = r"^the order process-manager rebuilt (\d+) prior state events$")]
-async fn order_rebuilt(w: &mut ProcessManagerWorld, n: u32) {
-    assert_eq!(w.order_counts(), vec![n], "the order PM's rebuilt events");
-}
-
-#[then(regex = r"^the audit process-manager rebuilt (\d+) prior state events$")]
-async fn audit_rebuilt(w: &mut ProcessManagerWorld, n: u32) {
-    assert_eq!(w.audit_counts(), vec![n], "the audit PM's rebuilt events");
-}
-
-#[then("the order process-manager did not react")]
-async fn order_did_not_react(w: &mut ProcessManagerWorld) {
-    assert!(
-        w.response().commands.is_empty(),
-        "the order PM emitted no command"
-    );
-    assert!(w.order_counts().is_empty(), "the order PM recorded nothing");
 }
 
 #[tokio::main]

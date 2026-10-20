@@ -339,6 +339,27 @@ impl<S> AggregateDispatch<S> {
         self.handlers.keys().cloned().collect()
     }
 
+    /// Checks the aggregate's own claims: an old type its upcaster chains
+    /// accept that is also one of its current command types is
+    /// DUPLICATE_COMMAND_HANDLER (the old type would never reach its chain).
+    pub fn check_claims(&self) -> Result<(), CodedError> {
+        match self
+            .upcast_types()
+            .into_iter()
+            .find(|old| self.handlers.contains_key(old))
+        {
+            Some(old) => Err(CodedError::invalid_argument(
+                codes::DUPLICATE_COMMAND_HANDLER,
+                messages::DUPLICATE_COMMAND_HANDLER,
+                [
+                    (extras::DOMAIN.to_string(), self.domain.clone()),
+                    (extras::COMMAND_TYPE.to_string(), old),
+                ],
+            )),
+            None => Ok(()),
+        }
+    }
+
     /// The registered fully-qualified fact type names.
     pub fn fact_types(&self) -> Vec<String> {
         self.facts.keys().cloned().collect()

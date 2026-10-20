@@ -51,15 +51,10 @@ historical-state evidence the framework supplies.
   `inventory` per source event.
 - **CounterProjector** (domain `counter`) — folds a count, finishes into a
   `Projection`.
-- **OrderProcessManager** (domain `order-pm`) and **AuditProcessManager**
-  (domain `audit-pm`) — co-resident PMs consuming the same `counter`
-  trigger, over DIFFERENT state types. The order PM emits a `Reserve`
-  command and one unaddressed process event carrying an
-  `OrderProcessManagerState` with the count its rebuilt state held; the
-  audit PM emits one unaddressed process event carrying an
-  `AuditProcessManagerState` with what its rebuilt state saw. They
-  prove each PM rebuilds only its own state and that a process state
-  reaches only the PM that owns it.
+- **OrderProcessManager** (domain `order-pm`) — consumes the `counter`
+  trigger, emits a `Reserve` command and one unaddressed process event
+  carrying an `OrderProcessManagerState` with the count its rebuilt state
+  held, proving its own state is rebuilt before the handler.
 
 ## The order aggregate and the Fulfillment process manager (handler-contract)
 

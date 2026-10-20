@@ -16,7 +16,8 @@ use crate::pb;
 /// the typed old event and pack the typed new one.
 pub type UpcastFn = Box<dyn Fn(&Any) -> Result<Any, HandlerError> + Send + Sync>;
 
-/// The rule table for one upcaster component.
+/// The upcaster chain of one component (part of it, not a component of its
+/// own).
 pub struct UpcasterDispatch {
     name: String,
     domain: String,

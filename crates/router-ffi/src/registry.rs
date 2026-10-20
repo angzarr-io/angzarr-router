@@ -8,12 +8,10 @@ use prost_types::Any;
 use angzarr_router::aggregate::{AggregateDispatch, CommandContext, FactRecord};
 use angzarr_router::error::{codes, messages, CodedError, HandlerError};
 use angzarr_router::pb;
-use angzarr_router::process_manager::{
-    merge_responses, select_process_managers, ProcessManagerDispatch, ProcessManagerRoute,
-};
+use angzarr_router::process_manager::ProcessManagerDispatch;
 use angzarr_router::projector::ProjectorDispatch;
 use angzarr_router::rebuild::{FoldFailure, Rebuilder};
-use angzarr_router::router::{CommandHandler, CommandHandlers};
+use angzarr_router::router::{Router, RouterBuilder};
 use angzarr_router::saga::SagaDispatch;
 use angzarr_router::upcaster::UpcasterDispatch;
 
@@ -138,35 +136,55 @@ fn state_rebuilder(state_type_url: &str, fold: Option<u64>, cb: AngzarrCb) -> Re
     rebuilder
 }
 
-/// The registered tables behind an opaque router handle.
+/// The one component behind an opaque router handle (owner ruling: one
+/// coordinator, one component, one business process), held as the core's
+/// [`Router`]. Registering a second component, of any kind, is refused
+/// DUPLICATE_REGISTRATION.
 pub struct FfiRouter {
-    aggregates: CommandHandlers,
-    projectors: Vec<(String, ProjectorDispatch<Any>)>,
-    sagas: Vec<(String, SagaDispatch)>,
-    process_managers: Vec<(String, ProcessManagerDispatch<Any>)>,
-    /// Every registered component's registration hello (or the refusal to
-    /// build it), in registration order. The tables are fixed once
-    /// registered, so each is built when its component registers.
-    hellos: Vec<Result<pb::ComponentDescriptor, CodedError>>,
+    router: Option<Router>,
 }
 
 impl FfiRouter {
     pub fn new() -> Self {
-        FfiRouter {
-            aggregates: CommandHandlers::new(),
-            projectors: Vec::new(),
-            sagas: Vec::new(),
-            process_managers: Vec::new(),
-            hellos: Vec::new(),
-        }
+        FfiRouter { router: None }
     }
 
-    /// The registration hellos of every registered component, in
-    /// registration order, as ComponentDescriptors bytes; or the first
-    /// component's refusal to build one (MISSING_RULES_VERSION).
-    pub fn component_descriptors(&self) -> Result<Vec<u8>, CodedError> {
-        let components = self.hellos.iter().cloned().collect::<Result<Vec<_>, _>>()?;
-        Ok(pb::ComponentDescriptors { components }.encode_to_vec())
+    /// The component's registration hello (types.proto ComponentDescriptor,
+    /// the one ComponentService.Describe answers) as bytes; refused
+    /// MISSING_RULES_VERSION or MISSING_STATE_TYPE when it cannot be built,
+    /// and NO_HANDLERS_REGISTERED before a component registers.
+    pub fn component_descriptor(&self) -> Result<Vec<u8>, CodedError> {
+        Ok(self.router()?.component_descriptor()?.encode_to_vec())
+    }
+
+    /// The hosted component's router; NO_HANDLER_REGISTERED before one
+    /// registers.
+    fn router(&self) -> Result<&Router, CodedError> {
+        self.router.as_ref().ok_or_else(|| {
+            CodedError::invalid_argument(
+                codes::NO_HANDLERS_REGISTERED,
+                messages::NO_HANDLERS_REGISTERED,
+                [],
+            )
+        })
+    }
+
+    /// Refuses a second component (DUPLICATE_REGISTRATION).
+    fn refuse_a_second(&self) -> Result<(), CodedError> {
+        if self.router.is_some() {
+            return Err(CodedError::invalid_argument(
+                codes::DUPLICATE_REGISTRATION,
+                "this router already hosts its one component",
+                [],
+            ));
+        }
+        Ok(())
+    }
+
+    /// Hosts the component `builder` holds, once its build validates.
+    fn host(&mut self, builder: RouterBuilder) -> Result<(), CodedError> {
+        self.router = Some(builder.build()?);
+        Ok(())
     }
 
     /// Parses an AggregateDescriptor and populates the core tables with
@@ -183,6 +201,7 @@ impl FfiRouter {
                 [],
             )
         })?;
+        self.refuse_a_second()?;
         let rebuilder = state_rebuilder(&desc.state_type_url, desc.fold_callback_id, cb);
 
         let mut dispatch =
@@ -299,12 +318,8 @@ impl FfiRouter {
                 }
             });
         }
-        let hello = dispatch.component_descriptor();
-        // Refuses a second claim of one (domain, command type) (C-0010,
-        // C-0064).
-        self.aggregates.push(Box::new(dispatch))?;
-        self.hellos.push(hello);
-        Ok(())
+        // The build refuses an old type colliding with a current one.
+        self.host(RouterBuilder::new().aggregate(dispatch))
     }
 
     /// Parses a ProjectorDescriptor and populates a core projector table over
@@ -322,15 +337,7 @@ impl FfiRouter {
                 [],
             )
         })?;
-        // A projector dispatch returns one Projection per EventBook, so a
-        // router hosts at most one projector.
-        if !self.projectors.is_empty() {
-            return Err(CodedError::invalid_argument(
-                codes::DUPLICATE_REGISTRATION,
-                "a projector is already registered on this router",
-                [],
-            ));
-        }
+        self.refuse_a_second()?;
 
         let initial = Any {
             type_url: angzarr_router::type_url(&desc.projection_type_url),
@@ -359,14 +366,10 @@ impl FfiRouter {
             })
         });
 
-        self.hellos.push(dispatch.component_descriptor());
-        self.projectors.push((desc.name, dispatch));
-        Ok(())
+        self.host(RouterBuilder::new().projector(dispatch))
     }
 
-    /// Decodes ContextualCommand bytes, routes it through the aggregates'
-    /// claims (by domain and command type; a sole registered aggregate claims
-    /// any domain), and runs the core dispatch.
+    /// Decodes ContextualCommand bytes and handles them with the aggregate.
     pub fn dispatch(&self, request: &[u8]) -> Result<Vec<u8>, CodedError> {
         let req = pb::ContextualCommand::decode(request).map_err(|_| {
             CodedError::invalid_argument(
@@ -375,48 +378,16 @@ impl FfiRouter {
                 [],
             )
         })?;
-        let domain = req
-            .command
-            .as_ref()
-            .and_then(|c| c.cover.as_ref())
-            .map_or("", |c| c.domain.as_str());
-        let resp = match self.sole_aggregate_for(domain) {
-            Some(sole) => sole.dispatch(&req)?,
-            None => self.aggregates.dispatch(&req)?,
-        };
-        Ok(resp.encode_to_vec())
+        Ok(self.router()?.dispatch_command(&req)?.encode_to_vec())
     }
 
-    /// The sole registered aggregate, when it is the only one and `domain`
-    /// is not its own: it claims every domain.
-    fn sole_aggregate_for(&self, domain: &str) -> Option<&dyn CommandHandler> {
-        if self.aggregates.serves(domain) {
-            return None;
-        }
-        self.aggregates.sole()
-    }
-
-    /// Decodes EventBook bytes, routes to the registered projector (sole
-    /// projector claims everything; the core applies its own domain filter),
-    /// and runs the core dispatch.
+    /// Decodes EventBook bytes and runs the projector over them (the core
+    /// applies its domain filter).
     pub fn dispatch_projector(&self, request: &[u8]) -> Result<Vec<u8>, CodedError> {
         let book = pb::EventBook::decode(request).map_err(|_| {
             CodedError::invalid_argument(codes::ANY_DECODE_FAILED, "failed to decode EventBook", [])
         })?;
-
-        let dispatch = match self.projectors.as_slice() {
-            [(_, only)] => only,
-            _ => {
-                return Err(CodedError::invalid_argument(
-                    codes::NO_HANDLER_REGISTERED,
-                    "no single projector registered to claim the EventBook",
-                    [],
-                ));
-            }
-        };
-
-        let resp = dispatch.dispatch(&book)?;
-        Ok(resp.encode_to_vec())
+        Ok(self.router()?.dispatch_projector(&book)?.encode_to_vec())
     }
 
     /// Parses a SagaDescriptor and populates a core saga table with
@@ -431,6 +402,7 @@ impl FfiRouter {
                 [],
             )
         })?;
+        self.refuse_a_second()?;
         let mut dispatch = SagaDispatch::new(
             desc.name.clone(),
             desc.input_domain.clone(),
@@ -464,13 +436,10 @@ impl FfiRouter {
             });
         }
 
-        self.hellos.push(dispatch.component_descriptor());
-        self.sagas.push((desc.name, dispatch));
-        Ok(())
+        self.host(RouterBuilder::new().saga(dispatch))
     }
 
-    /// Decodes the source EventBook bytes, routes to the sagas consuming its
-    /// domain, and runs each core dispatch.
+    /// Decodes the source EventBook bytes and runs the saga over them.
     pub fn dispatch_saga(&self, request: &[u8]) -> Result<Vec<u8>, CodedError> {
         let source = pb::EventBook::decode(request).map_err(|_| {
             CodedError::invalid_argument(
@@ -479,47 +448,7 @@ impl FfiRouter {
                 [],
             )
         })?;
-
-        // Source-shape validation precedes routing: a source with no pages is
-        // EMPTY_SAGA_SOURCE, regardless of which (if any) saga consumes its
-        // domain. Otherwise an empty source has no cover domain, matches no
-        // saga, and would mis-report as NO_HANDLER_REGISTERED.
-        if source.pages.is_empty() {
-            return Err(CodedError::invalid_argument(
-                codes::EMPTY_SAGA_SOURCE,
-                messages::EMPTY_SAGA_SOURCE,
-                [],
-            ));
-        }
-
-        // Route by the source book's domain and merge: every saga consuming
-        // that domain runs, each skipping event types it does not declare
-        // (spec C-0051), so one router can host several sagas.
-        let domain = source
-            .cover
-            .as_ref()
-            .map(|c| c.domain.as_str())
-            .unwrap_or("");
-        let mut merged = pb::SagaResponse::default();
-        let mut matched = false;
-        for (_, saga) in self
-            .sagas
-            .iter()
-            .filter(|(_, s)| s.input_domain() == domain)
-        {
-            matched = true;
-            merged.commands.extend(saga.dispatch(&source)?.commands);
-        }
-        // A source domain no saga consumes is NO_HANDLER_REGISTERED (a PM
-        // trigger no PM consumes is a no-op instead, C-0022).
-        if !matched {
-            return Err(CodedError::invalid_argument(
-                codes::NO_HANDLER_REGISTERED,
-                "no saga registered for the source domain",
-                [],
-            ));
-        }
-        Ok(merged.encode_to_vec())
+        Ok(self.router()?.dispatch_saga(&source)?.encode_to_vec())
     }
 
     /// Parses a ProcessManagerDescriptor and populates a core PM table.
@@ -538,6 +467,7 @@ impl FfiRouter {
                 [],
             )
         })?;
+        self.refuse_a_second()?;
 
         let rebuilder = state_rebuilder(&desc.state_type_url, desc.fold_callback_id, cb);
 
@@ -579,14 +509,11 @@ impl FfiRouter {
             );
         }
 
-        self.hellos.push(dispatch.component_descriptor());
-        self.process_managers.push((desc.name, dispatch));
-        Ok(())
+        self.host(RouterBuilder::new().process_manager(dispatch))
     }
 
-    /// Decodes ProcessManagerHandleRequest bytes, routes to the addressed
-    /// co-resident PMs, and runs each core dispatch. Each PM's state is router-owned and rebuilt from its own
-    /// process state, so no PM ever folds into another's state.
+    /// Decodes ProcessManagerHandleRequest bytes and handles them with the
+    /// process manager, over its router-owned state.
     pub fn dispatch_process_manager(&self, request: &[u8]) -> Result<Vec<u8>, CodedError> {
         let req = pb::ProcessManagerHandleRequest::decode(request).map_err(|_| {
             CodedError::invalid_argument(
@@ -595,46 +522,9 @@ impl FfiRouter {
                 [],
             )
         })?;
-
-        // Trigger-shape validation precedes routing (mirrors dispatch_saga): a
-        // nil trigger is MISSING_PM_TRIGGER and a trigger with no pages is
-        // EMPTY_PM_TRIGGER, regardless of which PM (if any) consumes its domain.
-        let Some(trigger) = req.trigger.as_ref() else {
-            return Err(CodedError::invalid_argument(
-                codes::MISSING_PM_TRIGGER,
-                messages::MISSING_PM_TRIGGER,
-                [],
-            ));
-        };
-        if trigger.pages.is_empty() {
-            return Err(CodedError::invalid_argument(
-                codes::EMPTY_PM_TRIGGER,
-                messages::EMPTY_PM_TRIGGER,
-                [],
-            ));
-        }
-
-        // Route by identity, then by subscription (select_process_managers):
-        // a process-state book belongs to one PM; a new
-        // workflow's trigger reaches every PM consuming its domain, each
-        // no-opping on event types it does not declare (C-0022). Responses
-        // merge in registration order (merge_responses).
-        let routes: Vec<&dyn ProcessManagerRoute> = self
-            .process_managers
-            .iter()
-            .map(|(_, pm)| pm as &dyn ProcessManagerRoute)
-            .collect();
-        let selected = select_process_managers(&routes, &req);
-        // Co-hosted PMs share one binary, so one rules version.
-        let rules_version = self
-            .process_managers
-            .first()
-            .map_or("", |(_, pm)| pm.rules_version());
-        let responses = selected
-            .into_iter()
-            .map(|index| self.process_managers[index].1.dispatch(&req))
-            .collect::<Result<Vec<_>, _>>()?;
-        // PM tail: an unconsumed trigger domain is a no-op (C-0022), not an error.
-        Ok(merge_responses(rules_version, responses).encode_to_vec())
+        Ok(self
+            .router()?
+            .dispatch_process_manager(&req)?
+            .encode_to_vec())
     }
 }

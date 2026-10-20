@@ -10,6 +10,9 @@
 - **Implemented:** fold failures everywhere are INTERNAL and typed, and the
   native `Router` gathers registration hellos, per the owner rulings recorded
   under "Fold failures and the native Router" below.
+- **Implemented:** one component per router (owner ruling, 2026-10-20;
+  spec 825311f, decisions 14.19–14.23), recorded under "One component per
+  router" below. It supersedes every multi-component passage here.
 - **Open:** how the rules version is sourced (the owner intends the binary's
   full build version, emitted by versionator).
 
@@ -38,11 +41,10 @@ Source: angzarr-project `spec/20261019-draft` (eb09fbd).
 
 1. **Envelope guards** run first.
 2. **Upcast.** The payload of either arm (command or fact) runs through the
-   claimant aggregate's upcaster chains, by type URL (VC-1).
+   aggregate's upcaster chains, by type URL (VC-1).
 3. **Dispatch.** The body arm and the upcast type URL pick the handler. If no
-   handler claims the type, the router answers INVALID_ARGUMENT. The message
-   names the type URL as it was sent. If a chain ran, the extras carry
-   `upcast_type_url`.
+   handler takes the type, the aggregate answers INVALID_ARGUMENT. The message
+   names the type URL as it was sent; the extras carry `upcast_type_url`.
 4. **Conflicts** (Command arm only):
    - **STRICT:** no extra step.
    - **AGGREGATE_HANDLES:** the handler receives the window and nonce. If it
@@ -61,20 +63,15 @@ Source: angzarr-project `spec/20261019-draft` (eb09fbd).
      `CONFLICT_RESOLUTION_UNSUPPORTED` (INVALID_ARGUMENT). If an emitted event
      fails to fold, the error is INTERNAL.
 5. **Rules version.** The router always sets the binary's declared version on
-   every aggregate and PM response, overwriting whatever a handler set.
-   Co-hosted PMs share one binary, so they share one version, and the router
-   reports it even when no PM consumed the trigger.
+   every aggregate and PM response, overwriting whatever a handler set, even
+   when the PM did not consume the trigger.
 
 ### Claims
 
-At registration, `CommandHandlers` claims each aggregate's command types and the
-source types of its upcaster chains (`PayloadUpcaster::source_types`).
-
-- Two claims of one (domain, type) are `DUPLICATE_COMMAND_HANDLER`. That
-  includes an old type claimed by two aggregates, and an old type that
-  collides with a current one.
-- A fact goes to the first aggregate of its domain that records its type or
-  accepts it upcast.
+A router hosts one aggregate, so there is nothing to claim across
+aggregates. At build (`AggregateDispatch::check_claims`), an old type its
+upcaster chains accept (`PayloadUpcaster::source_types`) that is also one of
+its current command types is `DUPLICATE_COMMAND_HANDLER`.
 
 ## Rust API
 
@@ -82,11 +79,11 @@ Native aggregates keep typed state.
 
 | Symbol | Purpose |
 |---|---|
-| `with_rules_version` (aggregate and PM); `ProcessManagerDispatch::rules_version`; `ProcessManagerHandler::rules_version` | The binary's declared version, reported on every response. |
+| `with_rules_version` (aggregate and PM); `ProcessManagerDispatch::rules_version` | The binary's declared version, reported on every response. |
 | `with_commutative(changed)` (`S: Clone`); `with_commutative_via(capture, restore, changed)` | Turns on COMMUTATIVE resolution. `_via` stays public by owner ruling. |
-| `with_command_upcaster(impl PayloadUpcaster)` | Adds an upcaster chain. Its `source_types` are claimed at registration. |
+| `with_command_upcaster(impl PayloadUpcaster)` | Adds an upcaster chain. Its `source_types` must not be current command types (checked at build). |
 | `CommandContext.{expected_sequence, conflict_resolution, conflict}`, `aggregate::Conflict` | The resolved handling, plus the window and nonce under AGGREGATE_HANDLES. |
-| `CommandHandler::upcast_types` | The old types an aggregate claims. Default: empty. |
+| `CommandHandler::upcast_types`, `CommandHandler::check_claims` | The old types an aggregate accepts, and the build-time check above. Defaults: empty, and nothing to check. |
 | `Rebuilder::with_fold(fold)` | A batched fold, `fold(&mut S, &[EventPage], cover)`, called once over every uncovered page. It replaces per-type appliers. The C ABI uses it over `prost_types::Any` state. |
 | `conflict::overlap` | The overlap rule. |
 | Error codes | `CONFLICT_UNRESOLVED` and `CONFLICT_OVERLAP` (both ABORTED); `CONFLICT_RESOLUTION_UNSUPPORTED` (INVALID_ARGUMENT). |
@@ -209,16 +206,15 @@ language. Hosts only send it.
   in part below: the state type now comes from the rebuilder, so the
   `S: prost::Name` bound and the `_with_state` variants are gone).
 - **C ABI.**
-  - New entry point: `angzarr_router_component_descriptors(r, out)`. It fills
-    `out` with a serialized `io.angzarr.v1.ComponentDescriptors` (the
-    spec's `ComponentService.Describe` answer, since b50d29b) in registration
-    order, or with a status: the first refusal. Each hello is built when its
-    component registers (a registered table never changes), so a component
-    a registration refused has no hello.
+  - Entry point: `angzarr_router_component_descriptor(r, out)` (singular
+    since round 10). It fills `out` with a serialized
+    `io.angzarr.v1.ComponentDescriptor` (the spec's
+    `ComponentService.Describe` answer, spec 825311f), or with a status: the
+    component's refusal, or `NO_HANDLERS_REGISTERED` before one registers.
   - The saga and projector descriptors gain `rules_version`.
-- **Binding.** C-0535 and C-0565 (describing the process, spec b50d29b) bind
-  against the native order aggregate and a saga, each describing itself; the
-  native `Router` hosts one kind, so the step gathers each table's hello.
+- **Binding.** C-0535 and C-0565 (describing the process gives its one
+  component, spec 825311f) bind against a native `Router` hosting the order
+  aggregate.
 
 ### Router-owned projectors
 
@@ -324,14 +320,13 @@ type from the rebuilder; a component that declared none is refused
 `MISSING_STATE_TYPE` (INVALID_ARGUMENT, metadata `component`), since the
 spec sets `StateDescriptor` for both kinds.
 
-### `Router::component_descriptors()`
+### `Router::component_descriptor()`
 
-`CommandHandler`, `ProcessManagerHandler` and `ProjectorHandler` gain
+`CommandHandler`, `ProcessManagerHandler` and `ProjectorHandler` carry
 `component_descriptor()`, implemented by each dispatch table (sagas are held
-as `SagaDispatch` and use its own). `Router::component_descriptors()` returns
-every component's hello in registration order, the same shape as the C ABI's
-`angzarr_router_component_descriptors`, refusing with the first component
-whose hello fails. An upcaster router has none.
+as `SagaDispatch` and use its own). `Router::component_descriptor()` (singular
+since round 10) answers the one component's hello, as the C ABI's
+`angzarr_router_component_descriptor` does.
 
 ### `abi.proto` changes in round 6
 
@@ -354,11 +349,8 @@ Business code never decides when, and there is no request flag.
   (field 5; decision 14.14, C-0571, spec eb09fbd); the process-event books
   carry payloads only. A trigger the PM does not handle (outside its sources,
   or an undeclared type) answers nothing, as before.
-- **Co-resident PMs** (`merge_responses`): process events and commands
-  concatenate; the process state is that of the one PM that handled the
-  trigger. **Pending a ruling:** when several co-resident PMs handle one
-  trigger, the spec has one `process_state` field and does not say whose
-  state it carries; the merged answer then carries none.
+- **Co-resident PMs** do not exist: a router hosts one component (round 10),
+  so a PM's answer is its own.
 - **Unset:** `snapshot.sequence` and `snapshot.rules_version`, which the
   coordinator stamps.
 - **The image.** Native state: the prost-encoded message
@@ -371,6 +363,36 @@ Business code never decides when, and there is no request flag.
   stay unstamped. Across the C ABI this is one more host fold call per
   answer. A failing fold of an emitted event is INTERNAL with the "emitted"
   message, as COMMUTATIVE's already was.
+
+## One component per router (round 10)
+
+Owner ruling, 2026-10-20 (spec 825311f, decisions 14.19–14.23): one
+coordinator, one component, one business process. A component is one
+aggregate, saga, process manager or projector; its upcaster chain is part of
+it, not a component of its own. Nothing hosts several. (A saga or PM emitting
+commands to several domains, or a PM or projector with several input
+domains, stays.)
+
+- **Native `Router`.** `RouterBuilder` takes one component (and, optionally,
+  its upcaster chain); a second component of any kind, or a second chain, is
+  `DUPLICATE_REGISTRATION`; none is `NO_HANDLERS_REGISTERED`. The router
+  dispatches to that component: commands and facts to the aggregate, a saga
+  source (from the saga's input domain) to the saga, a PM request to the PM,
+  an EventBook to the projector (`dispatch_projector`, one `Projection`), and
+  `upcast` through the chain for its domain (otherwise pass-through).
+  `Router::component_descriptor()` is singular.
+- **C ABI.** `FfiRouter` holds one core `Router`; a second `register_*` of any
+  kind is `DUPLICATE_REGISTRATION`. `angzarr_router_component_descriptor`
+  replaces the plural entry point and answers one `ComponentDescriptor`.
+  ABI_VERSION stays 4 (unreleased).
+- **Deleted:** `CommandHandlers` (the cross-aggregate claims table, `sole`,
+  `serves`, first-handler-of-the-domain fallbacks), `MIXED_HANDLER_KINDS`,
+  saga fan-out and merge, chaining across several upcaster components,
+  `dispatch_projectors`, `ProcessManagerRoute`, `select_process_managers`,
+  `merge_responses`, `ProcessManagerHandler::rules_version`,
+  `CommandHandler::{domain, fact_types}`, and the co-resident
+  AuditProcessManager fixture. `DUPLICATE_COMMAND_HANDLER` keeps only its
+  within-aggregate meaning.
 
 ## Open
 

@@ -43,14 +43,6 @@ message Increased {
     component: "test.counter.OrderProcessManagerState"
     domain: "counter"
   };
-  option (io.angzarr.v1.event) = {
-    component: "test.counter.AuditProcessManagerState"
-    applies: true
-  };
-  option (io.angzarr.v1.event) = {
-    component: "test.counter.AuditProcessManagerState"
-    domain: "counter"
-  };
 }
 
 // --- commands ---
@@ -130,16 +122,3 @@ message OrderProcessManagerState {
   uint32 count = 1;
 }
 
-// AuditProcessManager is co-resident with OrderProcessManager: it consumes the
-// same "counter" Increased trigger but owns a DIFFERENT state type. It folds
-// Increased into its own state (applies) and reacts to the newest Increased
-// trigger with one fact (cover domain "audit") per prior state event and no
-// commands. Each PM must rebuild only its own state.
-message AuditProcessManagerState {
-  option (io.angzarr.v1.component) = {
-    kind: COMPONENT_KIND_PROCESS_MANAGER
-    domain: "audit-pm"
-    name: "AuditProcessManager"
-  };
-  repeated string seen = 1;
-}
