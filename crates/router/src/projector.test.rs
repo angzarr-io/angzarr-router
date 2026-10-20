@@ -166,8 +166,8 @@ fn missing_cover_is_coded_error() {
 
 #[test]
 fn no_finish_returns_default_projection() {
-    // Without a finisher, dispatch returns a default Projection carrying the
-    // cover and projector name (sequence 0, no payload).
+    // Without a finisher, dispatch returns a Projection carrying the cover,
+    // the projector name and its next sequence (no payload).
     let d = ProjectorDispatch::new("write-model", Folded::default)
         .on_event(&cover_full_name(), fold_cover);
     let proj = d
@@ -175,7 +175,7 @@ fn no_finish_returns_default_projection() {
         .expect("dispatch");
     assert_eq!(proj.projector, "write-model");
     assert_eq!(proj.cover.expect("cover").domain, "order");
-    assert_eq!(proj.next_sequence, 0);
+    assert_eq!(proj.next_sequence, 1, "the last page (sequence 0) + 1");
     assert!(proj.projection.is_none());
 }
 
