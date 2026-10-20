@@ -299,12 +299,6 @@ pub struct ProcessManagerState {
     pub count: u32,
 }
 
-/// The order process manager's name, as it describes itself.
-pub const ORDER_PM: &str = "order-pm";
-
-/// The audit process manager's name, as it describes itself.
-pub const AUDIT_PM: &str = "AuditProcessManager";
-
 /// Build the OrderProcessManager dispatch table: over the "counter" domain it
 /// reacts to the NEWEST Increased trigger by emitting one Reserve command for
 /// "inventory" plus one unaddressed process event recording the count its
@@ -320,7 +314,7 @@ pub fn order_pm() -> ProcessManagerDispatch<ProcessManagerState> {
         },
     );
 
-    ProcessManagerDispatch::new(ORDER_PM, "order-pm", ["inventory"], rebuilder).on_event(
+    ProcessManagerDispatch::new("order-pm", "order-pm", ["inventory"], rebuilder).on_event(
         "counter",
         "test.counter.Increased",
         |_event, state: &mut ProcessManagerState, _cover| {
@@ -356,7 +350,13 @@ pub fn audit_pm() -> ProcessManagerDispatch<AuditState> {
         },
     );
 
-    ProcessManagerDispatch::new(AUDIT_PM, "audit-pm", Vec::<String>::new(), rebuilder).on_event(
+    ProcessManagerDispatch::new(
+        "AuditProcessManager",
+        "audit-pm",
+        Vec::<String>::new(),
+        rebuilder,
+    )
+    .on_event(
         "counter",
         "test.counter.Increased",
         |_event, state: &mut AuditState, _cover| {
@@ -400,6 +400,17 @@ pub fn recorded_states<M: prost::Message + prost::Name + Default>(
         .collect()
 }
 
+/// A PM process-state book of `n` Increased events owned by `pm_domain` (its
+/// cover addresses the owning PM).
+pub fn pm_state_in(pm_domain: &str, n: u32) -> pb::EventBook {
+    let mut book = pm_state_of(n);
+    book.cover = Some(pb::Cover {
+        domain: pm_domain.to_string(),
+        ..Default::default()
+    });
+    book
+}
+
 /// A PM request whose trigger carries the given event pages in `domain`, the
 /// newest at sequence `newest_seq` when given. `process_state` is the PM's
 /// prior state book.
@@ -433,7 +444,6 @@ pub fn pm_trigger_request(
             ..Default::default()
         }),
         process_state,
-        component: ORDER_PM.to_string(),
     }
 }
 
@@ -441,7 +451,6 @@ pub fn pm_trigger_request(
 pub fn pm_empty_trigger() -> pb::ProcessManagerHandleRequest {
     pb::ProcessManagerHandleRequest {
         trigger: Some(pb::EventBook::default()),
-        component: ORDER_PM.to_string(),
         ..Default::default()
     }
 }
@@ -450,7 +459,6 @@ pub fn pm_empty_trigger() -> pb::ProcessManagerHandleRequest {
 pub fn pm_missing_trigger() -> pb::ProcessManagerHandleRequest {
     pb::ProcessManagerHandleRequest {
         trigger: None,
-        component: ORDER_PM.to_string(),
         ..Default::default()
     }
 }
@@ -782,7 +790,6 @@ pub fn reserving_trigger(label: &str, seq: u64) -> pb::ProcessManagerHandleReque
             ..Default::default()
         }),
         process_state: None,
-        component: "Reserving".to_string(),
     }
 }
 
@@ -1148,48 +1155,6 @@ pub fn fulfillment_pm_writing(
         })
 }
 
-/// A process manager named `name` reacting to "order" OrderPlaced: it records
-/// its name in `invoked`, writes one FulfillmentStarted process event
-/// (counted into its state's `placed`) and sends one command to the domain
-/// `name`.
-pub fn named_pm(
-    name: &str,
-    invoked: Arc<Mutex<Vec<String>>>,
-) -> ProcessManagerDispatch<orders::v1::FulfillmentState> {
-    let rebuilder = Rebuilder::of_message().apply(
-        "orders.v1.FulfillmentStarted",
-        |state: &mut orders::v1::FulfillmentState, _event| {
-            state.placed += 1;
-            Ok(())
-        },
-    );
-    let own = name.to_string();
-    ProcessManagerDispatch::new(name, name, [name], rebuilder).on_event(
-        "order",
-        "orders.v1.OrderPlaced",
-        move |_e, _s, _c| {
-            invoked.lock().unwrap().push(own.clone());
-            Ok(pb::ProcessManagerHandleResponse {
-                process_events: vec![pb::EventBook {
-                    pages: vec![pb::EventPage {
-                        payload: Some(orders_any(&orders::v1::FulfillmentStarted {})),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                }],
-                commands: vec![pb::CommandBook {
-                    cover: Some(pb::Cover {
-                        domain: own.clone(),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            })
-        },
-    )
-}
-
 /// The Fulfillment process manager's state with `placed`, as its process
 /// state image.
 pub fn fulfillment_state(placed: u32) -> prost_types::Any {
@@ -1221,7 +1186,6 @@ pub fn order_placed_trigger() -> pb::ProcessManagerHandleRequest {
             ..Default::default()
         }),
         process_state: None,
-        component: "Fulfillment".to_string(),
     }
 }
 

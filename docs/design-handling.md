@@ -19,7 +19,7 @@ at 4.
 
 ## Spec
 
-Source: angzarr-project `spec/20261019-draft` (3b30198).
+Source: angzarr-project `spec/20261019-draft` (eb09fbd).
 
 - **Protos:**
   - `command_handler.proto`: `CommandHandlerService.Handle`,
@@ -354,15 +354,11 @@ Business code never decides when, and there is no request flag.
   (field 5; decision 14.14, C-0571, spec eb09fbd); the process-event books
   carry payloads only. A trigger the PM does not handle (outside its sources,
   or an undeclared type) answers nothing, as before.
-- **Co-resident PMs** (settled by decision 14.16, spec 3b30198): a request
-  names the one PM it is for (`ProcessManagerHandleRequest.component`), and
-  the answer is that PM's process events, commands and process state alone.
-  There is no fan-out and no merging (`merge_responses` and the fan-out
-  selection are deleted). An empty name is `MISSING_PM_COMPONENT`
-  (INVALID_ARGUMENT); a name the process does not host is
-  `UNKNOWN_PM_COMPONENT` (NOT_FOUND), naming it in metadata `component`.
-  Across the C ABI, `angzarr_router_dispatch_process_manager` routes by the
-  request's own `component`: no entry-point or abi.proto change.
+- **Co-resident PMs** (`merge_responses`): process events and commands
+  concatenate; the process state is that of the one PM that handled the
+  trigger. **Pending a ruling:** when several co-resident PMs handle one
+  trigger, the spec has one `process_state` field and does not say whose
+  state it carries; the merged answer then carries none.
 - **Unset:** `snapshot.sequence` and `snapshot.rules_version`, which the
   coordinator stamps.
 - **The image.** Native state: the prost-encoded message

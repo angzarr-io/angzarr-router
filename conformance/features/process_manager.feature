@@ -8,9 +8,9 @@ Feature: Order process-manager dispatch
   PM's own state is rebuilt before the handler. The coordinator stamps the
   commands' identity and addresses the process events.
 
-  Co-resident process-managers share one router, but a request names the one
-  process-manager it is for (ProcessManagerHandleRequest.component): only
-  that PM reacts, over its own state, and its answer is its own.
+  Co-resident process-managers share one router: each rebuilds only its own
+  state (never another PM's, even within one dispatch), and a process state
+  reaches only the PM that owns it.
 
   Scenario: the newest trigger event reacts with a command
     Given an order process-manager
@@ -43,15 +43,15 @@ Feature: Order process-manager dispatch
     When a trigger with no pages is dispatched
     Then the dispatch fails with EMPTY_PM_TRIGGER
 
-  Scenario: a request reaches only the order process-manager it names
+  Scenario: co-resident process-managers each rebuild only their own state
     Given co-resident order and audit process-managers
-    When an Increased trigger for "order-pm" is dispatched over a prior state of 3 events
+    When an Increased trigger is dispatched over a prior state of 3 events
     Then the order process-manager rebuilt 3 prior state events
-    And the audit process-manager did not react
+    And the audit process-manager rebuilt 3 prior state events
 
-  Scenario: a request reaches only the audit process-manager it names
+  Scenario: a process state reaches only the process-manager that owns it
     Given co-resident order and audit process-managers
-    When an Increased trigger for "AuditProcessManager" is dispatched over a prior state of 2 events
+    When an Increased trigger is dispatched over a prior "audit-pm" state of 2 events
     Then the audit process-manager rebuilt 2 prior state events
     And the order process-manager did not react
 
