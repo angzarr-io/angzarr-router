@@ -22,7 +22,7 @@ at 4.
 
 ## Spec
 
-Source: angzarr-project `spec/20261019-draft` (eb09fbd).
+Source: angzarr-project `spec/20261019-draft` (9a84005).
 
 - **Protos:**
   - `command_handler.proto`: `CommandHandlerService.Handle`,
@@ -393,6 +393,25 @@ domains, stays.)
   `CommandHandler::{domain, fact_types}`, and the co-resident
   AuditProcessManager fixture. `DUPLICATE_COMMAND_HANDLER` keeps only its
   within-aggregate meaning.
+
+## One destination per saga (round 11)
+
+Decision 14.24, SG-1, spec 9a84005: a saga translates between exactly two
+domains, its one source (`input_domain`) and its one destination
+(`output_domain`); `output_domains` is PROCESS_MANAGER only.
+
+- **Core.** `SagaDispatch::new(name, input_domain, output_domain)` takes the
+  one destination (it took a list of target domains), read back with
+  `output_domain()`. An answer holding a command whose cover names any other
+  domain (an absent or empty cover included) is refused
+  `SAGA_COMMAND_OUTSIDE_DESTINATION` (INTERNAL), with no commands, naming
+  `expected_domain` and `actual_domain` in the ErrorInfo metadata (C-0583).
+- **C ABI.** `SagaDescriptor.output_domain = 7`; `target_domains = 3` is
+  reserved (ABI 3 published it). ABI_VERSION stays 4.
+- **Registration refusals name the component already hosted** (C-0580):
+  `DUPLICATE_REGISTRATION` carries metadata `component` and
+  `component_kind` (e.g. `AGGREGATE`). The component traits gained `name()`
+  for it.
 
 ## Open
 

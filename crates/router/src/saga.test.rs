@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use prost_types::Any;
 
-use crate::error::{codes, HandlerError};
+use crate::error::{codes, extras, GrpcCode, HandlerError};
 use crate::pb;
 use crate::saga::SagaDispatch;
 use crate::test_support::{command_page, event_page, uuid_of};
@@ -71,7 +71,7 @@ fn sequenced_page_of(fq: &str, seq: u64) -> pb::EventPage {
 
 #[test]
 fn declared_event_emits_its_command() {
-    let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory"])
+    let saga = SagaDispatch::new("OrderFulfillment", "order", "inventory")
         .on_event(FQ_ORDER_CREATED, |_e, _c| Ok(vec![command_to("inventory")]));
     let resp = saga
         .dispatch(&source_book("order", vec![event_page_of(FQ_ORDER_CREATED)]))
@@ -87,7 +87,7 @@ fn declared_event_emits_its_command() {
 fn undeclared_event_type_is_skipped() {
     // Only OrderCreated is declared; a StockReserved page emits nothing and
     // is not an error (spec C-0051).
-    let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory"])
+    let saga = SagaDispatch::new("OrderFulfillment", "order", "inventory")
         .on_event(FQ_ORDER_CREATED, |_e, _c| Ok(vec![command_to("inventory")]));
     let resp = saga
         .dispatch(&source_book(
@@ -105,7 +105,7 @@ fn undeclared_event_type_is_skipped() {
 fn every_page_is_a_fresh_trigger() {
     // The saga walks EVERY page (source = triggering events, not state):
     // three OrderCreated pages each emit one command → three commands.
-    let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory"])
+    let saga = SagaDispatch::new("OrderFulfillment", "order", "inventory")
         .on_event(FQ_ORDER_CREATED, |_e, _c| Ok(vec![command_to("inventory")]));
     let pages = (0..3).map(|_| event_page_of(FQ_ORDER_CREATED)).collect();
     let resp = saga
@@ -120,12 +120,12 @@ fn every_page_is_a_fresh_trigger() {
 fn emitted_commands_pass_through_unstamped_in_emission_order() {
     // A handler-set correlation survives untouched; nothing is filled in
     // from the source.
-    let saga = SagaDispatch::new("OrderSplit", "order", ["inventory", "fulfillment"]).on_event(
+    let saga = SagaDispatch::new("OrderSplit", "order", "inventory").on_event(
         FQ_ORDER_CREATED,
         |_e, _c| {
             let mut own = command_to("inventory");
             own.page.as_mut().unwrap().correlation_id = Some(uuid_of(9));
-            Ok(vec![own, command_to("fulfillment")])
+            Ok(vec![own, command_to("inventory")])
         },
     );
     let mut src = source_book(
@@ -147,9 +147,9 @@ fn emitted_commands_pass_through_unstamped_in_emission_order() {
         resp.commands,
         vec![
             expected_first.clone(),
-            command_to("fulfillment"),
+            command_to("inventory"),
             expected_first,
-            command_to("fulfillment"),
+            command_to("inventory"),
         ],
         "commands are returned exactly as emitted, page by page"
     );
@@ -159,7 +159,7 @@ fn emitted_commands_pass_through_unstamped_in_emission_order() {
 
 #[test]
 fn empty_source_is_empty_saga_source() {
-    let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory"]);
+    let saga = SagaDispatch::new("OrderFulfillment", "order", "inventory");
     let err = saga
         .dispatch(&source_book("order", vec![]))
         .expect_err("empty source must fail");
@@ -168,7 +168,7 @@ fn empty_source_is_empty_saga_source() {
 
 #[test]
 fn handler_error_propagates_as_unhandled() {
-    let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory"])
+    let saga = SagaDispatch::new("OrderFulfillment", "order", "inventory")
         .on_event(FQ_ORDER_CREATED, |_e, _c| {
             Err(HandlerError::Other("boom".to_string()))
         });
@@ -178,18 +178,49 @@ fn handler_error_propagates_as_unhandled() {
     assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
 }
 
+// --- one destination (saga.proto SagaResponse; decision 14.24, C-0583) -----
+
+// A saga translates between exactly two domains: a command for any domain
+// but its one destination is a saga bug, refused before it answers.
+#[test]
+fn a_command_for_a_domain_other_than_the_destination_is_refused_with_no_commands() {
+    for stray in ["shipping", ""] {
+        let saga = SagaDispatch::new("OrderFulfillment", "order", "inventory")
+            .on_event(FQ_ORDER_CREATED, move |_e, _c| {
+                Ok(vec![command_to("inventory"), command_to(stray)])
+            });
+        let err = saga
+            .dispatch(&source_book("order", vec![event_page_of(FQ_ORDER_CREATED)]))
+            .expect_err("a command outside the destination");
+        assert_eq!(err.code, codes::SAGA_COMMAND_OUTSIDE_DESTINATION);
+        assert_eq!(err.grpc, GrpcCode::Internal);
+        let extra = |key: &str| err.extras.get(key).map(String::as_str);
+        assert_eq!(extra(extras::EXPECTED_DOMAIN), Some("inventory"));
+        assert_eq!(extra(extras::ACTUAL_DOMAIN), Some(stray));
+    }
+}
+
+#[test]
+fn a_command_with_no_cover_is_outside_the_destination() {
+    let saga = SagaDispatch::new("OrderFulfillment", "order", "inventory")
+        .on_event(FQ_ORDER_CREATED, |_e, _c| {
+            Ok(vec![pb::CommandBook::default()])
+        });
+    let err = saga
+        .dispatch(&source_book("order", vec![event_page_of(FQ_ORDER_CREATED)]))
+        .expect_err("no cover names no destination");
+    assert_eq!(err.code, codes::SAGA_COMMAND_OUTSIDE_DESTINATION);
+}
+
 // --- accessors ------------------------------------------------------------
 
 #[test]
 fn accessors_report_name_domains_and_types() {
-    let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory", "fulfillment"])
+    let saga = SagaDispatch::new("OrderFulfillment", "order", "inventory")
         .on_event(FQ_ORDER_CREATED, |_e, _c| Ok(vec![]));
     assert_eq!(saga.name(), "OrderFulfillment");
     assert_eq!(saga.input_domain(), "order");
-    assert_eq!(
-        saga.target_domains(),
-        &["inventory".to_string(), "fulfillment".to_string()]
-    );
+    assert_eq!(saga.output_domain(), "inventory");
     assert_eq!(saga.event_types(), vec![FQ_ORDER_CREATED.to_string()]);
     assert_eq!(
         saga.subscriptions().get("order"),
@@ -203,7 +234,7 @@ fn accessors_report_name_domains_and_types() {
 fn a_context_handler_sees_each_triggering_page() {
     let seen: Arc<Mutex<Vec<(String, u64)>>> = Arc::default();
     let sink = seen.clone();
-    let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory"]).on_event_with_context(
+    let saga = SagaDispatch::new("OrderFulfillment", "order", "inventory").on_event_with_context(
         FQ_ORDER_CREATED,
         move |_e, source| {
             let domain = source.cover.map(|c| c.domain.clone()).unwrap_or_default();
@@ -232,7 +263,7 @@ fn a_context_handler_sees_each_triggering_page() {
 fn a_context_handler_sees_sequence_zero_for_an_unsequenced_page() {
     let seen: Arc<Mutex<Vec<u64>>> = Arc::default();
     let sink = seen.clone();
-    let saga = SagaDispatch::new("OrderFulfillment", "order", ["inventory"]).on_event_with_context(
+    let saga = SagaDispatch::new("OrderFulfillment", "order", "inventory").on_event_with_context(
         FQ_ORDER_CREATED,
         move |_e, source| {
             sink.lock().unwrap().push(source.sequence);

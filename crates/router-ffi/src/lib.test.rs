@@ -66,6 +66,9 @@ const CB_CHANGED_VALUE: u64 = 29;
 const CB_CHANGED_NONE: u64 = 30;
 /// Upcasts IncreaseByV1 to IncreaseBy (payload unchanged).
 const CB_UPCAST_V1: u64 = 31;
+/// A saga reaction answering a command for "inventory" and one for
+/// "shipping".
+const CB_SAGA_STRAY: u64 = 34;
 
 /// A fold failing with a FoldFailure whose index is outside every batch.
 const CB_FOLD_OUT_OF_RANGE: u64 = 32;
@@ -410,6 +413,20 @@ unsafe extern "C" fn host_cb(
                 .encode_to_vec(),
             );
             -13
+        }
+        CB_SAGA_STRAY => {
+            let to = |domain: &str| pb::CommandBook {
+                cover: Some(pb::Cover {
+                    domain: domain.to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let resp = pb::SagaResponse {
+                commands: vec![to("inventory"), to("shipping")],
+            };
+            host_fill(out, &resp.encode_to_vec());
+            STATUS_OK
         }
         CB_OK_ZERO => STATUS_OK,
         CB_OK_EMPTY => STATUS_OK_EMPTY,
@@ -1004,7 +1021,7 @@ fn saga_descriptor_bytes() -> Vec<u8> {
     abi_pb::SagaDescriptor {
         name: "OrderFulfillment".to_string(),
         input_domain: "order".to_string(),
-        target_domains: vec!["inventory".to_string()],
+        output_domain: "inventory".to_string(),
         events: vec![abi_pb::CallbackEntry {
             fq_type: FQ_ORDER_CREATED.to_string(),
             callback_id: CB_SAGA_EVENT,
@@ -1410,6 +1427,29 @@ fn saga_with(event: u64) -> Router {
         0
     );
     Router(r)
+}
+
+// saga.proto SagaResponse (decision 14.24, C-0583): a command for a domain
+// other than the saga's one destination is refused INTERNAL, no commands.
+#[test]
+fn a_saga_answer_outside_its_destination_is_refused_through_the_abi() {
+    let router = saga_with(CB_SAGA_STRAY);
+    let req = saga_request("order", vec![event_page_of(FQ_ORDER_CREATED)]);
+    let (ret, bytes) = router.dispatch_saga(&req);
+    assert_eq!(ret, -13, "INTERNAL");
+    let (reason, metadata) = error_info(&bytes);
+    assert_eq!(
+        reason,
+        angzarr_router::error::codes::SAGA_COMMAND_OUTSIDE_DESTINATION
+    );
+    assert_eq!(
+        metadata.get("expected_domain").map(String::as_str),
+        Some("inventory")
+    );
+    assert_eq!(
+        metadata.get("actual_domain").map(String::as_str),
+        Some("shipping")
+    );
 }
 
 #[test]

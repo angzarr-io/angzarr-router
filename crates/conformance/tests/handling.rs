@@ -1,5 +1,5 @@
 //! Binds angzarr-project's handler-contract tier
-//! (features/handler-contract/handling.feature, C-0533..C-0550, C-0565, C-0570 and C-0571; the spec is
+//! (features/handler-contract/handling.feature, C-0533..C-0550, C-0565, C-0570, C-0571, C-0580 and C-0583; the spec is
 //! the source, read from the submodule) to the Rust core: the order
 //! aggregate and the Fulfillment process manager built by hand over the
 //! orders.v1 fixture messages.
@@ -8,6 +8,15 @@ use angzarr_router::error::{CodedError, GrpcCode};
 use angzarr_router::pb;
 use angzarr_router_conformance as conf;
 use cucumber::{given, then, when, World};
+
+/// The business process's registered component.
+struct Registered(angzarr_router::router::Router);
+
+impl std::fmt::Debug for Registered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Registered(Router)")
+    }
+}
 
 #[derive(Debug, Default, World)]
 struct HandlingWorld {
@@ -19,6 +28,11 @@ struct HandlingWorld {
     result: Option<Result<pb::CommandHandlerResponse, CodedError>>,
     pm_result: Option<Result<pb::ProcessManagerHandleResponse, CodedError>>,
     pm_placed: u32,
+    saga: Option<(String, String, String)>,
+    saga_strays: Vec<(String, String)>,
+    saga_result: Option<Result<pb::SagaResponse, CodedError>>,
+    registered: Option<Registered>,
+    second_refusal: Option<CodedError>,
     described: Vec<pb::ComponentDescriptor>,
 }
 
@@ -288,6 +302,134 @@ async fn pm_events_carry_no_state(w: &mut HandlingWorld) {
         .process_events
         .iter()
         .all(|b| b.snapshot.is_none()));
+}
+
+// --- one destination per saga (C-0583; decision 14.24) ----------------------
+
+#[given(regex = r#"^an? "([^"]*)" saga translating "([^"]*)" events into "([^"]*)" commands$"#)]
+async fn saga_translating(w: &mut HandlingWorld, name: String, input: String, output: String) {
+    w.saga = Some((name, input, output));
+}
+
+#[given(
+    regex = r#"^its business code answers an OrderPlaced event with a (\w+) command for "([^"]*)" and a (\w+) command for "([^"]*)"$"#
+)]
+async fn saga_answers(
+    w: &mut HandlingWorld,
+    first: String,
+    first_domain: String,
+    second: String,
+    second_domain: String,
+) {
+    w.saga_strays = vec![(first, first_domain), (second, second_domain)];
+}
+
+#[when("the OrderPlaced event is handled")]
+async fn saga_handles(w: &mut HandlingWorld) {
+    let (name, input, output) = w.saga.clone().expect("a saga");
+    let commands: Vec<pb::CommandBook> = w
+        .saga_strays
+        .iter()
+        .map(|(command, domain)| conf::order_command_for(domain, command))
+        .collect();
+    let saga = angzarr_router::saga::SagaDispatch::new(name, input.clone(), output)
+        .on_event("orders.v1.OrderPlaced", move |_e, _c| Ok(commands.clone()));
+    let router = angzarr_router::router::RouterBuilder::new()
+        .saga(saga)
+        .build()
+        .expect("one saga");
+    let mut source = conf::order_placed_trigger().trigger.expect("a trigger");
+    source.cover.as_mut().expect("a cover").domain = input;
+    w.saga_result = Some(router.dispatch_saga(&source));
+}
+
+#[then("the saga's answer fails with INTERNAL status")]
+async fn saga_fails_internal(w: &mut HandlingWorld) {
+    let err = w
+        .saga_result
+        .as_ref()
+        .expect("the saga handled")
+        .as_ref()
+        .expect_err("refused");
+    assert_eq!(err.grpc, GrpcCode::Internal);
+}
+
+#[then("the answer carries no commands")]
+async fn saga_no_commands(w: &mut HandlingWorld) {
+    // A refused answer is a status with no SagaResponse: it carries none.
+    assert!(w.saga_result.as_ref().expect("handled").is_err());
+}
+
+// --- one component per business process (C-0580; decision 14.19) ------------
+
+#[given(r#"the "order" business binary has its "order" aggregate registered"#)]
+async fn order_registered(w: &mut HandlingWorld) {
+    let order = conf::order_aggregate(&w.rules_version, w.settle.clone(), w.seen.clone());
+    w.registered = Some(Registered(
+        angzarr_router::router::RouterBuilder::new()
+            .aggregate(order)
+            .build()
+            .expect("the order aggregate"),
+    ));
+}
+
+// The native builder takes a process's component at once: registering a
+// second beside the order aggregate refuses the whole configuration, and the
+// process keeps the one it has.
+#[when(
+    regex = r#"^an? (aggregate|saga|process manager|projector) component "([^"]*)" is registered in the same business process$"#
+)]
+async fn second_registered(w: &mut HandlingWorld, kind: String, name: String) {
+    let order = conf::order_aggregate(&w.rules_version, w.settle.clone(), w.seen.clone());
+    let builder = angzarr_router::router::RouterBuilder::new().aggregate(order);
+    let builder = match kind.as_str() {
+        "aggregate" => builder.aggregate(angzarr_router::aggregate::AggregateDispatch::new(
+            name.clone(),
+            name,
+            angzarr_router::rebuild::Rebuilder::new(|| ()),
+        )),
+        "saga" => builder.saga(angzarr_router::saga::SagaDispatch::new(
+            name,
+            "order",
+            "inventory",
+        )),
+        "process manager" => builder.process_manager(conf::fulfillment_pm(&w.rules_version)),
+        _ => builder.projector(angzarr_router::projector::ProjectorDispatch::new(
+            name,
+            || (),
+        )),
+    };
+    w.second_refusal = builder.build().err();
+}
+
+#[then(r#"the registration is refused, naming the "order" aggregate already registered"#)]
+async fn refused_naming_order(w: &mut HandlingWorld) {
+    let err = w.second_refusal.as_ref().expect("refused");
+    assert_eq!(
+        err.code,
+        angzarr_router::error::codes::DUPLICATE_REGISTRATION
+    );
+    assert_eq!(
+        err.extras.get("component").map(String::as_str),
+        Some("order")
+    );
+    assert_eq!(
+        err.extras.get("component_kind").map(String::as_str),
+        Some("AGGREGATE")
+    );
+}
+
+#[then(r#"the business process describes only the "order" aggregate"#)]
+async fn describes_only_order(w: &mut HandlingWorld) {
+    let hello = w
+        .registered
+        .as_ref()
+        .expect("registered")
+        .0
+        .component_descriptor()
+        .expect("its description");
+    assert_eq!(hello.name, "order");
+    assert_eq!(hello.kind(), pb::ComponentKind::Aggregate);
 }
 
 #[then("the command is accepted")]

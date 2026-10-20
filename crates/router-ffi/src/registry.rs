@@ -169,16 +169,13 @@ impl FfiRouter {
         })
     }
 
-    /// Refuses a second component (DUPLICATE_REGISTRATION).
+    /// Refuses a second component (DUPLICATE_REGISTRATION, naming the one
+    /// already hosted).
     fn refuse_a_second(&self) -> Result<(), CodedError> {
-        if self.router.is_some() {
-            return Err(CodedError::invalid_argument(
-                codes::DUPLICATE_REGISTRATION,
-                "this router already hosts its one component",
-                [],
-            ));
+        match self.router.as_ref() {
+            Some(router) => Err(router.refuse_another_component()),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     /// Hosts the component `builder` holds, once its build validates.
@@ -406,7 +403,7 @@ impl FfiRouter {
         let mut dispatch = SagaDispatch::new(
             desc.name.clone(),
             desc.input_domain.clone(),
-            desc.target_domains.clone(),
+            desc.output_domain.clone(),
         )
         .with_rules_version(desc.rules_version.clone());
 

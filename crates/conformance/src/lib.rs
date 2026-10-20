@@ -235,7 +235,7 @@ pub fn delivery_without_cover(n: u32) -> pb::EventBook {
 /// recording each triggering event's sequence in `seen`. Undeclared events
 /// are skipped.
 pub fn order_saga(seen: SequenceSink) -> SagaDispatch {
-    SagaDispatch::new("order-saga", "order", ["inventory"]).on_event_with_context(
+    SagaDispatch::new("order-saga", "order", "inventory").on_event_with_context(
         "test.counter.Increased",
         move |_any, source| {
             seen.lock().unwrap().push(source.sequence);
@@ -1115,6 +1115,26 @@ pub fn read_order_state(image: &prost_types::Any) -> (String, Vec<(String, u32)>
     let mut items: Vec<(String, u32)> = state.items.into_iter().collect();
     items.sort();
     (image.type_url.clone(), items, state.delivered)
+}
+
+/// An `orders.v1.<command>` command book for `domain` (empty payload).
+pub fn order_command_for(domain: &str, command: &str) -> pb::CommandBook {
+    pb::CommandBook {
+        cover: Some(pb::Cover {
+            domain: domain.to_string(),
+            ..Default::default()
+        }),
+        page: Some(pb::CommandPage {
+            body: Some(pb::command_page::Body::Command(pb::Command {
+                payload: Some(prost_types::Any {
+                    type_url: angzarr_router::type_url(&format!("orders.v1.{command}")),
+                    value: Vec::new(),
+                }),
+            })),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
 }
 
 /// An OrderPlaced trigger from "order".

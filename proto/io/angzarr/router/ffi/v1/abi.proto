@@ -169,13 +169,19 @@ message ProjectorDescriptor {
   string rules_version = 8;
 }
 
-// Registration payload for one saga component. A stateless translator:
-// declared events emit commands, passed through as emitted (the coordinator
-// stamps their identity and provenance). Empty `target_domains` is allowed.
+// Registration payload for one saga component. A stateless translator
+// between exactly two domains (decision 14.24): events of its one source
+// domain (`input_domain`) emit commands for its one destination domain
+// (`output_domain`), passed through as emitted (the coordinator stamps their
+// identity and provenance). An answer holding a command whose cover names
+// any other domain is a saga bug: the router refuses it INTERNAL
+// (SAGA_COMMAND_OUTSIDE_DESTINATION) with no commands.
 message SagaDescriptor {
   string name = 1;
   string input_domain = 2;
-  repeated string target_domains = 3;
+  // Field 3 was `target_domains` (several destinations; a saga has one).
+  reserved 3;
+  reserved "target_domains";
   repeated CallbackEntry events = 4;
   // Field 5 was `rejections` (compensation input; removed).
   reserved 5;
@@ -183,6 +189,8 @@ message SagaDescriptor {
   // The business binary's full version, baked in at build: carried on the
   // saga's registration hello (ComponentDescriptor.rules_version).
   string rules_version = 6;
+  // The saga's one destination domain (ComponentOptions.output_domain).
+  string output_domain = 7;
 }
 
 // aux payload for command-handler callbacks.

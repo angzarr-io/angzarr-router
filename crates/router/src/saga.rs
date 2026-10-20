@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use prost_types::Any;
 
-use crate::error::{codes, map_handler_error, messages, CodedError, HandlerError};
+use crate::error::{codes, extras, map_handler_error, messages, CodedError, HandlerError};
 use crate::pb;
 use crate::PageContext;
 
@@ -28,23 +28,24 @@ pub type EventFn = Box<
 pub struct SagaDispatch {
     name: String,
     input_domain: String,
-    targets: Vec<String>,
+    output_domain: String,
     handlers: HashMap<String, EventFn>,
     rules_version: String,
 }
 
 impl SagaDispatch {
-    /// An empty saga table translating `input_domain` events into commands
-    /// for `target_domains`.
+    /// An empty saga table translating events of its one source domain,
+    /// `input_domain`, into commands for its one destination domain,
+    /// `output_domain` (options.proto ComponentOptions; decision 14.24).
     pub fn new(
         name: impl Into<String>,
         input_domain: impl Into<String>,
-        target_domains: impl IntoIterator<Item = impl Into<String>>,
+        output_domain: impl Into<String>,
     ) -> Self {
         SagaDispatch {
             name: name.into(),
             input_domain: input_domain.into(),
-            targets: target_domains.into_iter().map(Into::into).collect(),
+            output_domain: output_domain.into(),
             handlers: HashMap::new(),
             rules_version: String::new(),
         }
@@ -108,9 +109,9 @@ impl SagaDispatch {
         &self.input_domain
     }
 
-    /// The domains this saga issues commands to.
-    pub fn target_domains(&self) -> &[String] {
-        &self.targets
+    /// The one domain its commands go to.
+    pub fn output_domain(&self) -> &str {
+        &self.output_domain
     }
 
     /// The registered fully-qualified event type names.
@@ -155,10 +156,35 @@ impl SagaDispatch {
                 sequence: page.sequence,
             };
             let commands = thunk(event_any, &context).map_err(map_handler_error)?;
+            if let Some(stray) = commands.iter().find(|c| self.outside_destination(c)) {
+                return Err(self.refuse_outside_destination(stray));
+            }
             resp.commands.extend(commands);
         }
 
         Ok(resp)
+    }
+
+    fn outside_destination(&self, command: &pb::CommandBook) -> bool {
+        command.cover.as_ref().map_or("", |c| c.domain.as_str()) != self.output_domain
+    }
+
+    /// A command for any domain but the saga's one destination is a saga
+    /// bug (saga.proto SagaResponse; decision 14.24): the whole answer is
+    /// refused INTERNAL, carrying no commands, naming both domains.
+    fn refuse_outside_destination(&self, stray: &pb::CommandBook) -> CodedError {
+        let actual = stray.cover.as_ref().map_or("", |c| c.domain.as_str());
+        CodedError::internal(
+            codes::SAGA_COMMAND_OUTSIDE_DESTINATION,
+            messages::SAGA_COMMAND_OUTSIDE_DESTINATION,
+            [
+                (
+                    extras::EXPECTED_DOMAIN.to_string(),
+                    self.output_domain.clone(),
+                ),
+                (extras::ACTUAL_DOMAIN.to_string(), actual.to_string()),
+            ],
+        )
     }
 }
 

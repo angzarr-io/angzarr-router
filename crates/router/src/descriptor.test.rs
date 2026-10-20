@@ -178,7 +178,7 @@ fn a_process_manager_without_a_rules_version_is_refused() {
 }
 
 fn notifier(version: &str) -> SagaDispatch {
-    SagaDispatch::new("Notifier", "order", ["email"]).with_rules_version(version)
+    SagaDispatch::new("Notifier", "order", "email").with_rules_version(version)
 }
 
 #[test]

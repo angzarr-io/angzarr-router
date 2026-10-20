@@ -47,7 +47,7 @@ historical-state evidence the framework supplies.
 `counter.proto` also declares the remaining kinds over the same
 `Increased` event:
 
-- **OrderSaga** (input domain `order`) — one `Reserve` command for
+- **OrderSaga** (input domain `order`, destination `inventory`) — one `Reserve` command for
   `inventory` per source event.
 - **CounterProjector** (domain `counter`) — folds a count, finishes into a
   `Projection`.
@@ -60,7 +60,7 @@ historical-state evidence the framework supplies.
 
 `crates/conformance/tests/handling.rs` binds angzarr-project's
 handler-contract tier (`features/handler-contract/handling.feature`,
-C-0533..C-0550, C-0565, C-0570, C-0571) straight from the submodule, C-0535 and C-0565 (describing the process) through
+C-0533..C-0550, C-0565, C-0570, C-0571, C-0580, C-0583) straight from the submodule, C-0535 and C-0565 (describing the process) through
 each component's `component_descriptor()`. The fixtures are built by hand over the plain messages of
 `conformance/proto/orders/v1/order.proto`: `OrderState` keeps a quantity per
 item (conflict unit `items[<item>]`), a shipping address (its own unit) and

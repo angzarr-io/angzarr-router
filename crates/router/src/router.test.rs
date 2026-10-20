@@ -93,7 +93,7 @@ fn an_empty_configuration_fails_to_build() {
 fn with_one(builder: RouterBuilder, kind: &str) -> RouterBuilder {
     match kind {
         "aggregate" => builder.aggregate(aggregate("a", "order", &["test.Create"])),
-        "saga" => builder.saga(SagaDispatch::new("s", "order", ["inventory"])),
+        "saga" => builder.saga(SagaDispatch::new("s", "order", "inventory")),
         "process manager" => builder.process_manager(ProcessManagerDispatch::new(
             "pm",
             "pm",
@@ -114,11 +114,21 @@ fn a_router_hosts_one_component_and_refuses_a_second_of_any_kind() {
             "one {first} builds"
         );
         for second in KINDS {
-            assert_eq!(
-                build_err(with_one(with_one(RouterBuilder::new(), first), second)),
-                codes::DUPLICATE_REGISTRATION,
-                "a {second} after a {first}"
-            );
+            let err = match with_one(with_one(RouterBuilder::new(), first), second).build() {
+                Ok(_) => panic!("a {second} after a {first} must be refused"),
+                Err(err) => err,
+            };
+            assert_eq!(err.code, codes::DUPLICATE_REGISTRATION);
+            // C-0580: the refusal names the component already registered.
+            let (name, kind) = match first {
+                "aggregate" => ("a", "AGGREGATE"),
+                "saga" => ("s", "SAGA"),
+                "process manager" => ("pm", "PROCESS_MANAGER"),
+                _ => ("p", "PROJECTOR"),
+            };
+            let extra = |key: &str| err.extras.get(key).map(String::as_str);
+            assert_eq!(extra(crate::error::extras::COMPONENT), Some(name));
+            assert_eq!(extra(crate::error::extras::COMPONENT_KIND), Some(kind));
         }
     }
 }
@@ -225,7 +235,7 @@ fn source(domain: &str) -> pb::EventBook {
 fn a_router_runs_its_saga() {
     let router = RouterBuilder::new()
         .saga(
-            SagaDispatch::new("s", "order", ["inventory"]).on_event("test.Created", |_, _| {
+            SagaDispatch::new("s", "order", "inventory").on_event("test.Created", |_, _| {
                 Ok(vec![pb::CommandBook {
                     cover: Some(pb::Cover {
                         domain: "inventory".to_string(),
@@ -390,6 +400,9 @@ fn boxed_components_build_routers() {
 struct Plain;
 
 impl CommandHandler for Plain {
+    fn name(&self) -> &str {
+        "plain"
+    }
     fn command_types(&self) -> Vec<String> {
         vec!["test.Plain".to_string()]
     }
@@ -509,7 +522,7 @@ fn a_router_answers_its_components_hello() {
     assert_eq!(
         kind(
             RouterBuilder::new()
-                .saga(SagaDispatch::new("s", "order", ["x"]).with_rules_version("1"))
+                .saga(SagaDispatch::new("s", "order", "x").with_rules_version("1"))
                 .build()
                 .unwrap()
         ),

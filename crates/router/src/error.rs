@@ -44,6 +44,7 @@ pub mod codes {
     pub const CONFLICT_RESOLUTION_UNSUPPORTED: &str = "CONFLICT_RESOLUTION_UNSUPPORTED";
     pub const MISSING_RULES_VERSION: &str = "MISSING_RULES_VERSION";
     pub const MISSING_STATE_TYPE: &str = "MISSING_STATE_TYPE";
+    pub const SAGA_COMMAND_OUTSIDE_DESTINATION: &str = "SAGA_COMMAND_OUTSIDE_DESTINATION";
 }
 
 /// Canonical static message text (byte-equal across languages).
@@ -68,6 +69,8 @@ pub mod messages {
     pub const MISSING_RULES_VERSION: &str = "a component registers with its rules version";
     pub const MISSING_STATE_TYPE: &str =
         "a stateful component registers with its state type (Rebuilder::of_message)";
+    pub const SAGA_COMMAND_OUTSIDE_DESTINATION: &str =
+        "a saga answered a command for a domain other than its one destination";
     pub const FOLD_FAILED: &str = "the state fold failed on an event it had accepted";
     pub const FOLD_FAILED_EMITTED: &str = "the state fold failed on an event this command emitted";
 }
@@ -83,6 +86,9 @@ pub mod extras {
     pub const SEQUENCE: &str = "sequence";
     pub const STATE_TYPE_URL: &str = "state_type_url";
     pub const COMPONENT: &str = "component";
+    pub const COMPONENT_KIND: &str = "component_kind";
+    pub const EXPECTED_DOMAIN: &str = "expected_domain";
+    pub const ACTUAL_DOMAIN: &str = "actual_domain";
     pub const FIRST_SEQUENCE: &str = "first_sequence";
     pub const LAST_SEQUENCE: &str = "last_sequence";
     pub const FOLD_MESSAGE: &str = "fold_message";
@@ -245,6 +251,16 @@ impl CodedError {
             details,
             GrpcCode::Internal,
         )
+    }
+
+    /// A component bug the client library refuses before it answers
+    /// (INTERNAL).
+    pub fn internal(
+        code: &str,
+        message: &str,
+        extras: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        Self::coded(code, message, extras, GrpcCode::Internal)
     }
 
     /// An unclassified error that escaped a business handler (INTERNAL).
