@@ -166,7 +166,7 @@ impl FfiRouter {
     /// component's refusal to build one (MISSING_RULES_VERSION).
     pub fn component_descriptors(&self) -> Result<Vec<u8>, CodedError> {
         let components = self.hellos.iter().cloned().collect::<Result<Vec<_>, _>>()?;
-        Ok(abi_pb::ComponentDescriptors { components }.encode_to_vec())
+        Ok(pb::ComponentDescriptors { components }.encode_to_vec())
     }
 
     /// Parses an AggregateDescriptor and populates the core tables with

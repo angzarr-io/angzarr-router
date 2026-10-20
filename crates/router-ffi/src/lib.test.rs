@@ -2253,7 +2253,7 @@ fn the_router_builds_every_components_registration_hello_in_order() {
     let router = every_kind("1.4.2+build.7");
     let (ret, bytes) = component_descriptors(router.0);
     assert_eq!(ret, 0);
-    let hellos = abi_pb::ComponentDescriptors::decode(bytes.as_slice())
+    let hellos = pb::ComponentDescriptors::decode(bytes.as_slice())
         .expect("ComponentDescriptors")
         .components;
     let summary: Vec<(String, pb::ComponentKind, Vec<String>, Option<String>)> = hellos
@@ -2362,7 +2362,7 @@ fn a_router_hosting_nothing_has_no_registration_hellos() {
     let router = Router(angzarr_router_new());
     let (ret, bytes) = component_descriptors(router.0);
     assert_eq!(ret, 0);
-    assert!(abi_pb::ComponentDescriptors::decode(bytes.as_slice())
+    assert!(pb::ComponentDescriptors::decode(bytes.as_slice())
         .expect("ComponentDescriptors")
         .components
         .is_empty());
@@ -2389,7 +2389,7 @@ fn a_refused_registration_has_no_registration_hello() {
     let router = Router(r);
     let (ret, bytes) = component_descriptors(router.0);
     assert_eq!(ret, 0);
-    let names: Vec<String> = abi_pb::ComponentDescriptors::decode(bytes.as_slice())
+    let names: Vec<String> = pb::ComponentDescriptors::decode(bytes.as_slice())
         .expect("ComponentDescriptors")
         .components
         .into_iter()

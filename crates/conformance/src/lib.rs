@@ -947,7 +947,7 @@ pub fn order_aggregate(
         )
         .on_event("orders.v1.AddLine", rename("orders.v1.AddLineItem"));
     let facts = seen.clone();
-    AggregateDispatch::new("Order", "order", rebuilder)
+    AggregateDispatch::new("order", "order", rebuilder)
         .with_rules_version(rules_version)
         .with_commutative(order_changed)
         .with_command_upcaster(upcaster)

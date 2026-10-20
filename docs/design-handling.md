@@ -19,7 +19,7 @@ at 4.
 
 ## Spec
 
-Source: angzarr-project `spec/20261019-draft` (619933c).
+Source: angzarr-project `spec/20261019-draft` (b50d29b).
 
 - **Protos:**
   - `command_handler.proto`: `CommandHandlerService.Handle`,
@@ -210,13 +210,15 @@ language. Hosts only send it.
   `S: prost::Name` bound and the `_with_state` variants are gone).
 - **C ABI.**
   - New entry point: `angzarr_router_component_descriptors(r, out)`. It fills
-    `out` with a serialized `ComponentDescriptors { repeated
-    io.angzarr.v1.ComponentDescriptor components = 1; }` in registration
+    `out` with a serialized `io.angzarr.v1.ComponentDescriptors` (the
+    spec's `ComponentService.Describe` answer, since b50d29b) in registration
     order, or with a status: the first refusal. Each hello is built when its
     component registers (a registered table never changes), so a component
     a registration refused has no hello.
   - The saga and projector descriptors gain `rules_version`.
-- **Binding.** C-0535 binds against the native order aggregate.
+- **Binding.** C-0535 and C-0565 (describing the process, spec b50d29b) bind
+  against the native order aggregate and a saga, each describing itself; the
+  native `Router` hosts one kind, so the step gathers each table's hello.
 
 ### Router-owned projectors
 
@@ -257,7 +259,7 @@ keep no state of any kind.
 |---|---|---|
 | `ProjectorDescriptor` | `projection_type_url = 6`, `fold_callback_id = 7`, `rules_version = 8` | `events = 3` and `finish_callback_id = 4`, both reserved because ABI 3 published them |
 | `SagaDescriptor` | `rules_version = 6` | none |
-| `ComponentDescriptors` | new message | none |
+| `ComponentDescriptors` | new message (round 5; replaced in round 7 by the spec's `io.angzarr.v1.ComponentDescriptors`, the same wire shape, so abi.proto no longer defines it) | none |
 | `ProjectorEventAux` | none | the whole message, which nothing uses any more |
 
 ## Fold failures and the native Router

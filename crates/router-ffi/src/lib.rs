@@ -189,7 +189,8 @@ pub unsafe extern "C" fn angzarr_router_dispatch_projector(
 }
 
 /// Fills `out` with the registration hellos of every registered component:
-/// a serialized `io.angzarr.router.ffi.v1.ComponentDescriptors`, each an
+/// a serialized `io.angzarr.v1.ComponentDescriptors` (the spec's
+/// `ComponentService.Describe` answer), each an
 /// `io.angzarr.v1.ComponentDescriptor` the router built from its own tables,
 /// in registration order. The host only sends them to its coordinator. A
 /// component registered without a rules version refuses the call

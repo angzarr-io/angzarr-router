@@ -1,5 +1,5 @@
 //! Binds angzarr-project's handler-contract tier
-//! (features/handler-contract/handling.feature, C-0533..C-0550; the spec is
+//! (features/handler-contract/handling.feature, C-0533..C-0550 and C-0565; the spec is
 //! the source, read from the submodule) to the Rust core: the order
 //! aggregate and the Fulfillment process manager built by hand over the
 //! orders.v1 fixture messages.
@@ -18,7 +18,8 @@ struct HandlingWorld {
     snapshot: Option<pb::Snapshot>,
     result: Option<Result<pb::CommandHandlerResponse, CodedError>>,
     pm_result: Option<Result<pb::ProcessManagerHandleResponse, CodedError>>,
-    registration: Option<pb::ComponentDescriptor>,
+    saga: Option<(String, String)>,
+    described: Vec<pb::ComponentDescriptor>,
 }
 
 impl HandlingWorld {
@@ -108,28 +109,77 @@ async fn reports(w: &mut HandlingWorld, version: String) {
     assert_eq!(reported, version);
 }
 
-// The registration hello (types.proto ComponentDescriptor): the router builds
-// it from the aggregate's own table.
-#[when(r#"the "order" business binary registers with its coordinator"#)]
-async fn registers(w: &mut HandlingWorld) {
+// Describing the process (component.proto, ComponentService.Describe): each
+// component's ComponentDescriptor, built by the router from its own table, in
+// the order the process hosts them. The native Router hosts one kind, so a
+// process hosting an aggregate and a saga gathers each table's description.
+#[given(
+    regex = r#"^the "order" business binary also hosts the "([^"]*)" saga reacting to "([^"]*)"$"#
+)]
+async fn hosts_saga(w: &mut HandlingWorld, name: String, domain: String) {
+    w.saga = Some((name, domain));
+}
+
+#[when(r#"the coordinator asks the "order" business binary to describe its components"#)]
+async fn describe(w: &mut HandlingWorld) {
     let order = conf::order_aggregate(&w.rules_version, w.settle.clone(), w.seen.clone());
-    w.registration = Some(order.component_descriptor().expect("a registration hello"));
+    let mut described = vec![order.component_descriptor().expect("the order aggregate")];
+    if let Some((name, domain)) = w.saga.clone() {
+        let saga = angzarr_router::saga::SagaDispatch::new(name, domain, Vec::<String>::new())
+            .with_rules_version(&w.rules_version);
+        described.push(saga.component_descriptor().expect("the saga"));
+    }
+    w.described = described;
 }
 
-#[then(regex = r#"^the registration carries rules version "([^"]*)"$"#)]
-async fn registration_version(w: &mut HandlingWorld, version: String) {
-    let hello = w.registration.as_ref().expect("the binary registered");
-    assert_eq!(hello.rules_version, version);
+fn described<'a>(w: &'a HandlingWorld, name: &str) -> &'a pb::ComponentDescriptor {
+    w.described
+        .iter()
+        .find(|d| d.name == name)
+        .unwrap_or_else(|| panic!("no description of {name}"))
 }
 
-#[then("the registration carries the order state type")]
-async fn registration_state(w: &mut HandlingWorld) {
-    let hello = w.registration.as_ref().expect("the binary registered");
-    assert_eq!(hello.kind(), pb::ComponentKind::Aggregate);
+#[then(regex = r#"^the "order" aggregate's description carries rules version "([^"]*)"$"#)]
+async fn described_version(w: &mut HandlingWorld, version: String) {
+    let order = described(w, "order");
+    assert_eq!(order.kind(), pb::ComponentKind::Aggregate);
+    assert_eq!(order.rules_version, version);
+}
+
+#[then(r#"the "order" aggregate's description carries the order state type"#)]
+async fn described_state(w: &mut HandlingWorld) {
     assert_eq!(
-        hello.state.as_ref().map(|s| s.type_url.as_str()),
+        described(w, "order")
+            .state
+            .as_ref()
+            .map(|s| s.type_url.as_str()),
         Some("/orders.v1.OrderState")
     );
+}
+
+#[then("the answer describes exactly these components:")]
+async fn describes_exactly(w: &mut HandlingWorld, step: &cucumber::gherkin::Step) {
+    let table = step.table.as_ref().expect("a table");
+    let expected: Vec<Vec<String>> = table.rows.iter().skip(1).cloned().collect();
+    let actual: Vec<Vec<String>> = w
+        .described
+        .iter()
+        .map(|d| {
+            vec![
+                d.name.clone(),
+                d.kind()
+                    .as_str_name()
+                    .trim_start_matches("COMPONENT_KIND_")
+                    .to_string(),
+                d.rules_version.clone(),
+                d.state
+                    .as_ref()
+                    .map(|s| s.type_url.clone())
+                    .unwrap_or_default(),
+            ]
+        })
+        .collect();
+    assert_eq!(actual, expected);
 }
 
 #[given(
