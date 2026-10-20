@@ -45,6 +45,8 @@ pub mod codes {
     pub const CONFLICT_RESOLUTION_UNSUPPORTED: &str = "CONFLICT_RESOLUTION_UNSUPPORTED";
     pub const MISSING_RULES_VERSION: &str = "MISSING_RULES_VERSION";
     pub const MISSING_STATE_TYPE: &str = "MISSING_STATE_TYPE";
+    pub const MISSING_PM_COMPONENT: &str = "MISSING_PM_COMPONENT";
+    pub const UNKNOWN_PM_COMPONENT: &str = "UNKNOWN_PM_COMPONENT";
 }
 
 /// Canonical static message text (byte-equal across languages).
@@ -70,6 +72,9 @@ pub mod messages {
     pub const MISSING_RULES_VERSION: &str = "a component registers with its rules version";
     pub const MISSING_STATE_TYPE: &str =
         "a stateful component registers with its state type (Rebuilder::of_message)";
+    pub const MISSING_PM_COMPONENT: &str =
+        "a process-manager request names the process manager it is for";
+    pub const UNKNOWN_PM_COMPONENT: &str = "this process hosts no process manager of that name";
     pub const FOLD_FAILED: &str = "the state fold failed on an event it had accepted";
     pub const FOLD_FAILED_EMITTED: &str = "the state fold failed on an event this command emitted";
 }
@@ -247,6 +252,16 @@ impl CodedError {
             details,
             GrpcCode::Internal,
         )
+    }
+
+    /// Something the request names that this process does not host
+    /// (NOT_FOUND).
+    pub fn not_found(
+        code: &str,
+        message: &str,
+        extras: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        Self::coded(code, message, extras, GrpcCode::NotFound)
     }
 
     /// An unclassified error that escaped a business handler (INTERNAL).

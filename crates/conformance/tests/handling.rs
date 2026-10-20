@@ -1,5 +1,5 @@
 //! Binds angzarr-project's handler-contract tier
-//! (features/handler-contract/handling.feature, C-0533..C-0550, C-0565, C-0570 and C-0571; the spec is
+//! (features/handler-contract/handling.feature, C-0533..C-0550, C-0565, C-0570, C-0571, C-0576 and C-0577; the spec is
 //! the source, read from the submodule) to the Rust core: the order
 //! aggregate and the Fulfillment process manager built by hand over the
 //! orders.v1 fixture messages.
@@ -20,6 +20,8 @@ struct HandlingWorld {
     pm_result: Option<Result<pb::ProcessManagerHandleResponse, CodedError>>,
     saga: Option<(String, String)>,
     pm_placed: u32,
+    hosted_pms: Vec<String>,
+    pm_invoked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     described: Vec<pb::ComponentDescriptor>,
 }
 
@@ -298,6 +300,80 @@ async fn pm_events_carry_no_state(w: &mut HandlingWorld) {
         .process_events
         .iter()
         .all(|b| b.snapshot.is_none()));
+}
+
+// --- one process manager per request (C-0576, C-0577; decision 14.16) ---------
+
+#[given(
+    regex = r#"^the business process hosts process managers "([^"]*)" and "([^"]*)", both reacting to "order"$"#
+)]
+async fn hosts_two_pms(w: &mut HandlingWorld, first: String, second: String) {
+    w.hosted_pms = vec![first, second];
+}
+
+#[given(regex = r#"^the business process hosts process manager "([^"]*)"$"#)]
+async fn hosts_one_pm(w: &mut HandlingWorld, name: String) {
+    w.hosted_pms = vec![name];
+}
+
+#[when(regex = r#"^an OrderPlaced trigger is handled for process manager "([^"]*)"$"#)]
+async fn handled_for(w: &mut HandlingWorld, named: String) {
+    let mut builder = angzarr_router::router::RouterBuilder::new();
+    for name in &w.hosted_pms {
+        builder = builder.process_manager(conf::named_pm(name, w.pm_invoked.clone()));
+    }
+    let router = builder.build().expect("build");
+    let mut req = conf::order_placed_trigger();
+    req.component = named;
+    w.pm_result = Some(router.dispatch_process_manager(&req));
+}
+
+#[then(regex = r#"^only "([^"]*)"'s business code is invoked$"#)]
+async fn only_invoked(w: &mut HandlingWorld, name: String) {
+    assert_eq!(*w.pm_invoked.lock().unwrap(), vec![name]);
+}
+
+#[then(regex = r#"^the answer holds only "([^"]*)"'s process events, commands and process state$"#)]
+async fn holds_only(w: &mut HandlingWorld, name: String) {
+    let answer = pm_answer(w);
+    assert_eq!(answer.process_events.len(), 1, "its one process event");
+    let targets: Vec<String> = answer
+        .commands
+        .iter()
+        .map(|c| {
+            c.cover
+                .as_ref()
+                .map(|c| c.domain.clone())
+                .unwrap_or_default()
+        })
+        .collect();
+    assert_eq!(targets, vec![name], "its one command");
+    assert_eq!(
+        answer.process_state.as_ref().and_then(|s| s.state.clone()),
+        Some(conf::fulfillment_state(1)),
+        "its own state after its one reaction"
+    );
+}
+
+#[then(regex = r"^the request is refused (NOT_FOUND|INVALID_ARGUMENT)$")]
+async fn pm_refused(w: &mut HandlingWorld, status: String) {
+    let err = w
+        .pm_result
+        .as_ref()
+        .expect("a request was handled")
+        .as_ref()
+        .expect_err("refused");
+    let expected = match status.as_str() {
+        "NOT_FOUND" => GrpcCode::NotFound,
+        _ => GrpcCode::InvalidArgument,
+    };
+    assert_eq!(err.grpc, expected);
+}
+
+#[then("no business code is invoked")]
+async fn no_business_code(w: &mut HandlingWorld) {
+    assert!(w.pm_invoked.lock().unwrap().is_empty());
+    assert!(w.seen.lock().unwrap().is_empty());
 }
 
 #[then("the command is accepted")]

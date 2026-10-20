@@ -1185,7 +1185,8 @@ impl Router {
     }
 }
 
-/// A PM request over a trigger book in `domain` carrying the given pages.
+/// A request for the OrderPM over a trigger book in `domain` carrying the
+/// given pages.
 fn pm_request(domain: &str, pages: Vec<pb::EventPage>) -> pb::ProcessManagerHandleRequest {
     pb::ProcessManagerHandleRequest {
         trigger: Some(pb::EventBook {
@@ -1197,6 +1198,7 @@ fn pm_request(domain: &str, pages: Vec<pb::EventPage>) -> pb::ProcessManagerHand
             ..Default::default()
         }),
         process_state: None,
+        component: "OrderPM".to_string(),
     }
 }
 
@@ -1234,8 +1236,8 @@ fn pm_emits_its_command_through_the_abi() {
 #[test]
 fn two_process_managers_share_a_source_domain_route_by_type() {
     // Two PMs subscribe to the SAME source domain (`orders`) for different event
-    // types. A trigger routes to the PM that declares its type; the other no-ops.
-    // Before multi-PM routing, registering two PMs returned NO_HANDLER_REGISTERED.
+    // types. The request names the PM it is for (decision 14.16): the named PM
+    // declaring the type reacts; named, the other no-ops.
     let r = angzarr_router_new();
     let pm1 = pm_descriptor_bytes(); // OrderPM: orders/OrderShipped -> CB_PM_EVENT
     let pm2 = abi_pb::ProcessManagerDescriptor {
@@ -1262,24 +1264,30 @@ fn two_process_managers_share_a_source_domain_route_by_type() {
     );
     let router = Router(r);
     reset_observations();
-    let req = pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)]);
+    let mut req = pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)]);
     let (ret, bytes) = router.dispatch_process_manager(&req);
-    assert_eq!(ret, 0, "multi-PM routing should not report NO_HANDLER");
+    assert_eq!(ret, 0);
     let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
-    assert_eq!(
-        resp.commands.len(),
-        1,
-        "routed to the PM declaring OrderShipped; the OrderCreated PM no-opped",
+    assert_eq!(resp.commands.len(), 1, "OrderPM declares OrderShipped");
+    req.component = "OtherPM".to_string();
+    let (ret, bytes) = router.dispatch_process_manager(&req);
+    assert_eq!(ret, 0);
+    let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
+    assert!(
+        resp.commands.is_empty(),
+        "OtherPM declares only OrderCreated"
     );
 }
 
 #[test]
 fn pm_missing_trigger_through_the_abi_is_missing_pm_trigger() {
-    // Trigger-shape validation precedes routing (mirrors the saga path): a nil
-    // trigger reports MISSING_PM_TRIGGER, not NO_HANDLER from an empty domain.
+    // The named PM refuses a nil trigger as MISSING_PM_TRIGGER.
     let router = Router::with_process_manager();
     reset_observations();
-    let (ret, bytes) = router.dispatch_process_manager(&pb::ProcessManagerHandleRequest::default());
+    let (ret, bytes) = router.dispatch_process_manager(&pb::ProcessManagerHandleRequest {
+        component: "OrderPM".to_string(),
+        ..Default::default()
+    });
     assert_eq!(ret, -3, "invalid argument, negated");
     let (_, reason) = decode_status(&bytes);
     assert_eq!(reason, angzarr_router::error::codes::MISSING_PM_TRIGGER);
@@ -1287,11 +1295,12 @@ fn pm_missing_trigger_through_the_abi_is_missing_pm_trigger() {
 
 #[test]
 fn pm_empty_trigger_through_the_abi_is_empty_pm_trigger() {
-    // A trigger book with no pages validates before routing as EMPTY_PM_TRIGGER.
+    // The named PM refuses a trigger book with no pages as EMPTY_PM_TRIGGER.
     let router = Router::with_process_manager();
     reset_observations();
     let req = pb::ProcessManagerHandleRequest {
         trigger: Some(pb::EventBook::default()),
+        component: "OrderPM".to_string(),
         ..Default::default()
     };
     let (ret, bytes) = router.dispatch_process_manager(&req);
@@ -1344,34 +1353,44 @@ fn command_domains(resp: &pb::ProcessManagerHandleResponse) -> Vec<String> {
         .collect()
 }
 
+// process_manager.proto, component (decision 14.16): the C ABI routes a PM
+// request by the component it names, with no fan-out.
 #[test]
-fn process_state_cover_routes_the_trigger_to_its_own_pm() {
+fn a_pm_request_reaches_only_the_pm_it_names_through_the_abi() {
     let router = Router::with_two_process_managers();
-    let mut req = pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)]);
-    req.process_state = Some(pb::EventBook {
-        cover: Some(pb::Cover {
-            domain: "other-pm".to_string(),
-            ..Default::default()
-        }),
-        ..Default::default()
-    });
-    let (ret, bytes) = router.dispatch_process_manager(&req);
-    assert_eq!(ret, 0);
-    let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
-    assert_eq!(command_domains(&resp), vec!["pm2-target".to_string()]);
+    for (name, target) in [("OrderPM", "inventory"), ("Pm2", "pm2-target")] {
+        let mut req = pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)]);
+        req.component = name.to_string();
+        let (ret, bytes) = router.dispatch_process_manager(&req);
+        assert_eq!(ret, 0);
+        let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
+        assert_eq!(
+            command_domains(&resp),
+            vec![target.to_string()],
+            "{name} alone"
+        );
+    }
 }
 
 #[test]
-fn uncovered_process_state_fans_the_trigger_out_in_registration_order() {
+fn a_pm_request_naming_no_hosted_pm_is_refused_through_the_abi() {
     let router = Router::with_two_process_managers();
-    let req = pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)]);
-    let (ret, bytes) = router.dispatch_process_manager(&req);
-    assert_eq!(ret, 0);
-    let resp = pb::ProcessManagerHandleResponse::decode(bytes.as_slice()).expect("PMResponse");
-    assert_eq!(
-        command_domains(&resp),
-        vec!["inventory".to_string(), "pm2-target".to_string()]
-    );
+    reset_observations();
+    for (named, ret_code, reason) in [
+        ("", -3, angzarr_router::error::codes::MISSING_PM_COMPONENT),
+        (
+            "Shipping",
+            -5,
+            angzarr_router::error::codes::UNKNOWN_PM_COMPONENT,
+        ),
+    ] {
+        let mut req = pm_request("orders", vec![event_page_of(FQ_ORDER_SHIPPED)]);
+        req.component = named.to_string();
+        let (ret, bytes) = router.dispatch_process_manager(&req);
+        assert_eq!(ret, ret_code, "{named:?}");
+        assert_eq!(decode_status(&bytes).1, reason);
+    }
+    assert!(observations().fold_calls.is_empty(), "no business code ran");
 }
 
 // --- registration-time claims + host fold status

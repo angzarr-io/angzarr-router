@@ -5,9 +5,7 @@
 
 use angzarr_router::error::CodedError;
 use angzarr_router::pb;
-use angzarr_router::process_manager::{
-    merge_responses, select_process_managers, ProcessManagerRoute,
-};
+use angzarr_router::router::RouterBuilder;
 use angzarr_router_conformance as conf;
 use cucumber::{given, then, when, World};
 
@@ -25,19 +23,14 @@ impl ProcessManagerWorld {
             self.result = Some(conf::order_pm().dispatch(&req));
             return;
         }
-        // Co-resident: the router's selection + merge over both PMs, each
-        // dispatching over its own state type.
-        let order = conf::order_pm();
-        let audit = conf::audit_pm();
-        let routes: [&dyn ProcessManagerRoute; 2] = [&order, &audit];
-        let responses = select_process_managers(&routes, &req)
-            .into_iter()
-            .map(|index| match index {
-                0 => order.dispatch(&req),
-                _ => audit.dispatch(&req),
-            })
-            .collect::<Result<Vec<_>, _>>();
-        self.result = Some(responses.map(|responses| merge_responses("", responses)));
+        // Co-resident: one router hosts both; the request names the one PM it
+        // is for, each over its own state type.
+        let router = RouterBuilder::new()
+            .process_manager(conf::order_pm())
+            .process_manager(conf::audit_pm())
+            .build()
+            .expect("build");
+        self.result = Some(router.dispatch_process_manager(&req));
     }
 
     /// The counts the order PM's process events recorded (one per reaction).
@@ -191,15 +184,17 @@ async fn co_resident_pms(w: &mut ProcessManagerWorld) {
 }
 
 #[when(
-    regex = r#"^an Increased trigger is dispatched over a prior "([^"]*)" state of (\d+) events$"#
+    regex = r#"^an Increased trigger for "([^"]*)" is dispatched over a prior state of (\d+) events$"#
 )]
-async fn increased_over_owned_state(w: &mut ProcessManagerWorld, owner: String, n: u32) {
-    w.dispatch(conf::pm_trigger_request(
+async fn increased_for(w: &mut ProcessManagerWorld, component: String, n: u32) {
+    let mut req = conf::pm_trigger_request(
         "counter",
         &["test.counter.Increased"],
-        Some(conf::pm_state_in(&owner, n)),
+        Some(conf::pm_state_of(n)),
         None,
-    ));
+    );
+    req.component = component;
+    w.dispatch(req);
 }
 
 #[then(regex = r"^the order process-manager rebuilt (\d+) prior state events$")]
@@ -219,6 +214,11 @@ async fn order_did_not_react(w: &mut ProcessManagerWorld) {
         "the order PM emitted no command"
     );
     assert!(w.order_counts().is_empty(), "the order PM recorded nothing");
+}
+
+#[then("the audit process-manager did not react")]
+async fn audit_did_not_react(w: &mut ProcessManagerWorld) {
+    assert!(w.audit_counts().is_empty(), "the audit PM recorded nothing");
 }
 
 #[tokio::main]

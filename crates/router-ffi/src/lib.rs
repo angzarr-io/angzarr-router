@@ -3,7 +3,8 @@
 //! claims: routing a command to its aggregate through the core's
 //! CommandHandlers (by domain and command type; a sole aggregate claims
 //! every domain), one projector per router, sagas by source domain, and
-//! co-resident PMs through the core's selection. Those rules are
+//! a process-manager request to the one PM it names (the core's
+//! select_process_manager). Those rules are
 //! mutation-tested with the core.
 //!
 //! # Status codes
@@ -318,8 +319,10 @@ pub unsafe extern "C" fn angzarr_router_register_process_manager(
     }
 }
 
-/// Dispatches `ProcessManagerHandleRequest` bytes through the registered
-/// process manager. On success returns 0 and fills `out` with
+/// Dispatches `ProcessManagerHandleRequest` bytes to the one registered
+/// process manager the request's `component` names (no fan-out; an empty
+/// name is INVALID_ARGUMENT, a name no registered PM has is NOT_FOUND). On
+/// success returns 0 and fills `out` with
 /// `ProcessManagerHandleResponse` bytes; on failure returns the negated gRPC
 /// code and fills `out` with `google.rpc.Status` bytes. Either way the host
 /// releases `out` with `angzarr_buf_release`.

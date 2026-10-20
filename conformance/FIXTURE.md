@@ -58,14 +58,14 @@ historical-state evidence the framework supplies.
   `OrderProcessManagerState` with the count its rebuilt state held; the
   audit PM emits one unaddressed process event carrying an
   `AuditProcessManagerState` with what its rebuilt state saw. They
-  prove each PM rebuilds only its own state and that a process state
-  reaches only the PM that owns it.
+  prove a request reaches only the PM it names (its `component`), which
+  rebuilds only its own state.
 
 ## The order aggregate and the Fulfillment process manager (handler-contract)
 
 `crates/conformance/tests/handling.rs` binds angzarr-project's
 handler-contract tier (`features/handler-contract/handling.feature`,
-C-0533..C-0550, C-0565, C-0570, C-0571) straight from the submodule, C-0535 and C-0565 (describing the process) through
+C-0533..C-0550, C-0565, C-0570, C-0571, C-0576, C-0577) straight from the submodule, C-0535 and C-0565 (describing the process) through
 each component's `component_descriptor()`. The fixtures are built by hand over the plain messages of
 `conformance/proto/orders/v1/order.proto`: `OrderState` keeps a quantity per
 item (conflict unit `items[<item>]`), a shipping address (its own unit) and

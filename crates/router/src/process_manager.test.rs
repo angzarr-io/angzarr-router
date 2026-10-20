@@ -33,6 +33,7 @@ fn request(
     pb::ProcessManagerHandleRequest {
         trigger,
         process_state,
+        component: String::new(),
     }
 }
 
@@ -370,9 +371,11 @@ fn accessors_report_name_domain_and_sources() {
     );
 }
 
-// --- co-resident routing (select_process_managers / merge_responses) -------
+// --- one process manager per request (process_manager.proto, component;
+// decision 14.16, C-0576/C-0577) ----------------------------------------------
 
-use crate::process_manager::{merge_responses, select_process_managers, ProcessManagerRoute};
+use crate::error::GrpcCode;
+use crate::process_manager::{select_process_manager, ProcessManagerRoute};
 
 /// A PM named `name` owning `pm_domain`, consuming FQ_SHIPPED from `source`.
 fn routed_pm(name: &str, pm_domain: &str, source: &str) -> ProcessManagerDispatch<TestState> {
@@ -383,72 +386,47 @@ fn routed_pm(name: &str, pm_domain: &str, source: &str) -> ProcessManagerDispatc
     )
 }
 
-fn state_in(domain: &str) -> pb::EventBook {
-    pb::EventBook {
-        cover: Some(pb::Cover {
-            domain: domain.to_string(),
-            ..Default::default()
-        }),
-        ..Default::default()
-    }
-}
-
 fn select(
     pms: &[&ProcessManagerDispatch<TestState>],
-    req: &pb::ProcessManagerHandleRequest,
-) -> Vec<usize> {
+    component: &str,
+) -> Result<usize, crate::error::CodedError> {
     let routes: Vec<&dyn ProcessManagerRoute> =
         pms.iter().map(|p| *p as &dyn ProcessManagerRoute).collect();
-    select_process_managers(&routes, req)
+    let mut req = request(Some(trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED)])), None);
+    req.component = component.to_string();
+    select_process_manager(&routes, &req)
 }
 
 #[test]
-fn event_trigger_without_state_identity_selects_every_subscriber_in_order() {
-    let a = routed_pm("a", "a-pm", IN_DOMAIN);
-    let other = routed_pm("x", "x-pm", "billing");
-    let b = routed_pm("b", "b-pm", IN_DOMAIN);
-    let req = request(Some(trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED)])), None);
-    assert_eq!(select(&[&a, &other, &b], &req), vec![0, 2]);
-}
-
-#[test]
-fn event_trigger_with_uncovered_state_selects_subscribers() {
+fn a_request_selects_the_process_manager_it_names() {
     let a = routed_pm("a", "a-pm", IN_DOMAIN);
     let b = routed_pm("b", "b-pm", IN_DOMAIN);
-    let req = request(
-        Some(trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED)])),
-        Some(pb::EventBook::default()),
-    );
-    assert_eq!(select(&[&a, &b], &req), vec![0, 1]);
+    assert_eq!(select(&[&a, &b], "b").expect("hosted"), 1);
+    assert_eq!(select(&[&a, &b], "a").expect("hosted"), 0);
 }
 
 #[test]
-fn process_state_cover_addresses_its_own_process_manager_only() {
+fn a_request_naming_no_process_manager_is_invalid_argument() {
     let a = routed_pm("a", "a-pm", IN_DOMAIN);
-    let b = routed_pm("b", "b-pm", IN_DOMAIN);
-    let req = request(
-        Some(trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED)])),
-        Some(state_in("b-pm")),
-    );
-    assert_eq!(select(&[&a, &b], &req), vec![1]);
+    let err = select(&[&a], "").expect_err("empty component");
+    assert_eq!(err.code, codes::MISSING_PM_COMPONENT);
+    assert_eq!(err.grpc, GrpcCode::InvalidArgument);
 }
 
 #[test]
-fn process_state_cover_matching_no_process_manager_falls_back_to_subscribers() {
+fn a_request_naming_a_process_manager_not_hosted_is_not_found() {
     let a = routed_pm("a", "a-pm", IN_DOMAIN);
-    let b = routed_pm("b", "b-pm", "billing");
-    let req = request(
-        Some(trigger(IN_DOMAIN, vec![ev(FQ_SHIPPED)])),
-        Some(state_in("unknown-pm")),
-    );
-    assert_eq!(select(&[&a, &b], &req), vec![0]);
-}
-
-#[test]
-fn missing_or_empty_trigger_selects_nothing_to_route() {
-    let a = routed_pm("a", "a-pm", IN_DOMAIN);
-    assert!(select(&[&a], &request(None, None)).is_empty());
-    assert!(select(&[&a], &request(Some(trigger(IN_DOMAIN, vec![])), None)).is_empty());
+    for hosted in [&[][..], &[&a][..]] {
+        let err = select(hosted, "Shipping").expect_err("not hosted");
+        assert_eq!(err.code, codes::UNKNOWN_PM_COMPONENT);
+        assert_eq!(err.grpc, GrpcCode::NotFound);
+        assert_eq!(
+            err.extras
+                .get(crate::error::extras::COMPONENT)
+                .map(String::as_str),
+            Some("Shipping")
+        );
+    }
 }
 
 #[test]
@@ -459,68 +437,6 @@ fn route_view_reports_identity_and_consumption() {
     assert_eq!(route.pm_domain(), "a-pm");
     assert!(route.consumes(IN_DOMAIN));
     assert!(!route.consumes("billing"));
-}
-
-#[test]
-fn merge_concatenates_in_order() {
-    let merged = merge_responses(
-        "v1",
-        vec![
-            pb::ProcessManagerHandleResponse {
-                process_events: vec![tagged_book("p1")],
-                commands: vec![command_to("c1")],
-                ..Default::default()
-            },
-            pb::ProcessManagerHandleResponse {
-                process_events: vec![tagged_book("p2")],
-                commands: vec![command_to("c2")],
-                rules_version: "v2".to_string(),
-                ..Default::default()
-            },
-        ],
-    );
-    assert_eq!(book_domains(&merged.process_events), vec!["p1", "p2"]);
-    let cmd_domains: Vec<_> = merged
-        .commands
-        .iter()
-        .map(|c| c.cover.as_ref().unwrap().domain.clone())
-        .collect();
-    assert_eq!(cmd_domains, vec!["c1", "c2"]);
-    assert_eq!(
-        merged.rules_version, "v1",
-        "co-hosted PMs share one binary, so one version"
-    );
-}
-
-/// A response carrying process state `label`.
-fn with_state(label: &str) -> pb::ProcessManagerHandleResponse {
-    pb::ProcessManagerHandleResponse {
-        process_state: Some(pb::Snapshot {
-            state: Some(crate::test_support::cover_any(label)),
-            ..Default::default()
-        }),
-        ..Default::default()
-    }
-}
-
-// process_manager.proto, process_state (decision 14.14): the PM that handled
-// the trigger answers its state; PMs the trigger reached but that did not
-// handle it answer nothing, so their (absent) state never displaces it.
-#[test]
-fn merge_keeps_the_process_state_of_the_one_pm_that_handled_the_trigger() {
-    let merged = merge_responses(
-        "v",
-        vec![
-            pb::ProcessManagerHandleResponse::default(),
-            with_state("handled"),
-            pb::ProcessManagerHandleResponse::default(),
-        ],
-    );
-    assert_eq!(
-        merged.process_state.and_then(|s| s.state),
-        Some(crate::test_support::cover_any("handled"))
-    );
-    assert!(merge_responses("v", Vec::new()).process_state.is_none());
 }
 
 // The handler reads the trigger's cover (e.g. to address the trigger's root).

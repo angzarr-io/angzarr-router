@@ -242,10 +242,13 @@ fn sagas_fan_out_and_merge_in_registration_order() {
     );
 }
 
+// process_manager.proto, component (decision 14.16): one PM per request,
+// named; no fan-out to the others and no merging.
 #[test]
-fn process_managers_route_through_selection() {
+fn a_process_manager_request_reaches_only_the_process_manager_it_names() {
     let pm = |name: &'static str| {
         ProcessManagerDispatch::new(name, format!("{name}-pm"), ["inventory"], fresh_rebuilder())
+            .with_rules_version(name)
             .on_event("order", "test.Created", move |_, _, _| {
                 Ok(pb::ProcessManagerHandleResponse {
                     process_events: vec![pb::EventBook {
@@ -255,6 +258,7 @@ fn process_managers_route_through_selection() {
                         }),
                         ..Default::default()
                     }],
+                    commands: vec![pb::CommandBook::default()],
                     ..Default::default()
                 })
             })
@@ -264,7 +268,7 @@ fn process_managers_route_through_selection() {
         .process_manager(pm("b"))
         .build()
         .expect("build");
-    let mut req = pb::ProcessManagerHandleRequest {
+    let request = |component: &str| pb::ProcessManagerHandleRequest {
         trigger: Some(pb::EventBook {
             cover: Some(pb::Cover {
                 domain: "order".to_string(),
@@ -274,28 +278,23 @@ fn process_managers_route_through_selection() {
             ..Default::default()
         }),
         process_state: None,
+        component: component.to_string(),
     };
-    let reactions = |resp: pb::ProcessManagerHandleResponse| -> Vec<String> {
-        resp.process_events
+    for name in ["a", "b"] {
+        let resp = router.dispatch_process_manager(&request(name)).unwrap();
+        let reactions: Vec<String> = resp
+            .process_events
             .into_iter()
             .map(|f| f.cover.unwrap().domain)
-            .collect()
-    };
-    assert_eq!(
-        reactions(router.dispatch_process_manager(&req).unwrap()),
-        vec!["a", "b"]
-    );
-    req.process_state = Some(pb::EventBook {
-        cover: Some(pb::Cover {
-            domain: "b-pm".to_string(),
-            ..Default::default()
-        }),
-        ..Default::default()
-    });
-    assert_eq!(
-        reactions(router.dispatch_process_manager(&req).unwrap()),
-        vec!["b"]
-    );
+            .collect();
+        assert_eq!(reactions, vec![name.to_string()], "only {name} reacts");
+        assert_eq!(resp.commands.len(), 1);
+        assert_eq!(resp.rules_version, name, "{name}'s own answer");
+    }
+    let err = router.dispatch_process_manager(&request("")).unwrap_err();
+    assert_eq!(err.code, codes::MISSING_PM_COMPONENT);
+    let err = router.dispatch_process_manager(&request("c")).unwrap_err();
+    assert_eq!(err.code, codes::UNKNOWN_PM_COMPONENT);
 }
 
 #[test]
@@ -417,6 +416,7 @@ fn boxed_components_build_routers() {
                 ..Default::default()
             }),
             process_state: None,
+            component: "pm".to_string(),
         })
         .expect("dispatch");
     assert_eq!(resp.process_events.len(), 1);

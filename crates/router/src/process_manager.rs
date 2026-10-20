@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use prost_types::Any;
 
-use crate::error::{codes, map_handler_error, messages, CodedError, HandlerError};
+use crate::error::{codes, extras, map_handler_error, messages, CodedError, HandlerError};
 use crate::pb;
 use crate::rebuild::Rebuilder;
 
@@ -226,7 +226,7 @@ impl<S> ProcessManagerDispatch<S> {
 /// The routing view of one process-manager component: its identity and the
 /// input domains it consumes. Implemented by every [`ProcessManagerDispatch`]
 /// regardless of its state type, so co-resident PMs with different state types
-/// route through one selection.
+/// route through one selection by name ([`select_process_manager`]).
 pub trait ProcessManagerRoute {
     /// The registered component name.
     fn name(&self) -> &str;
@@ -250,74 +250,32 @@ impl<S> ProcessManagerRoute for ProcessManagerDispatch<S> {
     }
 }
 
-/// Selects which of several co-resident process managers a request is
-/// addressed to, as indices into `pms` in registration order.
-///
-/// A process-state book belongs to exactly one PM, so identity routes first:
-/// the PM owning the process-state cover domain; when the state carries no
-/// identity (a new workflow) or names no registered PM, every PM consuming the
-/// trigger's domain.
-///
-/// A missing or page-less trigger selects nothing; the caller reports those
-/// shapes before routing.
-pub fn select_process_managers(
+/// Selects the one process manager a request is for, as an index into `pms`
+/// (process_manager.proto, ProcessManagerHandleRequest.component; decision
+/// 14.16): the PM whose name the request's `component` names. There is no
+/// fan-out to the others. An empty `component` is refused
+/// MISSING_PM_COMPONENT (INVALID_ARGUMENT); a name no hosted PM has is
+/// refused UNKNOWN_PM_COMPONENT (NOT_FOUND), naming it.
+pub fn select_process_manager(
     pms: &[&dyn ProcessManagerRoute],
     req: &pb::ProcessManagerHandleRequest,
-) -> Vec<usize> {
-    let Some(trigger) = req.trigger.as_ref() else {
-        return Vec::new();
-    };
-    if trigger.pages.is_empty() {
-        return Vec::new();
+) -> Result<usize, CodedError> {
+    if req.component.is_empty() {
+        return Err(CodedError::invalid_argument(
+            codes::MISSING_PM_COMPONENT,
+            messages::MISSING_PM_COMPONENT,
+            [],
+        ));
     }
-    let trigger_domain = trigger.cover.as_ref().map_or("", |c| c.domain.as_str());
-    let matching = |pred: &dyn Fn(&dyn ProcessManagerRoute) -> bool| -> Vec<usize> {
-        pms.iter()
-            .enumerate()
-            .filter(|(_, pm)| pred(**pm))
-            .map(|(i, _)| i)
-            .collect()
-    };
-
-    let state_domain = req
-        .process_state
-        .as_ref()
-        .and_then(|s| s.cover.as_ref())
-        .map_or("", |c| c.domain.as_str());
-    if !state_domain.is_empty() {
-        let owners = matching(&|pm| pm.pm_domain() == state_domain);
-        if !owners.is_empty() {
-            return owners;
-        }
-    }
-    matching(&|pm| pm.consumes(trigger_domain))
-}
-
-/// Merges co-resident PMs' responses: process events and commands
-/// concatenate in dispatch order. Co-hosted PMs share one binary and so one
-/// rules version (`rules_version`), reported even when no PM answered. The
-/// process state is that of the one PM that handled the trigger.
-pub fn merge_responses(
-    rules_version: &str,
-    responses: impl IntoIterator<Item = pb::ProcessManagerHandleResponse>,
-) -> pb::ProcessManagerHandleResponse {
-    let mut merged = pb::ProcessManagerHandleResponse {
-        rules_version: rules_version.to_string(),
-        ..Default::default()
-    };
-    let mut states = Vec::new();
-    for resp in responses {
-        merged.process_events.extend(resp.process_events);
-        merged.commands.extend(resp.commands);
-        states.extend(resp.process_state);
-    }
-    // Only a PM that handled the trigger answers a state. Several handling
-    // one trigger is not settled by the spec (one process_state field):
-    // the merged answer then carries none, pending a ruling.
-    if states.len() == 1 {
-        merged.process_state = states.pop();
-    }
-    merged
+    pms.iter()
+        .position(|pm| pm.name() == req.component)
+        .ok_or_else(|| {
+            CodedError::not_found(
+                codes::UNKNOWN_PM_COMPONENT,
+                messages::UNKNOWN_PM_COMPONENT,
+                [(extras::COMPONENT.to_string(), req.component.clone())],
+            )
+        })
 }
 
 #[cfg(test)]

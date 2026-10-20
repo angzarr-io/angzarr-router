@@ -9,7 +9,7 @@ use angzarr_router::aggregate::{AggregateDispatch, CommandContext, FactRecord};
 use angzarr_router::error::{codes, messages, CodedError, HandlerError};
 use angzarr_router::pb;
 use angzarr_router::process_manager::{
-    merge_responses, select_process_managers, ProcessManagerDispatch, ProcessManagerRoute,
+    select_process_manager, ProcessManagerDispatch, ProcessManagerRoute,
 };
 use angzarr_router::projector::ProjectorDispatch;
 use angzarr_router::rebuild::{FoldFailure, Rebuilder};
@@ -584,9 +584,10 @@ impl FfiRouter {
         Ok(())
     }
 
-    /// Decodes ProcessManagerHandleRequest bytes, routes to the addressed
-    /// co-resident PMs, and runs each core dispatch. Each PM's state is router-owned and rebuilt from its own
-    /// process state, so no PM ever folds into another's state.
+    /// Decodes ProcessManagerHandleRequest bytes and runs the one PM its
+    /// `component` names (select_process_manager; decision 14.16): no fan-out
+    /// and no merging. The answer is that PM's response alone, over its own
+    /// router-owned state.
     pub fn dispatch_process_manager(&self, request: &[u8]) -> Result<Vec<u8>, CodedError> {
         let req = pb::ProcessManagerHandleRequest::decode(request).map_err(|_| {
             CodedError::invalid_argument(
@@ -595,46 +596,15 @@ impl FfiRouter {
                 [],
             )
         })?;
-
-        // Trigger-shape validation precedes routing (mirrors dispatch_saga): a
-        // nil trigger is MISSING_PM_TRIGGER and a trigger with no pages is
-        // EMPTY_PM_TRIGGER, regardless of which PM (if any) consumes its domain.
-        let Some(trigger) = req.trigger.as_ref() else {
-            return Err(CodedError::invalid_argument(
-                codes::MISSING_PM_TRIGGER,
-                messages::MISSING_PM_TRIGGER,
-                [],
-            ));
-        };
-        if trigger.pages.is_empty() {
-            return Err(CodedError::invalid_argument(
-                codes::EMPTY_PM_TRIGGER,
-                messages::EMPTY_PM_TRIGGER,
-                [],
-            ));
-        }
-
-        // Route by identity, then by subscription (select_process_managers):
-        // a process-state book belongs to one PM; a new
-        // workflow's trigger reaches every PM consuming its domain, each
-        // no-opping on event types it does not declare (C-0022). Responses
-        // merge in registration order (merge_responses).
         let routes: Vec<&dyn ProcessManagerRoute> = self
             .process_managers
             .iter()
             .map(|(_, pm)| pm as &dyn ProcessManagerRoute)
             .collect();
-        let selected = select_process_managers(&routes, &req);
-        // Co-hosted PMs share one binary, so one rules version.
-        let rules_version = self
-            .process_managers
-            .first()
-            .map_or("", |(_, pm)| pm.rules_version());
-        let responses = selected
-            .into_iter()
-            .map(|index| self.process_managers[index].1.dispatch(&req))
-            .collect::<Result<Vec<_>, _>>()?;
-        // PM tail: an unconsumed trigger domain is a no-op (C-0022), not an error.
-        Ok(merge_responses(rules_version, responses).encode_to_vec())
+        let index = select_process_manager(&routes, &req)?;
+        Ok(self.process_managers[index]
+            .1
+            .dispatch(&req)?
+            .encode_to_vec())
     }
 }

@@ -10,7 +10,8 @@
 //!   (cover domain, fact type);
 //! - saga sources to every saga consuming the source domain, merged in
 //!   registration order (C-0013);
-//! - process-manager requests through [`select_process_managers`], merged;
+//! - a process-manager request to the one PM it names
+//!   ([`select_process_manager`]);
 //! - an EventBook to every projector, one Projection each (C-0015);
 //! - an UpcastRequest through every upcaster of its domain, in registration
 //!   order, each one's output feeding the next (C-0136).
@@ -24,9 +25,7 @@ use std::collections::HashMap;
 use crate::aggregate::AggregateDispatch;
 use crate::error::{codes, extras, messages, CodedError};
 use crate::pb;
-use crate::process_manager::{
-    merge_responses, select_process_managers, ProcessManagerDispatch, ProcessManagerRoute,
-};
+use crate::process_manager::{select_process_manager, ProcessManagerDispatch, ProcessManagerRoute};
 use crate::projector::ProjectorDispatch;
 use crate::saga::SagaDispatch;
 use crate::upcaster::UpcasterDispatch;
@@ -516,8 +515,8 @@ impl Router {
         Ok(merged)
     }
 
-    /// Runs the process managers [`select_process_managers`] addresses and
-    /// merges their responses in registration order.
+    /// Runs the one process manager the request names
+    /// ([`select_process_manager`]) and answers its response alone.
     pub fn dispatch_process_manager(
         &self,
         req: &pb::ProcessManagerHandleRequest,
@@ -529,14 +528,7 @@ impl Router {
             .iter()
             .map(|pm| pm.as_ref() as &dyn ProcessManagerRoute)
             .collect();
-        // Co-hosted PMs share one binary, so one rules version: reported even
-        // when no PM consumed the trigger.
-        let rules_version = pms.first().map_or("", |pm| pm.rules_version());
-        let responses = select_process_managers(&routes, req)
-            .into_iter()
-            .map(|index| pms[index].dispatch(req))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(merge_responses(rules_version, responses))
+        pms[select_process_manager(&routes, req)?].dispatch(req)
     }
 
     /// Runs every projector over the book, one Projection each, in

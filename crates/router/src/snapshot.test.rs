@@ -279,6 +279,7 @@ fn trigger(fq: &str, state: &[&str]) -> pb::ProcessManagerHandleRequest {
                 .collect(),
             ..Default::default()
         }),
+        component: "pm".to_string(),
     }
 }
 
