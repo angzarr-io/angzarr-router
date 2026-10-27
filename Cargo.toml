@@ -12,10 +12,15 @@ edition = "2021"
 license = "BSD-3-Clause"
 
 [workspace.dependencies]
-# The io.angzarr.v1 wire types, from angzarr-project's angzarr-proto crate at
-# the submodule's commit (the submodule pin is the version pin, as angzarr-cli
-# pins the same crate by full commit). prost and prost-types match its.
-angzarr-proto = { path = "angzarr-project/rust/angzarr-proto" }
+# The io.angzarr.v1 wire types, from angzarr-project's angzarr-proto crate,
+# pinned by full commit as a git dependency (as angzarr-cli and annals pin
+# it), so a dependent that links the router and names the same rev gets ONE
+# angzarr-proto crate and one set of types (backlog TG-1). A path dependency
+# into the submodule would give every dependent a second, incompatible copy.
+# Keep this rev equal to the angzarr-project submodule's commit (the
+# submodule supplies the .proto files and the shared features).
+# prost and prost-types match its.
+angzarr-proto = { git = "https://github.com/angzarr-io/angzarr-project", rev = "541cadc03351e20a7e41d27dffec623f80db409b" }
 prost = "0.14"
 prost-types = "0.14"
 prost-build = "0.14"
