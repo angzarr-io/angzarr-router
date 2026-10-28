@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use prost::Message;
 use prost_types::Any;
 
-use crate::aggregate::{AggregateDispatch, FactRecord};
+use crate::domain::{DomainDispatch, FactRecord};
 use crate::error::codes;
 use crate::pb;
 use crate::rebuild::Rebuilder;
@@ -50,8 +50,8 @@ fn image(pairs: &[(&str, u32)]) -> Any {
 /// The aggregate: `test.Bump(key)` emits one bump of `key`, `test.Nothing`
 /// emits nothing, `test.Refuse` is rejected; the fact `test.Note(key)` is
 /// recorded and flagged with a bump of "flag".
-fn items(rebuilder: Rebuilder<Items>) -> AggregateDispatch<Items> {
-    AggregateDispatch::new("items", "items", rebuilder)
+fn items(rebuilder: Rebuilder<Items>) -> DomainDispatch<Items> {
+    DomainDispatch::new("items", "items", rebuilder)
         .with_rules_version("7")
         .on_command("test.Bump", |cmd, _state, _cctx| {
             let key = pb::Cover::decode(cmd.value.as_slice()).unwrap().domain;
@@ -184,7 +184,7 @@ fn a_commutative_command_answers_the_head_plus_its_events() {
 
 #[test]
 fn an_aggregate_handles_command_answers_the_head_plus_its_events() {
-    let resolving = AggregateDispatch::new("items", "items", items_rebuilder()).on_command(
+    let resolving = DomainDispatch::new("items", "items", items_rebuilder()).on_command(
         "test.Bump",
         |cmd, _state, cctx| {
             if let Some(conflict) = cctx.conflict.as_ref() {
@@ -210,7 +210,7 @@ fn an_aggregate_handles_command_answers_the_head_plus_its_events() {
 
 #[test]
 fn a_rebuilder_with_no_state_message_answers_no_snapshot() {
-    let resp = AggregateDispatch::new("t", "t", cover_applier(fresh_rebuilder()))
+    let resp = DomainDispatch::new("t", "t", cover_applier(fresh_rebuilder()))
         .on_command("test.Nothing", |_, _, _| Ok(None))
         .dispatch(&command_for(typed("test.Nothing", "")))
         .expect("accepted");
@@ -226,7 +226,7 @@ fn a_rebuilder_states_its_image_through_with_state_image() {
 
 #[test]
 fn an_emitted_event_that_does_not_fold_fails_the_command() {
-    let corrupt = AggregateDispatch::new("items", "items", items_rebuilder()).on_command(
+    let corrupt = DomainDispatch::new("items", "items", items_rebuilder()).on_command(
         "test.Bump",
         |_cmd, _state, _cctx| {
             Ok(Some(pb::EventBook {
@@ -256,7 +256,7 @@ fn emitted_events_fold_at_the_sequences_they_will_be_given() {
             Ok(())
         },
     );
-    let resp = AggregateDispatch::new("items", "items", rebuilder)
+    let resp = DomainDispatch::new("items", "items", rebuilder)
         .on_command("test.Bump", |_cmd, _state, _cctx| {
             Ok(Some(pb::EventBook {
                 pages: vec![event_page(cover_any("x")), event_page(cover_any("y"))],

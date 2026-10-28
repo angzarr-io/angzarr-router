@@ -1,13 +1,13 @@
-//! AggregateDispatch — a domain's command → events table: an aggregate's,
+//! DomainDispatch — a domain's command → events table: an aggregate's,
 //! or a process manager's, since a process manager is a domain (decision
 //! 14.31), served by the same table with its start rule
-//! ([`AggregateDispatch::process_manager`]).
+//! ([`DomainDispatch::process_manager`]).
 //!
-//! Two calls per input, both pure: [`AggregateDispatch::admit`] applies the
+//! Two calls per input, both pure: [`DomainDispatch::admit`] applies the
 //! rules an input meets before its handler runs (deduplication by its id,
 //! the edition fork rule, a process manager's start rule), from what the
 //! runtime read of the addressed stream; then
-//! [`AggregateDispatch::dispatch`] runs the handler. The runtime (annals'
+//! [`DomainDispatch::dispatch`] runs the handler. The runtime (annals'
 //! kernel, or core's coordinator) owns the store reads and writes between
 //! and after them.
 //!
@@ -230,11 +230,11 @@ pub struct StreamStatus {
     pub next_sequence: u64,
 }
 
-/// What [`AggregateDispatch::admit`] decides for an input. A refusal is the
+/// What [`DomainDispatch::admit`] decides for an input. A refusal is the
 /// `Err` beside it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Admission {
-    /// Run the handler ([`AggregateDispatch::dispatch`]).
+    /// Run the handler ([`DomainDispatch::dispatch`]).
     Dispatch,
     /// A saga's command reaching a stream with no fork in its edition: the
     /// runtime appends this framework event at the stream's head, then
@@ -252,7 +252,7 @@ pub enum Admission {
 }
 
 /// The dispatch table for one domain: an aggregate or a process manager.
-pub struct AggregateDispatch<S> {
+pub struct DomainDispatch<S> {
     name: String,
     domain: String,
     kind: pb::ComponentKind,
@@ -264,14 +264,14 @@ pub struct AggregateDispatch<S> {
     rules_version: String,
 }
 
-impl<S> AggregateDispatch<S> {
+impl<S> DomainDispatch<S> {
     /// An empty aggregate table over a Rebuilder.
     pub fn new(
         name: impl Into<String>,
         domain: impl Into<String>,
         rebuilder: Rebuilder<S>,
     ) -> Self {
-        AggregateDispatch {
+        DomainDispatch {
             name: name.into(),
             domain: domain.into(),
             kind: pb::ComponentKind::Aggregate,
@@ -783,8 +783,8 @@ fn non_empty_payload(payload: Option<&Any>) -> Result<&Any, CodedError> {
 }
 
 #[cfg(test)]
-#[path = "aggregate.test.rs"]
-mod aggregate_tests;
+#[path = "domain.test.rs"]
+mod domain_tests;
 
 #[cfg(test)]
 #[path = "admit.test.rs"]

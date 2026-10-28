@@ -1,4 +1,4 @@
-//! AggregateDispatch contracts, transliterated from client-go's
+//! DomainDispatch contracts, transliterated from client-go's
 //! engine_test.go + engine_boundaries_test.go aggregate subset:
 //! validate-before-rebuild, exact envelope guard codes, CommandContext
 //! evidence, the Fact arm's ingest path, and pass-through of emitted
@@ -9,26 +9,25 @@ use std::sync::{Arc, Mutex};
 use prost::Message;
 use prost_types::Any;
 
-use crate::aggregate::{AggregateDispatch, CommandContext, FactRecord};
+use crate::domain::{CommandContext, DomainDispatch, FactRecord};
 use crate::error::{codes, GrpcCode};
 use crate::pb;
 use crate::test_support::*;
 use crate::{page_event, type_url, TYPE_URL_PREFIX};
 
-fn test_agg_dispatch() -> (
-    AggregateDispatch<TestState>,
-    Arc<Mutex<Vec<CommandContext>>>,
-) {
+fn test_agg_dispatch() -> (DomainDispatch<TestState>, Arc<Mutex<Vec<CommandContext>>>) {
     let contexts = Arc::new(Mutex::new(Vec::new()));
     let seen = contexts.clone();
-    let d = AggregateDispatch::new("agg-test", "order", cover_applier(fresh_rebuilder()))
-        .on_command(&cover_full_name(), move |_, _, cctx| {
+    let d = DomainDispatch::new("agg-test", "order", cover_applier(fresh_rebuilder())).on_command(
+        &cover_full_name(),
+        move |_, _, cctx| {
             seen.lock().unwrap().push(cctx);
             Ok(Some(pb::EventBook {
                 pages: vec![pb::EventPage::default()],
                 ..Default::default()
             }))
-        });
+        },
+    );
     (d, contexts)
 }
 
@@ -180,7 +179,7 @@ fn name_and_domain_are_exact() {
 
 #[test]
 fn command_types_exact() {
-    let d = AggregateDispatch::new("agg", "orders", fresh_rebuilder())
+    let d = DomainDispatch::new("agg", "orders", fresh_rebuilder())
         .on_command("test.CreateOrder", |_, _: &mut TestState, _| {
             Ok(Some(pb::EventBook::default()))
         });
@@ -192,8 +191,8 @@ fn command_types_exact() {
 /// An aggregate folding Cover events whose Cover fact handler records the
 /// fact annotated with the domains folded so far, flagged by one Cover event
 /// naming the fact.
-fn fact_aggregate() -> AggregateDispatch<TestState> {
-    AggregateDispatch::new("agg-test", "ledger", cover_applier(fresh_rebuilder())).on_fact(
+fn fact_aggregate() -> DomainDispatch<TestState> {
+    DomainDispatch::new("agg-test", "ledger", cover_applier(fresh_rebuilder())).on_fact(
         &cover_full_name(),
         |fact, state: &TestState| {
             let folded = pb::Cover::decode(fact.value.as_slice()).unwrap().domain;
@@ -246,7 +245,7 @@ fn a_fact_is_recorded_then_flagged_against_the_folded_state() {
 
 #[test]
 fn a_fact_recorded_as_received_needs_no_flags() {
-    let d = AggregateDispatch::new("agg-test", "ledger", fresh_rebuilder())
+    let d = DomainDispatch::new("agg-test", "ledger", fresh_rebuilder())
         .on_fact(&cover_full_name(), |fact, _s: &TestState| {
             Ok(FactRecord::from(fact.clone()))
         });
@@ -258,7 +257,7 @@ fn a_fact_recorded_as_received_needs_no_flags() {
 fn an_undeclared_fact_type_is_refused_before_any_handler_runs() {
     let ran = Arc::new(Mutex::new(0));
     let seen = ran.clone();
-    let d = AggregateDispatch::new("agg-test", "ledger", cover_applier(fresh_rebuilder())).on_fact(
+    let d = DomainDispatch::new("agg-test", "ledger", cover_applier(fresh_rebuilder())).on_fact(
         &cover_full_name(),
         move |fact, _s: &TestState| {
             *seen.lock().unwrap() += 1;
@@ -335,7 +334,7 @@ fn a_corrupt_prior_event_fails_the_fact() {
 
 #[test]
 fn a_failing_fact_handler_fails_the_request() {
-    let d = AggregateDispatch::new("agg-test", "ledger", fresh_rebuilder())
+    let d = DomainDispatch::new("agg-test", "ledger", fresh_rebuilder())
         .on_fact(&cover_full_name(), |_f, _s: &TestState| {
             Err(crate::error::HandlerError::Other("broken".to_string()))
         });
@@ -366,7 +365,7 @@ fn the_emitted_book_passes_through_unstamped() {
         ..Default::default()
     };
     let returned = emitted.clone();
-    let d = AggregateDispatch::new("agg", "order", fresh_rebuilder())
+    let d = DomainDispatch::new("agg", "order", fresh_rebuilder())
         .on_command("test.Create", move |_, _: &mut TestState, _| {
             Ok(Some(returned.clone()))
         });
@@ -390,7 +389,7 @@ fn the_emitted_book_passes_through_unstamped() {
 
 #[test]
 fn a_handler_emitting_nothing_answers_an_empty_book() {
-    let d = AggregateDispatch::new("agg", "order", fresh_rebuilder())
+    let d = DomainDispatch::new("agg", "order", fresh_rebuilder())
         .on_command("test.Create", |_, _: &mut TestState, _| Ok(None));
     let resp = d
         .dispatch(&command_for(Any {

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 ///
 /// `io.angzarr.v1.*` and `sererr.v1.*` are extern-pathed to the router crate
 /// so we DON'T regenerate them: the harness must build the SAME Rust types
-/// `AggregateDispatch::dispatch` consumes. extern_path suppresses codegen
+/// `DomainDispatch::dispatch` consumes. extern_path suppresses codegen
 /// only — the descriptor set still carries those files for the pool.
 fn main() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

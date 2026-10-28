@@ -17,7 +17,7 @@ router.
   repo carries no Python binding.
 - **client-rust** dispatches through `crates/router`'s Rust-native API (no
   FFI) and has no engine of its own. That API (`Rebuilder`,
-  `AggregateDispatch` with commands and facts (an aggregate's or a process
+  `DomainDispatch` with commands and facts (an aggregate's or a process
   manager's: a PM is a domain, decision 14.31), `SagaDispatch`,
   `ProjectorDispatch`, `RouterBuilder`/`Router`
   (one component per router),
@@ -45,7 +45,7 @@ bindings/<lang>    ── registry of callback_id → typed invoker, one trampol
 crates/router-ffi  ── descriptor → the one component's core table,
         │             router-held state and projections
         ▼
-crates/router      ── Rebuilder, AggregateDispatch (aggregate or PM),
+crates/router      ── Rebuilder, DomainDispatch (aggregate or PM),
                       SagaDispatch, Router (one component),
                       ProjectorDispatch, CodedError
 ```
@@ -104,7 +104,7 @@ so a binding keeps no state of any kind.
 | Command upcasting | Command and fact payloads run through the aggregate's upcaster chains before dispatch; a refusal names the sent type URL, its extras the chain's last (`upcast_type_url`); routing tries the sent type, then the aggregate of the domain whose chain serves it (docs/design-handling.md) |
 | Conflicts | Handlers see the resolved `Handling` (`expected_sequence`, `conflict_resolution`). AGGREGATE_HANDLES hands the window and nonce in `CommandContext.conflict`; output without `resolve_conflicts(window, nonce)` on exactly that nonce is discarded: `CONFLICT_UNRESOLVED` (ABORTED). COMMUTATIVE runs in the router over the generated `changed()`: decide on the head, keep the events iff `changed(expected, head)` and `changed(head, head + events)` do not overlap, else `CONFLICT_OVERLAP` (ABORTED); none registered: `CONFLICT_RESOLUTION_UNSUPPORTED` |
 | Rules version | Every `CommandHandlerResponse` (an aggregate's or a PM's) carries the binary's declared rules version, overwriting a handler's. Snapshot selection is the coordinator's (decision 14.1) |
-| Process manager | A domain (decision 14.31): served by `AggregateDispatch::process_manager`, its inputs commands and facts, its output its own events. `admit` applies its start rule: with no instance, a type it `starts` is dispatched, any other command is refused `PM_NO_INSTANCE` (FAILED_PRECONDITION) and any other fact is skipped. No triggers, no commands out (POC line: red, being implemented) |
+| Process manager | A domain (decision 14.31): served by `DomainDispatch::process_manager`, its inputs commands and facts, its output its own events. `admit` applies its start rule: with no instance, a type it `starts` is dispatched, any other command is refused `PM_NO_INSTANCE` (FAILED_PRECONDITION) and any other fact is skipped. No triggers, no commands out (POC line: red, being implemented) |
 | Projector | Folds every page into one projection instance, each fold seeing the book cover and the page's sequence; undeclared domains fold nothing (C-0032), and a projector declaring `"*"` consumes every domain; unmatched types are skipped with a WARN; without a finish step the `Projection` carries the cover, the projector's name and its next sequence (the last page's sequence + 1, or the book's `next_sequence` with no pages); a failing fold is a handler bug (INTERNAL), named as a failing state fold is, with the projection type (`with_projection_type`) as `state_type_url`. Across the C ABI the projection is router-held (a serialized `Any` of the registered projection type, empty at first), folded by one stateless batched host fold call per delivery, and the router builds the `Projection` (cover, projector name, next sequence after the last page) |
 | Registration hello | Every component builds the spec's `ComponentDescriptor` from its own table (`component_descriptor()`): name, kind, inputs (a saga's input domain, a PM's sources, a projector's domains or `*`, none for an aggregate), the rules version, and for aggregates and PMs the state type the rebuilder declares with its resolutions (STRICT, AGGREGATE_HANDLES, plus COMMUTATIVE first with `changed()`). `Router::component_descriptor()` and the C ABI's `angzarr_router_component_descriptor` answer the one component's (`ComponentService.Describe`); an empty rules version is `MISSING_RULES_VERSION`, an undeclared state type `MISSING_STATE_TYPE` (both INVALID_ARGUMENT, naming the `component`) |
 | Snapshot | Every domain answer (an aggregate's or a PM's) carries `events.snapshot.state`, the state after its events (the emitted events, or a fact's record, folded at the sequences they will get). Sequence and rules version stay unset for the coordinator; a rejection has no body |

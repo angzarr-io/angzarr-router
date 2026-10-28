@@ -387,7 +387,7 @@ async fn second_registered(w: &mut HandlingWorld, kind: String, name: String) {
     let order = conf::order_aggregate(&w.rules_version, w.settle.clone(), w.seen.clone());
     let builder = angzarr_router::router::RouterBuilder::new().aggregate(order);
     let builder = match kind.as_str() {
-        "aggregate" => builder.aggregate(angzarr_router::aggregate::AggregateDispatch::new(
+        "aggregate" => builder.aggregate(angzarr_router::domain::DomainDispatch::new(
             name.clone(),
             name,
             angzarr_router::rebuild::Rebuilder::new(|| ()),

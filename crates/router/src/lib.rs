@@ -9,9 +9,9 @@
 
 #![forbid(unsafe_code)]
 
-pub mod aggregate;
 pub mod conflict;
 pub mod descriptor;
+pub mod domain;
 pub mod error;
 pub mod projector;
 pub mod proto;

@@ -55,7 +55,7 @@ FFI + conformance — is likewise written once.)
 This line brings the pure dispatch to spec 636b313 for the angzarr/annals
 POC: a process manager is a domain (decision 14.31; the trigger-fed
 `ProcessManagerDispatch` is deleted), refusals are typed and come back
-through a saga's OnRefused, and `AggregateDispatch::admit` applies the
+through a saga's OnRefused, and `DomainDispatch::admit` applies the
 rules an input meets before its handler runs (deduplication, edition forks,
 the PM start rule). The distributed side is left broken here:
 `crates/router-ffi` is out of the workspace and the bindings are not

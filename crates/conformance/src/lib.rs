@@ -6,7 +6,7 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use angzarr_router::aggregate::{AggregateDispatch, FactRecord};
+use angzarr_router::domain::{DomainDispatch, FactRecord};
 use angzarr_router::error::{CodedError, HandlerError};
 use angzarr_router::projector::ProjectorDispatch;
 use angzarr_router::rebuild::Rebuilder;
@@ -93,7 +93,7 @@ where
 // ---------------------------------------------------------------------------
 
 /// Build the CounterAggregate dispatch table (appliers and handlers).
-pub fn counter_aggregate(observed: ObservedSink) -> AggregateDispatch<CounterState> {
+pub fn counter_aggregate(observed: ObservedSink) -> DomainDispatch<CounterState> {
     let rebuilder = Rebuilder::of_message()
         .apply(
             "test.counter.Increased",
@@ -114,7 +114,7 @@ pub fn counter_aggregate(observed: ObservedSink) -> AggregateDispatch<CounterSta
             Ok(())
         });
 
-    AggregateDispatch::new("counter-aggregate", "counter", rebuilder)
+    DomainDispatch::new("counter-aggregate", "counter", rebuilder)
         // n > 0 emits n Increased; n == 0 rejects VALUE_NOT_POSITIVE.
         .on_command("test.counter.IncreaseBy", move |any, state, ctx| {
             // Record the historical-state evidence (host state never crosses).
@@ -480,7 +480,7 @@ fn increased_page(seq: u64) -> pb::EventPage {
 /// CounterState; IncreaseBy records the handled cover and emits one
 /// Increased; the only fact, Increased, is recorded as received and flagged
 /// by a CounterState carrying the count it brings the ledger to.
-pub fn ledger_aggregate(seen: CoverSink, applied: SequenceSink) -> AggregateDispatch<CounterState> {
+pub fn ledger_aggregate(seen: CoverSink, applied: SequenceSink) -> DomainDispatch<CounterState> {
     let rebuilder = Rebuilder::of_message()
         .apply_with_context(
             "test.counter.Increased",
@@ -494,7 +494,7 @@ pub fn ledger_aggregate(seen: CoverSink, applied: SequenceSink) -> AggregateDisp
             *state = CounterState::decode(any.value.as_slice())?;
             Ok(())
         });
-    AggregateDispatch::new("Ledger", "ledger", rebuilder)
+    DomainDispatch::new("Ledger", "ledger", rebuilder)
         .on_command("test.counter.IncreaseBy", move |_cmd, _state, cctx| {
             seen.lock().unwrap().push(cctx.cover.clone());
             Ok(Some(pb::EventBook {
@@ -698,7 +698,7 @@ pub fn order_aggregate(
     rules_version: &str,
     settle: Settle,
     seen: OrderSink,
-) -> AggregateDispatch<orders::v1::OrderState> {
+) -> DomainDispatch<orders::v1::OrderState> {
     let rebuilder = Rebuilder::of_message()
         .apply(
             "orders.v1.ItemAdded",
@@ -735,7 +735,7 @@ pub fn order_aggregate(
         )
         .on_event("orders.v1.AddLine", rename("orders.v1.AddLineItem"));
     let facts = seen.clone();
-    AggregateDispatch::new("order", "order", rebuilder)
+    DomainDispatch::new("order", "order", rebuilder)
         .with_rules_version(rules_version)
         .with_commutative(order_changed)
         .with_command_upcaster(upcaster)
@@ -898,7 +898,7 @@ pub fn order_snapshot(items: &[&str], rules_version: &str) -> pb::Snapshot {
 /// The Fulfillment process manager at `rules_version`: a domain (decision
 /// 14.31) whose StartFulfillment command, its starting input, records
 /// nothing.
-pub fn fulfillment_pm(rules_version: &str) -> AggregateDispatch<orders::v1::FulfillmentState> {
+pub fn fulfillment_pm(rules_version: &str) -> DomainDispatch<orders::v1::FulfillmentState> {
     fulfillment_pm_writing(rules_version, false)
 }
 
@@ -907,7 +907,7 @@ pub fn fulfillment_pm(rules_version: &str) -> AggregateDispatch<orders::v1::Fulf
 pub fn fulfillment_pm_writing(
     rules_version: &str,
     writes: bool,
-) -> AggregateDispatch<orders::v1::FulfillmentState> {
+) -> DomainDispatch<orders::v1::FulfillmentState> {
     let rebuilder = Rebuilder::of_message().apply(
         "orders.v1.FulfillmentStarted",
         |state: &mut orders::v1::FulfillmentState, _event| {
@@ -915,7 +915,7 @@ pub fn fulfillment_pm_writing(
             Ok(())
         },
     );
-    AggregateDispatch::process_manager("Fulfillment", "fulfillment", rebuilder)
+    DomainDispatch::process_manager("Fulfillment", "fulfillment", rebuilder)
         .with_rules_version(rules_version)
         .on_command("orders.v1.StartFulfillment", move |_c, _s, _ctx| {
             Ok(writes.then(|| pb::EventBook {

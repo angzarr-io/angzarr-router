@@ -2,7 +2,7 @@
 //! ComponentDescriptor (types.proto) from its own dispatch table, and none
 //! builds one without a rules version.
 
-use crate::aggregate::{AggregateDispatch, CommandContext, FactRecord};
+use crate::domain::{CommandContext, DomainDispatch, FactRecord};
 use crate::error::{codes, GrpcCode};
 use crate::pb;
 use crate::projector::ProjectorDispatch;
@@ -10,8 +10,8 @@ use crate::rebuild::Rebuilder;
 use crate::saga::SagaDispatch;
 use crate::test_support::LedgerState;
 
-fn ledger(version: &str) -> AggregateDispatch<LedgerState> {
-    AggregateDispatch::new("Ledger", "ledger", Rebuilder::of_message()).with_rules_version(version)
+fn ledger(version: &str) -> DomainDispatch<LedgerState> {
+    DomainDispatch::new("Ledger", "ledger", Rebuilder::of_message()).with_rules_version(version)
 }
 
 fn resolutions(descriptor: &pb::ComponentDescriptor) -> Vec<pb::ConflictResolution> {
@@ -93,7 +93,7 @@ fn a_commutative_aggregate_lists_commutative_first() {
 
 #[test]
 fn an_aggregate_over_any_state_takes_the_state_type_its_rebuilder_declares() {
-    let dispatch: AggregateDispatch<prost_types::Any> = AggregateDispatch::new(
+    let dispatch: DomainDispatch<prost_types::Any> = DomainDispatch::new(
         "Counter",
         "counter",
         Rebuilder::new(Default::default).with_state_type("test.counter.CounterState"),
@@ -108,10 +108,10 @@ fn an_aggregate_over_any_state_takes_the_state_type_its_rebuilder_declares() {
 
 #[test]
 fn a_stateful_component_whose_rebuilder_declares_no_state_type_is_refused() {
-    let aggregate: AggregateDispatch<LedgerState> =
-        AggregateDispatch::new("Ledger", "ledger", Rebuilder::new(LedgerState::default))
+    let aggregate: DomainDispatch<LedgerState> =
+        DomainDispatch::new("Ledger", "ledger", Rebuilder::new(LedgerState::default))
             .with_rules_version("1");
-    let pm: AggregateDispatch<LedgerState> = AggregateDispatch::process_manager(
+    let pm: DomainDispatch<LedgerState> = DomainDispatch::process_manager(
         "Fulfillment",
         "fulfillment",
         Rebuilder::new(LedgerState::default),
@@ -132,9 +132,9 @@ fn an_aggregate_without_a_rules_version_is_refused() {
     assert_missing_rules_version(ledger("").component_descriptor());
 }
 
-fn fulfillment(version: &str) -> AggregateDispatch<LedgerState> {
+fn fulfillment(version: &str) -> DomainDispatch<LedgerState> {
     let noop = |_: &prost_types::Any, _: &mut LedgerState, _: CommandContext| Ok(None);
-    AggregateDispatch::process_manager("Fulfillment", "fulfillment", Rebuilder::of_message())
+    DomainDispatch::process_manager("Fulfillment", "fulfillment", Rebuilder::of_message())
         .on_command("test.PlaceOrder", noop)
         .on_command("test.RecordPayment", noop)
         .on_fact("test.TimedOut", |fact, _| {

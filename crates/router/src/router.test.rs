@@ -4,7 +4,7 @@
 
 use prost_types::Any;
 
-use crate::aggregate::AggregateDispatch;
+use crate::domain::DomainDispatch;
 use crate::error::{codes, CodedError};
 use crate::pb;
 use crate::projector::ProjectorDispatch;
@@ -26,8 +26,8 @@ fn any_of_type(fq: &str) -> Any {
 
 /// An aggregate in `domain` handling `commands`, each emitting one event
 /// page tagged (type URL) with `label`.
-fn aggregate(label: &'static str, domain: &str, commands: &[&str]) -> AggregateDispatch<TestState> {
-    let mut agg = AggregateDispatch::new(label, domain, fresh_rebuilder());
+fn aggregate(label: &'static str, domain: &str, commands: &[&str]) -> DomainDispatch<TestState> {
+    let mut agg = DomainDispatch::new(label, domain, fresh_rebuilder());
     for c in commands {
         agg = agg.on_command(c, move |_, _, _| {
             Ok(Some(pb::EventBook {
@@ -92,7 +92,7 @@ fn with_one(builder: RouterBuilder, kind: &str) -> RouterBuilder {
         "aggregate" => builder.aggregate(aggregate("a", "order", &["test.Create"])),
         "saga" => builder.saga(SagaDispatch::new("s", "order", "inventory")),
         "process manager" => builder.process_manager(
-            AggregateDispatch::process_manager("pm", "pm", fresh_rebuilder())
+            DomainDispatch::process_manager("pm", "pm", fresh_rebuilder())
                 .on_command("test.Start", |_, _, _| Ok(None)),
         ),
         _ => builder.projector(ProjectorDispatch::new("p", || ())),
@@ -191,7 +191,7 @@ fn a_router_dispatches_commands_and_facts_to_its_aggregate() {
     let router = RouterBuilder::new()
         .aggregate(
             aggregate("created", "order", &["test.Create"]).on_fact("test.Paid", |_, _| {
-                Ok(crate::aggregate::FactRecord::from(any_of_type("paid")))
+                Ok(crate::domain::FactRecord::from(any_of_type("paid")))
             }),
         )
         .build()
@@ -263,7 +263,7 @@ fn a_router_runs_its_saga() {
 fn a_router_runs_its_process_manager_as_a_domain() {
     let router = RouterBuilder::new()
         .process_manager(
-            AggregateDispatch::process_manager("pm", "pm", Rebuilder::<LedgerState>::of_message())
+            DomainDispatch::process_manager("pm", "pm", Rebuilder::<LedgerState>::of_message())
                 .with_rules_version("9")
                 .on_command("test.Start", |_, _, _| {
                     Ok(Some(pb::EventBook {
@@ -415,10 +415,10 @@ fn a_hand_written_aggregate_meets_the_framework_rules() {
     let mut book = command("plain", "test.Plain").command.unwrap();
     book.cover.as_mut().unwrap().edition = Some("what-if".to_string());
     let err = Plain
-        .admit(&crate::aggregate::Arrival {
+        .admit(&crate::domain::Arrival {
             command: &book,
             recorded: &[],
-            stream: crate::aggregate::StreamStatus {
+            stream: crate::domain::StreamStatus {
                 exists: true,
                 forked: false,
                 next_sequence: 1,
@@ -495,8 +495,8 @@ fn an_aggregate_naming_a_source_type_twice_builds() {
 
 // --- the registration hello (types.proto ComponentDescriptor) ----------------
 
-fn ledger(version: &str) -> AggregateDispatch<LedgerState> {
-    AggregateDispatch::new("Ledger", "ledger", Rebuilder::of_message())
+fn ledger(version: &str) -> DomainDispatch<LedgerState> {
+    DomainDispatch::new("Ledger", "ledger", Rebuilder::of_message())
         .with_rules_version(version)
         .on_command("test.Ledger", |_, _, _| Ok(None))
 }
@@ -521,7 +521,7 @@ fn a_router_answers_its_components_hello() {
         kind(
             RouterBuilder::new()
                 .process_manager(
-                    AggregateDispatch::process_manager(
+                    DomainDispatch::process_manager(
                         "p",
                         "pm",
                         Rebuilder::<LedgerState>::of_message()

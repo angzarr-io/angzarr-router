@@ -24,7 +24,7 @@
 //! The component may be registered boxed (`Box<dyn CommandHandler>` and so
 //! on). Transport (gRPC servers), health and readiness stay with the host.
 
-use crate::aggregate::{Admission, AggregateDispatch, Arrival};
+use crate::domain::{Admission, Arrival, DomainDispatch};
 use crate::error::{codes, extras, messages, CodedError};
 use crate::pb;
 use crate::projector::ProjectorDispatch;
@@ -41,7 +41,7 @@ pub trait CommandHandler: Send + Sync {
         pb::ComponentKind::Aggregate
     }
     /// The rules an input meets before its handler runs (deduplication,
-    /// editions, a process manager's start rule): [`AggregateDispatch::admit`].
+    /// editions, a process manager's start rule): [`DomainDispatch::admit`].
     /// A hand-written domain gets the framework's rules for a domain with
     /// no start rule (validation, deduplication, editions); it never
     /// reimplements them.
@@ -101,33 +101,33 @@ impl<T: CommandHandler + ?Sized> CommandHandler for Box<T> {
     }
 }
 
-impl<S> CommandHandler for AggregateDispatch<S> {
+impl<S> CommandHandler for DomainDispatch<S> {
     fn name(&self) -> &str {
-        AggregateDispatch::name(self)
+        DomainDispatch::name(self)
     }
     fn kind(&self) -> pb::ComponentKind {
-        AggregateDispatch::kind(self)
+        DomainDispatch::kind(self)
     }
     fn admit(&self, arrival: &Arrival<'_>) -> Result<Admission, CodedError> {
-        AggregateDispatch::admit(self, arrival)
+        DomainDispatch::admit(self, arrival)
     }
     fn command_types(&self) -> Vec<String> {
-        AggregateDispatch::command_types(self)
+        DomainDispatch::command_types(self)
     }
     fn upcast_types(&self) -> Vec<String> {
-        AggregateDispatch::upcast_types(self)
+        DomainDispatch::upcast_types(self)
     }
     fn check_claims(&self) -> Result<(), CodedError> {
-        AggregateDispatch::check_claims(self)
+        DomainDispatch::check_claims(self)
     }
     fn dispatch(
         &self,
         req: &pb::ContextualCommand,
     ) -> Result<pb::CommandHandlerResponse, CodedError> {
-        AggregateDispatch::dispatch(self, req)
+        DomainDispatch::dispatch(self, req)
     }
     fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError> {
-        AggregateDispatch::component_descriptor(self)
+        DomainDispatch::component_descriptor(self)
     }
 }
 
@@ -238,7 +238,7 @@ impl RouterBuilder {
     }
 
     /// Hosts a process manager: a domain (decision 14.31), hosted as an
-    /// aggregate is ([`AggregateDispatch::process_manager`]).
+    /// aggregate is ([`DomainDispatch::process_manager`]).
     pub fn process_manager(self, pm: impl CommandHandler + 'static) -> Self {
         self.aggregate(pm)
     }
@@ -319,7 +319,7 @@ impl Router {
     }
 
     /// The rules the domain's input meets before its handler runs
-    /// ([`AggregateDispatch::admit`]): the runtime calls it first, acts on
+    /// ([`DomainDispatch::admit`]): the runtime calls it first, acts on
     /// the [`Admission`] (appending a fork, answering a duplicate or a
     /// skip), and only then reads the stream and calls
     /// [`Self::dispatch_command`].

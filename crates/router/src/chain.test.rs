@@ -10,7 +10,7 @@
 
 use prost::Message;
 
-use crate::aggregate::{Admission, AggregateDispatch, Arrival, FactRecord, StreamStatus};
+use crate::domain::{Admission, Arrival, DomainDispatch, FactRecord, StreamStatus};
 use crate::error::{CodedError, HandlerError};
 use crate::pb;
 use crate::saga::{address_refusal_fact, SagaDispatch};
@@ -19,8 +19,8 @@ use crate::test_support::*;
 const INSTANCE: u8 = 7;
 const EDITION: &str = "what-if";
 
-fn wallet() -> AggregateDispatch<TestState> {
-    AggregateDispatch::new("Wallet", "wallet", fresh_rebuilder()).on_command(
+fn wallet() -> DomainDispatch<TestState> {
+    DomainDispatch::new("Wallet", "wallet", fresh_rebuilder()).on_command(
         &fq::<HoldFunds>(),
         |command, _state, _ctx| {
             let hold = HoldFunds::decode(command.value.as_slice()).expect("HoldFunds");
@@ -35,8 +35,8 @@ fn wallet() -> AggregateDispatch<TestState> {
     )
 }
 
-fn buyin() -> AggregateDispatch<TestState> {
-    AggregateDispatch::process_manager("BuyIn", "buyin", fresh_rebuilder())
+fn buyin() -> DomainDispatch<TestState> {
+    DomainDispatch::process_manager("BuyIn", "buyin", fresh_rebuilder())
         .on_command(&fq::<StartBuyIn>(), |command, _state, _ctx| {
             let start = StartBuyIn::decode(command.value.as_slice()).expect("StartBuyIn");
             Ok(Some(pb::EventBook {

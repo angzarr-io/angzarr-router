@@ -24,8 +24,8 @@ use std::sync::{Arc, Mutex};
 
 use prost_types::Any;
 
-use crate::aggregate::{AggregateDispatch, CommandContext};
 use crate::conflict::overlap;
+use crate::domain::{CommandContext, DomainDispatch};
 use crate::error::{codes, GrpcCode};
 use crate::pb;
 use crate::rebuild::Rebuilder;
@@ -70,10 +70,8 @@ pub(crate) fn list_rebuilder() -> Rebuilder<ListState> {
 
 /// A list aggregate whose `test.Bump` command bumps the item named in the
 /// command's Cover payload, recording each CommandContext it saw.
-pub(crate) fn list_aggregate(
-    seen: Arc<Mutex<Vec<CommandContext>>>,
-) -> AggregateDispatch<ListState> {
-    AggregateDispatch::new("list", "list", list_rebuilder()).on_command(
+pub(crate) fn list_aggregate(seen: Arc<Mutex<Vec<CommandContext>>>) -> DomainDispatch<ListState> {
+    DomainDispatch::new("list", "list", list_rebuilder()).on_command(
         "test.Bump",
         move |cmd, _state, cctx| {
             let key = <pb::Cover as prost::Message>::decode(cmd.value.as_slice())
@@ -151,8 +149,8 @@ fn strict_hands_the_handler_its_handling_and_no_conflict() {
 fn handles(
     ack: impl Fn(&[u8]) -> Option<Vec<u8>> + Send + Sync + 'static,
     windows: Arc<Mutex<Vec<Vec<u64>>>>,
-) -> AggregateDispatch<ListState> {
-    AggregateDispatch::new("list", "list", list_rebuilder()).on_command(
+) -> DomainDispatch<ListState> {
+    DomainDispatch::new("list", "list", list_rebuilder()).on_command(
         "test.Bump",
         move |_cmd, _state, cctx| {
             let conflict = cctx
@@ -241,7 +239,7 @@ fn aggregate_handles_with_an_empty_window_still_demands_the_nonce() {
 
 // --- COMMUTATIVE: the library resolver (CR-1) -------------------------------
 
-fn commutative(seen: Arc<Mutex<Vec<CommandContext>>>) -> AggregateDispatch<ListState> {
+fn commutative(seen: Arc<Mutex<Vec<CommandContext>>>) -> DomainDispatch<ListState> {
     list_aggregate(seen).with_commutative(changed)
 }
 
@@ -288,7 +286,7 @@ fn commutative_fails_stale_on_overlap() {
 // persisted) that fails is still a handler bug, said differently.
 #[test]
 fn commutative_folding_an_emitted_event_that_fails_says_the_command_emitted_it() {
-    let emits_corrupt = AggregateDispatch::new("list", "list", list_rebuilder())
+    let emits_corrupt = DomainDispatch::new("list", "list", list_rebuilder())
         .on_command("test.Bump", |_cmd, _state, _cctx| {
             Ok(Some(pb::EventBook {
                 pages: vec![sequenced_event_page(9, corrupt_cover_any())],
@@ -352,7 +350,7 @@ fn commutative_only_counts_events_from_the_expected_sequence() {
 fn commutative_decides_on_the_head() {
     let states = Arc::new(Mutex::new(Vec::new()));
     let sink = states.clone();
-    let d = AggregateDispatch::new("list", "list", list_rebuilder())
+    let d = DomainDispatch::new("list", "list", list_rebuilder())
         .with_commutative(changed)
         .on_command("test.Bump", move |_c, state: &mut ListState, _cctx| {
             sink.lock().unwrap().push(state.clone());
@@ -377,7 +375,7 @@ fn commutative_decides_on_the_head() {
 // are changed(head, head + its events), never what decide did to the state.
 #[test]
 fn commutative_restores_the_head_before_folding_the_commands_events() {
-    let d = AggregateDispatch::new("list", "list", list_rebuilder())
+    let d = DomainDispatch::new("list", "list", list_rebuilder())
         .with_commutative(changed)
         .on_command("test.Bump", |_c, state: &mut ListState, _cctx| {
             *state.items.entry("b".to_string()).or_default() += 10;
@@ -462,7 +460,7 @@ fn overlap_follows_the_conflict_units_rules() {
 /// A list aggregate whose chain upcasts BumpV1 → Bump and BumpOld →
 /// BumpLost (a type nothing handles), handling Bump as a command and
 /// FactV2 as a fact, and recording the type URL each handler received.
-fn upcasting_aggregate(handled: Arc<Mutex<Vec<String>>>) -> AggregateDispatch<ListState> {
+fn upcasting_aggregate(handled: Arc<Mutex<Vec<String>>>) -> DomainDispatch<ListState> {
     let rename = |to: &'static str| {
         move |any: &Any| -> Result<Any, crate::error::HandlerError> {
             Ok(Any {
@@ -476,7 +474,7 @@ fn upcasting_aggregate(handled: Arc<Mutex<Vec<String>>>) -> AggregateDispatch<Li
         .on_event("test.BumpOld", rename("test.BumpLost"))
         .on_event("test.FactV1", rename("test.FactV2"));
     let facts = handled.clone();
-    AggregateDispatch::new("list", "list", list_rebuilder())
+    DomainDispatch::new("list", "list", list_rebuilder())
         .with_command_upcaster(upcaster)
         .on_command("test.Bump", move |cmd, _s, _c| {
             handled.lock().unwrap().push(cmd.type_url.clone());
@@ -484,7 +482,7 @@ fn upcasting_aggregate(handled: Arc<Mutex<Vec<String>>>) -> AggregateDispatch<Li
         })
         .on_fact("test.FactV2", move |fact, _s| {
             facts.lock().unwrap().push(fact.type_url.clone());
-            Ok(crate::aggregate::FactRecord::from(fact.clone()))
+            Ok(crate::domain::FactRecord::from(fact.clone()))
         })
 }
 
@@ -578,7 +576,7 @@ fn every_aggregate_response_reports_the_rules_version() {
     let d = list_aggregate(Arc::default())
         .with_rules_version(RULES)
         .on_fact(&cover_full_name(), |fact, _s| {
-            Ok(crate::aggregate::FactRecord::from(fact.clone()))
+            Ok(crate::domain::FactRecord::from(fact.clone()))
         });
     let command = d.dispatch(&strict("a", &[])).expect("command");
     assert_eq!(command.rules_version, RULES);

@@ -1,6 +1,6 @@
 //! A domain's input on the current spec (angzarr-project spec/20261019-draft
 //! at 636b313): typed refusals, the process manager as a domain, and the
-//! rules an input meets before its handler runs ([`AggregateDispatch::admit`]).
+//! rules an input meets before its handler runs ([`DomainDispatch::admit`]).
 //!
 //! Spec governing each group:
 //! - typed refusals: options.proto CommandOptions.refuses; types.proto
@@ -20,7 +20,7 @@
 use prost::Message;
 use prost_types::Any;
 
-use crate::aggregate::{Admission, AggregateDispatch, Arrival, FactRecord, StreamStatus};
+use crate::domain::{Admission, Arrival, DomainDispatch, FactRecord, StreamStatus};
 use crate::error::{codes, CodedError, GrpcCode, HandlerError};
 use crate::pb;
 use crate::test_support::*;
@@ -30,8 +30,8 @@ use crate::upcaster::UpcasterDispatch;
 
 /// The wallet aggregate: HoldFunds holds, or is refused with the typed
 /// refusal InsufficientFunds when it asks for more than 100.
-fn wallet() -> AggregateDispatch<TestState> {
-    AggregateDispatch::new("Wallet", "wallet", fresh_rebuilder()).on_command(
+fn wallet() -> DomainDispatch<TestState> {
+    DomainDispatch::new("Wallet", "wallet", fresh_rebuilder()).on_command(
         &fq::<HoldFunds>(),
         |command, _state, _ctx| {
             let hold = HoldFunds::decode(command.value.as_slice()).expect("HoldFunds");
@@ -60,8 +60,8 @@ fn wallet() -> AggregateDispatch<TestState> {
 /// RecordFundsHeld (not starting) records nothing new; BuyInTimedOut is a
 /// fact (not starting); a refused HoldFunds, passed through, records
 /// BuyInFailed with the amount the wallet was asked for.
-fn buyin() -> AggregateDispatch<TestState> {
-    AggregateDispatch::process_manager("BuyIn", "buyin", cover_applier(fresh_rebuilder()))
+fn buyin() -> DomainDispatch<TestState> {
+    DomainDispatch::process_manager("BuyIn", "buyin", cover_applier(fresh_rebuilder()))
         .on_command(&fq::<StartBuyIn>(), |command, _state, _ctx| {
             let start = StartBuyIn::decode(command.value.as_slice()).expect("StartBuyIn");
             Ok(Some(pb::EventBook {
