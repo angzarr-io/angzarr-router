@@ -42,6 +42,10 @@ pub mod codes {
     pub const MISSING_RULES_VERSION: &str = "MISSING_RULES_VERSION";
     pub const MISSING_STATE_TYPE: &str = "MISSING_STATE_TYPE";
     pub const SAGA_COMMAND_OUTSIDE_DESTINATION: &str = "SAGA_COMMAND_OUTSIDE_DESTINATION";
+    /// A saga command naming an edition other than its trigger's (owner
+    /// ruling, 2026-10-28; types.proto Cover.edition: a saga stays in the
+    /// edition of the event it handles).
+    pub const SAGA_COMMAND_OUTSIDE_EDITION: &str = "SAGA_COMMAND_OUTSIDE_EDITION";
     /// An input from outside (not a saga's) addressed in an edition to a
     /// stream with no fork there (types.proto, Cover.edition; decision 14.32).
     pub const EDITION_NOT_FORKED: &str = "EDITION_NOT_FORKED";
@@ -83,6 +87,8 @@ pub mod messages {
         "a saga answered a command for a domain other than its one destination";
     pub const FOLD_FAILED: &str = "the state fold failed on an event it had accepted";
     pub const FOLD_FAILED_EMITTED: &str = "the state fold failed on an event this command emitted";
+    pub const SAGA_COMMAND_OUTSIDE_EDITION: &str =
+        "a saga answered a command for an edition other than its trigger's";
     pub const EDITION_NOT_FORKED: &str =
         "the stream has no fork in the edition; fork it, or let a saga's command reach it";
     pub const PM_NO_INSTANCE: &str =
