@@ -229,6 +229,14 @@ pub struct StreamStatus {
     /// head, for a stream not forked there): the fork sequence of an
     /// arrival fork.
     pub next_sequence: u64,
+    /// The input's edition is deleted, or being deleted: a stream of it
+    /// holds an EditionDeleted, or none of its EditionCreated remains (the
+    /// store's knowledge, from its rows alone; meta/events.proto,
+    /// EditionDeleted).
+    pub edition_deleted: bool,
+    /// THIS stream has recorded its own EditionDeleted, or its rows of the
+    /// edition are already removed.
+    pub deleted: bool,
 }
 
 /// What [`DomainDispatch::admit`] decides for an input. A refusal is the
@@ -248,8 +256,17 @@ pub enum Admission {
     Duplicate(Vec<pb::EventPage>),
     /// A process manager's fact for a correlation with no instance, of a
     /// type it does not declare as starting: skipped silently, answered
-    /// APPLIED with no events (process_manager.proto).
+    /// APPLIED with no events (process_manager.proto). Also a carried
+    /// deletion reaching a stream with nothing of the edition left to delete.
     Skip,
+    /// A policy carrying an edition's deletion onward reached a stream of
+    /// that edition (meta/events.proto, EditionDeleted): the runtime records
+    /// this meta-event at the stream's head, after its earlier work; then
+    /// carries it onward through the domain's policy flows
+    /// ([`crate::policy::PolicyDispatch::carry_deletion`]); and only once it
+    /// has propagated removes the stream's rows of the edition (the store's
+    /// `remove_deleted`). No handler runs.
+    Delete(pb::meta::EditionDeleted),
 }
 
 /// Handles a passed-through refusal (the standard `CommandRefused`) of one

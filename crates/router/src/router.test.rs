@@ -422,6 +422,7 @@ fn a_hand_written_aggregate_meets_the_framework_rules() {
                 exists: true,
                 forked: false,
                 next_sequence: 1,
+                ..Default::default()
             },
         })
         .expect_err("not forked");

@@ -94,6 +94,7 @@ fn run(policy: PolicyDispatch, edition: Option<&str>) -> pb::EventPage {
         exists: false,
         forked: true,
         next_sequence: 0,
+        ..Default::default()
     };
     assert_eq!(
         pm.admit(&Arrival {
@@ -136,6 +137,7 @@ fn run(policy: PolicyDispatch, edition: Option<&str>) -> pb::EventPage {
                 exists: true,
                 forked: false,
                 next_sequence: 12,
+                ..Default::default()
             },
         })
         .expect("admitted");
@@ -170,6 +172,7 @@ fn run(policy: PolicyDispatch, edition: Option<&str>) -> pb::EventPage {
                 exists: true,
                 forked: true,
                 next_sequence: 1,
+                ..Default::default()
             },
         })
         .expect("its own stream"),

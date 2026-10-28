@@ -306,6 +306,29 @@ impl PolicyDispatch {
     }
 }
 
+impl PolicyDispatch {
+    /// The deletion this policy carries onward (meta/events.proto,
+    /// EditionDeleted, PROPAGATED): for each EditionDeleted on its source
+    /// stream, one input per stream of the edition the policy reached in its
+    /// destination domain (`targets`: the runtime's lookup, since the policy
+    /// keeps no state), carrying the deletion as a meta-event in a Command
+    /// arm, its `propagated_from` and `causation_id` the source's
+    /// EditionDeleted, and each target addressed in the deleted edition.
+    /// Identity is left for the runtime to stamp, as for any policy command.
+    /// A target outside the destination domain is
+    /// POLICY_COMMAND_OUTSIDE_DESTINATION, one in another edition
+    /// POLICY_COMMAND_OUTSIDE_EDITION. A source with no EditionDeleted
+    /// carries nothing.
+    pub fn carry_deletion(
+        &self,
+        source: &pb::EventBook,
+        targets: &[pb::Cover],
+    ) -> Result<Vec<pb::CommandBook>, CodedError> {
+        let _ = (source, targets);
+        todo!("red: a policy carries an edition's deletion onward")
+    }
+}
+
 /// Addresses and identifies the refusal fact OnRefused answered, as the
 /// policy's runtime does (types.proto, the command_identity region,
 /// Validation; policy.proto, Refusals, Mechanics): its cover is the exact

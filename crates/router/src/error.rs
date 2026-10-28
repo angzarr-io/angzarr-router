@@ -50,6 +50,9 @@ pub mod codes {
     /// identity, no Handling), or a refusal lacking what addressing it needs
     /// (policy.proto, OnRefusedResponse): a policy bug.
     pub const MALFORMED_REFUSAL_FACT: &str = "MALFORMED_REFUSAL_FACT";
+    /// An arrival in an edition that is deleted, or being deleted
+    /// (meta/events.proto, EditionDeleted): NOT_FOUND, writing nothing.
+    pub const EDITION_NOT_FOUND: &str = "EDITION_NOT_FOUND";
     /// An input from outside (not a policy's) addressed in an edition to a
     /// stream with no fork there (types.proto, Cover.edition; decision 14.32).
     pub const EDITION_NOT_FORKED: &str = "EDITION_NOT_FORKED";
@@ -95,6 +98,8 @@ pub mod messages {
         "a policy answered a command for an edition other than its trigger's";
     pub const MALFORMED_REFUSAL_FACT: &str =
         "a policy's refusal fact must be a bare Fact, addressed and identified by its runtime";
+    pub const EDITION_NOT_FOUND: &str =
+        "the edition is deleted, or being deleted; only ForkStream brings its name back";
     pub const EDITION_NOT_FORKED: &str =
         "the stream has no fork in the edition; fork it, or let a policy's command reach it";
     pub const PM_NO_INSTANCE: &str =

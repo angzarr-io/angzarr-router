@@ -111,6 +111,7 @@ fn existing() -> StreamStatus {
         exists: true,
         forked: false,
         next_sequence: 3,
+        ..Default::default()
     }
 }
 
