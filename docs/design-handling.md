@@ -1,5 +1,12 @@
 # Design: rules version, conflict resolution, command upcasting and router-owned state
 
+> **Superseded in part on the POC line (spec 636b313, decision 14.31):** a
+> process manager is a domain, so every passage below about process-manager
+> triggers, `ProcessManagerDispatch`, `ProcessManagerHandler`,
+> `ProcessManagerHandleResponse`/`process_state` and their C-ABI
+> descriptors describes code deleted on `poc/dispatch`. Kept as the record
+> of what the distributed side (router-ffi, the bindings) still implements.
+
 **Status:**
 - **Implemented:** conflict resolution, command upcasting, the rules version
   on every response, and claims for upcaster source types at registration.

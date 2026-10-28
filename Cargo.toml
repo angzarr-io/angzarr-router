@@ -1,10 +1,17 @@
 [workspace]
 resolver = "2"
-members = ["crates/router", "crates/router-ffi", "crates/conformance", "tools/archlint"]
+members = ["crates/router", "crates/conformance", "tools/archlint"]
 # The angzarr-project submodule's crates are standalone workspaces of their
 # own (angzarr-proto declares `[workspace]`), consumed here as path
 # dependencies only.
-exclude = ["angzarr-project"]
+#
+# crates/router-ffi (the C ABI the Go/Java/C#/C++/TypeScript bindings link)
+# is out of the workspace on the POC line (poc/dispatch): it is the router's
+# distributed side, which the angzarr/annals POC leaves broken (plan "SCOPE
+# NOW"). It still registers trigger-fed process managers, which spec 636b313
+# deleted (decision 14.31), so it does not build against this pin. Restore it
+# to `members` when the distributed side is brought to the spec.
+exclude = ["angzarr-project", "crates/router-ffi"]
 
 [workspace.package]
 version = "0.1.0"
@@ -20,7 +27,7 @@ license = "BSD-3-Clause"
 # Keep this rev equal to the angzarr-project submodule's commit (the
 # submodule supplies the .proto files and the shared features).
 # prost and prost-types match its.
-angzarr-proto = { git = "https://github.com/angzarr-io/angzarr-project", rev = "541cadc03351e20a7e41d27dffec623f80db409b" }
+angzarr-proto = { git = "https://github.com/angzarr-io/angzarr-project", rev = "636b313f4e12e38c43573e08633f1016306ce3b6" }
 prost = "0.14"
 prost-types = "0.14"
 prost-build = "0.14"

@@ -141,6 +141,7 @@ impl<P> ProjectorDispatch<P> {
             inputs,
             &self.rules_version,
             None,
+            Vec::new(),
         )
     }
 

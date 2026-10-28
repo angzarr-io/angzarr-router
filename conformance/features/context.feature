@@ -7,7 +7,7 @@ Feature: Facts and handler context
   the arm must match the handler's kind) is refused with NO_FACT_HANDLER and
   nothing is recorded. Appliers see each event's sequence; handlers read the
   cover they are handling; a projector fold knows where each event sits. The
-  ledger aggregate, reserving process-manager and tracking projector are
+  ledger aggregate and tracking projector are
   built through each binding's hand-written API over the fixture's
   CounterState. Roots are UUID v5 (NAMESPACE_OID) of the quoted label.
 
@@ -35,11 +35,6 @@ Feature: Facts and handler context
     Given a ledger aggregate
     When an IncreaseBy command for ledger root "ledger-1" is dispatched
     Then the ledger handler saw root "ledger-1"
-
-  Scenario: a process-manager handler reads the trigger cover
-    Given a reserving process-manager
-    When an Increased trigger of counter root "table-1" at sequence 2 is dispatched to the reserving process-manager
-    Then the reserving process-manager saw trigger root "table-1"
 
   Scenario: a projector fold reads each event's root and sequence
     Given a tracking projector

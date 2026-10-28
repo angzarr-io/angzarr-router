@@ -7,12 +7,9 @@ use prost_types::Any;
 use crate::aggregate::AggregateDispatch;
 use crate::error::{codes, CodedError};
 use crate::pb;
-use crate::process_manager::ProcessManagerDispatch;
 use crate::projector::ProjectorDispatch;
 use crate::rebuild::Rebuilder;
-use crate::router::{
-    CommandHandler, ProcessManagerHandler, ProjectorHandler, Router, RouterBuilder,
-};
+use crate::router::{CommandHandler, ProjectorHandler, Router, RouterBuilder};
 use crate::saga::SagaDispatch;
 use crate::test_support::{
     command_page, event_page, fact_page, fresh_rebuilder, LedgerState, TestState,
@@ -94,12 +91,10 @@ fn with_one(builder: RouterBuilder, kind: &str) -> RouterBuilder {
     match kind {
         "aggregate" => builder.aggregate(aggregate("a", "order", &["test.Create"])),
         "saga" => builder.saga(SagaDispatch::new("s", "order", "inventory")),
-        "process manager" => builder.process_manager(ProcessManagerDispatch::new(
-            "pm",
-            "pm",
-            ["inventory"],
-            fresh_rebuilder(),
-        )),
+        "process manager" => builder.process_manager(
+            AggregateDispatch::process_manager("pm", "pm", fresh_rebuilder())
+                .on_command("test.Start", |_, _, _| Ok(None)),
+        ),
         _ => builder.projector(ProjectorDispatch::new("p", || ())),
     }
 }
@@ -262,29 +257,33 @@ fn a_router_runs_its_saga() {
     );
 }
 
+// A process manager is a domain (decision 14.31): the router hosts it as it
+// hosts an aggregate, and a command to it answers its own events only.
 #[test]
-fn a_router_runs_its_process_manager() {
+fn a_router_runs_its_process_manager_as_a_domain() {
     let router = RouterBuilder::new()
         .process_manager(
-            ProcessManagerDispatch::new("pm", "pm", ["inventory"], fresh_rebuilder())
+            AggregateDispatch::process_manager("pm", "pm", Rebuilder::<LedgerState>::of_message())
                 .with_rules_version("9")
-                .on_event("order", "test.Created", |_, _, _| {
-                    Ok(pb::ProcessManagerHandleResponse {
-                        commands: vec![pb::CommandBook::default()],
+                .on_command("test.Start", |_, _, _| {
+                    Ok(Some(pb::EventBook {
+                        pages: vec![event_page(any_of_type("test.Started"))],
                         ..Default::default()
-                    })
-                }),
+                    }))
+                })
+                .starts("test.Start"),
         )
         .build()
         .expect("build");
     let resp = router
-        .dispatch_process_manager(&pb::ProcessManagerHandleRequest {
-            trigger: Some(source("order")),
-            process_state: None,
-        })
+        .dispatch_command(&command("pm", "test.Start"))
         .expect("pm");
-    assert_eq!(resp.commands.len(), 1);
+    assert_eq!(emitted_label(&resp), "test.Started");
     assert_eq!(resp.rules_version, "9");
+    assert_eq!(
+        router.component_descriptor().expect("hello").kind(),
+        pb::ComponentKind::ProcessManager
+    );
 }
 
 #[test]
@@ -318,13 +317,6 @@ fn a_router_refuses_dispatch_of_another_kind() {
             .code,
         codes::NO_HANDLER_REGISTERED
     );
-    assert_eq!(
-        router
-            .dispatch_process_manager(&pb::ProcessManagerHandleRequest::default())
-            .unwrap_err()
-            .code,
-        codes::NO_HANDLER_REGISTERED
-    );
     let aggregate_router = with_one(RouterBuilder::new(), "aggregate")
         .build()
         .expect("build");
@@ -351,30 +343,6 @@ fn boxed_components_build_routers() {
         .dispatch_command(&command("order", "test.Create"))
         .expect("dispatch");
     assert_eq!(emitted_label(&resp), "boxed");
-
-    let pm: Box<dyn ProcessManagerHandler> = Box::new(
-        ProcessManagerDispatch::new("pm", "pm", ["inventory"], fresh_rebuilder()).on_event(
-            "order",
-            "test.Created",
-            |_, _, _| {
-                Ok(pb::ProcessManagerHandleResponse {
-                    process_events: vec![pb::EventBook::default()],
-                    ..Default::default()
-                })
-            },
-        ),
-    );
-    let router = RouterBuilder::new()
-        .process_manager(pm)
-        .build()
-        .expect("build");
-    let resp = router
-        .dispatch_process_manager(&pb::ProcessManagerHandleRequest {
-            trigger: Some(source("order")),
-            process_state: None,
-        })
-        .expect("dispatch");
-    assert_eq!(resp.process_events.len(), 1);
 
     let projector: Box<dyn ProjectorHandler> =
         Box::new(ProjectorDispatch::new("p", || ()).finish(|_, _| {
@@ -437,6 +405,27 @@ fn a_hand_written_aggregate_builds_a_router() {
         pb::CommandHandlerResponse::default()
     );
     assert_eq!(router.component_descriptor().expect("hello").name, "plain");
+}
+
+// A hand-written domain meets the framework's rules without reimplementing
+// them: an outside command to a stream not forked in its edition is refused
+// (decision 14.32).
+#[test]
+fn a_hand_written_aggregate_meets_the_framework_rules() {
+    let mut book = command("plain", "test.Plain").command.unwrap();
+    book.cover.as_mut().unwrap().edition = Some("what-if".to_string());
+    let err = Plain
+        .admit(&crate::aggregate::Arrival {
+            command: &book,
+            recorded: &[],
+            stream: crate::aggregate::StreamStatus {
+                exists: true,
+                forked: false,
+                next_sequence: 1,
+            },
+        })
+        .expect_err("not forked");
+    assert_eq!(err.code, codes::EDITION_NOT_FORKED);
 }
 
 // --- the aggregate's own upcaster chain ---------------------------------------
@@ -532,10 +521,9 @@ fn a_router_answers_its_components_hello() {
         kind(
             RouterBuilder::new()
                 .process_manager(
-                    ProcessManagerDispatch::new(
+                    AggregateDispatch::process_manager(
                         "p",
                         "pm",
-                        ["x"],
                         Rebuilder::<LedgerState>::of_message()
                     )
                     .with_rules_version("1")

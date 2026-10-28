@@ -14,7 +14,7 @@ dependencies = [
 [[package]]
 name = "angzarr-proto"
 version = "0.1.0"
-source = "git+https://github.com/angzarr-io/angzarr-project?rev=541cadc03351e20a7e41d27dffec623f80db409b#541cadc03351e20a7e41d27dffec623f80db409b"
+source = "git+https://github.com/angzarr-io/angzarr-project?rev=636b313f4e12e38c43573e08633f1016306ce3b6#636b313f4e12e38c43573e08633f1016306ce3b6"
 dependencies = [
  "bytes",
  "prost",
@@ -48,16 +48,6 @@ dependencies = [
  "prost-types",
  "tokio",
  "uuid",
-]
-
-[[package]]
-name = "angzarr-router-ffi"
-version = "0.1.0"
-dependencies = [
- "angzarr-router",
- "prost",
- "prost-build",
- "prost-types",
 ]
 
 [[package]]

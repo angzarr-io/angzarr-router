@@ -19,9 +19,6 @@ struct ContextWorld {
 #[given("a ledger aggregate")]
 async fn ledger(_w: &mut ContextWorld) {}
 
-#[given("a reserving process-manager")]
-async fn reserving(_w: &mut ContextWorld) {}
-
 #[given("a tracking projector")]
 async fn tracking(_w: &mut ContextWorld) {}
 
@@ -57,15 +54,6 @@ async fn ledger_command_over(w: &mut ContextWorld, label: String, first: u64, se
     ledger
         .dispatch(&conf::ledger_command_over(&label, &[first, second]))
         .expect("dispatch");
-}
-
-#[when(
-    regex = r#"^an Increased trigger of counter root "([^"]*)" at sequence (\d+) is dispatched to the reserving process-manager$"#
-)]
-async fn reserving_trigger(w: &mut ContextWorld, label: String, seq: u64) {
-    let pm = conf::reserving_pm(w.covers.clone());
-    pm.dispatch(&conf::reserving_trigger(&label, seq))
-        .expect("PM dispatch succeeded");
 }
 
 #[when(
@@ -141,11 +129,6 @@ fn single_root(sink: &conf::CoverSink) -> Vec<u8> {
 
 #[then(regex = r#"^the ledger handler saw root "([^"]*)"$"#)]
 async fn ledger_saw(w: &mut ContextWorld, label: String) {
-    assert_eq!(single_root(&w.covers), conf::root_of(&label));
-}
-
-#[then(regex = r#"^the reserving process-manager saw trigger root "([^"]*)"$"#)]
-async fn pm_saw(w: &mut ContextWorld, label: String) {
     assert_eq!(single_root(&w.covers), conf::root_of(&label));
 }
 

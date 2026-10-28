@@ -13,7 +13,6 @@ pub mod aggregate;
 pub mod conflict;
 pub mod descriptor;
 pub mod error;
-pub mod process_manager;
 pub mod projector;
 pub mod proto;
 pub mod rebuild;
@@ -80,6 +79,24 @@ pub fn fact_payload(page: &pb::CommandPage) -> Option<&Any> {
     }
 }
 
+/// An input's deduplication key on its addressed stream (types.proto, the
+/// command_identity region): a command's `command_id`; a fact's
+/// `command_id` when set, else UUIDv5 of its `fact_origin.external_id`
+/// (`angzarr_proto::ids::fact_command_id`); a refusal fact's is the refused
+/// command's id, which the saga's runtime stamped as its `command_id`.
+/// `None` when the input carries no identity to key on.
+///
+/// There is no trigger-fed process manager to key by trigger (decision
+/// 14.31: a process manager is a domain, deduplicated like any other):
+///
+/// ```compile_fail
+/// use angzarr_router::process_manager::ProcessManagerDispatch;
+/// ```
+pub fn input_id(book: &pb::CommandBook) -> Option<pb::Uuid> {
+    let _ = book;
+    todo!("red: an input's deduplication key")
+}
+
 /// An upcaster chain a command handler runs on incoming command and fact
 /// payloads before dispatch (upcaster.proto; decision 12.11):
 /// [`upcaster::UpcasterDispatch`] is one.
@@ -116,3 +133,7 @@ mod handling_tests;
 #[cfg(test)]
 #[path = "snapshot.test.rs"]
 mod snapshot_tests;
+
+#[cfg(test)]
+#[path = "chain.test.rs"]
+mod chain_tests;

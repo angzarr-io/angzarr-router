@@ -9,7 +9,8 @@ use crate::pb;
 
 /// A component's ComponentDescriptor. `inputs` are the domains whose events
 /// it consumes (deduplicated and sorted); `state` is set for aggregates and
-/// process managers only. An empty `rules_version` is refused
+/// process managers only; `starting_types` are a process manager's starting
+/// input types (decision 14.31). An empty `rules_version` is refused
 /// MISSING_RULES_VERSION (INVALID_ARGUMENT), as the coordinator refuses
 /// such a registration, naming the component.
 pub(crate) fn component_descriptor(
@@ -18,6 +19,7 @@ pub(crate) fn component_descriptor(
     inputs: impl IntoIterator<Item = String>,
     rules_version: &str,
     state: Option<pb::StateDescriptor>,
+    starting_types: Vec<String>,
 ) -> Result<pb::ComponentDescriptor, CodedError> {
     if rules_version.is_empty() {
         return Err(CodedError::invalid_argument(
@@ -36,6 +38,7 @@ pub(crate) fn component_descriptor(
             .collect(),
         rules_version: rules_version.to_string(),
         state,
+        starting_types,
     })
 }
 

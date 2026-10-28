@@ -2,7 +2,7 @@
 //! crate (types.proto, upcaster.proto, options.proto and sererr). That crate
 //! does not compile the service protos, so the few request/response messages
 //! they define (CommandHandlerResponse, CommandResponse, SagaResponse,
-//! ProcessManagerHandleRequest/Response) are generated here, with every type
+//! Refusal, OnRefusedResponse) are generated here, with every type
 //! angzarr-proto provides extern-pathed to it: no io.angzarr.v1 type exists
 //! twice.
 
@@ -36,10 +36,11 @@ const ANGZARR_PROTO_FILES: [&str; 3] = [
 ];
 
 /// The service protos whose messages this crate generates.
-const SERVICE_FILES: [&str; 3] = [
+/// (process_manager.proto defines nothing since decision 14.31: a process
+/// manager is a domain, served by command_handler.proto.)
+const SERVICE_FILES: [&str; 2] = [
     "io/angzarr/v1/command_handler.proto",
     "io/angzarr/v1/saga.proto",
-    "io/angzarr/v1/process_manager.proto",
 ];
 
 fn main() {

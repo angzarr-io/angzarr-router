@@ -1,8 +1,8 @@
 //! Binds angzarr-project's handler-contract tier
 //! (features/handler-contract/handling.feature, C-0533..C-0550, C-0565, C-0570, C-0571, C-0580 and C-0583; the spec is
 //! the source, read from the submodule) to the Rust core: the order
-//! aggregate and the Fulfillment process manager built by hand over the
-//! orders.v1 fixture messages.
+//! aggregate and the Fulfillment process manager (a domain, decision 14.31)
+//! built by hand over the orders.v1 fixture messages.
 
 use angzarr_router::error::{CodedError, GrpcCode};
 use angzarr_router::pb;
@@ -26,7 +26,7 @@ struct HandlingWorld {
     seen: conf::OrderSink,
     snapshot: Option<pb::Snapshot>,
     result: Option<Result<pb::CommandHandlerResponse, CodedError>>,
-    pm_result: Option<Result<pb::ProcessManagerHandleResponse, CodedError>>,
+    pm_result: Option<Result<pb::CommandHandlerResponse, CodedError>>,
     pm_placed: u32,
     saga: Option<(String, String, String)>,
     saga_strays: Vec<(String, String)>,
@@ -107,10 +107,10 @@ async fn fulfillment(w: &mut HandlingWorld, version: String) {
     w.pm_rules_version = version;
 }
 
-#[when("the process manager handles an OrderPlaced event")]
+#[when("the process manager handles a StartFulfillment command")]
 async fn pm_handles(w: &mut HandlingWorld) {
     let pm = conf::fulfillment_pm(&w.pm_rules_version);
-    w.pm_result = Some(pm.dispatch(&conf::order_placed_trigger()));
+    w.pm_result = Some(pm.dispatch(&conf::start_fulfillment()));
 }
 
 #[then(regex = r#"^the answer reports rules version "([^"]*)"$"#)]
@@ -268,16 +268,16 @@ async fn answer_carries_state(w: &mut HandlingWorld, described: String) {
 }
 
 #[when(
-    regex = r"^the process manager handles an OrderPlaced event (and writes a FulfillmentStarted event|without writing a process event)$"
+    regex = r"^the process manager handles a StartFulfillment command (and writes a FulfillmentStarted event|without writing a process event)$"
 )]
 async fn pm_handles_writing(w: &mut HandlingWorld, writing: String) {
     let writes = writing.starts_with("and writes");
     w.pm_placed = u32::from(writes);
     let pm = conf::fulfillment_pm_writing(&w.pm_rules_version, writes);
-    w.pm_result = Some(pm.dispatch(&conf::order_placed_trigger()));
+    w.pm_result = Some(pm.dispatch(&conf::start_fulfillment()));
 }
 
-fn pm_answer(w: &HandlingWorld) -> &pb::ProcessManagerHandleResponse {
+fn pm_answer(w: &HandlingWorld) -> &pb::CommandHandlerResponse {
     w.pm_result
         .as_ref()
         .expect("the PM handled")
@@ -285,23 +285,27 @@ fn pm_answer(w: &HandlingWorld) -> &pb::ProcessManagerHandleResponse {
         .expect("the PM answered")
 }
 
-#[then("the answer's process state is the process manager's state after the reaction")]
-async fn pm_process_state(w: &mut HandlingWorld) {
+#[then("the answer's snapshot state is the process manager's state after the command")]
+async fn pm_snapshot_state(w: &mut HandlingWorld) {
     assert_eq!(
         pm_answer(w)
-            .process_state
+            .events
             .as_ref()
+            .and_then(|b| b.snapshot.as_ref())
             .and_then(|s| s.state.clone()),
         Some(conf::fulfillment_state(w.pm_placed))
     );
 }
 
-#[then("none of the answer's process events carry a state")]
-async fn pm_events_carry_no_state(w: &mut HandlingWorld) {
-    assert!(pm_answer(w)
-        .process_events
-        .iter()
-        .all(|b| b.snapshot.is_none()));
+#[then("none of the answer's event pages carry a state")]
+async fn pm_pages_carry_no_state(w: &mut HandlingWorld) {
+    let events = pm_answer(w).events.as_ref().expect("its events");
+    // The state rides the snapshot only: every page is the PM's event.
+    assert_eq!(events.pages.len() as u32, w.pm_placed);
+    assert!(events.pages.iter().all(|p| p
+        .payload
+        .as_ref()
+        .is_some_and(|a| a.type_url.ends_with("orders.v1.FulfillmentStarted"))));
 }
 
 // --- one destination per saga (C-0583; decision 14.24) ----------------------
@@ -338,7 +342,7 @@ async fn saga_handles(w: &mut HandlingWorld) {
         .saga(saga)
         .build()
         .expect("one saga");
-    let mut source = conf::order_placed_trigger().trigger.expect("a trigger");
+    let mut source = conf::order_placed_source();
     source.cover.as_mut().expect("a cover").domain = input;
     w.saga_result = Some(router.dispatch_saga(&source));
 }

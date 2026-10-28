@@ -2,10 +2,9 @@
 //! ComponentDescriptor (types.proto) from its own dispatch table, and none
 //! builds one without a rules version.
 
-use crate::aggregate::AggregateDispatch;
+use crate::aggregate::{AggregateDispatch, CommandContext, FactRecord};
 use crate::error::{codes, GrpcCode};
 use crate::pb;
-use crate::process_manager::ProcessManagerDispatch;
 use crate::projector::ProjectorDispatch;
 use crate::rebuild::Rebuilder;
 use crate::saga::SagaDispatch;
@@ -112,10 +111,9 @@ fn a_stateful_component_whose_rebuilder_declares_no_state_type_is_refused() {
     let aggregate: AggregateDispatch<LedgerState> =
         AggregateDispatch::new("Ledger", "ledger", Rebuilder::new(LedgerState::default))
             .with_rules_version("1");
-    let pm: ProcessManagerDispatch<LedgerState> = ProcessManagerDispatch::new(
+    let pm: AggregateDispatch<LedgerState> = AggregateDispatch::process_manager(
         "Fulfillment",
         "fulfillment",
-        ["shipping"],
         Rebuilder::new(LedgerState::default),
     )
     .with_rules_version("1");
@@ -134,31 +132,38 @@ fn an_aggregate_without_a_rules_version_is_refused() {
     assert_missing_rules_version(ledger("").component_descriptor());
 }
 
-fn fulfillment(version: &str) -> ProcessManagerDispatch<LedgerState> {
-    let noop = |_: &prost_types::Any, _: &mut LedgerState, _: Option<&pb::Cover>| {
-        Ok(pb::ProcessManagerHandleResponse::default())
-    };
-    ProcessManagerDispatch::new(
-        "Fulfillment",
-        "fulfillment",
-        ["shipping"],
-        Rebuilder::of_message(),
-    )
-    .on_event("order", "test.OrderPlaced", noop)
-    .on_event("payment", "test.PaymentTaken", noop)
-    .on_event("order", "test.OrderCancelled", noop)
-    .with_rules_version(version)
+fn fulfillment(version: &str) -> AggregateDispatch<LedgerState> {
+    let noop = |_: &prost_types::Any, _: &mut LedgerState, _: CommandContext| Ok(None);
+    AggregateDispatch::process_manager("Fulfillment", "fulfillment", Rebuilder::of_message())
+        .on_command("test.PlaceOrder", noop)
+        .on_command("test.RecordPayment", noop)
+        .on_fact("test.TimedOut", |fact, _| {
+            Ok(FactRecord::from(fact.clone()))
+        })
+        .starts("test.RecordPayment")
+        .starts("test.PlaceOrder")
+        .with_rules_version(version)
 }
 
+// A process manager is a domain (decision 14.31): it subscribes to no domain,
+// so it announces no inputs; it announces its state as an aggregate does, and
+// its starting input types, sorted (ComponentDescriptor.starting_types).
 #[test]
-fn a_process_manager_announces_its_sources_and_state() {
+fn a_process_manager_announces_its_state_and_starting_types_and_no_inputs() {
     let descriptor = fulfillment("2.0.1")
         .component_descriptor()
         .expect("descriptor");
     assert_eq!(descriptor.name, "Fulfillment");
     assert_eq!(descriptor.kind(), pb::ComponentKind::ProcessManager);
     assert_eq!(descriptor.rules_version, "2.0.1");
-    assert_eq!(inputs(&descriptor), vec!["order", "payment"]);
+    assert!(inputs(&descriptor).is_empty(), "a PM subscribes to nothing");
+    assert_eq!(
+        descriptor.starting_types,
+        vec![
+            "test.PlaceOrder".to_string(),
+            "test.RecordPayment".to_string()
+        ]
+    );
     assert_eq!(
         descriptor.state.as_ref().expect("state").type_url,
         "/test.ledger.LedgerState"
@@ -170,6 +175,19 @@ fn a_process_manager_announces_its_sources_and_state() {
             pb::ConflictResolution::AggregateHandles
         ]
     );
+}
+
+// types.proto ComponentDescriptor.starting_types: "a non-PM descriptor listing
+// starting_types is refused like one with an empty rules_version".
+#[test]
+fn an_aggregate_declaring_a_starting_type_is_refused() {
+    let err = ledger("1")
+        .on_command("test.Open", |_, _, _| Ok(None))
+        .starts("test.Open")
+        .component_descriptor()
+        .expect_err("starts is a process manager's");
+    assert_eq!(err.code, codes::STARTING_TYPES_ON_NON_PM);
+    assert_eq!(err.grpc, GrpcCode::InvalidArgument);
 }
 
 #[test]

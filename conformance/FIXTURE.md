@@ -51,10 +51,8 @@ historical-state evidence the framework supplies.
   `inventory` per source event.
 - **CounterProjector** (domain `counter`) — folds a count, finishes into a
   `Projection`.
-- **OrderProcessManager** (domain `order-pm`) — consumes the `counter`
-  trigger, emits a `Reserve` command and one unaddressed process event
-  carrying an `OrderProcessManagerState` with the count its rebuilt state
-  held, proving its own state is rebuilt before the handler.
+(The trigger-fed OrderProcessManager is deleted: since decision 14.31 a
+process manager is a domain, fed commands by sagas.)
 
 ## The order aggregate and the Fulfillment process manager (handler-contract)
 
@@ -68,4 +66,5 @@ unmarked notes (the wildcard `*notes`), with `changed()` hand-written to what
 the generator would emit. `AddItem(item)` records `ItemAdded(item)`; the
 upcaster chain renames `AddItemV1` to `AddItem`, `ItemDeliveredV1` to
 `ItemDelivered` (a fact) and `AddLine` to `AddLineItem`, which nothing
-handles. The Fulfillment process manager reacts to `OrderPlaced`.
+handles. The Fulfillment process manager is a domain: `StartFulfillment`,
+its starting command, records `FulfillmentStarted` (or nothing).

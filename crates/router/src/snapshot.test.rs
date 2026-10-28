@@ -1,7 +1,7 @@
 //! The post-command snapshot (owner ruling, round 7): the router fills
 //! `events.snapshot.state` with the state after the emitted events on every
-//! aggregate answer, and a process manager's state after its process events
-//! in `process_state` on every answer it handles. Business code never decides when; the
+//! domain's answer (an aggregate's or a process manager's, a PM being a domain;
+//! decision 14.31). Business code never decides when; the
 //! coordinator stamps the snapshot's sequence and rules version.
 
 use std::collections::BTreeMap;
@@ -12,7 +12,6 @@ use prost_types::Any;
 use crate::aggregate::{AggregateDispatch, FactRecord};
 use crate::error::codes;
 use crate::pb;
-use crate::process_manager::ProcessManagerDispatch;
 use crate::rebuild::Rebuilder;
 use crate::test_support::*;
 use crate::type_url;
@@ -243,94 +242,6 @@ fn an_emitted_event_that_does_not_fold_fails_the_command() {
     assert_eq!(err.message, crate::error::messages::FOLD_FAILED_EMITTED);
 }
 
-// --- process managers -----------------------------------------------------
-
-fn pm(process_events: Vec<pb::EventBook>) -> ProcessManagerDispatch<Items> {
-    ProcessManagerDispatch::new("pm", "pm", ["x"], items_rebuilder()).on_event(
-        "order",
-        "test.Placed",
-        move |_e, _s, _c| {
-            Ok(pb::ProcessManagerHandleResponse {
-                process_events: process_events.clone(),
-                ..Default::default()
-            })
-        },
-    )
-}
-
-fn trigger(fq: &str, state: &[&str]) -> pb::ProcessManagerHandleRequest {
-    pb::ProcessManagerHandleRequest {
-        trigger: Some(pb::EventBook {
-            cover: Some(pb::Cover {
-                domain: "order".to_string(),
-                ..Default::default()
-            }),
-            pages: vec![event_page(Any {
-                type_url: type_url(fq),
-                value: Vec::new(),
-            })],
-            ..Default::default()
-        }),
-        process_state: Some(pb::EventBook {
-            pages: state
-                .iter()
-                .zip(0..)
-                .map(|(k, seq)| sequenced_event_page(seq, cover_any(k)))
-                .collect(),
-            ..Default::default()
-        }),
-    }
-}
-
-// process_manager.proto, process_state (decision 14.14, C-0571): the
-// post-reaction state has its own field; process events carry payloads only.
-#[test]
-fn a_process_manager_answers_its_state_after_its_process_events_in_process_state() {
-    let books = vec![
-        pb::EventBook {
-            pages: vec![event_page(cover_any("p"))],
-            ..Default::default()
-        },
-        pb::EventBook {
-            pages: vec![event_page(cover_any("q"))],
-            ..Default::default()
-        },
-    ];
-    let resp = pm(books)
-        .dispatch(&trigger("test.Placed", &["a"]))
-        .expect("handled");
-    assert_eq!(resp.process_events.len(), 2);
-    assert!(
-        resp.process_events.iter().all(|b| b.snapshot.is_none()),
-        "process events carry payloads only"
-    );
-    let state = resp.process_state.expect("the post-reaction state");
-    assert_eq!(state.state, Some(image(&[("a", 1), ("p", 1), ("q", 1)])));
-    assert_eq!(state.sequence, 0);
-    assert_eq!(state.rules_version, "");
-}
-
-#[test]
-fn a_process_manager_emitting_no_process_events_still_answers_its_state() {
-    let resp = pm(Vec::new())
-        .dispatch(&trigger("test.Placed", &["a"]))
-        .expect("handled");
-    assert!(resp.process_events.is_empty(), "no book of its own");
-    assert_eq!(
-        resp.process_state.and_then(|s| s.state),
-        Some(image(&[("a", 1)]))
-    );
-}
-
-#[test]
-fn a_trigger_the_process_manager_does_not_handle_answers_nothing() {
-    let resp = pm(Vec::new())
-        .dispatch(&trigger("test.Other", &["a"]))
-        .expect("not handled");
-    assert_eq!(resp.process_events, Vec::new());
-    assert!(resp.process_state.is_none());
-}
-
 // The snapshot must equal what a rebuild would fold once the events are
 // stamped, so the fold sees each emitted page at the sequence it will get
 // (the head's next sequence onward); the answered pages stay unstamped.
@@ -357,39 +268,4 @@ fn emitted_events_fold_at_the_sequences_they_will_be_given() {
     assert_eq!(*seen.lock().unwrap(), vec![0, 1, 2, 3]);
     let pages = resp.events.unwrap().pages;
     assert!(pages.iter().all(|p| p.sequence == 0), "answered unstamped");
-}
-
-#[test]
-fn process_events_fold_at_the_sequences_they_will_be_given() {
-    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let record = seen.clone();
-    let rebuilder = Rebuilder::<Items>::of_message().apply_with_context(
-        &cover_full_name(),
-        move |_s: &mut Items, _any, ctx| {
-            record.lock().unwrap().push(ctx.sequence);
-            Ok(())
-        },
-    );
-    let books = vec![
-        pb::EventBook {
-            pages: vec![event_page(cover_any("p"))],
-            ..Default::default()
-        },
-        pb::EventBook {
-            pages: vec![event_page(cover_any("q"))],
-            ..Default::default()
-        },
-    ];
-    let mut req = trigger("test.Placed", &["a"]);
-    req.process_state.as_mut().unwrap().next_sequence = 1;
-    ProcessManagerDispatch::new("pm", "pm", ["x"], rebuilder)
-        .on_event("order", "test.Placed", move |_e, _s, _c| {
-            Ok(pb::ProcessManagerHandleResponse {
-                process_events: books.clone(),
-                ..Default::default()
-            })
-        })
-        .dispatch(&req)
-        .expect("handled");
-    assert_eq!(*seen.lock().unwrap(), vec![0, 1, 2]);
 }

@@ -4,7 +4,18 @@
 //! is a fresh trigger. Declared event types emit commands; an undeclared
 //! event type is skipped (C-0051), not an error. There is no compensation
 //! input. Emitted commands pass through as the handler returned them: the
-//! coordinator stamps their identity, causation and correlation.
+//! coordinator stamps their identity, causation and correlation; the router
+//! addresses them in the trigger's edition (a saga stays in the edition of
+//! the event it handles; types.proto, Cover.edition).
+//!
+//! Refusals (saga.proto, SagaService, Refusals; decision 14.31): when one of
+//! the saga's commands is refused, [`SagaDispatch::dispatch_refusal`] (the
+//! saga's OnRefused) answers the one refusal fact for the saga's own source
+//! domain: the standard `CommandRefused` (pass-through), or, when the saga
+//! registers a callback for the refused command's type
+//! ([`SagaDispatch::on_refused`]), the domestic fact that callback returns
+//! (translate). [`address_refusal_fact`] then addresses and identifies it,
+//! as the runtime must, to the exact stream of the triggering event.
 
 use std::collections::HashMap;
 
@@ -23,6 +34,12 @@ pub type EventFn = Box<
         + Send
         + Sync,
 >;
+
+/// A saga's translating callback for one refused command type: reads the
+/// `Refusal` (the triggering event, the command as sent, the target's
+/// response with its typed refusal object) and returns a fact of the saga's
+/// source domain, packed.
+pub type RefusalFn = Box<dyn Fn(&pb::Refusal) -> Result<Any, HandlerError> + Send + Sync>;
 
 /// The dispatch table for one saga component.
 pub struct SagaDispatch {
@@ -79,6 +96,36 @@ impl SagaDispatch {
         self
     }
 
+    /// Registers the translating callback for refusals of the
+    /// fully-qualified command type `command` (translate mode; saga.proto,
+    /// Refusals). Its presence IS translate mode for that command; a refused
+    /// command of a type with none is passed through.
+    pub fn on_refused(
+        self,
+        command: &str,
+        thunk: impl Fn(&pb::Refusal) -> Result<Any, HandlerError> + Send + Sync + 'static,
+    ) -> Self {
+        // RED STUB: registers nothing.
+        let _ = (command, thunk);
+        self
+    }
+
+    /// `SagaService.OnRefused`: the refusal fact for the saga's own source
+    /// domain, as a CommandBook whose page body is a Fact and whose cover
+    /// and identity are left for the runtime ([`address_refusal_fact`]).
+    /// Pass-through (no callback for the refused command's type): the
+    /// standard `CommandRefused { command, refusal, trigger }`, `refusal`
+    /// the typed refusal object still packed, `trigger` the triggering
+    /// event's EventRef. Translate: the callback's fact. A failing callback
+    /// is a saga bug (dead-lettered and alerted).
+    pub fn dispatch_refusal(
+        &self,
+        refusal: &pb::Refusal,
+    ) -> Result<pb::OnRefusedResponse, CodedError> {
+        let _ = refusal;
+        todo!("red: OnRefused answers the refusal fact")
+    }
+
     /// The rules version the saga registers with: the business binary's
     /// full version, baked in at build. Empty until declared.
     pub fn with_rules_version(mut self, rules_version: impl Into<String>) -> Self {
@@ -96,6 +143,7 @@ impl SagaDispatch {
             [self.input_domain.clone()],
             &self.rules_version,
             None,
+            Vec::new(),
         )
     }
 
@@ -188,6 +236,27 @@ impl SagaDispatch {
     }
 }
 
+/// Addresses and identifies the refusal fact OnRefused answered, as the
+/// saga's runtime does (types.proto, the command_identity region,
+/// Validation; saga.proto, Refusals, Mechanics): its cover is the exact
+/// stream of the triggering event (domain, root and edition); its
+/// `command_id` is the refused command's (no prefix, no derivation); its
+/// `causation_id` and `correlation_id` are the refused command's; and its
+/// `fact_origin.external_id` is that command_id's canonical text. An
+/// answer whose page is not a Fact, or that sets its own cover, identity or
+/// Handling, is a saga bug, refused.
+pub fn address_refusal_fact(
+    refusal: &pb::Refusal,
+    answer: &pb::OnRefusedResponse,
+) -> Result<pb::CommandBook, CodedError> {
+    let _ = (refusal, answer);
+    todo!("red: the refusal fact goes to the trigger's exact stream under the refused command's id")
+}
+
 #[cfg(test)]
 #[path = "saga.test.rs"]
 mod saga_tests;
+
+#[cfg(test)]
+#[path = "refusal.test.rs"]
+mod refusal_tests;

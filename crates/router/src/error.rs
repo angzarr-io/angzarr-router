@@ -32,12 +32,9 @@ pub mod codes {
     pub const UNHANDLED_HANDLER_ERROR: &str = "UNHANDLED_HANDLER_ERROR";
     pub const MISSING_EVENT_BOOK_COVER: &str = "MISSING_EVENT_BOOK_COVER";
     pub const EMPTY_SAGA_SOURCE: &str = "EMPTY_SAGA_SOURCE";
-    pub const MISSING_PM_TRIGGER: &str = "MISSING_PM_TRIGGER";
     pub const DUPLICATE_REGISTRATION: &str = "DUPLICATE_REGISTRATION";
     pub const NO_HANDLERS_REGISTERED: &str = "NO_HANDLERS_REGISTERED";
     pub const DUPLICATE_COMMAND_HANDLER: &str = "DUPLICATE_COMMAND_HANDLER";
-    pub const EMPTY_PM_TRIGGER: &str = "EMPTY_PM_TRIGGER";
-    pub const MISSING_PM_EVENT_PAYLOAD: &str = "MISSING_PM_EVENT_PAYLOAD";
     pub const NO_FACT_HANDLER: &str = "NO_FACT_HANDLER";
     pub const CONFLICT_UNRESOLVED: &str = "CONFLICT_UNRESOLVED";
     pub const CONFLICT_OVERLAP: &str = "CONFLICT_OVERLAP";
@@ -45,6 +42,22 @@ pub mod codes {
     pub const MISSING_RULES_VERSION: &str = "MISSING_RULES_VERSION";
     pub const MISSING_STATE_TYPE: &str = "MISSING_STATE_TYPE";
     pub const SAGA_COMMAND_OUTSIDE_DESTINATION: &str = "SAGA_COMMAND_OUTSIDE_DESTINATION";
+    /// An input from outside (not a saga's) addressed in an edition to a
+    /// stream with no fork there (types.proto, Cover.edition; decision 14.32).
+    pub const EDITION_NOT_FORKED: &str = "EDITION_NOT_FORKED";
+    /// A command for a process manager's correlation with no instance, of a
+    /// type the PM does not declare as starting (process_manager.proto;
+    /// decision 14.31).
+    pub const PM_NO_INSTANCE: &str = "PM_NO_INSTANCE";
+    /// An input addressed to a process manager whose set correlation_id
+    /// differs from its cover's root (process_manager.proto, Stream).
+    pub const PM_CORRELATION_NOT_ROOT: &str = "PM_CORRELATION_NOT_ROOT";
+    /// A refusal fact addressed to any stream but the exact one its
+    /// causation_id names (types.proto, the command_identity region).
+    pub const REFUSAL_FACT_WRONG_STREAM: &str = "REFUSAL_FACT_WRONG_STREAM";
+    /// A component other than a process manager declaring starting types
+    /// (types.proto, ComponentDescriptor.starting_types).
+    pub const STARTING_TYPES_ON_NON_PM: &str = "STARTING_TYPES_ON_NON_PM";
 }
 
 /// Canonical static message text (byte-equal across languages).
@@ -54,9 +67,6 @@ pub mod messages {
     pub const PERSISTED_EVENT_CORRUPT: &str = "persisted event payload corrupt";
     pub const MISSING_EVENT_BOOK_COVER: &str = "missing event book cover";
     pub const EMPTY_SAGA_SOURCE: &str = "empty saga source";
-    pub const MISSING_PM_TRIGGER: &str = "missing PM trigger";
-    pub const EMPTY_PM_TRIGGER: &str = "empty PM trigger";
-    pub const MISSING_PM_EVENT_PAYLOAD: &str = "missing event payload on PM trigger";
     pub const NO_HANDLERS_REGISTERED: &str = "no handlers registered";
     pub const DUPLICATE_COMMAND_HANDLER: &str =
         "an old type the aggregate's upcaster chain accepts is also one of its command types";
@@ -73,6 +83,16 @@ pub mod messages {
         "a saga answered a command for a domain other than its one destination";
     pub const FOLD_FAILED: &str = "the state fold failed on an event it had accepted";
     pub const FOLD_FAILED_EMITTED: &str = "the state fold failed on an event this command emitted";
+    pub const EDITION_NOT_FORKED: &str =
+        "the stream has no fork in the edition; fork it, or let a saga's command reach it";
+    pub const PM_NO_INSTANCE: &str =
+        "no process manager instance for the correlation, and the command does not start one";
+    pub const PM_CORRELATION_NOT_ROOT: &str =
+        "an input to a process manager sets a correlation_id other than its cover's root";
+    pub const REFUSAL_FACT_WRONG_STREAM: &str =
+        "a refusal fact is accepted only by the exact stream its causation_id names";
+    pub const STARTING_TYPES_ON_NON_PM: &str =
+        "only a process manager declares starting input types";
 }
 
 /// Cross-language detail-key constants.
@@ -116,6 +136,12 @@ pub struct CodedError {
     pub message: String,
     pub extras: BTreeMap<String, String>,
     pub grpc: GrpcCode,
+    /// A business rejection's TYPED refusal object, packed: one of the
+    /// command's `CommandOptions.refuses` types (options.proto; decision
+    /// 14.31). Carried in the rejection's status details; the refused
+    /// saga receives it as `RefusalResponse.refusal`. Boxed, so the
+    /// common error stays small.
+    pub refusal: Option<Box<prost_types::Any>>,
 }
 
 /// What a business handler may fail with: a coded error (rejections and
@@ -145,6 +171,7 @@ impl CodedError {
             message: message.to_string(),
             extras: extras.into_iter().collect(),
             grpc,
+            refusal: None,
         }
     }
 
@@ -298,6 +325,25 @@ impl CodedError {
         details: impl IntoIterator<Item = (String, String)>,
     ) -> Self {
         Self::coded(code, message, details, GrpcCode::NotFound)
+    }
+}
+
+impl CodedError {
+    /// This business rejection carrying its typed refusal object (one of
+    /// the command's `refuses` types, packed).
+    pub fn with_refusal(self, refusal: prost_types::Any) -> Self {
+        // RED STUB: drops the refusal object.
+        let _ = refusal;
+        self
+    }
+
+    /// The refused saga's view of this answer (types.proto,
+    /// RefusalResponse): `Some` for a business rejection
+    /// (FAILED_PRECONDITION) only, carrying the typed refusal object and the
+    /// status message; `None` for every other failure, which never reaches
+    /// a saga's OnRefused (retried, or dead-lettered as a bug).
+    pub fn refusal_response(&self) -> Option<angzarr_proto::v1::RefusalResponse> {
+        todo!("red: a business rejection becomes the saga's RefusalResponse")
     }
 }
 

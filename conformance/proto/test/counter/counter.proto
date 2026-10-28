@@ -8,21 +8,20 @@ import "io/angzarr/v1/options.proto";
 // the generated clients must pass the SAME behavior suite as the hand-written
 // harness. Four components are declared here over one event so the
 // multi-consumer model is exercised hard — Increased folds into the aggregate,
-// folds the projector, folds the process manager's own state, AND triggers the
-// saga and the process manager.
+// folds the projector, AND triggers the saga. (No process manager: since
+// decision 14.31 a process manager is a domain fed commands by sagas, with no
+// triggers; the trigger-fed OrderProcessManager is deleted.)
 //
 // CounterAggregate is the smallest aggregate exercising every load-bearing
 // dispatch mechanism (per-page appliers, a handler with framework context in
 // and a book out, host state that never crosses, the coded-error path).
-// OrderSaga, CounterProjector, and OrderProcessManager add the
-// remaining three kinds. Behaviour is described once in features/ and run
+// OrderSaga and CounterProjector add two more kinds. Behaviour is described once in features/ and run
 // against every implementation.
 
 // --- event ---
 
-// Increased folds into the aggregate (count += 1), folds the projector and both
-// process managers' own states, and triggers the saga and both process
-// managers.
+// Increased folds into the aggregate (count += 1), folds the projector, and
+// triggers the saga.
 // One (event) entry per consuming component (multiple subscribers are modelled
 // as multiple components).
 message Increased {
@@ -33,14 +32,6 @@ message Increased {
   };
   option (io.angzarr.v1.event) = {
     component: "test.counter.CounterProjectorState"
-    domain: "counter"
-  };
-  option (io.angzarr.v1.event) = {
-    component: "test.counter.OrderProcessManagerState"
-    applies: true
-  };
-  option (io.angzarr.v1.event) = {
-    component: "test.counter.OrderProcessManagerState"
     domain: "counter"
   };
 }
@@ -64,8 +55,7 @@ message FailHard {
   option (io.angzarr.v1.command) = {component: "test.counter.CounterState"};
 }
 
-// Reserve is never handled by the aggregate; it is the command the saga and the
-// order process manager emit.
+// Reserve is never handled by the aggregate; it is the command the saga emits.
 message Reserve {}
 
 // --- aggregate ---
@@ -105,20 +95,3 @@ message CounterProjectorState {
   };
   uint32 count = 1;
 }
-
-// --- process manager ---
-
-// OrderProcessManager folds Increased into its own state (applies) AND reacts to
-// the newest Increased trigger from "counter" by emitting a Reserve
-// command for "inventory" plus one process event and one fact per prior state
-// event.
-message OrderProcessManagerState {
-  option (io.angzarr.v1.component) = {
-    kind: COMPONENT_KIND_PROCESS_MANAGER
-    domain: "order-pm"
-    output_domain: "inventory"
-    name: "OrderProcessManager"
-  };
-  uint32 count = 1;
-}
-

@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use angzarr_router::aggregate::{AggregateDispatch, FactRecord};
 use angzarr_router::error::{CodedError, HandlerError};
-use angzarr_router::process_manager::ProcessManagerDispatch;
 use angzarr_router::projector::ProjectorDispatch;
 use angzarr_router::rebuild::Rebuilder;
 use angzarr_router::saga::SagaDispatch;
@@ -286,140 +285,6 @@ pub fn saga_event_source(event_fq: &str, seq: u64) -> pb::EventBook {
 /// A saga source carrying no pages → EMPTY_SAGA_SOURCE.
 pub fn saga_empty_source() -> pb::EventBook {
     pb::EventBook::default()
-}
-
-// ---------------------------------------------------------------------------
-// The fixture: OrderProcessManager on the router core (stateful dispatch).
-// ---------------------------------------------------------------------------
-
-/// The PM's own event-sourced state. Host state — it never crosses the
-/// boundary; the harness reads reactions out of the response.
-#[derive(Default)]
-pub struct ProcessManagerState {
-    pub count: u32,
-}
-
-/// Build the OrderProcessManager dispatch table: over the "counter" domain it
-/// reacts to the NEWEST Increased trigger by emitting one Reserve command for
-/// "inventory" plus one unaddressed process event recording the count its
-/// rebuilt state held (an `OrderProcessManagerState`), so the rebuild is
-/// observable.
-pub fn order_pm() -> ProcessManagerDispatch<ProcessManagerState> {
-    let rebuilder = Rebuilder::new(ProcessManagerState::default).apply(
-        "test.counter.Increased",
-        |state: &mut ProcessManagerState, event| {
-            counter::Increased::decode(event.value.as_slice())?;
-            state.count += 1;
-            Ok(())
-        },
-    );
-
-    ProcessManagerDispatch::new("order-pm", "order-pm", ["inventory"], rebuilder).on_event(
-        "counter",
-        "test.counter.Increased",
-        |_event, state: &mut ProcessManagerState, _cover| {
-            let seen = counter::OrderProcessManagerState { count: state.count };
-            Ok(pb::ProcessManagerHandleResponse {
-                process_events: vec![process_event(&seen)],
-                commands: vec![reserve_command_to("inventory")],
-                ..Default::default()
-            })
-        },
-    )
-}
-
-/// One unaddressed process-event book whose single page carries `state`
-/// (payload only: the coordinator addresses and stamps it).
-fn process_event<M: prost::Message + prost::Name>(state: &M) -> pb::EventBook {
-    pb::EventBook {
-        pages: vec![pb::EventPage {
-            payload: Some(prost_types::Any {
-                type_url: angzarr_router::type_url(&M::full_name()),
-                value: state.encode_to_vec(),
-            }),
-            ..Default::default()
-        }],
-        ..Default::default()
-    }
-}
-
-/// The state a PM recorded in its process events, decoded as `M` from every
-/// page carrying `M`'s type: one entry per reacting PM of that kind.
-pub fn recorded_states<M: prost::Message + prost::Name + Default>(
-    resp: &pb::ProcessManagerHandleResponse,
-) -> Vec<M> {
-    resp.process_events
-        .iter()
-        .flat_map(|book| &book.pages)
-        .filter_map(|page| page.payload.as_ref())
-        .filter(|any| angzarr_router::type_name_from_url(&any.type_url) == M::full_name())
-        .map(|any| M::decode(any.value.as_slice()).expect("a recorded PM state"))
-        .collect()
-}
-
-/// A PM request whose trigger carries the given event pages in `domain`, the
-/// newest at sequence `newest_seq` when given. `process_state` is the PM's
-/// prior state book.
-pub fn pm_trigger_request(
-    domain: &str,
-    event_fqs: &[&str],
-    process_state: Option<pb::EventBook>,
-    newest_seq: Option<u64>,
-) -> pb::ProcessManagerHandleRequest {
-    let pages = event_fqs
-        .iter()
-        .map(|fq| pb::EventPage {
-            payload: Some(prost_types::Any {
-                type_url: angzarr_router::type_url(fq),
-                value: Vec::new(),
-            }),
-            ..Default::default()
-        })
-        .collect();
-    let mut pages: Vec<pb::EventPage> = pages;
-    if let (Some(seq), Some(last)) = (newest_seq, pages.last_mut()) {
-        last.sequence = seq;
-    }
-    pb::ProcessManagerHandleRequest {
-        trigger: Some(pb::EventBook {
-            cover: Some(pb::Cover {
-                domain: domain.to_string(),
-                ..Default::default()
-            }),
-            pages,
-            ..Default::default()
-        }),
-        process_state,
-    }
-}
-
-/// A PM request with an empty trigger book → EMPTY_PM_TRIGGER.
-pub fn pm_empty_trigger() -> pb::ProcessManagerHandleRequest {
-    pb::ProcessManagerHandleRequest {
-        trigger: Some(pb::EventBook::default()),
-        ..Default::default()
-    }
-}
-
-/// A PM request with no trigger at all → MISSING_PM_TRIGGER.
-pub fn pm_missing_trigger() -> pb::ProcessManagerHandleRequest {
-    pb::ProcessManagerHandleRequest {
-        trigger: None,
-        ..Default::default()
-    }
-}
-
-/// A PM process-state book of `n` Increased events (drives the rebuild).
-pub fn pm_state_of(n: u32) -> pb::EventBook {
-    pb::EventBook {
-        pages: (0..n)
-            .map(|_| pb::EventPage {
-                payload: Some(increased_any()),
-                ..Default::default()
-            })
-            .collect(),
-        ..Default::default()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -706,37 +571,6 @@ pub fn ledger_fact(fact: &str, prior: u64) -> pb::ContextualCommand {
         });
     }
     cc
-}
-
-/// The reserving process-manager (domain "reserving-pm", target
-/// "inventory") over CounterState (Increased folds count += 1): an Increased
-/// trigger from "counter" records the trigger cover and emits nothing.
-pub fn reserving_pm(seen: CoverSink) -> ProcessManagerDispatch<CounterState> {
-    ProcessManagerDispatch::new(
-        "Reserving",
-        "reserving-pm",
-        ["inventory"],
-        Rebuilder::of_message().apply("test.counter.Increased", |state: &mut CounterState, _| {
-            state.count += 1;
-            Ok(())
-        }),
-    )
-    .on_event("counter", "test.counter.Increased", move |_e, _s, cover| {
-        seen.lock().unwrap().push(cover.cloned());
-        Ok(pb::ProcessManagerHandleResponse::default())
-    })
-}
-
-/// An Increased trigger from "counter" root `label` at sequence `seq`.
-pub fn reserving_trigger(label: &str, seq: u64) -> pb::ProcessManagerHandleRequest {
-    pb::ProcessManagerHandleRequest {
-        trigger: Some(pb::EventBook {
-            cover: Some(cover_of("counter", label)),
-            pages: vec![increased_page(seq)],
-            ..Default::default()
-        }),
-        process_state: None,
-    }
 }
 
 /// (root bytes, sequence) pairs a projector fold observed.
@@ -1061,18 +895,19 @@ pub fn order_snapshot(items: &[&str], rules_version: &str) -> pb::Snapshot {
     }
 }
 
-/// The Fulfillment process manager at `rules_version`: it reacts to
-/// OrderPlaced from "order" with nothing.
-pub fn fulfillment_pm(rules_version: &str) -> ProcessManagerDispatch<orders::v1::FulfillmentState> {
+/// The Fulfillment process manager at `rules_version`: a domain (decision
+/// 14.31) whose StartFulfillment command, its starting input, records
+/// nothing.
+pub fn fulfillment_pm(rules_version: &str) -> AggregateDispatch<orders::v1::FulfillmentState> {
     fulfillment_pm_writing(rules_version, false)
 }
 
-/// [`fulfillment_pm`] that, when `writes`, reacts to OrderPlaced with one
-/// FulfillmentStarted process event, which counts into its state's `placed`.
+/// [`fulfillment_pm`] that, when `writes`, answers StartFulfillment with one
+/// FulfillmentStarted event, which counts into its state's `placed`.
 pub fn fulfillment_pm_writing(
     rules_version: &str,
     writes: bool,
-) -> ProcessManagerDispatch<orders::v1::FulfillmentState> {
+) -> AggregateDispatch<orders::v1::FulfillmentState> {
     let rebuilder = Rebuilder::of_message().apply(
         "orders.v1.FulfillmentStarted",
         |state: &mut orders::v1::FulfillmentState, _event| {
@@ -1080,25 +915,31 @@ pub fn fulfillment_pm_writing(
             Ok(())
         },
     );
-    ProcessManagerDispatch::new("Fulfillment", "fulfillment", ["shipping"], rebuilder)
+    AggregateDispatch::process_manager("Fulfillment", "fulfillment", rebuilder)
         .with_rules_version(rules_version)
-        .on_event("order", "orders.v1.OrderPlaced", move |_e, _s, _c| {
-            let process_events = if writes {
-                vec![pb::EventBook {
-                    pages: vec![pb::EventPage {
-                        payload: Some(orders_any(&orders::v1::FulfillmentStarted {})),
-                        ..Default::default()
-                    }],
+        .on_command("orders.v1.StartFulfillment", move |_c, _s, _ctx| {
+            Ok(writes.then(|| pb::EventBook {
+                pages: vec![pb::EventPage {
+                    payload: Some(orders_any(&orders::v1::FulfillmentStarted {})),
                     ..Default::default()
-                }]
-            } else {
-                Vec::new()
-            };
-            Ok(pb::ProcessManagerHandleResponse {
-                process_events,
+                }],
                 ..Default::default()
-            })
+            }))
         })
+        .starts("orders.v1.StartFulfillment")
+}
+
+/// A StartFulfillment command for the Fulfillment instance of correlation
+/// "order-1" (its root; decision 14.30), over no prior events.
+pub fn start_fulfillment() -> pb::ContextualCommand {
+    let mut book = order_command_for("fulfillment", "StartFulfillment");
+    book.cover.as_mut().expect("a cover").root = Some(pb::Uuid {
+        value: root_of("order-1").into(),
+    });
+    pb::ContextualCommand {
+        command: Some(book),
+        ..Default::default()
+    }
 }
 
 /// The Fulfillment process manager's state with `placed`, as its process
@@ -1137,21 +978,18 @@ pub fn order_command_for(domain: &str, command: &str) -> pb::CommandBook {
     }
 }
 
-/// An OrderPlaced trigger from "order".
-pub fn order_placed_trigger() -> pb::ProcessManagerHandleRequest {
-    pb::ProcessManagerHandleRequest {
-        trigger: Some(pb::EventBook {
-            cover: Some(pb::Cover {
-                domain: "order".to_string(),
-                ..Default::default()
-            }),
-            pages: vec![pb::EventPage {
-                payload: Some(orders_any(&orders::v1::OrderPlaced {})),
-                ..Default::default()
-            }],
+/// A saga source: one OrderPlaced event from "order".
+pub fn order_placed_source() -> pb::EventBook {
+    pb::EventBook {
+        cover: Some(pb::Cover {
+            domain: "order".to_string(),
             ..Default::default()
         }),
-        process_state: None,
+        pages: vec![pb::EventPage {
+            payload: Some(orders_any(&orders::v1::OrderPlaced {})),
+            ..Default::default()
+        }],
+        ..Default::default()
     }
 }
 

@@ -1,4 +1,15 @@
-//! AggregateDispatch — the command → events table.
+//! AggregateDispatch — a domain's command → events table: an aggregate's,
+//! or a process manager's, since a process manager is a domain (decision
+//! 14.31), served by the same table with its start rule
+//! ([`AggregateDispatch::process_manager`]).
+//!
+//! Two calls per input, both pure: [`AggregateDispatch::admit`] applies the
+//! rules an input meets before its handler runs (deduplication by its id,
+//! the edition fork rule, a process manager's start rule), from what the
+//! runtime read of the addressed stream; then
+//! [`AggregateDispatch::dispatch`] runs the handler. The runtime (annals'
+//! kernel, or core's coordinator) owns the store reads and writes between
+//! and after them.
 //!
 //! `CommandHandlerService.Handle` is the only input path: the body arm of the
 //! ContextualCommand's page picks the pipeline (Command → a command handler,
@@ -187,10 +198,64 @@ impl From<Any> for FactRecord {
 /// Generated thunks unmarshal to the typed fact and pack the typed result.
 pub type FactFn<S> = Box<dyn Fn(&Any, &S) -> Result<FactRecord, HandlerError> + Send + Sync>;
 
-/// The dispatch table for one aggregate component.
+/// What the runtime knows when an input reaches a domain, before its
+/// handler runs: the input and what it read of the addressed stream.
+#[derive(Debug, Clone, Copy)]
+pub struct Arrival<'a> {
+    /// The input as delivered: its cover names the addressed stream
+    /// (domain, edition, root); its identity is stamped (command_id; and
+    /// causation_id for a saga's command or a refusal fact).
+    pub command: &'a pb::CommandBook,
+    /// The events the addressed stream already holds under this input's id
+    /// ([`crate::input_id`]; the store's `find_command`), in sequence
+    /// order. Empty when none.
+    pub recorded: &'a [pb::EventPage],
+    /// The addressed stream, as read in the input's edition.
+    pub stream: StreamStatus,
+}
+
+/// The addressed stream as the runtime read it in the input's edition.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StreamStatus {
+    /// The stream holds any event, as read in the input's edition: for a
+    /// process manager, its instance exists (process_manager.proto,
+    /// Starting an instance).
+    pub exists: bool,
+    /// In a named edition: the stream has a fork there (decision 14.32).
+    /// Ignored for main, which is never forked.
+    pub forked: bool,
+    /// The stream's next sequence as read in the input's edition (main's
+    /// head, for a stream not forked there): the fork sequence of an
+    /// arrival fork.
+    pub next_sequence: u64,
+}
+
+/// What [`AggregateDispatch::admit`] decides for an input. A refusal is the
+/// `Err` beside it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Admission {
+    /// Run the handler ([`AggregateDispatch::dispatch`]).
+    Dispatch,
+    /// A saga's command reaching a stream with no fork in its edition: the
+    /// runtime appends this framework event at the stream's head, then
+    /// runs the handler (types.proto, EditionForked, Propagation).
+    /// `propagated_from` is left for the runtime, which knows the fork
+    /// event of the stream the saga reacted to.
+    Fork(pb::EditionForked),
+    /// Already applied: the runtime answers these events, DUPLICATE, and the
+    /// handler does not run (types.proto, the command_identity region).
+    Duplicate(Vec<pb::EventPage>),
+    /// A process manager's fact for a correlation with no instance, of a
+    /// type it does not declare as starting: skipped silently, answered
+    /// APPLIED with no events (process_manager.proto).
+    Skip,
+}
+
+/// The dispatch table for one domain: an aggregate or a process manager.
 pub struct AggregateDispatch<S> {
     name: String,
     domain: String,
+    kind: pb::ComponentKind,
     rebuilder: Rebuilder<S>,
     handlers: HashMap<String, CommandFn<S>>,
     facts: HashMap<String, FactFn<S>>,
@@ -209,6 +274,7 @@ impl<S> AggregateDispatch<S> {
         AggregateDispatch {
             name: name.into(),
             domain: domain.into(),
+            kind: pb::ComponentKind::Aggregate,
             rebuilder,
             handlers: HashMap::new(),
             facts: HashMap::new(),
@@ -216,6 +282,78 @@ impl<S> AggregateDispatch<S> {
             upcasters: Vec::new(),
             rules_version: String::new(),
         }
+    }
+
+    /// An empty process-manager table over a Rebuilder: a domain (decision
+    /// 14.31) whose inputs are commands and facts, whose only output is its
+    /// own events, whose root is its correlation id, and which declares its
+    /// starting inputs ([`Self::starts`]). Registered with kind
+    /// PROCESS_MANAGER and no inputs (it subscribes to nothing).
+    pub fn process_manager(
+        name: impl Into<String>,
+        domain: impl Into<String>,
+        rebuilder: Rebuilder<S>,
+    ) -> Self {
+        // RED STUB: registers as an aggregate.
+        Self::new(name, domain, rebuilder)
+    }
+
+    /// Declares a registered command or fact type (fully qualified) as one
+    /// that may start a process-manager instance (options.proto,
+    /// CommandOptions.starts; advertised as
+    /// ComponentDescriptor.starting_types). An aggregate declaring one is
+    /// refused at registration (STARTING_TYPES_ON_NON_PM).
+    pub fn starts(self, full_name: &str) -> Self {
+        // RED STUB: declares nothing.
+        let _ = full_name;
+        self
+    }
+
+    /// Registers the handler of a refusal fact passed through by one of the
+    /// domain's sagas: the standard `CommandRefused` whose refused command
+    /// is of the fully-qualified type `refused_command` (another domain's
+    /// command), the generated `on_refused_<Command>` dispatch (types.proto,
+    /// the refusal_facts region; decision 14.31). An ordinary, infallible
+    /// fact handler: it receives the decoded `CommandRefused` and records
+    /// its events. A `CommandRefused` for a command type with none is
+    /// NO_FACT_HANDLER.
+    pub fn on_refused(
+        self,
+        refused_command: &str,
+        thunk: impl Fn(&pb::CommandRefused, &S) -> Result<FactRecord, HandlerError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        // RED STUB: registers nothing.
+        let _ = (refused_command, thunk);
+        self
+    }
+
+    /// AGGREGATE or PROCESS_MANAGER.
+    pub fn kind(&self) -> pb::ComponentKind {
+        self.kind
+    }
+
+    /// The rules an input meets before its handler runs, decided from the
+    /// [`Arrival`] alone (no I/O), in order:
+    /// 1. validation: a refusal fact (a Fact with causation_id) is accepted
+    ///    only by the exact stream its causation_id names
+    ///    (REFUSAL_FACT_WRONG_STREAM); an input to a process manager whose
+    ///    set correlation_id differs from its cover's root is malformed
+    ///    (PM_CORRELATION_NOT_ROOT);
+    /// 2. deduplication: events already recorded under the input's id are
+    ///    [`Admission::Duplicate`];
+    /// 3. editions: in a named edition, a stream with no fork there takes a
+    ///    saga's command by forking ([`Admission::Fork`]) and refuses any
+    ///    other input FAILED_PRECONDITION, EDITION_NOT_FORKED;
+    /// 4. a process manager's start rule, by the input's type after
+    ///    upcasting: with no instance, a starting type is dispatched; any
+    ///    other command is refused FAILED_PRECONDITION, PM_NO_INSTANCE, and
+    ///    any other fact is [`Admission::Skip`].
+    pub fn admit(&self, arrival: &Arrival<'_>) -> Result<Admission, CodedError> {
+        let _ = arrival;
+        todo!("red: the rules an input meets before its handler runs")
     }
 
     /// The rules version reported on every response
@@ -242,6 +380,7 @@ impl<S> AggregateDispatch<S> {
                 self.rebuilder.state_type_url(),
                 self.commutative.is_some(),
             )?),
+            Vec::new(),
         )
     }
 
@@ -646,3 +785,7 @@ fn non_empty_payload(payload: Option<&Any>) -> Result<&Any, CodedError> {
 #[cfg(test)]
 #[path = "aggregate.test.rs"]
 mod aggregate_tests;
+
+#[cfg(test)]
+#[path = "admit.test.rs"]
+mod admit_tests;

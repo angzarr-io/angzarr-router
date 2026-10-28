@@ -125,3 +125,52 @@ fn rejection_details_travel_as_extras() {
     );
     assert_eq!(err.extras.get("input").map(String::as_str), Some("0"));
 }
+
+// --- typed refusals (decision 14.31; types.proto RefusalResponse) ---------------
+
+fn typed_refusal() -> prost_types::Any {
+    prost_types::Any {
+        type_url: "/test.wallet.InsufficientFunds".to_string(),
+        value: vec![8, 100, 16, 150],
+    }
+}
+
+#[test]
+fn a_business_rejection_becomes_the_sagas_refusal_response() {
+    let err = CodedError::rejection_precondition_failed("INSUFFICIENT_FUNDS", "holds 100", [])
+        .with_refusal(typed_refusal());
+    assert_eq!(err.grpc, GrpcCode::FailedPrecondition, "still a rejection");
+    assert_eq!(
+        err.refusal_response(),
+        Some(angzarr_proto::v1::RefusalResponse {
+            refusal: Some(typed_refusal()),
+            message: "holds 100".to_string(),
+        })
+    );
+}
+
+#[test]
+fn a_rejection_without_a_typed_refusal_still_reaches_the_saga() {
+    let err = CodedError::rejection_precondition_failed("CLOSED", "the wallet is closed", []);
+    assert_eq!(
+        err.refusal_response(),
+        Some(angzarr_proto::v1::RefusalResponse {
+            refusal: None,
+            message: "the wallet is closed".to_string(),
+        })
+    );
+}
+
+// Only a business rejection (FAILED_PRECONDITION) reaches OnRefused; anything
+// else is retried or dead-lettered as a bug.
+#[test]
+fn only_a_business_rejection_reaches_on_refused() {
+    for err in [
+        CodedError::rejection_invalid_argument("BAD", "bad", []),
+        CodedError::rejection_not_found("GONE", "gone", []),
+        CodedError::unhandled("boom"),
+        CodedError::stale(codes::CONFLICT_OVERLAP, messages::CONFLICT_OVERLAP, []),
+    ] {
+        assert_eq!(err.refusal_response(), None, "{}", err.code);
+    }
+}

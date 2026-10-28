@@ -10,9 +10,12 @@
 //! chain accepts one of its own current types is DUPLICATE_COMMAND_HANDLER.
 //! The built [`Router`] dispatches to that component:
 //!
-//! - a command or a fact (a page's Fact arm) to the aggregate;
-//! - a saga source to the saga, when it comes from the saga's input domain;
-//! - a process-manager request to the process manager;
+//! - a command or a fact (a page's Fact arm) to the domain: an aggregate, or
+//!   a process manager, which is a domain (decision 14.31) served the same
+//!   way, after [`Router::admit`] has applied the rules a domain's input
+//!   meets before its handler runs;
+//! - a saga source to the saga, when it comes from the saga's input domain,
+//!   and a refusal of one of its commands to the saga's OnRefused;
 //! - an EventBook to the projector, one Projection;
 //! - an UpcastRequest for the chain's domain through the component's chain,
 //!   each rule's output feeding the next (C-0136); other requests pass
@@ -21,18 +24,31 @@
 //! The component may be registered boxed (`Box<dyn CommandHandler>` and so
 //! on). Transport (gRPC servers), health and readiness stay with the host.
 
-use crate::aggregate::AggregateDispatch;
+use crate::aggregate::{Admission, AggregateDispatch, Arrival};
 use crate::error::{codes, extras, messages, CodedError};
 use crate::pb;
-use crate::process_manager::ProcessManagerDispatch;
 use crate::projector::ProjectorDispatch;
 use crate::saga::SagaDispatch;
 use crate::upcaster::UpcasterDispatch;
 
-/// An aggregate as the router sees it, whatever its state type.
+/// A domain (an aggregate or a process manager; decision 14.31) as the
+/// router sees it, whatever its state type.
 pub trait CommandHandler: Send + Sync {
     /// The component's name.
     fn name(&self) -> &str;
+    /// AGGREGATE or PROCESS_MANAGER.
+    fn kind(&self) -> pb::ComponentKind {
+        pb::ComponentKind::Aggregate
+    }
+    /// The rules an input meets before its handler runs (deduplication,
+    /// editions, a process manager's start rule): [`AggregateDispatch::admit`].
+    /// A hand-written domain gets the framework's rules for a domain with
+    /// no start rule (validation, deduplication, editions); it never
+    /// reimplements them.
+    fn admit(&self, arrival: &Arrival<'_>) -> Result<Admission, CodedError> {
+        let _ = arrival;
+        todo!("red: a hand-written domain meets the framework's rules")
+    }
     /// The fully-qualified command types it handles.
     fn command_types(&self) -> Vec<String>;
     /// The fully-qualified types its upcaster chains accept (none by
@@ -59,6 +75,12 @@ impl<T: CommandHandler + ?Sized> CommandHandler for Box<T> {
     fn name(&self) -> &str {
         (**self).name()
     }
+    fn kind(&self) -> pb::ComponentKind {
+        (**self).kind()
+    }
+    fn admit(&self, arrival: &Arrival<'_>) -> Result<Admission, CodedError> {
+        (**self).admit(arrival)
+    }
     fn command_types(&self) -> Vec<String> {
         (**self).command_types()
     }
@@ -83,6 +105,12 @@ impl<S> CommandHandler for AggregateDispatch<S> {
     fn name(&self) -> &str {
         AggregateDispatch::name(self)
     }
+    fn kind(&self) -> pb::ComponentKind {
+        AggregateDispatch::kind(self)
+    }
+    fn admit(&self, arrival: &Arrival<'_>) -> Result<Admission, CodedError> {
+        AggregateDispatch::admit(self, arrival)
+    }
     fn command_types(&self) -> Vec<String> {
         AggregateDispatch::command_types(self)
     }
@@ -100,49 +128,6 @@ impl<S> CommandHandler for AggregateDispatch<S> {
     }
     fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError> {
         AggregateDispatch::component_descriptor(self)
-    }
-}
-
-/// A process manager as the router sees it, whatever its state type.
-pub trait ProcessManagerHandler: Send + Sync {
-    /// The component's name.
-    fn name(&self) -> &str;
-    /// `ProcessManagerService.Handle`.
-    fn dispatch(
-        &self,
-        req: &pb::ProcessManagerHandleRequest,
-    ) -> Result<pb::ProcessManagerHandleResponse, CodedError>;
-    /// The registration hello (types.proto, ComponentDescriptor).
-    fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError>;
-}
-
-impl<T: ProcessManagerHandler + ?Sized> ProcessManagerHandler for Box<T> {
-    fn name(&self) -> &str {
-        (**self).name()
-    }
-    fn dispatch(
-        &self,
-        req: &pb::ProcessManagerHandleRequest,
-    ) -> Result<pb::ProcessManagerHandleResponse, CodedError> {
-        (**self).dispatch(req)
-    }
-    fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError> {
-        (**self).component_descriptor()
-    }
-}
-
-impl<S> ProcessManagerHandler for ProcessManagerDispatch<S> {
-    fn name(&self) -> &str {
-        ProcessManagerDispatch::name(self)
-    }
-    fn dispatch(
-        &self,
-        req: &pb::ProcessManagerHandleRequest,
-    ) -> Result<pb::ProcessManagerHandleResponse, CodedError> {
-        ProcessManagerDispatch::dispatch(self, req)
-    }
-    fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError> {
-        ProcessManagerDispatch::component_descriptor(self)
     }
 }
 
@@ -184,7 +169,6 @@ impl<P> ProjectorHandler for ProjectorDispatch<P> {
 enum Component {
     Aggregate(Box<dyn CommandHandler>),
     Saga(SagaDispatch),
-    ProcessManager(Box<dyn ProcessManagerHandler>),
     Projector(Box<dyn ProjectorHandler>),
 }
 
@@ -193,16 +177,14 @@ impl Component {
         match self {
             Component::Aggregate(c) => c.name(),
             Component::Saga(c) => c.name(),
-            Component::ProcessManager(c) => c.name(),
             Component::Projector(c) => c.name(),
         }
     }
 
     fn kind(&self) -> pb::ComponentKind {
         match self {
-            Component::Aggregate(_) => pb::ComponentKind::Aggregate,
+            Component::Aggregate(c) => c.kind(),
             Component::Saga(_) => pb::ComponentKind::Saga,
-            Component::ProcessManager(_) => pb::ComponentKind::ProcessManager,
             Component::Projector(_) => pb::ComponentKind::Projector,
         }
     }
@@ -255,11 +237,10 @@ impl RouterBuilder {
         self
     }
 
-    /// Hosts a process manager.
-    pub fn process_manager(mut self, pm: impl ProcessManagerHandler + 'static) -> Self {
-        self.components
-            .push(Component::ProcessManager(Box::new(pm)));
-        self
+    /// Hosts a process manager: a domain (decision 14.31), hosted as an
+    /// aggregate is ([`AggregateDispatch::process_manager`]).
+    pub fn process_manager(self, pm: impl CommandHandler + 'static) -> Self {
+        self.aggregate(pm)
     }
 
     /// Hosts a projector.
@@ -333,12 +314,37 @@ impl Router {
         match &self.component {
             Component::Aggregate(aggregate) => aggregate.component_descriptor(),
             Component::Saga(saga) => saga.component_descriptor(),
-            Component::ProcessManager(pm) => pm.component_descriptor(),
             Component::Projector(projector) => projector.component_descriptor(),
         }
     }
 
-    /// Handles a command or a fact with the aggregate.
+    /// The rules the domain's input meets before its handler runs
+    /// ([`AggregateDispatch::admit`]): the runtime calls it first, acts on
+    /// the [`Admission`] (appending a fork, answering a duplicate or a
+    /// skip), and only then reads the stream and calls
+    /// [`Self::dispatch_command`].
+    pub fn admit(&self, arrival: &Arrival<'_>) -> Result<Admission, CodedError> {
+        match &self.component {
+            Component::Aggregate(domain) => domain.admit(arrival),
+            _ => Err(wrong_kind()),
+        }
+    }
+
+    /// The saga's OnRefused (saga.proto): the refusal fact for its own
+    /// source domain, passed through or translated
+    /// ([`SagaDispatch::dispatch_refusal`]).
+    pub fn dispatch_refusal(
+        &self,
+        refusal: &pb::Refusal,
+    ) -> Result<pb::OnRefusedResponse, CodedError> {
+        match &self.component {
+            Component::Saga(saga) => saga.dispatch_refusal(refusal),
+            _ => Err(wrong_kind()),
+        }
+    }
+
+    /// Handles a command or a fact with the domain (an aggregate or a
+    /// process manager).
     pub fn dispatch_command(
         &self,
         req: &pb::ContextualCommand,
@@ -365,17 +371,6 @@ impl Router {
             ));
         }
         saga.dispatch(source)
-    }
-
-    /// Handles a trigger with the process manager.
-    pub fn dispatch_process_manager(
-        &self,
-        req: &pb::ProcessManagerHandleRequest,
-    ) -> Result<pb::ProcessManagerHandleResponse, CodedError> {
-        match &self.component {
-            Component::ProcessManager(pm) => pm.dispatch(req),
-            _ => Err(wrong_kind()),
-        }
     }
 
     /// Runs the projector over the book: one Projection.

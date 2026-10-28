@@ -166,3 +166,96 @@ pub fn assert_fold_failed(
         Some(state_type_url)
     );
 }
+
+// --- the buy-in workflow (decision 14.31's example, cut down) ---------------
+//
+// A "buyin" process manager, a "wallet" aggregate and the sagas between
+// them: the PM records BuyInStarted; the saga (buyin -> wallet) turns it
+// into HoldFunds; the wallet may refuse HoldFunds with the typed refusal
+// InsufficientFunds; the refusal comes back to the buy-in as a fact.
+
+macro_rules! test_message {
+    ($name:ident, $package:literal { $($field:ident : $ty:ty = $tag:literal),* }) => {
+        #[derive(Clone, PartialEq, prost::Message)]
+        pub struct $name {
+            $(#[prost(uint32, tag = $tag)] pub $field: $ty,)*
+        }
+        impl prost::Name for $name {
+            const NAME: &'static str = stringify!($name);
+            const PACKAGE: &'static str = $package;
+        }
+    };
+}
+
+test_message!(StartBuyIn, "test.buyin" { amount: u32 = "1" });
+test_message!(RecordFundsHeld, "test.buyin" { amount: u32 = "1" });
+test_message!(BuyInStarted, "test.buyin" { amount: u32 = "1" });
+test_message!(BuyInFailed, "test.buyin" { requested: u32 = "1" });
+test_message!(BuyInTimedOut, "test.buyin" {});
+test_message!(FundsUnavailable, "test.buyin" { available: u32 = "1" });
+test_message!(HoldFunds, "test.wallet" { amount: u32 = "1" });
+test_message!(ReleaseFunds, "test.wallet" { amount: u32 = "1" });
+test_message!(InsufficientFunds, "test.wallet" { available: u32 = "1", requested: u32 = "2" });
+
+/// The fully-qualified name of a test message.
+pub fn fq<M: prost::Name>() -> String {
+    M::full_name()
+}
+
+/// A stream's cover: `domain`, `edition` (None for main), root `root`.
+pub fn stream(domain: &str, edition: Option<&str>, root: u8) -> pb::Cover {
+    pb::Cover {
+        domain: domain.to_string(),
+        root: Some(uuid_of(root)),
+        edition: edition.map(str::to_string),
+    }
+}
+
+/// A command book addressed to `cover`, its Command arm carrying `command`,
+/// with command_id `id`.
+pub fn command_book(cover: pb::Cover, command: Any, id: u8) -> pb::CommandBook {
+    let mut page = command_page(command);
+    page.command_id = Some(uuid_of(id));
+    pb::CommandBook {
+        cover: Some(cover),
+        page: Some(page),
+        ..Default::default()
+    }
+}
+
+/// A fact book addressed to `cover`, its Fact arm carrying `fact`, from the
+/// external id `external_id` (command_id left for the runtime to derive).
+pub fn fact_book(cover: pb::Cover, fact: Any, external_id: &str) -> pb::CommandBook {
+    let mut page = fact_page(fact);
+    page.fact_origin = Some(pb::FactOrigin {
+        external_id: external_id.to_string(),
+        ..Default::default()
+    });
+    pb::CommandBook {
+        cover: Some(cover),
+        page: Some(page),
+        ..Default::default()
+    }
+}
+
+/// `book` as a saga's command: caused by the event at `sequence` of
+/// `trigger`.
+pub fn caused_by(mut book: pb::CommandBook, trigger: pb::Cover, sequence: u64) -> pb::CommandBook {
+    book.page.as_mut().unwrap().causation_id = Some(pb::EventRef {
+        stream: Some(trigger),
+        sequence,
+    });
+    book
+}
+
+/// An event page at `sequence` recorded by the command `command_id`.
+pub fn recorded_page(sequence: u64, event: Any, command_id: u8) -> pb::EventPage {
+    pb::EventPage {
+        payload: Some(event),
+        sequence,
+        meta: Some(pb::EventMeta {
+            causation: Some(pb::event_meta::Causation::CommandId(uuid_of(command_id))),
+            ..Default::default()
+        }),
+    }
+}

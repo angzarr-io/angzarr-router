@@ -33,10 +33,6 @@ name = "saga"
 harness = false
 
 [[test]]
-name = "process_manager"
-harness = false
-
-[[test]]
 name = "context"
 harness = false
 

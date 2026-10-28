@@ -4,8 +4,8 @@
 //!
 //! Spec governing each group (angzarr-project spec/20261019-draft):
 //! - rules version: types.proto EventMeta.rules_version,
-//!   command_handler.proto CommandHandlerResponse.rules_version,
-//!   process_manager.proto ProcessManagerHandleResponse.rules_version;
+//!   command_handler.proto CommandHandlerResponse.rules_version (a process
+//!   manager's too: it is a domain, decision 14.31);
 //!   decision 12.6; backlog RV-2.
 //! - conflict delivery: types.proto Handling, ConflictResolution,
 //!   ContextualCommand.conflict_nonce; decision 12.7; backlog HD-5, NC-1.
@@ -28,7 +28,6 @@ use crate::aggregate::{AggregateDispatch, CommandContext};
 use crate::conflict::overlap;
 use crate::error::{codes, GrpcCode};
 use crate::pb;
-use crate::process_manager::ProcessManagerDispatch;
 use crate::rebuild::Rebuilder;
 use crate::test_support::*;
 use crate::type_url;
@@ -566,8 +565,8 @@ fn a_type_with_no_handler_and_no_upcaster_path_is_refused_naming_the_sent_type()
 
 // --- the rules version every response reports -------------------------------
 //
-// command_handler.proto CommandHandlerResponse.rules_version and
-// process_manager.proto ProcessManagerHandleResponse.rules_version: "the
+// command_handler.proto CommandHandlerResponse.rules_version (every domain's,
+// a process manager's included; decision 14.31): "the
 // client library fills it from the domain's declaration on every response"
 // (decision 12.6; backlog RV-2). Owner ruling: the binary's full baked
 // version string; snapshot validity is the coordinator's, not the router's.
@@ -595,97 +594,4 @@ fn an_undeclared_rules_version_reports_empty() {
         .dispatch(&strict("a", &[]))
         .expect("command");
     assert_eq!(resp.rules_version, "");
-}
-
-fn shipped(domain: &str) -> pb::ProcessManagerHandleRequest {
-    pb::ProcessManagerHandleRequest {
-        trigger: Some(pb::EventBook {
-            cover: Some(pb::Cover {
-                domain: domain.to_string(),
-                ..Default::default()
-            }),
-            pages: vec![event_page(Any {
-                type_url: type_url("test.Shipped"),
-                value: Vec::new(),
-            })],
-            ..Default::default()
-        }),
-        process_state: None,
-    }
-}
-
-#[test]
-fn every_process_manager_response_reports_the_rules_version() {
-    let pm = ProcessManagerDispatch::new("pm", "pm", ["inventory"], fresh_rebuilder())
-        .with_rules_version(RULES)
-        .on_event("orders", "test.Shipped", |_e, _s, _c| {
-            Ok(pb::ProcessManagerHandleResponse::default())
-        });
-    assert_eq!(
-        pm.dispatch(&shipped("orders"))
-            .expect("handled")
-            .rules_version,
-        RULES
-    );
-    assert_eq!(
-        pm.dispatch(&shipped("billing"))
-            .expect("outside the sources")
-            .rules_version,
-        RULES,
-        "even a trigger the PM does not consume"
-    );
-}
-
-#[test]
-// Owner ruling: the router always sets the declared version, overwriting a
-// handler's.
-fn a_process_manager_handlers_rules_version_is_overwritten() {
-    let pm = ProcessManagerDispatch::new("pm", "pm", ["inventory"], fresh_rebuilder()).on_event(
-        "orders",
-        "test.Shipped",
-        |_e, _s, _c| {
-            Ok(pb::ProcessManagerHandleResponse {
-                rules_version: "from-the-handler".to_string(),
-                ..Default::default()
-            })
-        },
-    );
-    assert_eq!(
-        pm.dispatch(&shipped("orders"))
-            .expect("handled")
-            .rules_version,
-        "",
-        "none declared: the declared (empty) version still wins"
-    );
-    let pm = pm.with_rules_version(RULES);
-    assert_eq!(pm.rules_version(), RULES);
-    assert_eq!(
-        pm.dispatch(&shipped("orders"))
-            .expect("handled")
-            .rules_version,
-        RULES
-    );
-}
-
-// A router answers its PM's version even for a trigger the PM does not
-// consume.
-#[test]
-fn a_router_of_a_process_manager_reports_the_version_for_an_unconsumed_trigger() {
-    let router = crate::router::RouterBuilder::new()
-        .process_manager(
-            ProcessManagerDispatch::new("pm", "pm", ["inventory"], fresh_rebuilder())
-                .with_rules_version(RULES)
-                .on_event("orders", "test.Shipped", |_e, _s, _c| {
-                    Ok(pb::ProcessManagerHandleResponse::default())
-                }),
-        )
-        .build()
-        .expect("build");
-    assert_eq!(
-        router
-            .dispatch_process_manager(&shipped("billing"))
-            .expect("no PM consumes billing")
-            .rules_version,
-        RULES
-    );
 }
