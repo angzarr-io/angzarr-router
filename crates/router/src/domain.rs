@@ -4,12 +4,17 @@
 //! ([`DomainDispatch::process_manager`]).
 //!
 //! Two calls per input, both pure: [`DomainDispatch::admit`] applies the
-//! rules an input meets before its handler runs (deduplication by its id,
-//! the edition fork rule, a process manager's start rule), from what the
-//! runtime read of the addressed stream; then
+//! rules an input meets before its handler runs (deduplication by its id, a
+//! process manager's start rule), from what the runtime read of the
+//! addressed stream; then
 //! [`DomainDispatch::dispatch`] runs the handler. The runtime (annals'
 //! kernel, or core's coordinator) owns the store reads and writes between
 //! and after them.
+//!
+//! The router never sees a meta-event and has no edition-lifecycle outcome
+//! (owner ruling, 2026-10-28): creating, forking, refusing an unforked or
+//! deleted edition's arrival and deleting are the runtime's, decided before
+//! it calls the router.
 //!
 //! `CommandHandlerService.Handle` is the only input path: the body arm of the
 //! ContextualCommand's page picks the pipeline (Command → a command handler,
@@ -222,51 +227,21 @@ pub struct StreamStatus {
     /// process manager, its instance exists (process_manager.proto,
     /// Starting an instance).
     pub exists: bool,
-    /// In a named edition: the stream has a fork there (decision 14.32).
-    /// Ignored for main, which is never forked.
-    pub forked: bool,
-    /// The stream's next sequence as read in the input's edition (main's
-    /// head, for a stream not forked there): the fork sequence of an
-    /// arrival fork.
-    pub next_sequence: u64,
-    /// The input's edition is deleted, or being deleted: a stream of it
-    /// holds an EditionDeleted, or none of its EditionCreated remains (the
-    /// store's knowledge, from its rows alone; meta/events.proto,
-    /// EditionDeleted).
-    pub edition_deleted: bool,
-    /// THIS stream has recorded its own EditionDeleted, or its rows of the
-    /// edition are already removed.
-    pub deleted: bool,
 }
 
 /// What [`DomainDispatch::admit`] decides for an input. A refusal is the
-/// `Err` beside it.
+/// `Err` beside it. No edition-lifecycle outcome: those are the runtime's.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Admission {
     /// Run the handler ([`DomainDispatch::dispatch`]).
     Dispatch,
-    /// A policy's command reaching a stream with no fork in its edition: the
-    /// runtime appends this framework event at the stream's head, then
-    /// runs the handler (types.proto, meta.EditionCreated, Propagation).
-    /// `propagated_from` is left for the runtime, which knows the fork
-    /// event of the stream the policy reacted to.
-    Fork(pb::meta::EditionCreated),
     /// Already applied: the runtime answers these events, DUPLICATE, and the
     /// handler does not run (types.proto, the command_identity region).
     Duplicate(Vec<pb::EventPage>),
     /// A process manager's fact for a correlation with no instance, of a
     /// type it does not declare as starting: skipped silently, answered
-    /// APPLIED with no events (process_manager.proto). Also a carried
-    /// deletion reaching a stream with nothing of the edition left to delete.
+    /// APPLIED with no events (process_manager.proto).
     Skip,
-    /// A policy carrying an edition's deletion onward reached a stream of
-    /// that edition (meta/events.proto, EditionDeleted): the runtime records
-    /// this meta-event at the stream's head, after its earlier work; then
-    /// carries it onward through the domain's policy flows
-    /// ([`crate::policy::PolicyDispatch::carry_deletion`]); and only once it
-    /// has propagated removes the stream's rows of the edition (the store's
-    /// `remove_deleted`). No handler runs.
-    Delete(pb::meta::EditionDeleted),
 }
 
 /// Handles a passed-through refusal (the standard `CommandRefused`) of one
@@ -381,10 +356,7 @@ impl<S> DomainDispatch<S> {
     ///    (PM_CORRELATION_NOT_ROOT);
     /// 2. deduplication: events already recorded under the input's id are
     ///    [`Admission::Duplicate`];
-    /// 3. editions: in a named edition, a stream with no fork there takes a
-    ///    policy's command by forking ([`Admission::Fork`]) and refuses any
-    ///    other input FAILED_PRECONDITION, EDITION_NOT_FORKED;
-    /// 4. a process manager's start rule, by the input's type after
+    /// 3. a process manager's start rule, by the input's type after
     ///    upcasting: with no instance, a starting type is dispatched; any
     ///    other command is refused FAILED_PRECONDITION, PM_NO_INSTANCE, and
     ///    any other fact is [`Admission::Skip`].
@@ -867,69 +839,12 @@ pub fn admit_rules(
         }
     }
 
-    // A deletion a policy carried (meta.EditionDeleted): recorded by a
-    // stream of the edition even while the edition is being deleted; no
-    // start rule, no fork.
-    let carried_deletion = !is_fact
-        && page.causation_id.is_some()
-        && edition.is_some()
-        && crate::type_name_from_url(&sent.type_url) == crate::edition_deleted_name();
-    if carried_deletion {
-        if !arrival.recorded.is_empty() {
-            return Ok(Admission::Duplicate(arrival.recorded.to_vec()));
-        }
-        if !arrival.stream.forked || arrival.stream.deleted {
-            return Ok(Admission::Skip);
-        }
-        let deleted = pb::meta::EditionDeleted::decode(sent.value.as_slice()).map_err(|_| {
-            CodedError::invalid_argument(
-                codes::ANY_DECODE_FAILED,
-                "failed to decode EditionDeleted",
-                [(extras::TYPE_URL.to_string(), sent.type_url.clone())],
-            )
-        })?;
-        return Ok(Admission::Delete(pb::meta::EditionDeleted {
-            deleted_by: page.command_id.clone(),
-            ..deleted
-        }));
-    }
-
-    // After deletion, any other arrival in the edition is refused: it does
-    // not exist, and the arrival re-creates nothing.
-    if edition.is_some() && arrival.stream.edition_deleted {
-        return Err(CodedError::rejection_not_found(
-            codes::EDITION_NOT_FOUND,
-            messages::EDITION_NOT_FOUND,
-            [(extras::DOMAIN.to_string(), cover.domain.clone())],
-        ));
-    }
-
     // 2. Deduplication.
     if !arrival.recorded.is_empty() {
         return Ok(Admission::Duplicate(arrival.recorded.to_vec()));
     }
 
-    // 3. Editions: a policy's input (one with a causation_id) forks the stream
-    // on arrival; any other is refused until the stream is forked.
-    let fork = match edition {
-        Some(edition) if !arrival.stream.forked => {
-            if page.causation_id.is_none() {
-                return Err(CodedError::rejection_precondition_failed(
-                    codes::EDITION_NOT_FORKED,
-                    messages::EDITION_NOT_FORKED,
-                    [(extras::DOMAIN.to_string(), cover.domain.clone())],
-                ));
-            }
-            Some(arrival_fork(
-                edition,
-                arrival.stream.next_sequence,
-                page.command_id.clone(),
-            ))
-        }
-        _ => None,
-    };
-
-    // 4. A process manager's start rule.
+    // 3. A process manager's start rule.
     if let Some(starts) = start_rule {
         if !arrival.stream.exists && !starts(sent)? {
             if is_fact {
@@ -943,22 +858,7 @@ pub fn admit_rules(
         }
     }
 
-    Ok(fork.map_or(Admission::Dispatch, Admission::Fork))
-}
-
-/// The fork a policy's input makes on arriving at a stream with no fork in
-/// its edition (types.proto, meta.EditionCreated, Propagation): at the stream's
-/// head, `forked_by` the arriving input's id. `propagated_from` is the
-/// runtime's to fill. The one place the router builds the fork event, so
-/// the spec's coming rename of it is a change here.
-fn arrival_fork(edition: &str, head: u64, forked_by: Option<pb::Uuid>) -> pb::meta::EditionCreated {
-    pb::meta::EditionCreated {
-        edition: edition.to_string(),
-        parent_sequence: head,
-        commit_position: 0,
-        propagated_from: None,
-        forked_by,
-    }
+    Ok(Admission::Dispatch)
 }
 
 /// The conflict window: the pages at or after `expected` (types.proto,

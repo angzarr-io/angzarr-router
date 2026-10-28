@@ -10,7 +10,6 @@
 //!   options.proto CommandOptions.starts; decision 14.31 (Start rule).
 //! - deduplication: types.proto, the command_identity region
 //!   (Deduplication); decision 14.31 (Identity).
-//! - editions: types.proto Cover.edition and meta.EditionCreated; decision 14.32.
 //! - the refusal fact's exact stream: types.proto, the command_identity
 //!   region (Validation); decision 14.31 ("The exact stream").
 //!
@@ -107,12 +106,7 @@ fn arrival<'a>(command: &'a pb::CommandBook, stream: StreamStatus) -> Arrival<'a
 }
 
 fn existing() -> StreamStatus {
-    StreamStatus {
-        exists: true,
-        forked: false,
-        next_sequence: 3,
-        ..Default::default()
-    }
+    StreamStatus { exists: true }
 }
 
 fn absent() -> StreamStatus {
@@ -407,127 +401,6 @@ fn a_facts_id_derives_from_its_external_id() {
     );
 }
 
-// --- editions: per-stream forks (decision 14.32) ------------------------------------
-
-#[test]
-fn an_outside_command_to_a_stream_not_forked_in_its_edition_is_refused() {
-    let command = command_book(
-        stream("wallet", Some("what-if"), 1),
-        any_of(&HoldFunds { amount: 5 }),
-        9,
-    );
-    refused(
-        wallet()
-            .admit(&arrival(&command, existing()))
-            .expect_err("not forked"),
-        codes::EDITION_NOT_FORKED,
-        GrpcCode::FailedPrecondition,
-    );
-}
-
-#[test]
-fn an_outside_fact_to_a_stream_not_forked_in_its_edition_is_refused() {
-    let fact = fact_book(
-        stream("buyin", Some("what-if"), INSTANCE),
-        any_of(&BuyInTimedOut {}),
-        "timer-1",
-    );
-    refused(
-        buyin()
-            .admit(&arrival(&fact, existing()))
-            .expect_err("not forked"),
-        codes::EDITION_NOT_FORKED,
-        GrpcCode::FailedPrecondition,
-    );
-}
-
-// The fork travels with the data: a policy's command in X forks its target at
-// the target's own head, then is handled.
-#[test]
-fn a_policies_command_forks_its_target_on_arrival() {
-    let command = caused_by(
-        command_book(
-            stream("wallet", Some("what-if"), 1),
-            any_of(&HoldFunds { amount: 5 }),
-            9,
-        ),
-        stream("buyin", Some("what-if"), INSTANCE),
-        0,
-    );
-    assert_eq!(
-        wallet()
-            .admit(&arrival(&command, existing()))
-            .expect("forked"),
-        Admission::Fork(pb::meta::EditionCreated {
-            edition: "what-if".to_string(),
-            parent_sequence: 3,
-            commit_position: 0,
-            propagated_from: None,
-            forked_by: Some(uuid_of(9)),
-        })
-    );
-}
-
-// Nothing is PM-specific: a policy's starting command forks a PM's stream too.
-#[test]
-fn a_policies_command_forks_a_process_manager_like_any_domain() {
-    let command = caused_by(
-        command_book(
-            stream("buyin", Some("what-if"), INSTANCE),
-            any_of(&StartBuyIn { amount: 5 }),
-            4,
-        ),
-        stream("table", Some("what-if"), 2),
-        6,
-    );
-    assert!(matches!(
-        buyin().admit(&arrival(&command, absent())),
-        Ok(Admission::Fork(pb::meta::EditionCreated {
-            parent_sequence: 0,
-            ..
-        }))
-    ));
-}
-
-#[test]
-fn a_stream_forked_in_the_edition_takes_any_input() {
-    let command = command_book(
-        stream("wallet", Some("what-if"), 1),
-        any_of(&HoldFunds { amount: 5 }),
-        9,
-    );
-    let forked = StreamStatus {
-        forked: true,
-        ..existing()
-    };
-    assert_eq!(
-        wallet()
-            .admit(&arrival(&command, forked))
-            .expect("admitted"),
-        Admission::Dispatch
-    );
-}
-
-// Main is never forked, and a policy's command in main forks nothing.
-#[test]
-fn main_is_never_forked() {
-    let command = caused_by(
-        command_book(
-            stream("wallet", None, 1),
-            any_of(&HoldFunds { amount: 5 }),
-            9,
-        ),
-        stream("buyin", None, INSTANCE),
-        0,
-    );
-    assert_eq!(
-        wallet()
-            .admit(&arrival(&command, existing()))
-            .expect("admitted"),
-        Admission::Dispatch
-    );
-}
-
 // --- refusal facts at their source --------------------------------------------------
 
 /// The refusal fact a policy (buyin -> wallet) delivers to the buy-in when
@@ -637,4 +510,38 @@ fn a_passed_through_refusal_of_a_command_with_no_handler_is_no_fact_handler() {
         })
         .expect_err("no handler");
     assert_eq!(err.code, codes::NO_FACT_HANDLER);
+}
+
+// --- no edition-lifecycle outcome (owner ruling, 2026-10-28) -----------------
+
+// The router never sees a meta-event: creating, forking, refusing an
+// arrival in an unforked or deleted edition, and deleting are the runtime's,
+// decided before it calls the router. So admit answers Dispatch, Duplicate
+// or Skip (or a refusal), and the runtime tells it only whether the stream
+// exists. Both matches are exhaustive with no wildcard: an edition outcome
+// or input added back fails to compile here.
+#[test]
+fn admit_has_no_edition_lifecycle_outcome() {
+    fn outcome(admission: &Admission) -> &'static str {
+        match admission {
+            Admission::Dispatch => "dispatch",
+            Admission::Duplicate(_) => "duplicate",
+            Admission::Skip => "skip",
+        }
+    }
+    let StreamStatus { exists: _ } = StreamStatus::default();
+
+    // An input in an edition is admitted exactly as one in main: the router
+    // neither forks nor refuses it for its edition.
+    for edition in [None, Some("what-if")] {
+        let command = command_book(
+            stream("wallet", edition, 1),
+            any_of(&HoldFunds { amount: 5 }),
+            9,
+        );
+        let admitted = wallet()
+            .admit(&arrival(&command, absent()))
+            .expect("admitted");
+        assert_eq!(outcome(&admitted), "dispatch", "{edition:?}");
+    }
 }

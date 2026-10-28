@@ -408,25 +408,20 @@ fn a_hand_written_aggregate_builds_a_router() {
 }
 
 // A hand-written domain meets the framework's rules without reimplementing
-// them: an outside command to a stream not forked in its edition is refused
-// (decision 14.32).
+// them: a command already recorded under its id is a duplicate.
 #[test]
 fn a_hand_written_aggregate_meets_the_framework_rules() {
     let mut book = command("plain", "test.Plain").command.unwrap();
-    book.cover.as_mut().unwrap().edition = Some("what-if".to_string());
-    let err = Plain
+    book.page.as_mut().unwrap().command_id = Some(crate::test_support::uuid_of(9));
+    let recorded = vec![event_page(any_of_type("test.Plained"))];
+    let admission = Plain
         .admit(&crate::domain::Arrival {
             command: &book,
-            recorded: &[],
-            stream: crate::domain::StreamStatus {
-                exists: true,
-                forked: false,
-                next_sequence: 1,
-                ..Default::default()
-            },
+            recorded: &recorded,
+            stream: crate::domain::StreamStatus { exists: true },
         })
-        .expect_err("not forked");
-    assert_eq!(err.code, codes::EDITION_NOT_FORKED);
+        .expect("admitted");
+    assert_eq!(admission, crate::domain::Admission::Duplicate(recorded));
 }
 
 // --- the aggregate's own upcaster chain ---------------------------------------

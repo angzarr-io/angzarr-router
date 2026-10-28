@@ -87,20 +87,15 @@ fn run(policy: PolicyDispatch, edition: Option<&str>) -> pb::EventPage {
     let pm = buyin();
     let instance = stream("buyin", edition, INSTANCE);
 
-    // 1. The PM starts: a client's StartBuyIn to an instance forked in the
-    //    edition (or in main).
+    // 1. The PM starts: a client's StartBuyIn to a new instance, in the
+    //    edition (forked by the runtime) or in main.
     let start = command_book(instance.clone(), any_of(&StartBuyIn { amount: 150 }), 1);
-    let forked = StreamStatus {
-        exists: false,
-        forked: true,
-        next_sequence: 0,
-        ..Default::default()
-    };
+    let new_instance = StreamStatus { exists: false };
     assert_eq!(
         pm.admit(&Arrival {
             command: &start,
             recorded: &[],
-            stream: forked,
+            stream: new_instance,
         })
         .expect("a starting command"),
         Admission::Dispatch
@@ -123,28 +118,26 @@ fn run(policy: PolicyDispatch, edition: Option<&str>) -> pb::EventPage {
     trigger.pages[0].sequence = 0;
     let sent = policy.dispatch(&trigger).expect("translated").commands;
     assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0].cover.as_ref().and_then(|c| c.edition.as_deref()),
+        edition,
+        "a policy's command stays in its trigger's edition"
+    );
     let mut hold = caused_by(sent[0].clone(), instance.clone(), 0);
     let page = hold.page.as_mut().unwrap();
     page.command_id = Some(uuid_of(9));
     page.correlation_id = Some(uuid_of(INSTANCE));
 
-    // 3. The wallet: a policy's command forks it in the edition, then refuses.
+    // 3. The wallet (forked in the edition by the runtime, which owns
+    //    edition lifecycle) refuses.
     let admission = wallet()
         .admit(&Arrival {
             command: &hold,
             recorded: &[],
-            stream: StreamStatus {
-                exists: true,
-                forked: false,
-                next_sequence: 12,
-                ..Default::default()
-            },
+            stream: StreamStatus { exists: true },
         })
         .expect("admitted");
-    match edition {
-        Some(_) => assert!(matches!(admission, Admission::Fork(_)), "{admission:?}"),
-        None => assert_eq!(admission, Admission::Dispatch),
-    }
+    assert_eq!(admission, Admission::Dispatch);
     let refused = wallet()
         .dispatch(&pb::ContextualCommand {
             command: Some(hold.clone()),
@@ -168,12 +161,7 @@ fn run(policy: PolicyDispatch, edition: Option<&str>) -> pb::EventPage {
         pm.admit(&Arrival {
             command: &fact,
             recorded: &[],
-            stream: StreamStatus {
-                exists: true,
-                forked: true,
-                next_sequence: 1,
-                ..Default::default()
-            },
+            stream: StreamStatus { exists: true },
         })
         .expect("its own stream"),
         Admission::Dispatch
@@ -220,8 +208,9 @@ fn a_refusal_is_translated_for_the_policies_source_in_process() {
     );
 }
 
-// The same chain in an edition: the policy's command forks the wallet on
-// arrival, and the refusal fact returns to the buy-in's stream in the edition.
+// The same chain in an edition: the policy's command stays in its trigger's
+// edition, and the refusal fact returns to the buy-in's stream in the
+// edition. (Forking the wallet there is the runtime's.)
 #[test]
 fn the_refusal_path_stays_in_its_edition() {
     let recorded = run(buyin_wallet(), Some(EDITION));
