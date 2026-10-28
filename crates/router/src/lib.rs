@@ -93,8 +93,18 @@ pub fn fact_payload(page: &pb::CommandPage) -> Option<&Any> {
 /// use angzarr_router::process_manager::ProcessManagerDispatch;
 /// ```
 pub fn input_id(book: &pb::CommandBook) -> Option<pb::Uuid> {
-    let _ = book;
-    todo!("red: an input's deduplication key")
+    let page = book.page.as_ref()?;
+    if let Some(id) = page.command_id.as_ref() {
+        return Some(id.clone());
+    }
+    match &page.body {
+        Some(pb::command_page::Body::Fact(_)) => page
+            .fact_origin
+            .as_ref()
+            .filter(|origin| !origin.external_id.is_empty())
+            .map(|origin| angzarr_proto::ids::fact_command_id(&origin.external_id)),
+        _ => None,
+    }
 }
 
 /// An upcaster chain a command handler runs on incoming command and fact

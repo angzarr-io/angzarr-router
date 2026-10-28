@@ -46,8 +46,7 @@ pub trait CommandHandler: Send + Sync {
     /// no start rule (validation, deduplication, editions); it never
     /// reimplements them.
     fn admit(&self, arrival: &Arrival<'_>) -> Result<Admission, CodedError> {
-        let _ = arrival;
-        todo!("red: a hand-written domain meets the framework's rules")
+        crate::domain::admit_rules(arrival, None)
     }
     /// The fully-qualified command types it handles.
     fn command_types(&self) -> Vec<String>;

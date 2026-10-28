@@ -18,9 +18,10 @@
 //! unknown command must report NO_HANDLER_REGISTERED, not whatever the
 //! rebuild would surface). There is no compensation input.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
+use prost::Message;
 use prost_types::Any;
 
 use crate::error::{codes, extras, map_handler_error, messages, CodedError, HandlerError};
@@ -251,6 +252,20 @@ pub enum Admission {
     Skip,
 }
 
+/// Handles a passed-through refusal (the standard `CommandRefused`) of one
+/// refused command type against the rebuilt state: the source domain's
+/// `on_refused_<Command>`.
+pub type RefusedFn<S> =
+    Box<dyn Fn(&pb::CommandRefused, &S) -> Result<FactRecord, HandlerError> + Send + Sync>;
+
+/// One fact handler, bound to its input: records it against the state.
+type RecordFn<'a, S> = Box<dyn Fn(&S) -> Result<FactRecord, CodedError> + 'a>;
+
+/// A process manager's start rule: whether an input payload (as sent) is of
+/// a type that may start an instance, judged after upcasting. `None` for an
+/// aggregate, which has none.
+pub type StartRule<'a> = Option<&'a dyn Fn(&Any) -> Result<bool, CodedError>>;
+
 /// The dispatch table for one domain: an aggregate or a process manager.
 pub struct DomainDispatch<S> {
     name: String,
@@ -259,6 +274,8 @@ pub struct DomainDispatch<S> {
     rebuilder: Rebuilder<S>,
     handlers: HashMap<String, CommandFn<S>>,
     facts: HashMap<String, FactFn<S>>,
+    refused: HashMap<String, RefusedFn<S>>,
+    starting: BTreeSet<String>,
     commutative: Option<Box<dyn Resolver<S>>>,
     upcasters: Vec<Box<dyn crate::PayloadUpcaster>>,
     rules_version: String,
@@ -278,6 +295,8 @@ impl<S> DomainDispatch<S> {
             rebuilder,
             handlers: HashMap::new(),
             facts: HashMap::new(),
+            refused: HashMap::new(),
+            starting: BTreeSet::new(),
             commutative: None,
             upcasters: Vec::new(),
             rules_version: String::new(),
@@ -294,8 +313,10 @@ impl<S> DomainDispatch<S> {
         domain: impl Into<String>,
         rebuilder: Rebuilder<S>,
     ) -> Self {
-        // RED STUB: registers as an aggregate.
-        Self::new(name, domain, rebuilder)
+        DomainDispatch {
+            kind: pb::ComponentKind::ProcessManager,
+            ..Self::new(name, domain, rebuilder)
+        }
     }
 
     /// Declares a registered command or fact type (fully qualified) as one
@@ -303,9 +324,8 @@ impl<S> DomainDispatch<S> {
     /// CommandOptions.starts; advertised as
     /// ComponentDescriptor.starting_types). An aggregate declaring one is
     /// refused at registration (STARTING_TYPES_ON_NON_PM).
-    pub fn starts(self, full_name: &str) -> Self {
-        // RED STUB: declares nothing.
-        let _ = full_name;
+    pub fn starts(mut self, full_name: &str) -> Self {
+        self.starting.insert(full_name.to_string());
         self
     }
 
@@ -318,15 +338,15 @@ impl<S> DomainDispatch<S> {
     /// its events. A `CommandRefused` for a command type with none is
     /// NO_FACT_HANDLER.
     pub fn on_refused(
-        self,
+        mut self,
         refused_command: &str,
         thunk: impl Fn(&pb::CommandRefused, &S) -> Result<FactRecord, HandlerError>
             + Send
             + Sync
             + 'static,
     ) -> Self {
-        // RED STUB: registers nothing.
-        let _ = (refused_command, thunk);
+        self.refused
+            .insert(refused_command.to_string(), Box::new(thunk));
         self
     }
 
@@ -352,8 +372,16 @@ impl<S> DomainDispatch<S> {
     ///    other command is refused FAILED_PRECONDITION, PM_NO_INSTANCE, and
     ///    any other fact is [`Admission::Skip`].
     pub fn admit(&self, arrival: &Arrival<'_>) -> Result<Admission, CodedError> {
-        let _ = arrival;
-        todo!("red: the rules an input meets before its handler runs")
+        if self.kind != pb::ComponentKind::ProcessManager {
+            return admit_rules(arrival, None);
+        }
+        let starts = |sent: &Any| -> Result<bool, CodedError> {
+            let any = self.upcast(sent)?;
+            Ok(self
+                .starting
+                .contains(crate::type_name_from_url(&any.type_url)))
+        };
+        admit_rules(arrival, Some(&starts))
     }
 
     /// The rules version reported on every response
@@ -370,9 +398,16 @@ impl<S> DomainDispatch<S> {
     /// the state type its rebuilder declares. Refused MISSING_RULES_VERSION
     /// without a rules version, MISSING_STATE_TYPE without a state type.
     pub fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError> {
+        if self.kind != pb::ComponentKind::ProcessManager && !self.starting.is_empty() {
+            return Err(CodedError::invalid_argument(
+                codes::STARTING_TYPES_ON_NON_PM,
+                messages::STARTING_TYPES_ON_NON_PM,
+                [(extras::COMPONENT.to_string(), self.name.clone())],
+            ));
+        }
         crate::descriptor::component_descriptor(
             &self.name,
-            pb::ComponentKind::Aggregate,
+            self.kind,
             [],
             &self.rules_version,
             Some(crate::descriptor::state_descriptor(
@@ -380,7 +415,7 @@ impl<S> DomainDispatch<S> {
                 self.rebuilder.state_type_url(),
                 self.commutative.is_some(),
             )?),
-            Vec::new(),
+            self.starting.iter().cloned().collect(),
         )
     }
 
@@ -549,11 +584,44 @@ impl<S> DomainDispatch<S> {
             Some(pb::command_page::Body::Fact(fact)) => {
                 let sent = non_empty_payload(fact.payload.as_ref())?;
                 let any = self.upcast(sent)?;
-                let Some(thunk) = self.facts.get(crate::type_name_from_url(&any.type_url)) else {
-                    return Err(self.unknown(codes::NO_FACT_HANDLER, sent, &any));
+                let fact_type = crate::type_name_from_url(&any.type_url);
+                let record_with: RecordFn<'_, S> = match self.facts.get(fact_type) {
+                    Some(thunk) => {
+                        let any = any.clone();
+                        Box::new(move |state| thunk(&any, state).map_err(map_handler_error))
+                    }
+                    None if fact_type == <pb::CommandRefused as prost::Name>::full_name() => {
+                        let refused =
+                            pb::CommandRefused::decode(any.value.as_slice()).map_err(|_| {
+                                CodedError::invalid_argument(
+                                    codes::ANY_DECODE_FAILED,
+                                    "failed to decode CommandRefused",
+                                    [(extras::TYPE_URL.to_string(), any.type_url.clone())],
+                                )
+                            })?;
+                        let refused_type = refused
+                            .command
+                            .as_ref()
+                            .and_then(|b| b.page.as_ref())
+                            .and_then(crate::command_payload)
+                            .map(|p| p.type_url.clone())
+                            .unwrap_or_default();
+                        let Some(thunk) =
+                            self.refused.get(crate::type_name_from_url(&refused_type))
+                        else {
+                            return Err(CodedError::unknown_type(
+                                codes::NO_FACT_HANDLER,
+                                &sent.type_url,
+                                &any.type_url,
+                                [(extras::COMMAND_TYPE.to_string(), refused_type)],
+                            ));
+                        };
+                        Box::new(move |state| thunk(&refused, state).map_err(map_handler_error))
+                    }
+                    None => return Err(self.unknown(codes::NO_FACT_HANDLER, sent, &any)),
                 };
                 let (mut state, _) = self.rebuilder.rebuild(req.events.as_ref())?;
-                let record = thunk(&any, &state).map_err(map_handler_error)?;
+                let record = record_with(&state)?;
                 let recorded = pb::EventBook {
                     pages: std::iter::once(record.fact)
                         .chain(record.flags)
@@ -729,6 +797,113 @@ impl<S> DomainDispatch<S> {
                 Ok((out, state))
             }
         }
+    }
+}
+
+/// The rules every domain's input meets before its handler runs
+/// ([`DomainDispatch::admit`]), with a process manager's `start_rule`
+/// (`None` for an aggregate, or a hand-written domain with no start rule).
+pub fn admit_rules(
+    arrival: &Arrival<'_>,
+    start_rule: StartRule<'_>,
+) -> Result<Admission, CodedError> {
+    let book = arrival.command;
+    let Some(page) = book.page.as_ref() else {
+        return Err(CodedError::invalid_argument(
+            codes::MISSING_COMMAND_PAGE,
+            messages::NO_COMMAND_PAGES,
+            [],
+        ));
+    };
+    let (is_fact, sent) = match &page.body {
+        Some(pb::command_page::Body::Command(c)) => (false, c.payload.as_ref()),
+        Some(pb::command_page::Body::Fact(f)) => (true, f.payload.as_ref()),
+        None => (false, None),
+    };
+    let sent = non_empty_payload(sent)?;
+    let cover = book.cover.clone().unwrap_or_default();
+    let edition = cover.edition.as_deref().filter(|e| !e.is_empty());
+
+    // 1. Validation.
+    if let (true, Some(cause)) = (is_fact, page.causation_id.as_ref()) {
+        let named = cause.stream.clone().unwrap_or_default();
+        let same = named.domain == cover.domain
+            && named.root == cover.root
+            && named.edition.as_deref().filter(|e| !e.is_empty()) == edition;
+        if !same {
+            return Err(CodedError::invalid_argument(
+                codes::REFUSAL_FACT_WRONG_STREAM,
+                messages::REFUSAL_FACT_WRONG_STREAM,
+                [(extras::DOMAIN.to_string(), cover.domain.clone())],
+            ));
+        }
+    }
+    if start_rule.is_some() {
+        if let Some(correlation) = page.correlation_id.as_ref() {
+            if Some(correlation) != cover.root.as_ref() {
+                return Err(CodedError::invalid_argument(
+                    codes::PM_CORRELATION_NOT_ROOT,
+                    messages::PM_CORRELATION_NOT_ROOT,
+                    [(extras::DOMAIN.to_string(), cover.domain.clone())],
+                ));
+            }
+        }
+    }
+
+    // 2. Deduplication.
+    if !arrival.recorded.is_empty() {
+        return Ok(Admission::Duplicate(arrival.recorded.to_vec()));
+    }
+
+    // 3. Editions: a saga's input (one with a causation_id) forks the stream
+    // on arrival; any other is refused until the stream is forked.
+    let fork = match edition {
+        Some(edition) if !arrival.stream.forked => {
+            if page.causation_id.is_none() {
+                return Err(CodedError::rejection_precondition_failed(
+                    codes::EDITION_NOT_FORKED,
+                    messages::EDITION_NOT_FORKED,
+                    [(extras::DOMAIN.to_string(), cover.domain.clone())],
+                ));
+            }
+            Some(arrival_fork(
+                edition,
+                arrival.stream.next_sequence,
+                page.command_id.clone(),
+            ))
+        }
+        _ => None,
+    };
+
+    // 4. A process manager's start rule.
+    if let Some(starts) = start_rule {
+        if !arrival.stream.exists && !starts(sent)? {
+            if is_fact {
+                return Ok(Admission::Skip);
+            }
+            return Err(CodedError::rejection_precondition_failed(
+                codes::PM_NO_INSTANCE,
+                messages::PM_NO_INSTANCE,
+                [(extras::TYPE_URL.to_string(), sent.type_url.clone())],
+            ));
+        }
+    }
+
+    Ok(fork.map_or(Admission::Dispatch, Admission::Fork))
+}
+
+/// The fork a saga's input makes on arriving at a stream with no fork in
+/// its edition (types.proto, EditionForked, Propagation): at the stream's
+/// head, `forked_by` the arriving input's id. `propagated_from` is the
+/// runtime's to fill. The one place the router builds the fork event, so
+/// the spec's coming rename of it is a change here.
+fn arrival_fork(edition: &str, head: u64, forked_by: Option<pb::Uuid>) -> pb::EditionForked {
+    pb::EditionForked {
+        edition: edition.to_string(),
+        parent_sequence: head,
+        commit_position: 0,
+        propagated_from: None,
+        forked_by,
     }
 }
 

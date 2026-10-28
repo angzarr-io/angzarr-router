@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 
+use prost::{Message, Name};
 use prost_types::Any;
 
 use crate::error::{codes, extras, map_handler_error, messages, CodedError, HandlerError};
@@ -47,6 +48,7 @@ pub struct SagaDispatch {
     input_domain: String,
     output_domain: String,
     handlers: HashMap<String, EventFn>,
+    refusals: HashMap<String, RefusalFn>,
     rules_version: String,
 }
 
@@ -64,6 +66,7 @@ impl SagaDispatch {
             input_domain: input_domain.into(),
             output_domain: output_domain.into(),
             handlers: HashMap::new(),
+            refusals: HashMap::new(),
             rules_version: String::new(),
         }
     }
@@ -101,12 +104,11 @@ impl SagaDispatch {
     /// Refusals). Its presence IS translate mode for that command; a refused
     /// command of a type with none is passed through.
     pub fn on_refused(
-        self,
+        mut self,
         command: &str,
         thunk: impl Fn(&pb::Refusal) -> Result<Any, HandlerError> + Send + Sync + 'static,
     ) -> Self {
-        // RED STUB: registers nothing.
-        let _ = (command, thunk);
+        self.refusals.insert(command.to_string(), Box::new(thunk));
         self
     }
 
@@ -122,8 +124,50 @@ impl SagaDispatch {
         &self,
         refusal: &pb::Refusal,
     ) -> Result<pb::OnRefusedResponse, CodedError> {
-        let _ = refusal;
-        todo!("red: OnRefused answers the refusal fact")
+        let missing = |what: &str| {
+            CodedError::invalid_argument(
+                codes::MISSING_COMMAND_BOOK,
+                &format!("a refusal carries its {what}"),
+                [],
+            )
+        };
+        let command = refusal.command.as_ref().ok_or_else(|| missing("command"))?;
+        let event = refusal.event.as_ref().ok_or_else(|| missing("event"))?;
+        let refused_type = command
+            .page
+            .as_ref()
+            .and_then(crate::command_payload)
+            .map(|p| crate::type_name_from_url(&p.type_url).to_string())
+            .unwrap_or_default();
+        let payload = match self.refusals.get(&refused_type) {
+            Some(translate) => translate(refusal).map_err(map_handler_error)?,
+            None => {
+                let trigger = pb::EventRef {
+                    stream: event.cover.clone(),
+                    sequence: event.pages.last().map_or(0, |p| p.sequence),
+                };
+                let fact = pb::CommandRefused {
+                    command: Some(command.clone()),
+                    refusal: refusal.response.as_ref().and_then(|r| r.refusal.clone()),
+                    trigger: Some(trigger),
+                };
+                Any {
+                    type_url: crate::type_url(&pb::CommandRefused::full_name()),
+                    value: fact.encode_to_vec(),
+                }
+            }
+        };
+        Ok(pb::OnRefusedResponse {
+            fact: Some(pb::CommandBook {
+                page: Some(pb::CommandPage {
+                    body: Some(pb::command_page::Body::Fact(pb::Fact {
+                        payload: Some(payload),
+                    })),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        })
     }
 
     /// The rules version the saga registers with: the business binary's
@@ -207,6 +251,32 @@ impl SagaDispatch {
             if let Some(stray) = commands.iter().find(|c| self.outside_destination(c)) {
                 return Err(self.refuse_outside_destination(stray));
             }
+            let edition = source
+                .cover
+                .as_ref()
+                .and_then(|c| c.edition.clone())
+                .filter(|e| !e.is_empty());
+            let mut commands = commands;
+            for command in &mut commands {
+                let cover = command.cover.get_or_insert_with(Default::default);
+                match cover.edition.as_deref().filter(|e| !e.is_empty()) {
+                    None => cover.edition = edition.clone(),
+                    Some(named) if Some(named) != edition.as_deref() => {
+                        return Err(CodedError::internal(
+                            codes::SAGA_COMMAND_OUTSIDE_EDITION,
+                            messages::SAGA_COMMAND_OUTSIDE_EDITION,
+                            [
+                                (
+                                    extras::EXPECTED_EDITION.to_string(),
+                                    edition.clone().unwrap_or_default(),
+                                ),
+                                (extras::ACTUAL_EDITION.to_string(), named.to_string()),
+                            ],
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            }
             resp.commands.extend(commands);
         }
 
@@ -249,8 +319,56 @@ pub fn address_refusal_fact(
     refusal: &pb::Refusal,
     answer: &pb::OnRefusedResponse,
 ) -> Result<pb::CommandBook, CodedError> {
-    let _ = (refusal, answer);
-    todo!("red: the refusal fact goes to the trigger's exact stream under the refused command's id")
+    let malformed = |why: &str| {
+        CodedError::internal(
+            codes::MALFORMED_REFUSAL_FACT,
+            messages::MALFORMED_REFUSAL_FACT,
+            [(extras::REASON.to_string(), why.to_string())],
+        )
+    };
+    let fact = answer.fact.as_ref().ok_or_else(|| malformed("no fact"))?;
+    if fact.cover.is_some() || fact.handling.is_some() {
+        return Err(malformed("the saga set the fact's cover or handling"));
+    }
+    let page = fact.page.as_ref().ok_or_else(|| malformed("no page"))?;
+    if crate::fact_payload(page).is_none() {
+        return Err(malformed("the page is not a Fact"));
+    }
+    if page.command_id.is_some()
+        || page.correlation_id.is_some()
+        || page.causation_id.is_some()
+        || page.fact_origin.is_some()
+    {
+        return Err(malformed("the saga set the fact's identity"));
+    }
+    let refused = refusal
+        .command
+        .as_ref()
+        .and_then(|c| c.page.as_ref())
+        .ok_or_else(|| malformed("the refusal carries no refused command"))?;
+    let command_id = refused
+        .command_id
+        .clone()
+        .ok_or_else(|| malformed("the refused command carries no command_id"))?;
+    let trigger = refusal
+        .event
+        .as_ref()
+        .and_then(|e| e.cover.clone())
+        .ok_or_else(|| malformed("the refusal carries no triggering stream"))?;
+    Ok(pb::CommandBook {
+        cover: Some(trigger),
+        page: Some(pb::CommandPage {
+            body: page.body.clone(),
+            fact_origin: Some(pb::FactOrigin {
+                external_id: command_id.to_string(),
+                ..Default::default()
+            }),
+            command_id: Some(command_id),
+            correlation_id: refused.correlation_id.clone(),
+            causation_id: refused.causation_id.clone(),
+        }),
+        handling: None,
+    })
 }
 
 #[cfg(test)]

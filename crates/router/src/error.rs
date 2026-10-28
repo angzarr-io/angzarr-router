@@ -46,6 +46,10 @@ pub mod codes {
     /// ruling, 2026-10-28; types.proto Cover.edition: a saga stays in the
     /// edition of the event it handles).
     pub const SAGA_COMMAND_OUTSIDE_EDITION: &str = "SAGA_COMMAND_OUTSIDE_EDITION";
+    /// A saga's OnRefused answer that is not a bare Fact (no cover, no
+    /// identity, no Handling), or a refusal lacking what addressing it needs
+    /// (saga.proto, OnRefusedResponse): a saga bug.
+    pub const MALFORMED_REFUSAL_FACT: &str = "MALFORMED_REFUSAL_FACT";
     /// An input from outside (not a saga's) addressed in an edition to a
     /// stream with no fork there (types.proto, Cover.edition; decision 14.32).
     pub const EDITION_NOT_FORKED: &str = "EDITION_NOT_FORKED";
@@ -89,6 +93,8 @@ pub mod messages {
     pub const FOLD_FAILED_EMITTED: &str = "the state fold failed on an event this command emitted";
     pub const SAGA_COMMAND_OUTSIDE_EDITION: &str =
         "a saga answered a command for an edition other than its trigger's";
+    pub const MALFORMED_REFUSAL_FACT: &str =
+        "a saga's refusal fact must be a bare Fact, addressed and identified by its runtime";
     pub const EDITION_NOT_FORKED: &str =
         "the stream has no fork in the edition; fork it, or let a saga's command reach it";
     pub const PM_NO_INSTANCE: &str =
@@ -115,6 +121,9 @@ pub mod extras {
     pub const COMPONENT_KIND: &str = "component_kind";
     pub const EXPECTED_DOMAIN: &str = "expected_domain";
     pub const ACTUAL_DOMAIN: &str = "actual_domain";
+    pub const EXPECTED_EDITION: &str = "expected_edition";
+    pub const ACTUAL_EDITION: &str = "actual_edition";
+    pub const REASON: &str = "reason";
     pub const FIRST_SEQUENCE: &str = "first_sequence";
     pub const LAST_SEQUENCE: &str = "last_sequence";
     pub const FOLD_MESSAGE: &str = "fold_message";
@@ -338,9 +347,10 @@ impl CodedError {
     /// This business rejection carrying its typed refusal object (one of
     /// the command's `refuses` types, packed).
     pub fn with_refusal(self, refusal: prost_types::Any) -> Self {
-        // RED STUB: drops the refusal object.
-        let _ = refusal;
-        self
+        CodedError {
+            refusal: Some(Box::new(refusal)),
+            ..self
+        }
     }
 
     /// The refused saga's view of this answer (types.proto,
@@ -349,7 +359,10 @@ impl CodedError {
     /// status message; `None` for every other failure, which never reaches
     /// a saga's OnRefused (retried, or dead-lettered as a bug).
     pub fn refusal_response(&self) -> Option<angzarr_proto::v1::RefusalResponse> {
-        todo!("red: a business rejection becomes the saga's RefusalResponse")
+        (self.grpc == GrpcCode::FailedPrecondition).then(|| angzarr_proto::v1::RefusalResponse {
+            refusal: self.refusal.as_deref().cloned(),
+            message: self.message.clone(),
+        })
     }
 }
 
