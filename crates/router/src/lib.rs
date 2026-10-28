@@ -111,8 +111,16 @@ pub fn input_id(book: &pb::CommandBook) -> Option<pb::Uuid> {
 /// one in the reserved `io.angzarr.v1.meta` namespace. Business handlers
 /// never see one.
 pub fn is_meta_event(type_url: &str) -> bool {
-    let _ = type_url;
-    todo!("red: the meta-event namespace")
+    type_name_from_url(type_url).starts_with(META_EVENT_PREFIX)
+}
+
+/// The fully-qualified-name prefix of every framework meta-event.
+const META_EVENT_PREFIX: &str = "io.angzarr.v1.meta.";
+
+/// The fully-qualified name of the edition-deletion meta-event, the one
+/// place the router names it.
+pub(crate) fn edition_deleted_name() -> String {
+    <pb::meta::EditionDeleted as prost::Name>::full_name()
 }
 
 /// An upcaster chain a command handler runs on incoming command and fact

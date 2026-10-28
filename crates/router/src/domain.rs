@@ -867,6 +867,43 @@ pub fn admit_rules(
         }
     }
 
+    // A deletion a policy carried (meta.EditionDeleted): recorded by a
+    // stream of the edition even while the edition is being deleted; no
+    // start rule, no fork.
+    let carried_deletion = !is_fact
+        && page.causation_id.is_some()
+        && edition.is_some()
+        && crate::type_name_from_url(&sent.type_url) == crate::edition_deleted_name();
+    if carried_deletion {
+        if !arrival.recorded.is_empty() {
+            return Ok(Admission::Duplicate(arrival.recorded.to_vec()));
+        }
+        if !arrival.stream.forked || arrival.stream.deleted {
+            return Ok(Admission::Skip);
+        }
+        let deleted = pb::meta::EditionDeleted::decode(sent.value.as_slice()).map_err(|_| {
+            CodedError::invalid_argument(
+                codes::ANY_DECODE_FAILED,
+                "failed to decode EditionDeleted",
+                [(extras::TYPE_URL.to_string(), sent.type_url.clone())],
+            )
+        })?;
+        return Ok(Admission::Delete(pb::meta::EditionDeleted {
+            deleted_by: page.command_id.clone(),
+            ..deleted
+        }));
+    }
+
+    // After deletion, any other arrival in the edition is refused: it does
+    // not exist, and the arrival re-creates nothing.
+    if edition.is_some() && arrival.stream.edition_deleted {
+        return Err(CodedError::rejection_not_found(
+            codes::EDITION_NOT_FOUND,
+            messages::EDITION_NOT_FOUND,
+            [(extras::DOMAIN.to_string(), cover.domain.clone())],
+        ));
+    }
+
     // 2. Deduplication.
     if !arrival.recorded.is_empty() {
         return Ok(Admission::Duplicate(arrival.recorded.to_vec()));

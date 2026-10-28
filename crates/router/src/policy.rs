@@ -237,11 +237,14 @@ impl PolicyDispatch {
             let Some(event_any) = crate::page_event(page) else {
                 continue;
             };
+            if crate::is_meta_event(&event_any.type_url) {
+                continue; // business code never sees a meta-event (14.32)
+            }
             let Some(thunk) = self
                 .handlers
                 .get(crate::type_name_from_url(&event_any.type_url))
             else {
-                continue; // policy only reacts to declared types (spec C-0051)
+                continue; // a policy handles only its declared types (spec C-0051)
             };
             let context = PageContext {
                 cover: source.cover.as_ref(),
@@ -262,16 +265,9 @@ impl PolicyDispatch {
                 match cover.edition.as_deref().filter(|e| !e.is_empty()) {
                     None => cover.edition = edition.clone(),
                     Some(named) if Some(named) != edition.as_deref() => {
-                        return Err(CodedError::internal(
-                            codes::POLICY_COMMAND_OUTSIDE_EDITION,
-                            messages::POLICY_COMMAND_OUTSIDE_EDITION,
-                            [
-                                (
-                                    extras::EXPECTED_EDITION.to_string(),
-                                    edition.clone().unwrap_or_default(),
-                                ),
-                                (extras::ACTUAL_EDITION.to_string(), named.to_string()),
-                            ],
+                        return Err(refuse_outside_edition(
+                            edition.as_deref().unwrap_or_default(),
+                            named,
                         ));
                     }
                     Some(_) => {}
@@ -324,9 +320,75 @@ impl PolicyDispatch {
         source: &pb::EventBook,
         targets: &[pb::Cover],
     ) -> Result<Vec<pb::CommandBook>, CodedError> {
-        let _ = (source, targets);
-        todo!("red: a policy carries an edition's deletion onward")
+        let mut carried = Vec::new();
+        for page in &source.pages {
+            let Some(any) = crate::page_event(page) else {
+                continue;
+            };
+            if crate::type_name_from_url(&any.type_url) != crate::edition_deleted_name() {
+                continue;
+            }
+            let deleted = pb::meta::EditionDeleted::decode(any.value.as_slice()).map_err(|_| {
+                CodedError::invalid_argument(
+                    codes::ANY_DECODE_FAILED,
+                    "failed to decode EditionDeleted",
+                    [(extras::TYPE_URL.to_string(), any.type_url.clone())],
+                )
+            })?;
+            let trigger = pb::EventRef {
+                stream: source.cover.clone(),
+                sequence: page.sequence,
+            };
+            let payload = pb::meta::EditionDeleted {
+                propagated_from: Some(trigger.clone()),
+                deleted_by: None,
+                ..deleted.clone()
+            };
+            let payload = Any {
+                type_url: crate::type_url(&crate::edition_deleted_name()),
+                value: payload.encode_to_vec(),
+            };
+            for target in targets {
+                let mut book = pb::CommandBook {
+                    cover: Some(target.clone()),
+                    page: Some(pb::CommandPage {
+                        body: Some(pb::command_page::Body::Command(pb::Command {
+                            payload: Some(payload.clone()),
+                        })),
+                        causation_id: Some(trigger.clone()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                if self.outside_destination(&book) {
+                    return Err(self.refuse_outside_destination(&book));
+                }
+                let cover = book.cover.get_or_insert_with(Default::default);
+                match cover.edition.as_deref().filter(|e| !e.is_empty()) {
+                    None => cover.edition = Some(deleted.edition.clone()),
+                    Some(named) if named != deleted.edition => {
+                        return Err(refuse_outside_edition(&deleted.edition, named));
+                    }
+                    Some(_) => {}
+                }
+                carried.push(book);
+            }
+        }
+        Ok(carried)
     }
+}
+
+/// A command (or a carried deletion) naming an edition other than its
+/// trigger's: a policy bug, refused INTERNAL.
+fn refuse_outside_edition(expected: &str, actual: &str) -> CodedError {
+    CodedError::internal(
+        codes::POLICY_COMMAND_OUTSIDE_EDITION,
+        messages::POLICY_COMMAND_OUTSIDE_EDITION,
+        [
+            (extras::EXPECTED_EDITION.to_string(), expected.to_string()),
+            (extras::ACTUAL_EDITION.to_string(), actual.to_string()),
+        ],
+    )
 }
 
 /// Addresses and identifies the refusal fact OnRefused answered, as the
