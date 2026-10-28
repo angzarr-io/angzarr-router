@@ -1,7 +1,7 @@
 //! The io.angzarr.v1 wire types come from angzarr-project's angzarr-proto
 //! crate (types.proto, upcaster.proto, options.proto and sererr). That crate
 //! does not compile the service protos, so the few request/response messages
-//! they define (CommandHandlerResponse, CommandResponse, SagaResponse,
+//! they define (CommandHandlerResponse, CommandResponse, PolicyResponse,
 //! Refusal, OnRefusedResponse) are generated here, with every type
 //! angzarr-proto provides extern-pathed to it: no io.angzarr.v1 type exists
 //! twice.
@@ -40,7 +40,7 @@ const ANGZARR_PROTO_FILES: [&str; 3] = [
 /// manager is a domain, served by command_handler.proto.)
 const SERVICE_FILES: [&str; 2] = [
     "io/angzarr/v1/command_handler.proto",
-    "io/angzarr/v1/saga.proto",
+    "io/angzarr/v1/policy.proto",
 ];
 
 fn main() {

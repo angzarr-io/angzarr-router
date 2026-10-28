@@ -31,7 +31,7 @@ pub mod codes {
     pub const PERSISTED_EVENT_CORRUPT: &str = "PERSISTED_EVENT_CORRUPT";
     pub const UNHANDLED_HANDLER_ERROR: &str = "UNHANDLED_HANDLER_ERROR";
     pub const MISSING_EVENT_BOOK_COVER: &str = "MISSING_EVENT_BOOK_COVER";
-    pub const EMPTY_SAGA_SOURCE: &str = "EMPTY_SAGA_SOURCE";
+    pub const EMPTY_POLICY_SOURCE: &str = "EMPTY_POLICY_SOURCE";
     pub const DUPLICATE_REGISTRATION: &str = "DUPLICATE_REGISTRATION";
     pub const NO_HANDLERS_REGISTERED: &str = "NO_HANDLERS_REGISTERED";
     pub const DUPLICATE_COMMAND_HANDLER: &str = "DUPLICATE_COMMAND_HANDLER";
@@ -41,16 +41,16 @@ pub mod codes {
     pub const CONFLICT_RESOLUTION_UNSUPPORTED: &str = "CONFLICT_RESOLUTION_UNSUPPORTED";
     pub const MISSING_RULES_VERSION: &str = "MISSING_RULES_VERSION";
     pub const MISSING_STATE_TYPE: &str = "MISSING_STATE_TYPE";
-    pub const SAGA_COMMAND_OUTSIDE_DESTINATION: &str = "SAGA_COMMAND_OUTSIDE_DESTINATION";
-    /// A saga command naming an edition other than its trigger's (owner
-    /// ruling, 2026-10-28; types.proto Cover.edition: a saga stays in the
+    pub const POLICY_COMMAND_OUTSIDE_DESTINATION: &str = "POLICY_COMMAND_OUTSIDE_DESTINATION";
+    /// A policy command naming an edition other than its trigger's (owner
+    /// ruling, 2026-10-28; types.proto Cover.edition: a policy stays in the
     /// edition of the event it handles).
-    pub const SAGA_COMMAND_OUTSIDE_EDITION: &str = "SAGA_COMMAND_OUTSIDE_EDITION";
-    /// A saga's OnRefused answer that is not a bare Fact (no cover, no
+    pub const POLICY_COMMAND_OUTSIDE_EDITION: &str = "POLICY_COMMAND_OUTSIDE_EDITION";
+    /// A policy's OnRefused answer that is not a bare Fact (no cover, no
     /// identity, no Handling), or a refusal lacking what addressing it needs
-    /// (saga.proto, OnRefusedResponse): a saga bug.
+    /// (policy.proto, OnRefusedResponse): a policy bug.
     pub const MALFORMED_REFUSAL_FACT: &str = "MALFORMED_REFUSAL_FACT";
-    /// An input from outside (not a saga's) addressed in an edition to a
+    /// An input from outside (not a policy's) addressed in an edition to a
     /// stream with no fork there (types.proto, Cover.edition; decision 14.32).
     pub const EDITION_NOT_FORKED: &str = "EDITION_NOT_FORKED";
     /// A command for a process manager's correlation with no instance, of a
@@ -74,7 +74,7 @@ pub mod messages {
     pub const NO_COMMAND_PAGES: &str = "No command pages";
     pub const PERSISTED_EVENT_CORRUPT: &str = "persisted event payload corrupt";
     pub const MISSING_EVENT_BOOK_COVER: &str = "missing event book cover";
-    pub const EMPTY_SAGA_SOURCE: &str = "empty saga source";
+    pub const EMPTY_POLICY_SOURCE: &str = "empty policy source";
     pub const NO_HANDLERS_REGISTERED: &str = "no handlers registered";
     pub const DUPLICATE_COMMAND_HANDLER: &str =
         "an old type the aggregate's upcaster chain accepts is also one of its command types";
@@ -87,16 +87,16 @@ pub mod messages {
     pub const MISSING_RULES_VERSION: &str = "a component registers with its rules version";
     pub const MISSING_STATE_TYPE: &str =
         "a stateful component registers with its state type (Rebuilder::of_message)";
-    pub const SAGA_COMMAND_OUTSIDE_DESTINATION: &str =
-        "a saga answered a command for a domain other than its one destination";
+    pub const POLICY_COMMAND_OUTSIDE_DESTINATION: &str =
+        "a policy answered a command for a domain other than its one destination";
     pub const FOLD_FAILED: &str = "the state fold failed on an event it had accepted";
     pub const FOLD_FAILED_EMITTED: &str = "the state fold failed on an event this command emitted";
-    pub const SAGA_COMMAND_OUTSIDE_EDITION: &str =
-        "a saga answered a command for an edition other than its trigger's";
+    pub const POLICY_COMMAND_OUTSIDE_EDITION: &str =
+        "a policy answered a command for an edition other than its trigger's";
     pub const MALFORMED_REFUSAL_FACT: &str =
-        "a saga's refusal fact must be a bare Fact, addressed and identified by its runtime";
+        "a policy's refusal fact must be a bare Fact, addressed and identified by its runtime";
     pub const EDITION_NOT_FORKED: &str =
-        "the stream has no fork in the edition; fork it, or let a saga's command reach it";
+        "the stream has no fork in the edition; fork it, or let a policy's command reach it";
     pub const PM_NO_INSTANCE: &str =
         "no process manager instance for the correlation, and the command does not start one";
     pub const PM_CORRELATION_NOT_ROOT: &str =
@@ -154,7 +154,7 @@ pub struct CodedError {
     /// A business rejection's TYPED refusal object, packed: one of the
     /// command's `CommandOptions.refuses` types (options.proto; decision
     /// 14.31). Carried in the rejection's status details; the refused
-    /// saga receives it as `RefusalResponse.refusal`. Boxed, so the
+    /// policy receives it as `RefusalResponse.refusal`. Boxed, so the
     /// common error stays small.
     pub refusal: Option<Box<prost_types::Any>>,
 }
@@ -353,11 +353,11 @@ impl CodedError {
         }
     }
 
-    /// The refused saga's view of this answer (types.proto,
+    /// The refused policy's view of this answer (types.proto,
     /// RefusalResponse): `Some` for a business rejection
     /// (FAILED_PRECONDITION) only, carrying the typed refusal object and the
     /// status message; `None` for every other failure, which never reaches
-    /// a saga's OnRefused (retried, or dead-lettered as a bug).
+    /// a policy's OnRefused (retried, or dead-lettered as a bug).
     pub fn refusal_response(&self) -> Option<angzarr_proto::v1::RefusalResponse> {
         (self.grpc == GrpcCode::FailedPrecondition).then(|| angzarr_proto::v1::RefusalResponse {
             refusal: self.refusal.as_deref().cloned(),

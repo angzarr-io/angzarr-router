@@ -4,8 +4,8 @@
 //! plays the runtime between hops, stamping identity and reading streams,
 //! and commits nothing.
 //!
-//! The owner's words (decision 14.31): "saga calls foreign command handler,
-//! which refuses. saga then calls its domain command handler and passes it a
+//! The owner's words (decision 14.31): "policy calls foreign command handler,
+//! which refuses. policy then calls its domain command handler and passes it a
 //! fact (that the foreign CH refused)".
 
 use prost::Message;
@@ -13,7 +13,7 @@ use prost::Message;
 use crate::domain::{Admission, Arrival, DomainDispatch, FactRecord, StreamStatus};
 use crate::error::{CodedError, HandlerError};
 use crate::pb;
-use crate::saga::{address_refusal_fact, SagaDispatch};
+use crate::policy::{address_refusal_fact, PolicyDispatch};
 use crate::test_support::*;
 
 const INSTANCE: u8 = 7;
@@ -65,8 +65,8 @@ fn buyin() -> DomainDispatch<TestState> {
         .starts(&fq::<StartBuyIn>())
 }
 
-fn buyin_wallet() -> SagaDispatch {
-    SagaDispatch::new("BuyInWallet", "buyin", "wallet").on_event(
+fn buyin_wallet() -> PolicyDispatch {
+    PolicyDispatch::new("BuyInWallet", "buyin", "wallet").on_event(
         &fq::<BuyInStarted>(),
         |event, _cover| {
             let started = BuyInStarted::decode(event.value.as_slice()).expect("BuyInStarted");
@@ -83,7 +83,7 @@ fn buyin_wallet() -> SagaDispatch {
 
 /// Runs the chain from StartBuyIn (in `edition`) to the buy-in's answer to
 /// the refusal, and returns the event it records.
-fn run(saga: SagaDispatch, edition: Option<&str>) -> pb::EventPage {
+fn run(policy: PolicyDispatch, edition: Option<&str>) -> pb::EventPage {
     let pm = buyin();
     let instance = stream("buyin", edition, INSTANCE);
 
@@ -113,21 +113,21 @@ fn run(saga: SagaDispatch, edition: Option<&str>) -> pb::EventPage {
         .events
         .expect("its events");
 
-    // 2. The runtime commits BuyInStarted at sequence 0; the saga translates.
+    // 2. The runtime commits BuyInStarted at sequence 0; the policy translates.
     let mut trigger = pb::EventBook {
         cover: Some(instance.clone()),
         pages: started.pages.clone(),
         ..Default::default()
     };
     trigger.pages[0].sequence = 0;
-    let sent = saga.dispatch(&trigger).expect("translated").commands;
+    let sent = policy.dispatch(&trigger).expect("translated").commands;
     assert_eq!(sent.len(), 1);
     let mut hold = caused_by(sent[0].clone(), instance.clone(), 0);
     let page = hold.page.as_mut().unwrap();
     page.command_id = Some(uuid_of(9));
     page.correlation_id = Some(uuid_of(INSTANCE));
 
-    // 3. The wallet: a saga's command forks it in the edition, then refuses.
+    // 3. The wallet: a policy's command forks it in the edition, then refuses.
     let admission = wallet()
         .admit(&Arrival {
             command: &hold,
@@ -150,13 +150,13 @@ fn run(saga: SagaDispatch, edition: Option<&str>) -> pb::EventPage {
         })
         .expect_err("refused");
 
-    // 4. Back to the saga: OnRefused builds the fact; the runtime addresses it.
+    // 4. Back to the policy: OnRefused builds the fact; the runtime addresses it.
     let refusal = pb::Refusal {
         event: Some(trigger),
         command: Some(hold),
         response: Some(refused.refusal_response().expect("a business rejection")),
     };
-    let answer = saga.dispatch_refusal(&refusal).expect("answered");
+    let answer = policy.dispatch_refusal(&refusal).expect("answered");
     let fact = address_refusal_fact(&refusal, &answer).expect("addressed");
     assert_eq!(fact.cover, Some(instance));
 
@@ -188,7 +188,7 @@ fn run(saga: SagaDispatch, edition: Option<&str>) -> pb::EventPage {
 }
 
 #[test]
-fn a_refusal_passes_through_to_the_sagas_source_in_process() {
+fn a_refusal_passes_through_to_the_policies_source_in_process() {
     let recorded = run(buyin_wallet(), None);
     assert_eq!(
         recorded.payload,
@@ -197,8 +197,8 @@ fn a_refusal_passes_through_to_the_sagas_source_in_process() {
 }
 
 #[test]
-fn a_refusal_is_translated_for_the_sagas_source_in_process() {
-    let saga = buyin_wallet().on_refused(&fq::<HoldFunds>(), |refusal| {
+fn a_refusal_is_translated_for_the_policies_source_in_process() {
+    let policy = buyin_wallet().on_refused(&fq::<HoldFunds>(), |refusal| {
         let typed = refusal
             .response
             .as_ref()
@@ -210,14 +210,14 @@ fn a_refusal_is_translated_for_the_sagas_source_in_process() {
             available: insufficient.available,
         }))
     });
-    let recorded = run(saga, None);
+    let recorded = run(policy, None);
     assert_eq!(
         recorded.payload,
         Some(any_of(&BuyInFailed { requested: 100 }))
     );
 }
 
-// The same chain in an edition: the saga's command forks the wallet on
+// The same chain in an edition: the policy's command forks the wallet on
 // arrival, and the refusal fact returns to the buy-in's stream in the edition.
 #[test]
 fn the_refusal_path_stays_in_its_edition() {

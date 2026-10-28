@@ -96,7 +96,7 @@ name = "engine-components-are-independent"
 why = "each component dispatcher builds on the kernel only, never on another component or the router that composes them"
 from = [
     "angzarr_router::domain::**",
-    "angzarr_router::saga::**",
+    "angzarr_router::policy::**",
     "angzarr_router::projector::**",
     "angzarr_router::upcaster::**",
 ]

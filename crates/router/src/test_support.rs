@@ -169,8 +169,8 @@ pub fn assert_fold_failed(
 
 // --- the buy-in workflow (decision 14.31's example, cut down) ---------------
 //
-// A "buyin" process manager, a "wallet" aggregate and the sagas between
-// them: the PM records BuyInStarted; the saga (buyin -> wallet) turns it
+// A "buyin" process manager, a "wallet" aggregate and the policies between
+// them: the PM records BuyInStarted; the policy (buyin -> wallet) turns it
 // into HoldFunds; the wallet may refuse HoldFunds with the typed refusal
 // InsufficientFunds; the refusal comes back to the buy-in as a fact.
 
@@ -238,7 +238,7 @@ pub fn fact_book(cover: pb::Cover, fact: Any, external_id: &str) -> pb::CommandB
     }
 }
 
-/// `book` as a saga's command: caused by the event at `sequence` of
+/// `book` as a policy's command: caused by the event at `sequence` of
 /// `trigger`.
 pub fn caused_by(mut book: pb::CommandBook, trigger: pb::Cover, sequence: u64) -> pb::CommandBook {
     book.page.as_mut().unwrap().causation_id = Some(pb::EventRef {

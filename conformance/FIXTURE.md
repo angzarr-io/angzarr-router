@@ -47,12 +47,12 @@ historical-state evidence the framework supplies.
 `counter.proto` also declares the remaining kinds over the same
 `Increased` event:
 
-- **OrderSaga** (input domain `order`, destination `inventory`) — one `Reserve` command for
+- **OrderPolicy** (input domain `order`, destination `inventory`) — one `Reserve` command for
   `inventory` per source event.
 - **CounterProjector** (domain `counter`) — folds a count, finishes into a
   `Projection`.
 (The trigger-fed OrderProcessManager is deleted: since decision 14.31 a
-process manager is a domain, fed commands by sagas.)
+process manager is a domain, fed commands by policies.)
 
 ## The order aggregate and the Fulfillment process manager (handler-contract)
 

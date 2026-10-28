@@ -1,4 +1,4 @@
-//! SagaDispatch contracts (spec C-0050..C-0053): a stateless translator
+//! PolicyDispatch contracts (spec C-0050..C-0053): a stateless translator
 //! that walks EVERY source page, emits commands for declared event types
 //! (passed through unstamped: the coordinator stamps identity, causation
 //! and correlation) and skips undeclared events.
@@ -9,7 +9,7 @@ use prost_types::Any;
 
 use crate::error::{codes, extras, GrpcCode, HandlerError};
 use crate::pb;
-use crate::saga::SagaDispatch;
+use crate::policy::PolicyDispatch;
 use crate::test_support::{command_page, event_page, uuid_of};
 use crate::type_url;
 
@@ -31,7 +31,7 @@ fn source_book(domain: &str, pages: Vec<pb::EventPage>) -> pb::EventBook {
 }
 
 /// An event page carrying a bare `Any` of the fully-qualified type (no
-/// payload bytes — these sagas react to type, not content).
+/// payload bytes — these policies react to type, not content).
 fn event_page_of(fq: &str) -> pb::EventPage {
     event_page(Any {
         type_url: type_url(fq),
@@ -54,7 +54,7 @@ fn command_to(domain: &str) -> pb::CommandBook {
     }
 }
 
-fn cmd_to<'a>(resp: &'a pb::SagaResponse, domain: &str) -> &'a pb::CommandBook {
+fn cmd_to<'a>(resp: &'a pb::PolicyResponse, domain: &str) -> &'a pb::CommandBook {
     resp.commands
         .iter()
         .find(|c| c.cover.as_ref().map(|cv| cv.domain.as_str()) == Some(domain))
@@ -71,9 +71,9 @@ fn sequenced_page_of(fq: &str, seq: u64) -> pb::EventPage {
 
 #[test]
 fn declared_event_emits_its_command() {
-    let saga = SagaDispatch::new("OrderFulfillment", "order", "inventory")
+    let policy = PolicyDispatch::new("OrderFulfillment", "order", "inventory")
         .on_event(FQ_ORDER_CREATED, |_e, _c| Ok(vec![command_to("inventory")]));
-    let resp = saga
+    let resp = policy
         .dispatch(&source_book("order", vec![event_page_of(FQ_ORDER_CREATED)]))
         .expect("dispatch");
     assert_eq!(resp.commands.len(), 1, "one command emitted (C-0050)");
@@ -87,9 +87,9 @@ fn declared_event_emits_its_command() {
 fn undeclared_event_type_is_skipped() {
     // Only OrderCreated is declared; a StockReserved page emits nothing and
     // is not an error (spec C-0051).
-    let saga = SagaDispatch::new("OrderFulfillment", "order", "inventory")
+    let policy = PolicyDispatch::new("OrderFulfillment", "order", "inventory")
         .on_event(FQ_ORDER_CREATED, |_e, _c| Ok(vec![command_to("inventory")]));
-    let resp = saga
+    let resp = policy
         .dispatch(&source_book(
             "order",
             vec![event_page_of(FQ_STOCK_RESERVED)],
@@ -103,12 +103,12 @@ fn undeclared_event_type_is_skipped() {
 
 #[test]
 fn every_page_is_a_fresh_trigger() {
-    // The saga walks EVERY page (source = triggering events, not state):
+    // The policy walks EVERY page (source = triggering events, not state):
     // three OrderCreated pages each emit one command → three commands.
-    let saga = SagaDispatch::new("OrderFulfillment", "order", "inventory")
+    let policy = PolicyDispatch::new("OrderFulfillment", "order", "inventory")
         .on_event(FQ_ORDER_CREATED, |_e, _c| Ok(vec![command_to("inventory")]));
     let pages = (0..3).map(|_| event_page_of(FQ_ORDER_CREATED)).collect();
-    let resp = saga
+    let resp = policy
         .dispatch(&source_book("order", pages))
         .expect("dispatch");
     assert_eq!(resp.commands.len(), 3, "every page triggers the handler");
@@ -120,7 +120,7 @@ fn every_page_is_a_fresh_trigger() {
 fn emitted_commands_pass_through_unstamped_in_emission_order() {
     // A handler-set correlation survives untouched; nothing is filled in
     // from the source.
-    let saga = SagaDispatch::new("OrderSplit", "order", "inventory").on_event(
+    let policy = PolicyDispatch::new("OrderSplit", "order", "inventory").on_event(
         FQ_ORDER_CREATED,
         |_e, _c| {
             let mut own = command_to("inventory");
@@ -139,7 +139,7 @@ fn emitted_commands_pass_through_unstamped_in_emission_order() {
         correlation_id: Some(uuid_of(1)),
         ..Default::default()
     });
-    let resp = saga.dispatch(&src).expect("dispatch");
+    let resp = policy.dispatch(&src).expect("dispatch");
 
     let mut expected_first = command_to("inventory");
     expected_first.page.as_mut().unwrap().correlation_id = Some(uuid_of(9));
@@ -158,41 +158,41 @@ fn emitted_commands_pass_through_unstamped_in_emission_order() {
 // --- envelope + error guards ---------------------------------------------
 
 #[test]
-fn empty_source_is_empty_saga_source() {
-    let saga = SagaDispatch::new("OrderFulfillment", "order", "inventory");
-    let err = saga
+fn empty_source_is_empty_policy_source() {
+    let policy = PolicyDispatch::new("OrderFulfillment", "order", "inventory");
+    let err = policy
         .dispatch(&source_book("order", vec![]))
         .expect_err("empty source must fail");
-    assert_eq!(err.code, codes::EMPTY_SAGA_SOURCE);
+    assert_eq!(err.code, codes::EMPTY_POLICY_SOURCE);
 }
 
 #[test]
 fn handler_error_propagates_as_unhandled() {
-    let saga = SagaDispatch::new("OrderFulfillment", "order", "inventory")
+    let policy = PolicyDispatch::new("OrderFulfillment", "order", "inventory")
         .on_event(FQ_ORDER_CREATED, |_e, _c| {
             Err(HandlerError::Other("boom".to_string()))
         });
-    let err = saga
+    let err = policy
         .dispatch(&source_book("order", vec![event_page_of(FQ_ORDER_CREATED)]))
         .expect_err("handler error must fail dispatch");
     assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
 }
 
-// --- one destination (saga.proto SagaResponse; decision 14.24, C-0583) -----
+// --- one destination (policy.proto PolicyResponse; decision 14.24, C-0583) -----
 
-// A saga translates between exactly two domains: a command for any domain
-// but its one destination is a saga bug, refused before it answers.
+// A policy translates between exactly two domains: a command for any domain
+// but its one destination is a policy bug, refused before it answers.
 #[test]
 fn a_command_for_a_domain_other_than_the_destination_is_refused_with_no_commands() {
     for stray in ["shipping", ""] {
-        let saga = SagaDispatch::new("OrderFulfillment", "order", "inventory")
+        let policy = PolicyDispatch::new("OrderFulfillment", "order", "inventory")
             .on_event(FQ_ORDER_CREATED, move |_e, _c| {
                 Ok(vec![command_to("inventory"), command_to(stray)])
             });
-        let err = saga
+        let err = policy
             .dispatch(&source_book("order", vec![event_page_of(FQ_ORDER_CREATED)]))
             .expect_err("a command outside the destination");
-        assert_eq!(err.code, codes::SAGA_COMMAND_OUTSIDE_DESTINATION);
+        assert_eq!(err.code, codes::POLICY_COMMAND_OUTSIDE_DESTINATION);
         assert_eq!(err.grpc, GrpcCode::Internal);
         let extra = |key: &str| err.extras.get(key).map(String::as_str);
         assert_eq!(extra(extras::EXPECTED_DOMAIN), Some("inventory"));
@@ -202,28 +202,28 @@ fn a_command_for_a_domain_other_than_the_destination_is_refused_with_no_commands
 
 #[test]
 fn a_command_with_no_cover_is_outside_the_destination() {
-    let saga = SagaDispatch::new("OrderFulfillment", "order", "inventory")
+    let policy = PolicyDispatch::new("OrderFulfillment", "order", "inventory")
         .on_event(FQ_ORDER_CREATED, |_e, _c| {
             Ok(vec![pb::CommandBook::default()])
         });
-    let err = saga
+    let err = policy
         .dispatch(&source_book("order", vec![event_page_of(FQ_ORDER_CREATED)]))
         .expect_err("no cover names no destination");
-    assert_eq!(err.code, codes::SAGA_COMMAND_OUTSIDE_DESTINATION);
+    assert_eq!(err.code, codes::POLICY_COMMAND_OUTSIDE_DESTINATION);
 }
 
 // --- accessors ------------------------------------------------------------
 
 #[test]
 fn accessors_report_name_domains_and_types() {
-    let saga = SagaDispatch::new("OrderFulfillment", "order", "inventory")
+    let policy = PolicyDispatch::new("OrderFulfillment", "order", "inventory")
         .on_event(FQ_ORDER_CREATED, |_e, _c| Ok(vec![]));
-    assert_eq!(saga.name(), "OrderFulfillment");
-    assert_eq!(saga.input_domain(), "order");
-    assert_eq!(saga.output_domain(), "inventory");
-    assert_eq!(saga.event_types(), vec![FQ_ORDER_CREATED.to_string()]);
+    assert_eq!(policy.name(), "OrderFulfillment");
+    assert_eq!(policy.input_domain(), "order");
+    assert_eq!(policy.output_domain(), "inventory");
+    assert_eq!(policy.event_types(), vec![FQ_ORDER_CREATED.to_string()]);
     assert_eq!(
-        saga.subscriptions().get("order"),
+        policy.subscriptions().get("order"),
         Some(&vec![FQ_ORDER_CREATED.to_string()])
     );
 }
@@ -234,15 +234,13 @@ fn accessors_report_name_domains_and_types() {
 fn a_context_handler_sees_each_triggering_page() {
     let seen: Arc<Mutex<Vec<(String, u64)>>> = Arc::default();
     let sink = seen.clone();
-    let saga = SagaDispatch::new("OrderFulfillment", "order", "inventory").on_event_with_context(
-        FQ_ORDER_CREATED,
-        move |_e, source| {
+    let policy = PolicyDispatch::new("OrderFulfillment", "order", "inventory")
+        .on_event_with_context(FQ_ORDER_CREATED, move |_e, source| {
             let domain = source.cover.map(|c| c.domain.clone()).unwrap_or_default();
             sink.lock().unwrap().push((domain, source.sequence));
             Ok(vec![command_to("inventory")])
-        },
-    );
-    let resp = saga
+        });
+    let resp = policy
         .dispatch(&source_book(
             "order",
             vec![
@@ -263,14 +261,13 @@ fn a_context_handler_sees_each_triggering_page() {
 fn a_context_handler_sees_sequence_zero_for_an_unsequenced_page() {
     let seen: Arc<Mutex<Vec<u64>>> = Arc::default();
     let sink = seen.clone();
-    let saga = SagaDispatch::new("OrderFulfillment", "order", "inventory").on_event_with_context(
-        FQ_ORDER_CREATED,
-        move |_e, source| {
+    let policy = PolicyDispatch::new("OrderFulfillment", "order", "inventory")
+        .on_event_with_context(FQ_ORDER_CREATED, move |_e, source| {
             sink.lock().unwrap().push(source.sequence);
             Ok(vec![])
-        },
-    );
-    saga.dispatch(&source_book("order", vec![event_page_of(FQ_ORDER_CREATED)]))
+        });
+    policy
+        .dispatch(&source_book("order", vec![event_page_of(FQ_ORDER_CREATED)]))
         .expect("dispatch");
     assert_eq!(*seen.lock().unwrap(), vec![0]);
 }

@@ -1,6 +1,6 @@
 //! Router: the one component of one business process (owner ruling: one
 //! coordinator, one component, one business process). A component is one
-//! aggregate, saga, process manager or projector; its upcaster chain is part
+//! aggregate, policy, process manager or projector; its upcaster chain is part
 //! of it, not another component.
 //!
 //! [`RouterBuilder`] takes the component (and, optionally, its upcaster
@@ -14,8 +14,8 @@
 //!   a process manager, which is a domain (decision 14.31) served the same
 //!   way, after [`Router::admit`] has applied the rules a domain's input
 //!   meets before its handler runs;
-//! - a saga source to the saga, when it comes from the saga's input domain,
-//!   and a refusal of one of its commands to the saga's OnRefused;
+//! - a policy source to the policy, when it comes from the policy's input domain,
+//!   and a refusal of one of its commands to the policy's OnRefused;
 //! - an EventBook to the projector, one Projection;
 //! - an UpcastRequest for the chain's domain through the component's chain,
 //!   each rule's output feeding the next (C-0136); other requests pass
@@ -27,8 +27,8 @@
 use crate::domain::{Admission, Arrival, DomainDispatch};
 use crate::error::{codes, extras, messages, CodedError};
 use crate::pb;
+use crate::policy::PolicyDispatch;
 use crate::projector::ProjectorDispatch;
-use crate::saga::SagaDispatch;
 use crate::upcaster::UpcasterDispatch;
 
 /// A domain (an aggregate or a process manager; decision 14.31) as the
@@ -167,7 +167,7 @@ impl<P> ProjectorHandler for ProjectorDispatch<P> {
 /// The one component a router hosts.
 enum Component {
     Aggregate(Box<dyn CommandHandler>),
-    Saga(SagaDispatch),
+    Policy(PolicyDispatch),
     Projector(Box<dyn ProjectorHandler>),
 }
 
@@ -175,7 +175,7 @@ impl Component {
     fn name(&self) -> &str {
         match self {
             Component::Aggregate(c) => c.name(),
-            Component::Saga(c) => c.name(),
+            Component::Policy(c) => c.name(),
             Component::Projector(c) => c.name(),
         }
     }
@@ -183,7 +183,7 @@ impl Component {
     fn kind(&self) -> pb::ComponentKind {
         match self {
             Component::Aggregate(c) => c.kind(),
-            Component::Saga(_) => pb::ComponentKind::Saga,
+            Component::Policy(_) => pb::ComponentKind::Policy,
             Component::Projector(_) => pb::ComponentKind::Projector,
         }
     }
@@ -230,9 +230,9 @@ impl RouterBuilder {
         self
     }
 
-    /// Hosts a saga.
-    pub fn saga(mut self, saga: SagaDispatch) -> Self {
-        self.components.push(Component::Saga(saga));
+    /// Hosts a policy.
+    pub fn policy(mut self, policy: PolicyDispatch) -> Self {
+        self.components.push(Component::Policy(policy));
         self
     }
 
@@ -312,7 +312,7 @@ impl Router {
     pub fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError> {
         match &self.component {
             Component::Aggregate(aggregate) => aggregate.component_descriptor(),
-            Component::Saga(saga) => saga.component_descriptor(),
+            Component::Policy(policy) => policy.component_descriptor(),
             Component::Projector(projector) => projector.component_descriptor(),
         }
     }
@@ -329,15 +329,15 @@ impl Router {
         }
     }
 
-    /// The saga's OnRefused (saga.proto): the refusal fact for its own
+    /// The policy's OnRefused (policy.proto): the refusal fact for its own
     /// source domain, passed through or translated
-    /// ([`SagaDispatch::dispatch_refusal`]).
+    /// ([`PolicyDispatch::dispatch_refusal`]).
     pub fn dispatch_refusal(
         &self,
         refusal: &pb::Refusal,
     ) -> Result<pb::OnRefusedResponse, CodedError> {
         match &self.component {
-            Component::Saga(saga) => saga.dispatch_refusal(refusal),
+            Component::Policy(policy) => policy.dispatch_refusal(refusal),
             _ => Err(wrong_kind()),
         }
     }
@@ -354,22 +354,25 @@ impl Router {
         }
     }
 
-    /// Runs the saga over a source from its input domain; a source with
+    /// Runs the policy over a source from its input domain; a source with
     /// pages from any other domain is NO_HANDLER_REGISTERED (a source with
-    /// none is the saga's EMPTY_SAGA_SOURCE).
-    pub fn dispatch_saga(&self, source: &pb::EventBook) -> Result<pb::SagaResponse, CodedError> {
-        let Component::Saga(saga) = &self.component else {
+    /// none is the policy's EMPTY_POLICY_SOURCE).
+    pub fn dispatch_policy(
+        &self,
+        source: &pb::EventBook,
+    ) -> Result<pb::PolicyResponse, CodedError> {
+        let Component::Policy(policy) = &self.component else {
             return Err(wrong_kind());
         };
         let domain = source.cover.as_ref().map_or("", |c| c.domain.as_str());
-        if !source.pages.is_empty() && saga.input_domain() != domain {
+        if !source.pages.is_empty() && policy.input_domain() != domain {
             return Err(CodedError::invalid_argument(
                 codes::NO_HANDLER_REGISTERED,
-                "the saga does not consume the source domain",
+                "the policy does not consume the source domain",
                 [(extras::DOMAIN.to_string(), domain.to_string())],
             ));
         }
-        saga.dispatch(source)
+        policy.dispatch(source)
     }
 
     /// Runs the projector over the book: one Projection.

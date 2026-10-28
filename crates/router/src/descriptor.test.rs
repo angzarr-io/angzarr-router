@@ -5,9 +5,9 @@
 use crate::domain::{CommandContext, DomainDispatch, FactRecord};
 use crate::error::{codes, GrpcCode};
 use crate::pb;
+use crate::policy::PolicyDispatch;
 use crate::projector::ProjectorDispatch;
 use crate::rebuild::Rebuilder;
-use crate::saga::SagaDispatch;
 use crate::test_support::LedgerState;
 
 fn ledger(version: &str) -> DomainDispatch<LedgerState> {
@@ -195,22 +195,22 @@ fn a_process_manager_without_a_rules_version_is_refused() {
     assert_missing_rules_version(fulfillment("").component_descriptor());
 }
 
-fn notifier(version: &str) -> SagaDispatch {
-    SagaDispatch::new("Notifier", "order", "email").with_rules_version(version)
+fn notifier(version: &str) -> PolicyDispatch {
+    PolicyDispatch::new("Notifier", "order", "email").with_rules_version(version)
 }
 
 #[test]
-fn a_saga_announces_its_input_domain_and_no_state() {
+fn a_policy_announces_its_input_domain_and_no_state() {
     let descriptor = notifier("3").component_descriptor().expect("descriptor");
     assert_eq!(descriptor.name, "Notifier");
-    assert_eq!(descriptor.kind(), pb::ComponentKind::Saga);
+    assert_eq!(descriptor.kind(), pb::ComponentKind::Policy);
     assert_eq!(descriptor.rules_version, "3");
     assert_eq!(inputs(&descriptor), vec!["order"]);
     assert!(descriptor.state.is_none());
 }
 
 #[test]
-fn a_saga_without_a_rules_version_is_refused() {
+fn a_policy_without_a_rules_version_is_refused() {
     assert_missing_rules_version(notifier("").component_descriptor());
 }
 

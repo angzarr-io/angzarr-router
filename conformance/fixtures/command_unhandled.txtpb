@@ -1,4 +1,4 @@
-# A command with no registered handler (Reserve is the command the saga and
+# A command with no registered handler (Reserve is the command the policy and
 # PM emit, never an on_command) — drives NO_HANDLER_REGISTERED before rebuild.
 command {
   cover { domain: "counter" }

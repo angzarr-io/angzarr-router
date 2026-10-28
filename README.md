@@ -55,7 +55,7 @@ FFI + conformance — is likewise written once.)
 This line brings the pure dispatch to spec 636b313 for the angzarr/annals
 POC: a process manager is a domain (decision 14.31; the trigger-fed
 `ProcessManagerDispatch` is deleted), refusals are typed and come back
-through a saga's OnRefused, and `DomainDispatch::admit` applies the
+through a policy's OnRefused, and `DomainDispatch::admit` applies the
 rules an input meets before its handler runs (deduplication, edition forks,
 the PM start rule). The distributed side is left broken here:
 `crates/router-ffi` is out of the workspace and the bindings are not
@@ -65,7 +65,7 @@ rebuilt.
 
 ```
 crates/
-├── router/        # core crate: Rebuilder, domain (aggregate or PM)/Saga/Projector dispatch
+├── router/        # core crate: Rebuilder, domain (aggregate or PM)/Policy/Projector dispatch
 ├── router-ffi/    # C ABI over the core (cdylib + staticlib) + component registry
 └── conformance/   # cucumber-rs harness running conformance/features against the core
 conformance/       # shared behaviour suite (features, fixture proto, .txtpb skeletons)
@@ -81,7 +81,7 @@ when set. The io.angzarr.v1 wire types are angzarr-project's
 `rust/angzarr-proto` crate at the submodule's commit (re-exported as
 `angzarr_router::pb`); `crates/router/build.rs` generates only the
 service-proto messages that crate does not compile
-(`CommandHandlerResponse`, `SagaResponse`, `Refusal`,
+(`CommandHandlerResponse`, `PolicyResponse`, `Refusal`,
 `OnRefusedResponse`), against its types. The `mutation-test` target passes the submodule's absolute
 path through that env var so cargo-mutants' copied trees build.
 

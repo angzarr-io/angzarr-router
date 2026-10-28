@@ -8,9 +8,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use angzarr_router::domain::{DomainDispatch, FactRecord};
 use angzarr_router::error::{CodedError, HandlerError};
+use angzarr_router::policy::PolicyDispatch;
 use angzarr_router::projector::ProjectorDispatch;
 use angzarr_router::rebuild::Rebuilder;
-use angzarr_router::saga::SagaDispatch;
 use prost::Message;
 use prost_reflect::{DescriptorPool, DynamicMessage};
 
@@ -226,15 +226,15 @@ pub fn delivery_without_cover(n: u32) -> pb::EventBook {
 }
 
 // ---------------------------------------------------------------------------
-// The fixture: OrderSaga on the router core (translation-side dispatch).
+// The fixture: OrderPolicy on the router core (translation-side dispatch).
 // ---------------------------------------------------------------------------
 
-/// Build the OrderSaga dispatch table: it translates each Increased source
+/// Build the OrderPolicy dispatch table: it translates each Increased source
 /// event into one Reserve command for "inventory" (passed through unstamped),
 /// recording each triggering event's sequence in `seen`. Undeclared events
 /// are skipped.
-pub fn order_saga(seen: SequenceSink) -> SagaDispatch {
-    SagaDispatch::new("order-saga", "order", "inventory").on_event_with_context(
+pub fn order_policy(seen: SequenceSink) -> PolicyDispatch {
+    PolicyDispatch::new("order-policy", "order", "inventory").on_event_with_context(
         "test.counter.Increased",
         move |_any, source| {
             seen.lock().unwrap().push(source.sequence);
@@ -262,9 +262,9 @@ fn reserve_command_to(domain: &str) -> pb::CommandBook {
     }
 }
 
-/// A saga source carrying one event of `event_fq` in the "order" domain at
+/// A policy source carrying one event of `event_fq` in the "order" domain at
 /// sequence `seq`.
-pub fn saga_event_source(event_fq: &str, seq: u64) -> pb::EventBook {
+pub fn policy_event_source(event_fq: &str, seq: u64) -> pb::EventBook {
     pb::EventBook {
         cover: Some(pb::Cover {
             domain: "order".to_string(),
@@ -282,8 +282,8 @@ pub fn saga_event_source(event_fq: &str, seq: u64) -> pb::EventBook {
     }
 }
 
-/// A saga source carrying no pages → EMPTY_SAGA_SOURCE.
-pub fn saga_empty_source() -> pb::EventBook {
+/// A policy source carrying no pages → EMPTY_POLICY_SOURCE.
+pub fn policy_empty_source() -> pb::EventBook {
     pb::EventBook::default()
 }
 
@@ -978,7 +978,7 @@ pub fn order_command_for(domain: &str, command: &str) -> pb::CommandBook {
     }
 }
 
-/// A saga source: one OrderPlaced event from "order".
+/// A policy source: one OrderPlaced event from "order".
 pub fn order_placed_source() -> pb::EventBook {
     pb::EventBook {
         cover: Some(pb::Cover {

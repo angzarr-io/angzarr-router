@@ -10,7 +10,7 @@
 //!   options.proto CommandOptions.starts; decision 14.31 (Start rule).
 //! - deduplication: types.proto, the command_identity region
 //!   (Deduplication); decision 14.31 (Identity).
-//! - editions: types.proto Cover.edition and EditionForked; decision 14.32.
+//! - editions: types.proto Cover.edition and meta.EditionCreated; decision 14.32.
 //! - the refusal fact's exact stream: types.proto, the command_identity
 //!   region (Validation); decision 14.31 ("The exact stream").
 //!
@@ -440,10 +440,10 @@ fn an_outside_fact_to_a_stream_not_forked_in_its_edition_is_refused() {
     );
 }
 
-// The fork travels with the data: a saga's command in X forks its target at
+// The fork travels with the data: a policy's command in X forks its target at
 // the target's own head, then is handled.
 #[test]
-fn a_sagas_command_forks_its_target_on_arrival() {
+fn a_policies_command_forks_its_target_on_arrival() {
     let command = caused_by(
         command_book(
             stream("wallet", Some("what-if"), 1),
@@ -457,7 +457,7 @@ fn a_sagas_command_forks_its_target_on_arrival() {
         wallet()
             .admit(&arrival(&command, existing()))
             .expect("forked"),
-        Admission::Fork(pb::EditionForked {
+        Admission::Fork(pb::meta::EditionCreated {
             edition: "what-if".to_string(),
             parent_sequence: 3,
             commit_position: 0,
@@ -467,9 +467,9 @@ fn a_sagas_command_forks_its_target_on_arrival() {
     );
 }
 
-// Nothing is PM-specific: a saga's starting command forks a PM's stream too.
+// Nothing is PM-specific: a policy's starting command forks a PM's stream too.
 #[test]
-fn a_sagas_command_forks_a_process_manager_like_any_domain() {
+fn a_policies_command_forks_a_process_manager_like_any_domain() {
     let command = caused_by(
         command_book(
             stream("buyin", Some("what-if"), INSTANCE),
@@ -481,7 +481,7 @@ fn a_sagas_command_forks_a_process_manager_like_any_domain() {
     );
     assert!(matches!(
         buyin().admit(&arrival(&command, absent())),
-        Ok(Admission::Fork(pb::EditionForked {
+        Ok(Admission::Fork(pb::meta::EditionCreated {
             parent_sequence: 0,
             ..
         }))
@@ -507,7 +507,7 @@ fn a_stream_forked_in_the_edition_takes_any_input() {
     );
 }
 
-// Main is never forked, and a saga's command in main forks nothing.
+// Main is never forked, and a policy's command in main forks nothing.
 #[test]
 fn main_is_never_forked() {
     let command = caused_by(
@@ -529,7 +529,7 @@ fn main_is_never_forked() {
 
 // --- refusal facts at their source --------------------------------------------------
 
-/// The refusal fact a saga (buyin -> wallet) delivers to the buy-in when
+/// The refusal fact a policy (buyin -> wallet) delivers to the buy-in when
 /// the wallet refuses its HoldFunds, addressed to `to`; its trigger is
 /// BuyInStarted at sequence 0 of `trigger`.
 fn refusal_fact(to: pb::Cover, trigger: pb::Cover) -> pb::CommandBook {

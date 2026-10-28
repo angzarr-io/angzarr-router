@@ -28,9 +28,9 @@ struct HandlingWorld {
     result: Option<Result<pb::CommandHandlerResponse, CodedError>>,
     pm_result: Option<Result<pb::CommandHandlerResponse, CodedError>>,
     pm_placed: u32,
-    saga: Option<(String, String, String)>,
-    saga_strays: Vec<(String, String)>,
-    saga_result: Option<Result<pb::SagaResponse, CodedError>>,
+    policy: Option<(String, String, String)>,
+    policy_strays: Vec<(String, String)>,
+    policy_result: Option<Result<pb::PolicyResponse, CodedError>>,
     registered: Option<Registered>,
     second_refusal: Option<CodedError>,
     described: Vec<pb::ComponentDescriptor>,
@@ -308,60 +308,60 @@ async fn pm_pages_carry_no_state(w: &mut HandlingWorld) {
         .is_some_and(|a| a.type_url.ends_with("orders.v1.FulfillmentStarted"))));
 }
 
-// --- one destination per saga (C-0583; decision 14.24) ----------------------
+// --- one destination per policy (C-0583; decision 14.24) ----------------------
 
-#[given(regex = r#"^an? "([^"]*)" saga translating "([^"]*)" events into "([^"]*)" commands$"#)]
-async fn saga_translating(w: &mut HandlingWorld, name: String, input: String, output: String) {
-    w.saga = Some((name, input, output));
+#[given(regex = r#"^an? "([^"]*)" policy translating "([^"]*)" events into "([^"]*)" commands$"#)]
+async fn policy_translating(w: &mut HandlingWorld, name: String, input: String, output: String) {
+    w.policy = Some((name, input, output));
 }
 
 #[given(
     regex = r#"^its business code answers an OrderPlaced event with a (\w+) command for "([^"]*)" and a (\w+) command for "([^"]*)"$"#
 )]
-async fn saga_answers(
+async fn policy_answers(
     w: &mut HandlingWorld,
     first: String,
     first_domain: String,
     second: String,
     second_domain: String,
 ) {
-    w.saga_strays = vec![(first, first_domain), (second, second_domain)];
+    w.policy_strays = vec![(first, first_domain), (second, second_domain)];
 }
 
 #[when("the OrderPlaced event is handled")]
-async fn saga_handles(w: &mut HandlingWorld) {
-    let (name, input, output) = w.saga.clone().expect("a saga");
+async fn policy_handles(w: &mut HandlingWorld) {
+    let (name, input, output) = w.policy.clone().expect("a policy");
     let commands: Vec<pb::CommandBook> = w
-        .saga_strays
+        .policy_strays
         .iter()
         .map(|(command, domain)| conf::order_command_for(domain, command))
         .collect();
-    let saga = angzarr_router::saga::SagaDispatch::new(name, input.clone(), output)
+    let policy = angzarr_router::policy::PolicyDispatch::new(name, input.clone(), output)
         .on_event("orders.v1.OrderPlaced", move |_e, _c| Ok(commands.clone()));
     let router = angzarr_router::router::RouterBuilder::new()
-        .saga(saga)
+        .policy(policy)
         .build()
-        .expect("one saga");
+        .expect("one policy");
     let mut source = conf::order_placed_source();
     source.cover.as_mut().expect("a cover").domain = input;
-    w.saga_result = Some(router.dispatch_saga(&source));
+    w.policy_result = Some(router.dispatch_policy(&source));
 }
 
-#[then("the saga's answer fails with INTERNAL status")]
-async fn saga_fails_internal(w: &mut HandlingWorld) {
+#[then("the policy's answer fails with INTERNAL status")]
+async fn policy_fails_internal(w: &mut HandlingWorld) {
     let err = w
-        .saga_result
+        .policy_result
         .as_ref()
-        .expect("the saga handled")
+        .expect("the policy handled")
         .as_ref()
         .expect_err("refused");
     assert_eq!(err.grpc, GrpcCode::Internal);
 }
 
 #[then("the answer carries no commands")]
-async fn saga_no_commands(w: &mut HandlingWorld) {
-    // A refused answer is a status with no SagaResponse: it carries none.
-    assert!(w.saga_result.as_ref().expect("handled").is_err());
+async fn policy_no_commands(w: &mut HandlingWorld) {
+    // A refused answer is a status with no PolicyResponse: it carries none.
+    assert!(w.policy_result.as_ref().expect("handled").is_err());
 }
 
 // --- one component per business process (C-0580; decision 14.19) ------------
@@ -381,7 +381,7 @@ async fn order_registered(w: &mut HandlingWorld) {
 // second beside the order aggregate refuses the whole configuration, and the
 // process keeps the one it has.
 #[when(
-    regex = r#"^an? (aggregate|saga|process manager|projector) component "([^"]*)" is registered in the same business process$"#
+    regex = r#"^an? (aggregate|policy|process manager|projector) component "([^"]*)" is registered in the same business process$"#
 )]
 async fn second_registered(w: &mut HandlingWorld, kind: String, name: String) {
     let order = conf::order_aggregate(&w.rules_version, w.settle.clone(), w.seen.clone());
@@ -392,7 +392,7 @@ async fn second_registered(w: &mut HandlingWorld, kind: String, name: String) {
             name,
             angzarr_router::rebuild::Rebuilder::new(|| ()),
         )),
-        "saga" => builder.saga(angzarr_router::saga::SagaDispatch::new(
+        "policy" => builder.policy(angzarr_router::policy::PolicyDispatch::new(
             name,
             "order",
             "inventory",

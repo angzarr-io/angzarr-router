@@ -1,7 +1,7 @@
 //! The framework wire types: angzarr-project's angzarr-proto crate
 //! (io.angzarr.v1 books, covers, pages, options and sererr), plus the
 //! request/response messages of the service protos angzarr-proto does not
-//! compile (CommandHandlerResponse, CommandResponse, SagaResponse, Refusal,
+//! compile (CommandHandlerResponse, CommandResponse, PolicyResponse, Refusal,
 //! OnRefusedResponse), generated against its types.
 //!
 //! Module nesting mirrors proto package segments exactly so prost's

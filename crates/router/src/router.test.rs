@@ -7,10 +7,10 @@ use prost_types::Any;
 use crate::domain::DomainDispatch;
 use crate::error::{codes, CodedError};
 use crate::pb;
+use crate::policy::PolicyDispatch;
 use crate::projector::ProjectorDispatch;
 use crate::rebuild::Rebuilder;
 use crate::router::{CommandHandler, ProjectorHandler, Router, RouterBuilder};
-use crate::saga::SagaDispatch;
 use crate::test_support::{
     command_page, event_page, fact_page, fresh_rebuilder, LedgerState, TestState,
 };
@@ -90,7 +90,7 @@ fn an_empty_configuration_fails_to_build() {
 fn with_one(builder: RouterBuilder, kind: &str) -> RouterBuilder {
     match kind {
         "aggregate" => builder.aggregate(aggregate("a", "order", &["test.Create"])),
-        "saga" => builder.saga(SagaDispatch::new("s", "order", "inventory")),
+        "policy" => builder.policy(PolicyDispatch::new("s", "order", "inventory")),
         "process manager" => builder.process_manager(
             DomainDispatch::process_manager("pm", "pm", fresh_rebuilder())
                 .on_command("test.Start", |_, _, _| Ok(None)),
@@ -99,7 +99,7 @@ fn with_one(builder: RouterBuilder, kind: &str) -> RouterBuilder {
     }
 }
 
-const KINDS: [&str; 4] = ["aggregate", "saga", "process manager", "projector"];
+const KINDS: [&str; 4] = ["aggregate", "policy", "process manager", "projector"];
 
 #[test]
 fn a_router_hosts_one_component_and_refuses_a_second_of_any_kind() {
@@ -117,7 +117,7 @@ fn a_router_hosts_one_component_and_refuses_a_second_of_any_kind() {
             // C-0580: the refusal names the component already registered.
             let (name, kind) = match first {
                 "aggregate" => ("a", "AGGREGATE"),
-                "saga" => ("s", "SAGA"),
+                "policy" => ("s", "POLICY"),
                 "process manager" => ("pm", "PROCESS_MANAGER"),
                 _ => ("p", "PROJECTOR"),
             };
@@ -157,7 +157,7 @@ fn an_upcaster_chain_is_part_of_its_component() {
 
 #[test]
 fn a_component_without_an_upcaster_chain_passes_events_through() {
-    let router = with_one(RouterBuilder::new(), "saga")
+    let router = with_one(RouterBuilder::new(), "policy")
         .build()
         .expect("build");
     let events = vec![event_page(any_of_type("test.V1"))];
@@ -227,10 +227,10 @@ fn source(domain: &str) -> pb::EventBook {
 }
 
 #[test]
-fn a_router_runs_its_saga() {
+fn a_router_runs_its_policy() {
     let router = RouterBuilder::new()
-        .saga(
-            SagaDispatch::new("s", "order", "inventory").on_event("test.Created", |_, _| {
+        .policy(
+            PolicyDispatch::new("s", "order", "inventory").on_event("test.Created", |_, _| {
                 Ok(vec![pb::CommandBook {
                     cover: Some(pb::Cover {
                         domain: "inventory".to_string(),
@@ -244,16 +244,16 @@ fn a_router_runs_its_saga() {
         .expect("build");
     assert_eq!(
         router
-            .dispatch_saga(&source("order"))
-            .expect("saga")
+            .dispatch_policy(&source("order"))
+            .expect("policy")
             .commands
             .len(),
         1
     );
     assert_eq!(
-        router.dispatch_saga(&source("billing")).unwrap_err().code,
+        router.dispatch_policy(&source("billing")).unwrap_err().code,
         codes::NO_HANDLER_REGISTERED,
-        "a source outside the saga's input domain"
+        "a source outside the policy's input domain"
     );
 }
 
@@ -300,7 +300,7 @@ fn a_router_answers_its_projectors_projection() {
 
 #[test]
 fn a_router_refuses_dispatch_of_another_kind() {
-    let router: Router = with_one(RouterBuilder::new(), "saga")
+    let router: Router = with_one(RouterBuilder::new(), "policy")
         .build()
         .expect("build");
     assert_eq!(
@@ -322,7 +322,7 @@ fn a_router_refuses_dispatch_of_another_kind() {
         .expect("build");
     assert_eq!(
         aggregate_router
-            .dispatch_saga(&source("order"))
+            .dispatch_policy(&source("order"))
             .unwrap_err()
             .code,
         codes::NO_HANDLER_REGISTERED
@@ -511,11 +511,11 @@ fn a_router_answers_its_components_hello() {
     assert_eq!(
         kind(
             RouterBuilder::new()
-                .saga(SagaDispatch::new("s", "order", "x").with_rules_version("1"))
+                .policy(PolicyDispatch::new("s", "order", "x").with_rules_version("1"))
                 .build()
                 .unwrap()
         ),
-        pb::ComponentKind::Saga
+        pb::ComponentKind::Policy
     );
     assert_eq!(
         kind(

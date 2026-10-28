@@ -13,11 +13,11 @@ pub mod conflict;
 pub mod descriptor;
 pub mod domain;
 pub mod error;
+pub mod policy;
 pub mod projector;
 pub mod proto;
 pub mod rebuild;
 pub mod router;
-pub mod saga;
 pub mod upcaster;
 
 pub use proto::io::angzarr::v1 as pb;
@@ -83,7 +83,7 @@ pub fn fact_payload(page: &pb::CommandPage) -> Option<&Any> {
 /// command_identity region): a command's `command_id`; a fact's
 /// `command_id` when set, else UUIDv5 of its `fact_origin.external_id`
 /// (`angzarr_proto::ids::fact_command_id`); a refusal fact's is the refused
-/// command's id, which the saga's runtime stamped as its `command_id`.
+/// command's id, which the policy's runtime stamped as its `command_id`.
 /// `None` when the input carries no identity to key on.
 ///
 /// There is no trigger-fed process manager to key by trigger (decision

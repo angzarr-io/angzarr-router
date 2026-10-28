@@ -29,7 +29,7 @@ name = "projector"
 harness = false
 
 [[test]]
-name = "saga"
+name = "policy"
 harness = false
 
 [[test]]

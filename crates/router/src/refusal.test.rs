@@ -1,7 +1,7 @@
-//! A saga on the current spec: its commands stay in its trigger's edition,
+//! A policy on the current spec: its commands stay in its trigger's edition,
 //! and a refusal of one of them comes back through OnRefused as the one
 //! refusal fact for its own source domain, passed through or translated
-//! (saga.proto, SagaService, Refusals; types.proto, the refusal_facts and
+//! (policy.proto, PolicyService, Refusals; types.proto, the refusal_facts and
 //! command_identity regions; decision 14.31).
 
 use prost::Message;
@@ -9,16 +9,16 @@ use prost_types::Any;
 
 use crate::error::{codes, CodedError, GrpcCode, HandlerError};
 use crate::pb;
-use crate::saga::{address_refusal_fact, SagaDispatch};
+use crate::policy::{address_refusal_fact, PolicyDispatch};
 use crate::test_support::*;
 
 const INSTANCE: u8 = 7;
 
-/// The saga (buyin -> wallet): BuyInStarted becomes HoldFunds for the
+/// The policy (buyin -> wallet): BuyInStarted becomes HoldFunds for the
 /// player's wallet (root 1), addressed by the business code without an
 /// edition.
-fn buyin_wallet() -> SagaDispatch {
-    SagaDispatch::new("BuyInWallet", "buyin", "wallet").on_event(
+fn buyin_wallet() -> PolicyDispatch {
+    PolicyDispatch::new("BuyInWallet", "buyin", "wallet").on_event(
         &fq::<BuyInStarted>(),
         |event, _cover| {
             let started = BuyInStarted::decode(event.value.as_slice()).expect("BuyInStarted");
@@ -53,7 +53,7 @@ fn trigger_ref(edition: Option<&str>) -> pb::EventRef {
     }
 }
 
-/// The HoldFunds the saga sent, as delivered: identity stamped.
+/// The HoldFunds the policy sent, as delivered: identity stamped.
 fn sent_command(edition: Option<&str>) -> pb::CommandBook {
     let mut book = caused_by(
         command_book(
@@ -93,10 +93,10 @@ fn fact_of<M: Message + Default>(answer: &pb::OnRefusedResponse) -> M {
     M::decode(any.value.as_slice()).expect("the fact's type")
 }
 
-// --- a saga translates an event into a command --------------------------------------
+// --- a policy translates an event into a command --------------------------------------
 
 #[test]
-fn a_saga_translates_an_event_into_a_command_for_its_destination() {
+fn a_policy_translates_an_event_into_a_command_for_its_destination() {
     let resp = buyin_wallet()
         .dispatch(&trigger_book(None))
         .expect("translated");
@@ -107,10 +107,10 @@ fn a_saga_translates_an_event_into_a_command_for_its_destination() {
     );
 }
 
-// A saga stays in the edition of the event it handles, and so do its
+// A policy stays in the edition of the event it handles, and so do its
 // commands (types.proto, Cover.edition, What-if execution).
 #[test]
-fn a_sagas_commands_stay_in_their_triggers_edition() {
+fn a_policies_commands_stay_in_their_triggers_edition() {
     let resp = buyin_wallet()
         .dispatch(&trigger_book(Some("what-if")))
         .expect("translated");
@@ -120,14 +120,14 @@ fn a_sagas_commands_stay_in_their_triggers_edition() {
     );
 }
 
-// A command that names a different edition from its trigger's is a saga bug
+// A command that names a different edition from its trigger's is a policy bug
 // (owner ruling, 2026-10-28): the whole answer is refused INTERNAL, as a
-// command outside the saga's destination is. An unset edition is stamped with
+// command outside the policy's destination is. An unset edition is stamped with
 // the trigger's (above); only an explicit different one is refused, from main
 // or from an edition alike.
 #[test]
-fn a_saga_command_naming_another_edition_is_refused() {
-    let saga = SagaDispatch::new("Stray", "buyin", "wallet").on_event(
+fn a_policy_command_naming_another_edition_is_refused() {
+    let policy = PolicyDispatch::new("Stray", "buyin", "wallet").on_event(
         &fq::<BuyInStarted>(),
         |_event, _cover| {
             Ok(vec![pb::CommandBook {
@@ -138,14 +138,14 @@ fn a_saga_command_naming_another_edition_is_refused() {
         },
     );
     for trigger_edition in [None, Some("what-if")] {
-        let err = saga
+        let err = policy
             .dispatch(&trigger_book(trigger_edition))
             .expect_err("another edition");
-        assert_eq!(err.code, codes::SAGA_COMMAND_OUTSIDE_EDITION);
+        assert_eq!(err.code, codes::POLICY_COMMAND_OUTSIDE_EDITION);
         assert_eq!(err.grpc, GrpcCode::Internal);
     }
     // Naming its trigger's own edition is not a different one.
-    let own = SagaDispatch::new("Own", "buyin", "wallet").on_event(
+    let own = PolicyDispatch::new("Own", "buyin", "wallet").on_event(
         &fq::<BuyInStarted>(),
         |_event, _cover| {
             Ok(vec![pb::CommandBook {
@@ -176,7 +176,7 @@ fn pass_through_answers_the_standard_command_refused() {
     );
     assert!(
         answer.fact.unwrap().cover.is_none(),
-        "the saga leaves the cover to the runtime"
+        "the policy leaves the cover to the runtime"
     );
 }
 
@@ -194,7 +194,7 @@ fn pass_through_without_a_typed_refusal_leaves_refusal_unset() {
 
 #[test]
 fn translate_answers_the_callbacks_domestic_fact() {
-    let saga = buyin_wallet().on_refused(&fq::<HoldFunds>(), |refusal| {
+    let policy = buyin_wallet().on_refused(&fq::<HoldFunds>(), |refusal| {
         let typed = refusal
             .response
             .as_ref()
@@ -206,7 +206,7 @@ fn translate_answers_the_callbacks_domestic_fact() {
             available: insufficient.available,
         }))
     });
-    let answer = saga
+    let answer = policy
         .dispatch_refusal(&refusal(None, Some(insufficient())))
         .expect("answered");
     let fact: FundsUnavailable = fact_of(&answer);
@@ -216,23 +216,23 @@ fn translate_answers_the_callbacks_domestic_fact() {
 // The callback's presence is translate mode for THAT command type only.
 #[test]
 fn a_command_type_with_no_callback_is_passed_through() {
-    let saga = buyin_wallet().on_refused(&fq::<ReleaseFunds>(), |_| {
+    let policy = buyin_wallet().on_refused(&fq::<ReleaseFunds>(), |_| {
         panic!("not the refused command's type")
     });
-    let answer = saga
+    let answer = policy
         .dispatch_refusal(&refusal(None, Some(insufficient())))
         .expect("answered");
     let fact: pb::CommandRefused = fact_of(&answer);
     assert_eq!(fact.refusal, Some(insufficient()));
 }
 
-// A failing callback is a saga bug: dead-lettered and alerted by the runtime.
+// A failing callback is a policy bug: dead-lettered and alerted by the runtime.
 #[test]
-fn a_failing_callback_is_a_saga_bug() {
-    let saga = buyin_wallet().on_refused(&fq::<HoldFunds>(), |_| {
+fn a_failing_callback_is_a_policy_bug() {
+    let policy = buyin_wallet().on_refused(&fq::<HoldFunds>(), |_| {
         Err(HandlerError::Other("cannot translate".to_string()))
     });
-    let err = saga
+    let err = policy
         .dispatch_refusal(&refusal(None, Some(insufficient())))
         .expect_err("a bug");
     assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
@@ -267,8 +267,8 @@ fn the_refusal_facts_id_is_the_refused_commands_id() {
     assert_eq!(crate::input_id(&fact), Some(uuid_of(9)));
 }
 
-// The saga builds Facts only through OnRefused: an answer that is not a Fact,
-// or that sets its own cover, is a saga bug.
+// The policy builds Facts only through OnRefused: an answer that is not a Fact,
+// or that sets its own cover, is a policy bug.
 #[test]
 fn an_answer_that_is_not_a_bare_fact_is_refused() {
     let refusal = refusal(None, Some(insufficient()));
@@ -286,7 +286,7 @@ fn an_answer_that_is_not_a_bare_fact_is_refused() {
         }),
     };
     for answer in [not_a_fact, addressed] {
-        let err: CodedError = address_refusal_fact(&refusal, &answer).expect_err("a saga bug");
+        let err: CodedError = address_refusal_fact(&refusal, &answer).expect_err("a policy bug");
         assert_eq!(err.grpc, GrpcCode::Internal);
     }
 }

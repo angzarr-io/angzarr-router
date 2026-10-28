@@ -1,19 +1,19 @@
-//! SagaDispatch — the stateless source-event → commands translator.
+//! PolicyDispatch — the stateless source-event → commands translator.
 //!
-//! A saga holds NO state and rebuilds nothing: every page of the source book
+//! A policy holds NO state and rebuilds nothing: every page of the source book
 //! is a fresh trigger. Declared event types emit commands; an undeclared
 //! event type is skipped (C-0051), not an error. There is no compensation
 //! input. Emitted commands pass through as the handler returned them: the
 //! coordinator stamps their identity, causation and correlation; the router
-//! addresses them in the trigger's edition (a saga stays in the edition of
+//! addresses them in the trigger's edition (a policy stays in the edition of
 //! the event it handles; types.proto, Cover.edition).
 //!
-//! Refusals (saga.proto, SagaService, Refusals; decision 14.31): when one of
-//! the saga's commands is refused, [`SagaDispatch::dispatch_refusal`] (the
-//! saga's OnRefused) answers the one refusal fact for the saga's own source
-//! domain: the standard `CommandRefused` (pass-through), or, when the saga
+//! Refusals (policy.proto, PolicyService, Refusals; decision 14.31): when one of
+//! the policy's commands is refused, [`PolicyDispatch::dispatch_refusal`] (the
+//! policy's OnRefused) answers the one refusal fact for the policy's own source
+//! domain: the standard `CommandRefused` (pass-through), or, when the policy
 //! registers a callback for the refused command's type
-//! ([`SagaDispatch::on_refused`]), the domestic fact that callback returns
+//! ([`PolicyDispatch::on_refused`]), the domestic fact that callback returns
 //! (translate). [`address_refusal_fact`] then addresses and identifies it,
 //! as the runtime must, to the exact stream of the triggering event.
 
@@ -36,14 +36,14 @@ pub type EventFn = Box<
         + Sync,
 >;
 
-/// A saga's translating callback for one refused command type: reads the
+/// A policy's translating callback for one refused command type: reads the
 /// `Refusal` (the triggering event, the command as sent, the target's
-/// response with its typed refusal object) and returns a fact of the saga's
+/// response with its typed refusal object) and returns a fact of the policy's
 /// source domain, packed.
 pub type RefusalFn = Box<dyn Fn(&pb::Refusal) -> Result<Any, HandlerError> + Send + Sync>;
 
-/// The dispatch table for one saga component.
-pub struct SagaDispatch {
+/// The dispatch table for one policy component.
+pub struct PolicyDispatch {
     name: String,
     input_domain: String,
     output_domain: String,
@@ -52,8 +52,8 @@ pub struct SagaDispatch {
     rules_version: String,
 }
 
-impl SagaDispatch {
-    /// An empty saga table translating events of its one source domain,
+impl PolicyDispatch {
+    /// An empty policy table translating events of its one source domain,
     /// `input_domain`, into commands for its one destination domain,
     /// `output_domain` (options.proto ComponentOptions; decision 14.24).
     pub fn new(
@@ -61,7 +61,7 @@ impl SagaDispatch {
         input_domain: impl Into<String>,
         output_domain: impl Into<String>,
     ) -> Self {
-        SagaDispatch {
+        PolicyDispatch {
             name: name.into(),
             input_domain: input_domain.into(),
             output_domain: output_domain.into(),
@@ -100,7 +100,7 @@ impl SagaDispatch {
     }
 
     /// Registers the translating callback for refusals of the
-    /// fully-qualified command type `command` (translate mode; saga.proto,
+    /// fully-qualified command type `command` (translate mode; policy.proto,
     /// Refusals). Its presence IS translate mode for that command; a refused
     /// command of a type with none is passed through.
     pub fn on_refused(
@@ -112,14 +112,14 @@ impl SagaDispatch {
         self
     }
 
-    /// `SagaService.OnRefused`: the refusal fact for the saga's own source
+    /// `PolicyService.OnRefused`: the refusal fact for the policy's own source
     /// domain, as a CommandBook whose page body is a Fact and whose cover
     /// and identity are left for the runtime ([`address_refusal_fact`]).
     /// Pass-through (no callback for the refused command's type): the
     /// standard `CommandRefused { command, refusal, trigger }`, `refusal`
     /// the typed refusal object still packed, `trigger` the triggering
     /// event's EventRef. Translate: the callback's fact. A failing callback
-    /// is a saga bug (dead-lettered and alerted).
+    /// is a policy bug (dead-lettered and alerted).
     pub fn dispatch_refusal(
         &self,
         refusal: &pb::Refusal,
@@ -170,20 +170,20 @@ impl SagaDispatch {
         })
     }
 
-    /// The rules version the saga registers with: the business binary's
+    /// The rules version the policy registers with: the business binary's
     /// full version, baked in at build. Empty until declared.
     pub fn with_rules_version(mut self, rules_version: impl Into<String>) -> Self {
         self.rules_version = rules_version.into();
         self
     }
 
-    /// The registration hello (types.proto, ComponentDescriptor): kind SAGA,
+    /// The registration hello (types.proto, ComponentDescriptor): kind POLICY,
     /// its input domain as its input, and no state. Refused
     /// MISSING_RULES_VERSION without a rules version.
     pub fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError> {
         crate::descriptor::component_descriptor(
             &self.name,
-            pb::ComponentKind::Saga,
+            pb::ComponentKind::Policy,
             [self.input_domain.clone()],
             &self.rules_version,
             None,
@@ -196,7 +196,7 @@ impl SagaDispatch {
         &self.name
     }
 
-    /// The domain whose events this saga consumes.
+    /// The domain whose events this policy consumes.
     pub fn input_domain(&self) -> &str {
         &self.input_domain
     }
@@ -221,17 +221,17 @@ impl SagaDispatch {
     /// Walks EVERY page of the source book: declared event types emit;
     /// undeclared types are skipped. Emitted commands pass through
     /// unstamped, in emission order. A source with no pages is
-    /// EMPTY_SAGA_SOURCE.
-    pub fn dispatch(&self, source: &pb::EventBook) -> Result<pb::SagaResponse, CodedError> {
+    /// EMPTY_POLICY_SOURCE.
+    pub fn dispatch(&self, source: &pb::EventBook) -> Result<pb::PolicyResponse, CodedError> {
         if source.pages.is_empty() {
             return Err(CodedError::invalid_argument(
-                codes::EMPTY_SAGA_SOURCE,
-                messages::EMPTY_SAGA_SOURCE,
+                codes::EMPTY_POLICY_SOURCE,
+                messages::EMPTY_POLICY_SOURCE,
                 [],
             ));
         }
 
-        let mut resp = pb::SagaResponse::default();
+        let mut resp = pb::PolicyResponse::default();
 
         for page in &source.pages {
             let Some(event_any) = crate::page_event(page) else {
@@ -241,7 +241,7 @@ impl SagaDispatch {
                 .handlers
                 .get(crate::type_name_from_url(&event_any.type_url))
             else {
-                continue; // saga only reacts to declared types (spec C-0051)
+                continue; // policy only reacts to declared types (spec C-0051)
             };
             let context = PageContext {
                 cover: source.cover.as_ref(),
@@ -263,8 +263,8 @@ impl SagaDispatch {
                     None => cover.edition = edition.clone(),
                     Some(named) if Some(named) != edition.as_deref() => {
                         return Err(CodedError::internal(
-                            codes::SAGA_COMMAND_OUTSIDE_EDITION,
-                            messages::SAGA_COMMAND_OUTSIDE_EDITION,
+                            codes::POLICY_COMMAND_OUTSIDE_EDITION,
+                            messages::POLICY_COMMAND_OUTSIDE_EDITION,
                             [
                                 (
                                     extras::EXPECTED_EDITION.to_string(),
@@ -287,14 +287,14 @@ impl SagaDispatch {
         command.cover.as_ref().map_or("", |c| c.domain.as_str()) != self.output_domain
     }
 
-    /// A command for any domain but the saga's one destination is a saga
-    /// bug (saga.proto SagaResponse; decision 14.24): the whole answer is
+    /// A command for any domain but the policy's one destination is a policy
+    /// bug (policy.proto PolicyResponse; decision 14.24): the whole answer is
     /// refused INTERNAL, carrying no commands, naming both domains.
     fn refuse_outside_destination(&self, stray: &pb::CommandBook) -> CodedError {
         let actual = stray.cover.as_ref().map_or("", |c| c.domain.as_str());
         CodedError::internal(
-            codes::SAGA_COMMAND_OUTSIDE_DESTINATION,
-            messages::SAGA_COMMAND_OUTSIDE_DESTINATION,
+            codes::POLICY_COMMAND_OUTSIDE_DESTINATION,
+            messages::POLICY_COMMAND_OUTSIDE_DESTINATION,
             [
                 (
                     extras::EXPECTED_DOMAIN.to_string(),
@@ -307,14 +307,14 @@ impl SagaDispatch {
 }
 
 /// Addresses and identifies the refusal fact OnRefused answered, as the
-/// saga's runtime does (types.proto, the command_identity region,
-/// Validation; saga.proto, Refusals, Mechanics): its cover is the exact
+/// policy's runtime does (types.proto, the command_identity region,
+/// Validation; policy.proto, Refusals, Mechanics): its cover is the exact
 /// stream of the triggering event (domain, root and edition); its
 /// `command_id` is the refused command's (no prefix, no derivation); its
 /// `causation_id` and `correlation_id` are the refused command's; and its
 /// `fact_origin.external_id` is that command_id's canonical text. An
 /// answer whose page is not a Fact, or that sets its own cover, identity or
-/// Handling, is a saga bug, refused.
+/// Handling, is a policy bug, refused.
 pub fn address_refusal_fact(
     refusal: &pb::Refusal,
     answer: &pb::OnRefusedResponse,
@@ -328,7 +328,7 @@ pub fn address_refusal_fact(
     };
     let fact = answer.fact.as_ref().ok_or_else(|| malformed("no fact"))?;
     if fact.cover.is_some() || fact.handling.is_some() {
-        return Err(malformed("the saga set the fact's cover or handling"));
+        return Err(malformed("the policy set the fact's cover or handling"));
     }
     let page = fact.page.as_ref().ok_or_else(|| malformed("no page"))?;
     if crate::fact_payload(page).is_none() {
@@ -339,7 +339,7 @@ pub fn address_refusal_fact(
         || page.causation_id.is_some()
         || page.fact_origin.is_some()
     {
-        return Err(malformed("the saga set the fact's identity"));
+        return Err(malformed("the policy set the fact's identity"));
     }
     let refused = refusal
         .command
@@ -372,8 +372,8 @@ pub fn address_refusal_fact(
 }
 
 #[cfg(test)]
-#[path = "saga.test.rs"]
-mod saga_tests;
+#[path = "policy.test.rs"]
+mod policy_tests;
 
 #[cfg(test)]
 #[path = "refusal.test.rs"]

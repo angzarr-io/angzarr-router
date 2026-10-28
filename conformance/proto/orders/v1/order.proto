@@ -41,7 +41,7 @@ message Acknowledge {
 }
 
 // The Fulfillment process manager's starting command (a process manager is
-// a domain, decision 14.31; a saga from "order" sends it).
+// a domain, decision 14.31; a policy from "order" sends it).
 message StartFulfillment {}
 
 // The Fulfillment process manager's event: it started fulfilling.

@@ -205,7 +205,7 @@ pub type FactFn<S> = Box<dyn Fn(&Any, &S) -> Result<FactRecord, HandlerError> + 
 pub struct Arrival<'a> {
     /// The input as delivered: its cover names the addressed stream
     /// (domain, edition, root); its identity is stamped (command_id; and
-    /// causation_id for a saga's command or a refusal fact).
+    /// causation_id for a policy's command or a refusal fact).
     pub command: &'a pb::CommandBook,
     /// The events the addressed stream already holds under this input's id
     /// ([`crate::input_id`]; the store's `find_command`), in sequence
@@ -237,12 +237,12 @@ pub struct StreamStatus {
 pub enum Admission {
     /// Run the handler ([`DomainDispatch::dispatch`]).
     Dispatch,
-    /// A saga's command reaching a stream with no fork in its edition: the
+    /// A policy's command reaching a stream with no fork in its edition: the
     /// runtime appends this framework event at the stream's head, then
-    /// runs the handler (types.proto, EditionForked, Propagation).
+    /// runs the handler (types.proto, meta.EditionCreated, Propagation).
     /// `propagated_from` is left for the runtime, which knows the fork
-    /// event of the stream the saga reacted to.
-    Fork(pb::EditionForked),
+    /// event of the stream the policy reacted to.
+    Fork(pb::meta::EditionCreated),
     /// Already applied: the runtime answers these events, DUPLICATE, and the
     /// handler does not run (types.proto, the command_identity region).
     Duplicate(Vec<pb::EventPage>),
@@ -330,7 +330,7 @@ impl<S> DomainDispatch<S> {
     }
 
     /// Registers the handler of a refusal fact passed through by one of the
-    /// domain's sagas: the standard `CommandRefused` whose refused command
+    /// domain's policies: the standard `CommandRefused` whose refused command
     /// is of the fully-qualified type `refused_command` (another domain's
     /// command), the generated `on_refused_<Command>` dispatch (types.proto,
     /// the refusal_facts region; decision 14.31). An ordinary, infallible
@@ -365,7 +365,7 @@ impl<S> DomainDispatch<S> {
     /// 2. deduplication: events already recorded under the input's id are
     ///    [`Admission::Duplicate`];
     /// 3. editions: in a named edition, a stream with no fork there takes a
-    ///    saga's command by forking ([`Admission::Fork`]) and refuses any
+    ///    policy's command by forking ([`Admission::Fork`]) and refuses any
     ///    other input FAILED_PRECONDITION, EDITION_NOT_FORKED;
     /// 4. a process manager's start rule, by the input's type after
     ///    upcasting: with no instance, a starting type is dispatched; any
@@ -855,7 +855,7 @@ pub fn admit_rules(
         return Ok(Admission::Duplicate(arrival.recorded.to_vec()));
     }
 
-    // 3. Editions: a saga's input (one with a causation_id) forks the stream
+    // 3. Editions: a policy's input (one with a causation_id) forks the stream
     // on arrival; any other is refused until the stream is forked.
     let fork = match edition {
         Some(edition) if !arrival.stream.forked => {
@@ -892,13 +892,13 @@ pub fn admit_rules(
     Ok(fork.map_or(Admission::Dispatch, Admission::Fork))
 }
 
-/// The fork a saga's input makes on arriving at a stream with no fork in
-/// its edition (types.proto, EditionForked, Propagation): at the stream's
+/// The fork a policy's input makes on arriving at a stream with no fork in
+/// its edition (types.proto, meta.EditionCreated, Propagation): at the stream's
 /// head, `forked_by` the arriving input's id. `propagated_from` is the
 /// runtime's to fill. The one place the router builds the fork event, so
 /// the spec's coming rename of it is a change here.
-fn arrival_fork(edition: &str, head: u64, forked_by: Option<pb::Uuid>) -> pb::EditionForked {
-    pb::EditionForked {
+fn arrival_fork(edition: &str, head: u64, forked_by: Option<pb::Uuid>) -> pb::meta::EditionCreated {
+    pb::meta::EditionCreated {
         edition: edition.to_string(),
         parent_sequence: head,
         commit_position: 0,

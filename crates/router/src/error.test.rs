@@ -136,7 +136,7 @@ fn typed_refusal() -> prost_types::Any {
 }
 
 #[test]
-fn a_business_rejection_becomes_the_sagas_refusal_response() {
+fn a_business_rejection_becomes_the_policies_refusal_response() {
     let err = CodedError::rejection_precondition_failed("INSUFFICIENT_FUNDS", "holds 100", [])
         .with_refusal(typed_refusal());
     assert_eq!(err.grpc, GrpcCode::FailedPrecondition, "still a rejection");
@@ -150,7 +150,7 @@ fn a_business_rejection_becomes_the_sagas_refusal_response() {
 }
 
 #[test]
-fn a_rejection_without_a_typed_refusal_still_reaches_the_saga() {
+fn a_rejection_without_a_typed_refusal_still_reaches_the_policy() {
     let err = CodedError::rejection_precondition_failed("CLOSED", "the wallet is closed", []);
     assert_eq!(
         err.refusal_response(),
