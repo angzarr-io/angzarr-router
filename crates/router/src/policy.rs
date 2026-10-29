@@ -310,7 +310,7 @@ impl PolicyDispatch {
     /// refused INTERNAL, carrying no commands, naming both domains.
     fn refuse_outside_destination(&self, stray: &pb::CommandBook) -> CodedError {
         let actual = stray.cover.as_ref().map_or("", |c| c.domain.as_str());
-        CodedError::bug(
+        CodedError::internal(
             codes::POLICY_COMMAND_OUTSIDE_DESTINATION,
             messages::POLICY_COMMAND_OUTSIDE_DESTINATION,
             [
@@ -351,7 +351,7 @@ fn check_root(command: &pb::CommandBook) -> Result<(), CodedError> {
     if named {
         return Ok(());
     }
-    Err(CodedError::bug(
+    Err(CodedError::internal(
         codes::POLICY_COMMAND_NO_ROOT,
         messages::POLICY_COMMAND_NO_ROOT,
         naming(command),
@@ -370,7 +370,7 @@ fn check_correlation(
         .as_ref()
         .and_then(|p| p.correlation_id.as_ref());
     match (carried, trigger) {
-        (Some(carried), Some(trigger)) if carried != trigger => Err(CodedError::bug(
+        (Some(carried), Some(trigger)) if carried != trigger => Err(CodedError::internal(
             codes::POLICY_COMMAND_OTHER_CORRELATION,
             messages::POLICY_COMMAND_OTHER_CORRELATION,
             naming(command),
@@ -382,7 +382,7 @@ fn check_correlation(
 /// A command naming an edition other than its
 /// trigger's: a policy bug, refused INTERNAL.
 fn refuse_outside_edition(expected: &str, actual: &str) -> CodedError {
-    CodedError::bug(
+    CodedError::internal(
         codes::POLICY_COMMAND_OUTSIDE_EDITION,
         messages::POLICY_COMMAND_OUTSIDE_EDITION,
         [
@@ -406,7 +406,7 @@ pub fn address_refusal_fact(
     answer: &pb::OnRefusedResponse,
 ) -> Result<pb::CommandBook, CodedError> {
     let malformed = |why: &str| {
-        CodedError::bug(
+        CodedError::internal(
             codes::MALFORMED_REFUSAL_FACT,
             messages::MALFORMED_REFUSAL_FACT,
             [(extras::REASON.to_string(), why.to_string())],

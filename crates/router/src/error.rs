@@ -321,18 +321,38 @@ impl CodedError {
         Self::coded(code, message, details, GrpcCode::FailedPrecondition)
     }
 
-    /// A bug (INTERNAL): a defect, never a business answer. The other of
-    /// the two classes a handler fails with (the first is
-    /// [`Self::rejection`]); the runtime alerts it and dead-letters the
-    /// input, and it never reaches a policy's OnRefused. The router raises
-    /// its own component bugs (a policy's malformed answer, say) with it
-    /// too.
+    /// A bug: a defect, never a business answer. The other of the two
+    /// classes a handler fails with (the first is [`Self::rejection`]). It
+    /// goes out as UNHANDLED_HANDLER_ERROR (INTERNAL), with `code` and
+    /// `details` as its cause, flattened as `cause=<code>` and
+    /// `cause.<arg>=<value>` (decision 14.37); the runtime alerts it and
+    /// dead-letters the input, and it never reaches a policy's OnRefused.
     pub fn bug(
         code: &str,
         message: &str,
         details: impl IntoIterator<Item = (String, String)>,
     ) -> Self {
-        Self::coded(code, message, details, GrpcCode::Internal)
+        let cause = std::iter::once((extras::CAUSE.to_string(), code.to_string())).chain(
+            details
+                .into_iter()
+                .map(|(name, value)| (format!("{}.{name}", extras::CAUSE), value)),
+        );
+        Self::coded(
+            codes::UNHANDLED_HANDLER_ERROR,
+            message,
+            cause,
+            GrpcCode::Internal,
+        )
+    }
+
+    /// A component bug the router itself finds (INTERNAL), under its own
+    /// code: a policy's malformed answer, say. Never a handler's.
+    pub(crate) fn internal(
+        code: &str,
+        message: &str,
+        extras: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        Self::coded(code, message, extras, GrpcCode::Internal)
     }
 }
 
