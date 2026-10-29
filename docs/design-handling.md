@@ -1,5 +1,14 @@
 # Design: rules version, conflict resolution, command upcasting and router-owned state
 
+> **Superseded in part by decision 14.37 (errors are a key and an argument
+> map):** every error code, status and message below is historical. A
+> failing fold is `FOLD_FAILED` / `FOLD_FAILED_EMITTED` with the fold's own
+> failure as `cause` (no `fold_message`; `FoldFailure` carries a `cause`, not
+> a `message`); `DUPLICATE_REGISTRATION` is `DUPLICATE_COMPONENT` or
+> `DUPLICATE_UPCASTER_CHAIN`; an unknown type is `UNKNOWN_COMMAND_TYPE`; the
+> router's own malformed-input and misconfiguration errors are INTERNAL. The
+> current contract is docs/architecture.md's Errors row.
+
 > **Superseded in part on the POC line (spec 636b313, decision 14.31):** a
 > process manager is a domain, so every passage below about process-manager
 > triggers, `ProcessManagerDispatch`, `ProcessManagerHandler`,
