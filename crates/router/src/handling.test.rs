@@ -203,6 +203,37 @@ fn a_fact_handler_reads_the_facts_identity_and_origin() {
     assert_eq!(cctx.fact_origin, Some(origin));
 }
 
+// A fact handler, like a command handler, knows whether the aggregate
+// exists: the prior-events book carried history.
+#[test]
+fn a_fact_handler_knows_whether_the_aggregate_exists() {
+    for (history, exists) in [
+        (vec![sequenced_event_page(0, bump("b"))], true),
+        (vec![], false),
+    ] {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let d = DomainDispatch::new("list", "list", list_rebuilder()).on_fact_with_context(
+            "test.Paid",
+            move |fact, _state, cctx| {
+                sink.lock().unwrap().push(cctx.had_prior_events);
+                Ok(crate::domain::FactRecord::from(fact.clone()))
+            },
+        );
+        let mut req = contextual(fact_page(Any {
+            type_url: type_url("test.Paid"),
+            value: Vec::new(),
+        }));
+        req.events = Some(pb::EventBook {
+            next_sequence: history.len() as u64,
+            pages: history,
+            ..Default::default()
+        });
+        d.dispatch(&req).expect("recorded");
+        assert_eq!(*seen.lock().unwrap(), vec![exists]);
+    }
+}
+
 /// An AGGREGATE_HANDLES aggregate whose handler records the window it saw and
 /// acknowledges with `ack(nonce)` (None: never calls resolve_conflicts).
 fn handles(

@@ -126,10 +126,11 @@ pub trait PayloadUpcaster: Send + Sync {
 pub struct PageContext<'a> {
     pub cover: Option<&'a pb::Cover>,
     pub sequence: u64,
-    /// The page's metadata (types.proto, EventMeta): its correlation_id,
-    /// recorded_at and causation. A policy reads its trigger's correlation
-    /// here (decision 14.36: it may name that correlation as the root).
-    /// RED: a compile stub, never filled yet (always `None`).
+    /// The page's metadata (types.proto, EventMeta), as delivered: its
+    /// correlation_id, recorded_at and causation; `None` when the page
+    /// carries none (an event this command just emitted carries none yet).
+    /// A policy reads its trigger's correlation here (decision 14.36: it
+    /// may name that correlation as the root).
     pub meta: Option<&'a pb::EventMeta>,
 }
 

@@ -320,7 +320,7 @@ impl<S> Rebuilder<S> {
             let ctx = PageContext {
                 cover: book.cover.as_ref(),
                 sequence: page.sequence,
-                meta: None,
+                meta: page.meta.as_ref(),
             };
             if let Err(err) = thunk(&mut state, event, &ctx) {
                 return Err(page_fold_error(
@@ -423,7 +423,7 @@ impl<S> Rebuilder<S> {
         let ctx = PageContext {
             cover,
             sequence: page.sequence,
-            meta: None,
+            meta: page.meta.as_ref(),
         };
         thunk(state, event, &ctx)
             .map_err(|err| page_fold_error(origin, page, &self.state_type_url, &err.to_string()))?;

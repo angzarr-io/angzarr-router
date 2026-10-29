@@ -264,7 +264,7 @@ fn a_finish_failure_is_not_a_fold_failure() {
 }
 
 // Each fold sees its page's place: the book's cover (root) and the page's
-// sequence, for idempotent per-page handling.
+// sequence, for idempotent per-page handling, and the page's metadata.
 #[test]
 fn folds_observe_the_book_cover_and_page_sequence() {
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -277,6 +277,7 @@ fn folds_observe_the_book_cover_and_page_sequence() {
                     .and_then(|c| c.root.clone())
                     .map(|r| r.value.to_vec()),
                 ctx.sequence,
+                ctx.meta.and_then(|m| m.recorded_at),
             ));
             Ok(())
         },
@@ -284,10 +285,21 @@ fn folds_observe_the_book_cover_and_page_sequence() {
     let mut events = book("order", cover_pages("order", 2));
     events.cover.as_mut().unwrap().root = Some(uuid_of(9));
     events.pages[0].sequence = 4;
+    let recorded_at = prost_types::Timestamp {
+        seconds: 1_700_000_000,
+        nanos: 0,
+    };
+    events.pages[0].meta = Some(pb::EventMeta {
+        recorded_at: Some(recorded_at),
+        ..Default::default()
+    });
     d.dispatch(&events).expect("dispatch");
     assert_eq!(
         *seen.lock().unwrap(),
-        vec![(Some(vec![9; 16]), 4), (Some(vec![9; 16]), 0)]
+        vec![
+            (Some(vec![9; 16]), 4, Some(recorded_at)),
+            (Some(vec![9; 16]), 0, None)
+        ]
     );
 }
 

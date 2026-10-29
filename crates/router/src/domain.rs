@@ -59,13 +59,11 @@ pub struct CommandContext {
     pub conflict: Option<Conflict>,
     /// The input's command id (types.proto, CommandPage.command_id): a
     /// client's, a policy's derived one, or a fact's derived from its
-    /// origin. RED: a compile stub, never filled yet.
+    /// origin; as delivered.
     pub command_id: Option<pb::Uuid>,
-    /// The input's correlation (CommandPage.correlation_id). RED: a compile
-    /// stub, never filled yet.
+    /// The input's correlation (CommandPage.correlation_id), as delivered.
     pub correlation_id: Option<pb::Uuid>,
     /// A fact's origin (CommandPage.fact_origin); `None` for a command.
-    /// RED: a compile stub, never filled yet.
     pub fact_origin: Option<pb::FactOrigin>,
 }
 
@@ -204,9 +202,11 @@ impl From<Any> for FactRecord {
     }
 }
 
-/// Records one fact (a command page's Fact arm) against the rebuilt state.
+/// Records one fact (a command page's Fact arm) against the rebuilt state,
+/// reading the fact's [`CommandContext`] (its identity and origin).
 /// Generated thunks unmarshal to the typed fact and pack the typed result.
-pub type FactFn<S> = Box<dyn Fn(&Any, &S) -> Result<FactRecord, HandlerError> + Send + Sync>;
+pub type FactFn<S> =
+    Box<dyn Fn(&Any, &S, CommandContext) -> Result<FactRecord, HandlerError> + Send + Sync>;
 
 /// What the runtime knows when an input reaches a domain, before its
 /// handler runs: the input and what it read of the addressed stream.
@@ -255,7 +255,7 @@ pub type RefusedFn<S> =
     Box<dyn Fn(&pb::CommandRefused, &S) -> Result<FactRecord, HandlerError> + Send + Sync>;
 
 /// One fact handler, bound to its input: records it against the state.
-type RecordFn<'a, S> = Box<dyn Fn(&S) -> Result<FactRecord, CodedError> + 'a>;
+type RecordFn<'a, S> = Box<dyn Fn(&S, CommandContext) -> Result<FactRecord, CodedError> + 'a>;
 
 /// A process manager's start rule: whether an input payload (as sent) is of
 /// a type that may start an instance, judged after upcasting. `None` for an
@@ -483,29 +483,27 @@ impl<S> DomainDispatch<S> {
     /// Registers the fact handler for a FULLY-QUALIFIED fact type: a page
     /// whose Fact arm carries it runs this handler.
     pub fn on_fact(
-        mut self,
+        self,
         fq_fact_type: &str,
         thunk: impl Fn(&Any, &S) -> Result<FactRecord, HandlerError> + Send + Sync + 'static,
     ) -> Self {
-        self.facts.insert(fq_fact_type.to_string(), Box::new(thunk));
-        self
+        self.on_fact_with_context(fq_fact_type, move |fact, state, _cctx| thunk(fact, state))
     }
 
     /// Registers a fact handler, as [`Self::on_fact`], that also receives
-    /// the fact's [`CommandContext`]: its command id, correlation and
-    /// origin (types.proto, CommandPage). RED: a compile stub; the context
-    /// is never filled yet (always the default).
+    /// the fact's [`CommandContext`]: what a command handler receives
+    /// (STRICT, no conflict), the fact's command id, correlation and origin
+    /// (types.proto, CommandPage) included.
     pub fn on_fact_with_context(
-        self,
+        mut self,
         fq_fact_type: &str,
         thunk: impl Fn(&Any, &S, CommandContext) -> Result<FactRecord, HandlerError>
             + Send
             + Sync
             + 'static,
     ) -> Self {
-        self.on_fact(fq_fact_type, move |fact, state| {
-            thunk(fact, state, CommandContext::default())
-        })
+        self.facts.insert(fq_fact_type.to_string(), Box::new(thunk));
+        self
     }
 
     /// The component name.
@@ -598,7 +596,9 @@ impl<S> DomainDispatch<S> {
                 let record_with: RecordFn<'_, S> = match self.facts.get(fact_type) {
                     Some(thunk) => {
                         let any = any.clone();
-                        Box::new(move |state| thunk(&any, state).map_err(map_handler_error))
+                        Box::new(move |state, cctx| {
+                            thunk(&any, state, cctx).map_err(map_handler_error)
+                        })
                     }
                     None if fact_type == <pb::CommandRefused as prost::Name>::full_name() => {
                         let refused =
@@ -626,12 +626,20 @@ impl<S> DomainDispatch<S> {
                                 [(extras::COMMAND_TYPE.to_string(), refused_type)],
                             ));
                         };
-                        Box::new(move |state| thunk(&refused, state).map_err(map_handler_error))
+                        Box::new(move |state, _cctx| {
+                            thunk(&refused, state).map_err(map_handler_error)
+                        })
                     }
                     None => return Err(self.unknown(codes::NO_FACT_HANDLER, sent, &any)),
                 };
-                let (mut state, _) = self.rebuilder.rebuild(req.events.as_ref())?;
-                let record = record_with(&state)?;
+                let (mut state, info) = self.rebuilder.rebuild(req.events.as_ref())?;
+                let record = record_with(
+                    &state,
+                    CommandContext {
+                        had_prior_events: info.had_prior_events,
+                        ..input_context(req, command_book)
+                    },
+                )?;
                 let recorded = pb::EventBook {
                     pages: std::iter::once(record.fact)
                         .chain(record.flags)
@@ -727,20 +735,13 @@ impl<S> DomainDispatch<S> {
             self.rebuilder
                 .apply_emitted(state, &out.pages, cover, next_sequence)
         };
-        let handling = command_book.handling.unwrap_or_default();
-        let expected_sequence = handling.expected_sequence.unwrap_or(next_sequence);
-        let conflict_resolution = pb::ConflictResolution::try_from(handling.conflict_resolution)
-            .unwrap_or(pb::ConflictResolution::Unspecified);
+        let base = input_context(req, command_book);
+        let expected_sequence = base.expected_sequence;
+        let conflict_resolution = base.conflict_resolution;
         let context = |had_prior_events: bool, conflict: Option<Conflict>| CommandContext {
-            next_sequence,
             had_prior_events,
-            cover: command_book.cover.clone(),
-            expected_sequence,
-            conflict_resolution,
             conflict,
-            command_id: None,
-            correlation_id: None,
-            fact_origin: None,
+            ..base.clone()
         };
         let run = |state: &mut S, cctx: CommandContext| -> Result<pb::EventBook, CodedError> {
             Ok(thunk(any, state, cctx)
@@ -921,6 +922,28 @@ fn non_empty_payload(payload: Option<&Any>) -> Result<&Any, CodedError> {
             messages::NO_COMMAND_PAGES,
             [],
         )),
+    }
+}
+
+/// What every handler of `req` reads, whatever its arm: the stream's next
+/// sequence, the input's cover, its resolved Handling, and its identity
+/// (command id, correlation, fact origin) as delivered. `had_prior_events`
+/// and `conflict` are the caller's (false and `None` here).
+fn input_context(req: &pb::ContextualCommand, command_book: &pb::CommandBook) -> CommandContext {
+    let next_sequence = crate::next_sequence(req.events.as_ref());
+    let handling = command_book.handling.unwrap_or_default();
+    let page = command_book.page.as_ref();
+    CommandContext {
+        next_sequence,
+        had_prior_events: false,
+        cover: command_book.cover.clone(),
+        expected_sequence: handling.expected_sequence.unwrap_or(next_sequence),
+        conflict_resolution: pb::ConflictResolution::try_from(handling.conflict_resolution)
+            .unwrap_or(pb::ConflictResolution::Unspecified),
+        conflict: None,
+        command_id: page.and_then(|p| p.command_id.clone()),
+        correlation_id: page.and_then(|p| p.correlation_id.clone()),
+        fact_origin: page.and_then(|p| p.fact_origin.clone()),
     }
 }
 

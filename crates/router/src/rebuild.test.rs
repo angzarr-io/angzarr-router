@@ -382,15 +382,18 @@ fn stateless_snapshot_covers_no_pages() {
     assert_eq!(state.applied, vec!["one", "two"]);
 }
 
-// Appliers registered with context see the book's cover and each page's
-// sequence.
+// Appliers registered with context see the book's cover, each page's
+// sequence and its metadata (here, its correlation's first byte; 0: none).
 #[test]
 fn context_appliers_see_the_book_cover_and_page_sequence() {
     let r = fresh_rebuilder().apply_with_context(&cover_full_name(), |s, _any, ctx| {
         s.applied.push(format!(
-            "{}@{}",
+            "{}@{}#{}",
             ctx.cover.map_or("", |c| c.domain.as_str()),
-            ctx.sequence
+            ctx.sequence,
+            ctx.meta
+                .and_then(|m| m.correlation_id.as_ref())
+                .map_or(0, |u| u.value[0])
         ));
         Ok(())
     });
@@ -405,8 +408,12 @@ fn context_appliers_see_the_book_cover_and_page_sequence() {
         ],
         ..Default::default()
     };
+    book.pages[0].meta = Some(pb::EventMeta {
+        correlation_id: Some(uuid_of(7)),
+        ..Default::default()
+    });
     let (state, _) = r.rebuild(Some(&book)).expect("rebuild");
-    assert_eq!(state.applied, vec!["ledger@4", "ledger@0"]);
+    assert_eq!(state.applied, vec!["ledger@4#7", "ledger@0#0"]);
 
     book.cover = None;
     let mut state = TestState::default();
@@ -420,7 +427,7 @@ fn context_appliers_see_the_book_cover_and_page_sequence() {
             })
         )
         .expect("apply"));
-    assert_eq!(state.applied, vec!["facts@4"]);
+    assert_eq!(state.applied, vec!["facts@4#7"]);
     assert!(!r
         .apply_page(&mut state, &pb::EventPage::default(), None)
         .expect("no event"));
