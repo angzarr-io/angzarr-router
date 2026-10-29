@@ -27,7 +27,7 @@ license = "BSD-3-Clause"
 # Keep this rev equal to the angzarr-project submodule's commit (the
 # submodule supplies the .proto files and the shared features).
 # prost and prost-types match its.
-angzarr-proto = { git = "https://github.com/angzarr-io/angzarr-project", rev = "5f88d678a53427bf9ef4b3061aa30863007d1ba1" }
+angzarr-proto = { git = "https://github.com/angzarr-io/angzarr-project", rev = "3aad63842e655343210ca05349c1a186072779ab" }
 prost = "0.14"
 prost-types = "0.14"
 prost-build = "0.14"

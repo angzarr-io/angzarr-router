@@ -48,3 +48,21 @@ fn decode_message_decodes_or_names_the_message_type() {
         Some("io.angzarr.v1.ContextualCommand")
     );
 }
+
+// Decision 14.37 (owner's rulings, 2026-10-29, late): prost's DecodeError
+// is a third-party library's error, so its own text travels verbatim as
+// `ext_err_txt` (prost gives it no numeric code).
+#[test]
+fn undecodable_bytes_carry_the_decoders_own_text() {
+    let garbage = [0xff, 0xff, 0xff];
+    let prost_text = <pb::ContextualCommand as prost::Message>::decode(&garbage[..])
+        .expect_err("undecodable")
+        .to_string();
+    let err = decode_message::<pb::ContextualCommand>(&garbage).expect_err("undecodable");
+    assert_eq!(
+        err.extras.get(error::extras::EXT_ERR_TXT),
+        Some(&prost_text),
+        "ext_err_txt (all: {:?})",
+        err.extras
+    );
+}

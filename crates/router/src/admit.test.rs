@@ -593,6 +593,38 @@ fn a_passed_through_refusal_of_a_command_with_no_handler_is_no_fact_handler() {
     crate::test_support::assert_bug(&err);
 }
 
+// A CommandRefused fact whose bytes do not decode: prost's DecodeError is a
+// third-party library's error, so its own text travels verbatim as
+// `ext_err_txt` beside ANY_DECODE_FAILED (decision 14.37, owner's rulings,
+// 2026-10-29, late).
+#[test]
+fn an_undecodable_command_refused_carries_the_decoders_own_text() {
+    let trigger = stream("buyin", None, INSTANCE);
+    let mut fact = refusal_fact(trigger.clone(), trigger);
+    let page = fact.page.as_mut().unwrap();
+    let Some(pb::command_page::Body::Fact(body)) = page.body.as_mut() else {
+        unreachable!()
+    };
+    let garbage = vec![0xff, 0xff, 0xff];
+    let prost_text = pb::CommandRefused::decode(garbage.as_slice())
+        .expect_err("undecodable")
+        .to_string();
+    body.payload.as_mut().unwrap().value = garbage;
+    let err = buyin()
+        .dispatch(&pb::ContextualCommand {
+            command: Some(fact),
+            ..Default::default()
+        })
+        .expect_err("undecodable");
+    assert_eq!(err.code, codes::ANY_DECODE_FAILED);
+    assert_eq!(
+        err.extras.get(crate::error::extras::EXT_ERR_TXT),
+        Some(&prost_text),
+        "ext_err_txt (all: {:?})",
+        err.extras
+    );
+}
+
 // --- no edition-lifecycle outcome (owner ruling, 2026-10-28) -----------------
 
 // The router never sees a meta-event: creating, forking, refusing an

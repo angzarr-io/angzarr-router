@@ -148,7 +148,7 @@ pub fn assert_bug(err: &crate::error::CodedError) {
         "{}: the router's own malformed-input error is a bug",
         err.code
     );
-    assert_eq!(err.grpc.class(), ErrorClass::Bug, "{}", err.code);
+    assert_eq!(err.grpc.class(), ErrorClass::FatalBug, "{}", err.code);
     assert_eq!(
         err.refusal_response(),
         None,

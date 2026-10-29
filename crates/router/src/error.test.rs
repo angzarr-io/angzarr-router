@@ -78,6 +78,10 @@ fn every_constructor() -> Vec<(&'static str, CodedError)> {
             CodedError::bug("LEDGER_OFFLINE", [arg("ledger", "main")]),
         ),
         (
+            "retryable_bug",
+            CodedError::retryable_bug("LEDGER_OFFLINE", [arg("ledger", "main")]),
+        ),
+        (
             "internal, a policy's",
             CodedError::internal(codes::POLICY_COMMAND_NO_ROOT, []),
         ),
@@ -503,11 +507,22 @@ const BUSINESS: [(BusinessStatus, GrpcCode); 6] = [
     (BusinessStatus::PermissionDenied, GrpcCode::PermissionDenied),
 ];
 const BUGS: [GrpcCode; 3] = [GrpcCode::Internal, GrpcCode::Unknown, GrpcCode::DataLoss];
-const RETRYABLE: [GrpcCode; 3] = [
+// Decision 14.37 (owner's rulings, 2026-10-29, late): the router gains
+// DEADLINE_EXCEEDED and RESOURCE_EXHAUSTED, both a bug's retryable branch.
+const RETRYABLE: [GrpcCode; 5] = [
     GrpcCode::Unavailable,
     GrpcCode::Aborted,
     GrpcCode::Unimplemented,
+    GrpcCode::DeadlineExceeded,
+    GrpcCode::ResourceExhausted,
 ];
+
+// The wire numbers are google.rpc.Code's.
+#[test]
+fn deadline_exceeded_and_resource_exhausted_carry_their_wire_numbers() {
+    assert_eq!(GrpcCode::DeadlineExceeded as i32, 4);
+    assert_eq!(GrpcCode::ResourceExhausted as i32, 8);
+}
 
 #[test]
 fn each_business_status_builds_a_refusal_with_that_status() {
@@ -547,8 +562,9 @@ fn the_status_decides_the_class() {
     let wrong: Vec<String> = BUSINESS
         .iter()
         .map(|(_, grpc)| (*grpc, ErrorClass::BusinessRefusal))
-        .chain(BUGS.map(|grpc| (grpc, ErrorClass::Bug)))
-        .chain(RETRYABLE.map(|grpc| (grpc, ErrorClass::Retryable)))
+        // A bug is fatal or retryable (owner's rulings, 2026-10-29, late).
+        .chain(BUGS.map(|grpc| (grpc, ErrorClass::FatalBug)))
+        .chain(RETRYABLE.map(|grpc| (grpc, ErrorClass::RetryableBug)))
         .filter(|(grpc, class)| {
             grpc.class() != *class
                 || grpc.is_business_refusal() != (*class == ErrorClass::BusinessRefusal)
@@ -575,10 +591,44 @@ fn every_business_refusal_reaches_on_refused() {
 fn a_bug_stays_internal_with_its_cause() {
     let err = CodedError::bug("LEDGER_OFFLINE", [arg("ledger", "main")]);
     assert_eq!(err.grpc, GrpcCode::Internal);
-    assert_eq!(err.grpc.class(), ErrorClass::Bug);
+    assert_eq!(err.grpc.class(), ErrorClass::FatalBug);
     assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
     assert_eq!(
         err.extras,
         [arg("cause", "LEDGER_OFFLINE"), arg("cause.ledger", "main")].into()
+    );
+}
+
+// Decision 14.37, PROPOSAL (a) of 2026-10-29 (late): a bug the handler
+// marks retryable (its ledger service is down) goes out as a retryable
+// STATUS, UNAVAILABLE, under UNHANDLED_HANDLER_ERROR with its own code and
+// args as the cause; the status alone decides the class. Never OnRefused.
+#[test]
+fn a_retryable_bug_is_unavailable_with_its_cause() {
+    let err = CodedError::retryable_bug("LEDGER_OFFLINE", [arg("ledger", "main")]);
+    assert_eq!(err.grpc, GrpcCode::Unavailable, "the retryable status");
+    assert_eq!(err.grpc.class(), ErrorClass::RetryableBug);
+    assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
+    assert_eq!(err.status_message(), codes::UNHANDLED_HANDLER_ERROR);
+    assert_eq!(
+        err.extras,
+        [arg("cause", "LEDGER_OFFLINE"), arg("cause.ledger", "main")].into()
+    );
+    assert_eq!(err.refusal_response(), None, "never a policy's OnRefused");
+}
+
+// A handler's retryable bug crosses the handler boundary unchanged: the
+// router neither reclasses it nor folds it into a fatal bug.
+#[test]
+fn a_handlers_retryable_bug_keeps_its_status_through_the_boundary() {
+    let err = call_handler::<()>(|| {
+        Err(CodedError::retryable_bug("LEDGER_OFFLINE", [arg("ledger", "main")]).into())
+    })
+    .expect_err("the handler failed");
+    assert_eq!(err.grpc, GrpcCode::Unavailable);
+    assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
+    assert_eq!(
+        err.extras.get("cause").map(String::as_str),
+        Some("LEDGER_OFFLINE")
     );
 }

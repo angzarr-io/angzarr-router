@@ -144,7 +144,7 @@ async fn on_refused_not_called(w: &mut RefusalWorld) {
     regex = r"^HoldFunds is retried with backoff up to its configured cap, then dead-lettered and alerted$"
 )]
 async fn retried(w: &mut RefusalWorld) {
-    assert_eq!(w.answer().grpc.class(), ErrorClass::Retryable);
+    assert_eq!(w.answer().grpc.class(), ErrorClass::RetryableBug);
 }
 
 #[then(regex = r"^HoldFunds is neither retried nor dead-lettered$")]
@@ -154,7 +154,7 @@ async fn neither(w: &mut RefusalWorld) {
 
 #[then(regex = r"^HoldFunds is dead-lettered and an alert is raised$")]
 async fn dead_lettered(w: &mut RefusalWorld) {
-    assert_eq!(w.answer().grpc.class(), ErrorClass::Bug);
+    assert_eq!(w.answer().grpc.class(), ErrorClass::FatalBug);
 }
 
 #[tokio::main]

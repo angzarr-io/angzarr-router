@@ -593,6 +593,8 @@ fn grpc_name(code: GrpcCode) -> &'static str {
     match code {
         GrpcCode::Unknown => "UNKNOWN",
         GrpcCode::InvalidArgument => "INVALID_ARGUMENT",
+        GrpcCode::DeadlineExceeded => "DEADLINE_EXCEEDED",
+        GrpcCode::ResourceExhausted => "RESOURCE_EXHAUSTED",
         GrpcCode::NotFound => "NOT_FOUND",
         GrpcCode::AlreadyExists => "ALREADY_EXISTS",
         GrpcCode::PermissionDenied => "PERMISSION_DENIED",
@@ -680,6 +682,27 @@ async fn fails_with_bug(
     add_item_fails(
         w,
         conf::AddItemFails::Bug {
+            code,
+            args: vec![(name, value)],
+            logs,
+        },
+    );
+}
+
+// C-0678 (decision 14.37, PROPOSAL (a)): a bug the handler marks retryable.
+#[given(
+    regex = r#"^business code for AddItem fails with a retryable bug, code (\w+) and arg (\w+) "([^"]*)", and logs "([^"]*)" for itself$"#
+)]
+async fn fails_with_retryable_bug(
+    w: &mut HandlingWorld,
+    code: String,
+    name: String,
+    value: String,
+    logs: String,
+) {
+    add_item_fails(
+        w,
+        conf::AddItemFails::RetryableBug {
             code,
             args: vec![(name, value)],
             logs,

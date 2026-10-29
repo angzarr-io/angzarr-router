@@ -16,9 +16,13 @@ pub const ERROR_INFO_DOMAIN: &str = "angzarr.io";
 pub enum GrpcCode {
     Unknown = 2,
     InvalidArgument = 3,
+    // RED STUB (feat/bug-branches): classed wrongly in `class` until green.
+    DeadlineExceeded = 4,
     NotFound = 5,
     AlreadyExists = 6,
     PermissionDenied = 7,
+    // RED STUB (feat/bug-branches): classed wrongly in `class` until green.
+    ResourceExhausted = 8,
     FailedPrecondition = 9,
     Aborted = 10,
     OutOfRange = 11,
@@ -45,6 +49,13 @@ pub enum ErrorClass {
     /// owner ruling, 2026-10-29). The backoff and the cap are the runtime's
     /// configuration; the router only classifies.
     Retryable,
+    /// RED STUB (feat/bug-branches): a bug's retryable branch (decision
+    /// 14.37, owner's rulings 2026-10-29, late). `class` does not answer it
+    /// yet; green replaces `Retryable` with it.
+    RetryableBug,
+    /// RED STUB (feat/bug-branches): a bug's fatal branch. `class` does not
+    /// answer it yet; green replaces `Bug` with it.
+    FatalBug,
 }
 
 impl GrpcCode {
@@ -61,6 +72,8 @@ impl GrpcCode {
             | GrpcCode::OutOfRange
             | GrpcCode::PermissionDenied => ErrorClass::BusinessRefusal,
             GrpcCode::Internal | GrpcCode::Unknown | GrpcCode::DataLoss => ErrorClass::Bug,
+            // RED STUB (feat/bug-branches): wrong until green.
+            GrpcCode::DeadlineExceeded | GrpcCode::ResourceExhausted => ErrorClass::Bug,
             GrpcCode::Aborted | GrpcCode::Unavailable | GrpcCode::Unimplemented => {
                 ErrorClass::Retryable
             }
@@ -299,6 +312,9 @@ pub mod extras {
     /// A wrapped cause's code; its args follow as `cause.<arg>` (decision
     /// 14.37).
     pub const CAUSE: &str = "cause";
+    /// A third-party library's own error text, verbatim (decision 14.37,
+    /// owner's rulings 2026-10-29, late): the one text an arg may hold.
+    pub const EXT_ERR_TXT: &str = "ext_err_txt";
 }
 
 /// Where a failing fold failed: the page, when known, else the batch's
@@ -542,6 +558,14 @@ impl CodedError {
             flatten(extras::CAUSE, code, details),
             GrpcCode::Internal,
         )
+    }
+
+    /// RED STUB (feat/bug-branches): a bug the handler marks retryable (an
+    /// external dependency that is down). Proposed wire shape (decision
+    /// 14.37, PROPOSAL (a)): UNAVAILABLE, UNHANDLED_HANDLER_ERROR, `code`
+    /// and `details` as its cause. The stub answers a fatal bug.
+    pub fn retryable_bug(code: &str, details: impl IntoIterator<Item = (String, String)>) -> Self {
+        Self::bug(code, details)
     }
 
     /// A bug the router itself finds (INTERNAL), under its own code:

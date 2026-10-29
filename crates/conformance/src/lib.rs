@@ -668,6 +668,12 @@ pub enum AddItemFails {
         args: Vec<(String, String)>,
         logs: String,
     },
+    /// A bug the handler marks retryable, with its own `code` and `args`.
+    RetryableBug {
+        code: String,
+        args: Vec<(String, String)>,
+        logs: String,
+    },
 }
 
 impl AddItemFails {
@@ -694,6 +700,10 @@ impl AddItemFails {
             AddItemFails::Bug { code, args, logs } => {
                 let _ = logs; // the handler's own log
                 CodedError::bug(code, args.clone()).into()
+            }
+            AddItemFails::RetryableBug { code, args, logs } => {
+                let _ = logs; // the handler's own log
+                CodedError::retryable_bug(code, args.clone()).into()
             }
         }
     }
