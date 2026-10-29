@@ -36,7 +36,7 @@ fn wallet() -> DomainDispatch<TestState> {
             let hold = HoldFunds::decode(command.value.as_slice()).expect("HoldFunds");
             if hold.amount > 100 {
                 return Err(HandlerError::Coded(
-                    CodedError::rejection_precondition_failed(
+                    CodedError::rejection(
                         "INSUFFICIENT_FUNDS",
                         "the wallet holds 100",
                         [],

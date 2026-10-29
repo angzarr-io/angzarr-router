@@ -99,26 +99,33 @@ fn coded_handler_error_passes_through_unchanged() {
     assert_eq!(mapped, original);
 }
 
+// A handler fails in exactly two classes: a business rejection (the
+// command is refused, FAILED_PRECONDITION) or a bug (a defect, INTERNAL,
+// alerted and dead-lettered).
 #[test]
-fn rejections_keep_their_grpc_code() {
-    let err = CodedError::rejection_precondition_failed(
-        "VALUE_NOT_POSITIVE",
-        "value must be positive",
-        [],
-    );
+fn a_rejection_is_a_business_refusal() {
+    let err = CodedError::rejection("VALUE_NOT_POSITIVE", "value must be positive", []);
     assert_eq!(err.grpc, GrpcCode::FailedPrecondition);
     assert_eq!(err.code, "VALUE_NOT_POSITIVE");
+    assert_eq!(err.message, "value must be positive");
+}
 
-    let err = CodedError::rejection_invalid_argument("VALUE_EMPTY", "value must not be empty", []);
-    assert_eq!(err.grpc, GrpcCode::InvalidArgument);
-
-    let err = CodedError::rejection_not_found("ENTITY_NOT_FOUND", "entity not found", []);
-    assert_eq!(err.grpc, GrpcCode::NotFound);
+#[test]
+fn a_bug_is_internal() {
+    let err = CodedError::bug(
+        "LEDGER_INVARIANT_BROKEN",
+        "the ledger went negative",
+        [("balance".to_string(), "-1".to_string())],
+    );
+    assert_eq!(err.grpc, GrpcCode::Internal);
+    assert_eq!(err.code, "LEDGER_INVARIANT_BROKEN");
+    assert_eq!(err.message, "the ledger went negative");
+    assert_eq!(err.extras.get("balance").map(String::as_str), Some("-1"));
 }
 
 #[test]
 fn rejection_details_travel_as_extras() {
-    let err = CodedError::rejection_precondition_failed(
+    let err = CodedError::rejection(
         "VALUE_NOT_POSITIVE",
         "value must be positive",
         [("input".to_string(), "0".to_string())],
@@ -137,7 +144,7 @@ fn typed_refusal() -> prost_types::Any {
 
 #[test]
 fn a_business_rejection_becomes_the_policies_refusal_response() {
-    let err = CodedError::rejection_precondition_failed("INSUFFICIENT_FUNDS", "holds 100", [])
+    let err = CodedError::rejection("INSUFFICIENT_FUNDS", "holds 100", [])
         .with_refusal(typed_refusal());
     assert_eq!(err.grpc, GrpcCode::FailedPrecondition, "still a rejection");
     assert_eq!(
@@ -151,7 +158,7 @@ fn a_business_rejection_becomes_the_policies_refusal_response() {
 
 #[test]
 fn a_rejection_without_a_typed_refusal_still_reaches_the_policy() {
-    let err = CodedError::rejection_precondition_failed("CLOSED", "the wallet is closed", []);
+    let err = CodedError::rejection("CLOSED", "the wallet is closed", []);
     assert_eq!(
         err.refusal_response(),
         Some(angzarr_proto::v1::RefusalResponse {
@@ -166,8 +173,7 @@ fn a_rejection_without_a_typed_refusal_still_reaches_the_policy() {
 #[test]
 fn only_a_business_rejection_reaches_on_refused() {
     for err in [
-        CodedError::rejection_invalid_argument("BAD", "bad", []),
-        CodedError::rejection_not_found("GONE", "gone", []),
+        CodedError::bug("BROKEN", "broken", []),
         CodedError::unhandled("boom"),
         CodedError::stale(codes::CONFLICT_OVERLAP, messages::CONFLICT_OVERLAP, []),
     ] {

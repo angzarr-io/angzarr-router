@@ -63,7 +63,7 @@ fn items(rebuilder: Rebuilder<Items>) -> DomainDispatch<Items> {
         .on_command("test.Nothing", |_cmd, _state, _cctx| Ok(None))
         .on_command("test.Refuse", |_cmd, _state, _cctx| {
             Err(crate::error::HandlerError::Coded(
-                crate::error::CodedError::rejection_precondition_failed("NO", "no", []),
+                crate::error::CodedError::rejection("NO", "no", []),
             ))
         })
         .on_fact("test.Note", |fact, _state| {

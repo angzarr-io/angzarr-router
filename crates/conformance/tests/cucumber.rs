@@ -127,6 +127,12 @@ async fn no_stamped_sequence(w: &mut CounterWorld) {
 #[then(regex = r"^the command is rejected as ([A-Z_]+)$")]
 async fn rejected_as(w: &mut CounterWorld, code: String) {
     assert_failed_with(w, &code);
+    let err = w.result.as_ref().unwrap().as_ref().unwrap_err();
+    assert_eq!(
+        err.grpc,
+        angzarr_router::error::GrpcCode::FailedPrecondition,
+        "a business rejection is FAILED_PRECONDITION"
+    );
 }
 
 #[then(regex = r"^the command fails with ([A-Z_]+)$")]
