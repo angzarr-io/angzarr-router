@@ -668,8 +668,17 @@ pub enum AddItemFails {
         args: Vec<(String, String)>,
         logs: String,
     },
-    /// A bug the handler marks retryable, with its own `code` and `args`.
+    /// An immediate-return business error ("re-read and re-decide",
+    /// ABORTED) under the handler's own `code` and `args`.
+    Immediate {
+        code: String,
+        args: Vec<(String, String)>,
+        logs: String,
+    },
+    /// A bug the handler marks retryable, under the `status` it picks,
+    /// with its own `code` and `args`.
     RetryableBug {
+        status: angzarr_router::error::RetryableStatus,
         code: String,
         args: Vec<(String, String)>,
         logs: String,
@@ -701,9 +710,18 @@ impl AddItemFails {
                 let _ = logs; // the handler's own log
                 CodedError::bug(code, args.clone()).into()
             }
-            AddItemFails::RetryableBug { code, args, logs } => {
+            AddItemFails::RetryableBug {
+                status,
+                code,
+                args,
+                logs,
+            } => {
                 let _ = logs; // the handler's own log
-                CodedError::retryable_bug(code, args.clone()).into()
+                CodedError::retryable_bug(*status, code, args.clone()).into()
+            }
+            AddItemFails::Immediate { code, args, logs } => {
+                let _ = logs; // the handler's own log
+                CodedError::immediate(code, args.clone()).into()
             }
         }
     }

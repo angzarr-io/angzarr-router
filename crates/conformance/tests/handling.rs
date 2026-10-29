@@ -5,7 +5,7 @@
 //! aggregate and the Fulfillment process manager (a domain, decision 14.31)
 //! built by hand over the orders.v1 fixture messages.
 
-use angzarr_router::error::{CodedError, GrpcCode};
+use angzarr_router::error::{CodedError, GrpcCode, RetryableStatus};
 use angzarr_router::pb;
 use angzarr_router_conformance as conf;
 use cucumber::{given, then, when, World};
@@ -689,12 +689,14 @@ async fn fails_with_bug(
     );
 }
 
-// C-0678 (decision 14.37, PROPOSAL (a)): a bug the handler marks retryable.
+// C-0678 (decision 14.37, latest): a bug the handler marks retryable,
+// under the status it picks.
 #[given(
-    regex = r#"^business code for AddItem fails with a retryable bug, code (\w+) and arg (\w+) "([^"]*)", and logs "([^"]*)" for itself$"#
+    regex = r#"^business code for AddItem fails with a retryable bug under (\w+), code (\w+) and arg (\w+) "([^"]*)", and logs "([^"]*)" for itself$"#
 )]
 async fn fails_with_retryable_bug(
     w: &mut HandlingWorld,
+    status: String,
     code: String,
     name: String,
     value: String,
@@ -703,6 +705,34 @@ async fn fails_with_retryable_bug(
     add_item_fails(
         w,
         conf::AddItemFails::RetryableBug {
+            status: match status.as_str() {
+                "UNAVAILABLE" => RetryableStatus::Unavailable,
+                "DEADLINE_EXCEEDED" => RetryableStatus::DeadlineExceeded,
+                "RESOURCE_EXHAUSTED" => RetryableStatus::ResourceExhausted,
+                other => panic!("{other} is no retryable status a handler picks"),
+            },
+            code,
+            args: vec![(name, value)],
+            logs,
+        },
+    );
+}
+
+// C-0679 (decision 14.37, latest): a handler's immediate-return business
+// error, under its own code.
+#[given(
+    regex = r#"^business code rejects AddItem for immediate return with code (\w+) and arg (\w+) "([^"]*)", and logs "([^"]*)" for itself$"#
+)]
+async fn rejects_for_immediate_return(
+    w: &mut HandlingWorld,
+    code: String,
+    name: String,
+    value: String,
+    logs: String,
+) {
+    add_item_fails(
+        w,
+        conf::AddItemFails::Immediate {
             code,
             args: vec![(name, value)],
             logs,

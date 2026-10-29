@@ -3,8 +3,9 @@
 //! the Rust core: the router's part of a refused policy command is the
 //! class its answer's gRPC status decides (decision 14.37, owner rulings
 //! of 2026-10-29). A business refusal reaches the policy's OnRefused (the
-//! answer has a `RefusalResponse`); a bug is alerted and dead-lettered; the
-//! rest are retried. Acting on the class (the retry, its cap, the dead
+//! answer has a `RefusalResponse`); ABORTED is returned at once, the runtime
+//! re-running the policy step; a fatal bug is alerted and dead-lettered; the
+//! rest are retried (decision 14.37, latest: four classes). Acting on the class (the retry, its cap, the dead
 //! letter, the alert, building the refusal fact) is the runtime's.
 //!
 //! The router is domain-blind, so the order aggregate's AddItem stands in
@@ -87,6 +88,12 @@ async fn buy_in_started(w: &mut RefusalWorld, amount: u64, wallet: String) {
             args: vec![("wallet".to_string(), wallet.clone())],
             logs: format!("cannot hold {amount}"),
         }),
+        // ABORTED: the handler's immediate-return business error.
+        Err(GrpcCode::Aborted) => Some(conf::AddItemFails::Immediate {
+            code: "FUNDS_MOVED".to_string(),
+            args: vec![("wallet".to_string(), wallet.clone())],
+            logs: "the funds moved under me".to_string(),
+        }),
         // INTERNAL: the handler's bug.
         Err(GrpcCode::Internal) => Some(conf::AddItemFails::Bug {
             code: "LEDGER_OFFLINE".to_string(),
@@ -147,9 +154,18 @@ async fn retried(w: &mut RefusalWorld) {
     assert_eq!(w.answer().grpc.class(), ErrorClass::RetryableBug);
 }
 
+// ABORTED: the runtime, as the policy step's caller, reloads and re-runs
+// the step under the capped backoff; the router's part is the class.
+#[then(
+    regex = r"^the policy step is reloaded and re-run with backoff up to its configured cap, then dead-lettered and alerted$"
+)]
+async fn rerun(w: &mut RefusalWorld) {
+    assert_eq!(w.answer().grpc.class(), ErrorClass::BusinessImmediate);
+}
+
 #[then(regex = r"^HoldFunds is neither retried nor dead-lettered$")]
 async fn neither(w: &mut RefusalWorld) {
-    assert_eq!(w.answer().grpc.class(), ErrorClass::BusinessRefusal);
+    assert_eq!(w.answer().grpc.class(), ErrorClass::BusinessFatal);
 }
 
 #[then(regex = r"^HoldFunds is dead-lettered and an alert is raised$")]

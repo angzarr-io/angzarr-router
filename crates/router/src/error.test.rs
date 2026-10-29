@@ -79,7 +79,15 @@ fn every_constructor() -> Vec<(&'static str, CodedError)> {
         ),
         (
             "retryable_bug",
-            CodedError::retryable_bug("LEDGER_OFFLINE", [arg("ledger", "main")]),
+            CodedError::retryable_bug(
+                RetryableStatus::Unavailable,
+                "LEDGER_OFFLINE",
+                [arg("ledger", "main")],
+            ),
+        ),
+        (
+            "immediate",
+            CodedError::immediate("PRICE_MOVED", [arg("item", "apple")]),
         ),
         (
             "internal, a policy's",
@@ -507,14 +515,28 @@ const BUSINESS: [(BusinessStatus, GrpcCode); 6] = [
     (BusinessStatus::PermissionDenied, GrpcCode::PermissionDenied),
 ];
 const BUGS: [GrpcCode; 3] = [GrpcCode::Internal, GrpcCode::Unknown, GrpcCode::DataLoss];
-// Decision 14.37 (owner's rulings, 2026-10-29, late): the router gains
-// DEADLINE_EXCEEDED and RESOURCE_EXHAUSTED, both a bug's retryable branch.
-const RETRYABLE: [GrpcCode; 5] = [
+// Decision 14.37 (owner's rulings, 2026-10-29, latest): four classes.
+// ABORTED is a business error returned at once ("re-read and re-decide");
+// the router gains DEADLINE_EXCEEDED and RESOURCE_EXHAUSTED, retryable
+// bugs beside UNAVAILABLE and UNIMPLEMENTED.
+const IMMEDIATE: [GrpcCode; 1] = [GrpcCode::Aborted];
+const RETRYABLE: [GrpcCode; 4] = [
     GrpcCode::Unavailable,
-    GrpcCode::Aborted,
     GrpcCode::Unimplemented,
     GrpcCode::DeadlineExceeded,
     GrpcCode::ResourceExhausted,
+];
+// The statuses a handler may pick for a retryable bug, and their wire codes.
+const RETRYABLE_STATUSES: [(RetryableStatus, GrpcCode); 3] = [
+    (RetryableStatus::Unavailable, GrpcCode::Unavailable),
+    (
+        RetryableStatus::DeadlineExceeded,
+        GrpcCode::DeadlineExceeded,
+    ),
+    (
+        RetryableStatus::ResourceExhausted,
+        GrpcCode::ResourceExhausted,
+    ),
 ];
 
 // The wire numbers are google.rpc.Code's.
@@ -548,7 +570,7 @@ fn only_a_business_status_converts_to_a_business_status() {
             "{grpc:?} is a business status"
         );
     }
-    for grpc in BUGS.into_iter().chain(RETRYABLE) {
+    for grpc in BUGS.into_iter().chain(IMMEDIATE).chain(RETRYABLE) {
         assert_eq!(
             BusinessStatus::try_from(grpc),
             Err(grpc),
@@ -561,13 +583,15 @@ fn only_a_business_status_converts_to_a_business_status() {
 fn the_status_decides_the_class() {
     let wrong: Vec<String> = BUSINESS
         .iter()
-        .map(|(_, grpc)| (*grpc, ErrorClass::BusinessRefusal))
-        // A bug is fatal or retryable (owner's rulings, 2026-10-29, late).
+        .map(|(_, grpc)| (*grpc, ErrorClass::BusinessFatal))
+        // Four classes (owner's rulings, 2026-10-29, latest).
+        .chain(IMMEDIATE.map(|grpc| (grpc, ErrorClass::BusinessImmediate)))
         .chain(BUGS.map(|grpc| (grpc, ErrorClass::FatalBug)))
         .chain(RETRYABLE.map(|grpc| (grpc, ErrorClass::RetryableBug)))
         .filter(|(grpc, class)| {
             grpc.class() != *class
-                || grpc.is_business_refusal() != (*class == ErrorClass::BusinessRefusal)
+                // Only a fatal business refusal reaches OnRefused.
+                || grpc.is_business_refusal() != (*class == ErrorClass::BusinessFatal)
         })
         .map(|(grpc, class)| format!("{grpc:?}: {:?}, expected {class:?}", grpc.class()))
         .collect();
@@ -599,22 +623,25 @@ fn a_bug_stays_internal_with_its_cause() {
     );
 }
 
-// Decision 14.37, PROPOSAL (a) of 2026-10-29 (late): a bug the handler
-// marks retryable (its ledger service is down) goes out as a retryable
-// STATUS, UNAVAILABLE, under UNHANDLED_HANDLER_ERROR with its own code and
-// args as the cause; the status alone decides the class. Never OnRefused.
+// Decision 14.37 (owner's rulings, 2026-10-29, latest): a bug the handler
+// marks retryable (its ledger service is down) goes out under the status
+// the handler PICKS, under UNHANDLED_HANDLER_ERROR with its own code and
+// args as the cause. Never OnRefused.
 #[test]
-fn a_retryable_bug_is_unavailable_with_its_cause() {
-    let err = CodedError::retryable_bug("LEDGER_OFFLINE", [arg("ledger", "main")]);
-    assert_eq!(err.grpc, GrpcCode::Unavailable, "the retryable status");
-    assert_eq!(err.grpc.class(), ErrorClass::RetryableBug);
-    assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
-    assert_eq!(err.status_message(), codes::UNHANDLED_HANDLER_ERROR);
-    assert_eq!(
-        err.extras,
-        [arg("cause", "LEDGER_OFFLINE"), arg("cause.ledger", "main")].into()
-    );
-    assert_eq!(err.refusal_response(), None, "never a policy's OnRefused");
+fn a_retryable_bug_goes_out_under_the_status_the_handler_picks() {
+    for (status, grpc) in RETRYABLE_STATUSES {
+        let err = CodedError::retryable_bug(status, "LEDGER_OFFLINE", [arg("ledger", "main")]);
+        assert_eq!(err.grpc, grpc, "{status:?}: the status the handler picked");
+        assert_eq!(err.grpc.class(), ErrorClass::RetryableBug, "{status:?}");
+        assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR, "{status:?}");
+        assert_eq!(err.status_message(), codes::UNHANDLED_HANDLER_ERROR);
+        assert_eq!(
+            err.extras,
+            [arg("cause", "LEDGER_OFFLINE"), arg("cause.ledger", "main")].into(),
+            "{status:?}"
+        );
+        assert_eq!(err.refusal_response(), None, "{status:?}: never OnRefused");
+    }
 }
 
 // A handler's retryable bug crosses the handler boundary unchanged: the
@@ -622,13 +649,43 @@ fn a_retryable_bug_is_unavailable_with_its_cause() {
 #[test]
 fn a_handlers_retryable_bug_keeps_its_status_through_the_boundary() {
     let err = call_handler::<()>(|| {
-        Err(CodedError::retryable_bug("LEDGER_OFFLINE", [arg("ledger", "main")]).into())
+        Err(CodedError::retryable_bug(
+            RetryableStatus::ResourceExhausted,
+            "LEDGER_OFFLINE",
+            [arg("ledger", "main")],
+        )
+        .into())
     })
     .expect_err("the handler failed");
-    assert_eq!(err.grpc, GrpcCode::Unavailable);
+    assert_eq!(err.grpc, GrpcCode::ResourceExhausted);
     assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
     assert_eq!(
         err.extras.get("cause").map(String::as_str),
         Some("LEDGER_OFFLINE")
     );
+}
+
+// Decision 14.37 (owner's rulings, 2026-10-29, latest): a handler may
+// choose the immediate-return business class, "re-read and re-decide":
+// ABORTED under its OWN key and args, returned at once, never OnRefused.
+#[test]
+fn a_handlers_immediate_rejection_is_aborted_under_its_own_code() {
+    let err = CodedError::immediate("PRICE_MOVED", [arg("item", "apple")]);
+    assert_eq!(err.grpc, GrpcCode::Aborted);
+    assert_eq!(err.grpc.class(), ErrorClass::BusinessImmediate);
+    assert_eq!(err.code, "PRICE_MOVED");
+    assert_eq!(err.status_message(), "PRICE_MOVED");
+    assert_eq!(err.extras, [arg("item", "apple")].into());
+    assert_eq!(err.refusal_response(), None, "never a policy's OnRefused");
+}
+
+// The framework's own conflicts are the immediate-return business class.
+#[test]
+fn a_framework_conflict_is_business_immediate() {
+    for code in [codes::CONFLICT_UNRESOLVED, codes::CONFLICT_OVERLAP] {
+        let err = CodedError::stale(code, []);
+        assert_eq!(err.grpc, GrpcCode::Aborted, "{code}");
+        assert_eq!(err.grpc.class(), ErrorClass::BusinessImmediate, "{code}");
+        assert_eq!(err.refusal_response(), None, "{code}: never OnRefused");
+    }
 }

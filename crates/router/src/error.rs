@@ -32,10 +32,10 @@ pub enum GrpcCode {
     DataLoss = 15,
 }
 
-/// The class an error is, decided by its gRPC status alone (owner ruling,
-/// 2026-10-29): a business refusal reaches the issuing policy's OnRefused;
-/// a bug is alerted and dead-lettered; anything else is retried with
-/// backoff up to a configured cap, then dead-lettered.
+/// The class an error is, decided by its gRPC status alone (decision
+/// 14.37). Four classes (owner's rulings, 2026-10-29, latest): business
+/// fatal, business immediate return, fatal bug, retryable bug; see the RED
+/// STUB variants below, which replace the first three.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorClass {
     /// FAILED_PRECONDITION, INVALID_ARGUMENT, NOT_FOUND, ALREADY_EXISTS,
@@ -49,13 +49,45 @@ pub enum ErrorClass {
     /// owner ruling, 2026-10-29). The backoff and the cap are the runtime's
     /// configuration; the router only classifies.
     Retryable,
-    /// RED STUB (feat/bug-branches): a bug's retryable branch (decision
-    /// 14.37, owner's rulings 2026-10-29, late). `class` does not answer it
-    /// yet; green replaces `Retryable` with it.
-    RetryableBug,
-    /// RED STUB (feat/bug-branches): a bug's fatal branch. `class` does not
-    /// answer it yet; green replaces `Bug` with it.
+    // RED STUBS (feat/bug-branches): the four classes of decision 14.37
+    // (owner's rulings, 2026-10-29, latest). `class` answers none of them
+    // yet; green replaces the three variants above with these four.
+    /// Business, fatal: FAILED_PRECONDITION, INVALID_ARGUMENT, NOT_FOUND,
+    /// ALREADY_EXISTS, OUT_OF_RANGE, PERMISSION_DENIED. Final: to the
+    /// caller, or the issuing policy's OnRefused; never retried.
+    BusinessFatal,
+    /// Business, immediate return: ABORTED, "re-read and re-decide". The
+    /// framework's conflicts (a stale or mismatched sequence, an overlap)
+    /// or a handler's own choice ([`CodedError::immediate`]). Returned at
+    /// once to an outside caller; for a policy step the runtime is the
+    /// caller, reloading and re-running the step under the capped backoff,
+    /// then dead-lettering it. Never OnRefused.
+    BusinessImmediate,
+    /// Bug, fatal: INTERNAL, UNKNOWN, DATA_LOSS. Dead-lettered and alerted
+    /// at once.
     FatalBug,
+    /// Bug, retryable: UNAVAILABLE, DEADLINE_EXCEEDED, RESOURCE_EXHAUSTED
+    /// (a handler's [`RetryableStatus`]), UNIMPLEMENTED and the remaining
+    /// framework statuses. Capped exponential backoff with jitter, then
+    /// dead-lettered and alerted. The statuses are not interchangeable:
+    /// see [`RetryableStatus`].
+    RetryableBug,
+}
+
+/// RED STUB (feat/bug-branches): the status a handler picks for a bug it
+/// marks retryable ([`CodedError::retryable_bug`]; decision 14.37, owner's
+/// rulings 2026-10-29, latest). The statuses are not interchangeable, and
+/// a retry loop honours the difference:
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryableStatus {
+    /// UNAVAILABLE: resend. The dependency is down for now.
+    Unavailable,
+    /// DEADLINE_EXCEEDED: resend only if the call is idempotent; the work
+    /// may have happened. (A command is idempotent by its `command_id`.)
+    DeadlineExceeded,
+    /// RESOURCE_EXHAUSTED: wait longer before resending; a quota or a
+    /// capacity limit was hit.
+    ResourceExhausted,
 }
 
 impl GrpcCode {
@@ -561,11 +593,26 @@ impl CodedError {
     }
 
     /// RED STUB (feat/bug-branches): a bug the handler marks retryable (an
-    /// external dependency that is down). Proposed wire shape (decision
-    /// 14.37, PROPOSAL (a)): UNAVAILABLE, UNHANDLED_HANDLER_ERROR, `code`
-    /// and `details` as its cause. The stub answers a fatal bug.
-    pub fn retryable_bug(code: &str, details: impl IntoIterator<Item = (String, String)>) -> Self {
+    /// external dependency that is down), under the status it picks
+    /// (decision 14.37, owner's rulings 2026-10-29, latest): that status,
+    /// UNHANDLED_HANDLER_ERROR, `code` and `details` as its cause. The stub
+    /// ignores `status` and answers a fatal bug.
+    pub fn retryable_bug(
+        status: RetryableStatus,
+        code: &str,
+        details: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        let _ = status;
         Self::bug(code, details)
+    }
+
+    /// RED STUB (feat/bug-branches): a handler's immediate-return business
+    /// error, "re-read and re-decide" (decision 14.37, owner's rulings
+    /// 2026-10-29, latest): ABORTED under the handler's own `code`, its
+    /// args `details`. Returned at once to the caller, never a policy's
+    /// OnRefused. The stub answers a FAILED_PRECONDITION rejection.
+    pub fn immediate(code: &str, details: impl IntoIterator<Item = (String, String)>) -> Self {
+        Self::rejection(BusinessStatus::FailedPrecondition, code, details)
     }
 
     /// A bug the router itself finds (INTERNAL), under its own code:
