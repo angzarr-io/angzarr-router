@@ -16,12 +16,10 @@ pub const ERROR_INFO_DOMAIN: &str = "angzarr.io";
 pub enum GrpcCode {
     Unknown = 2,
     InvalidArgument = 3,
-    // RED STUB (feat/bug-branches): classed wrongly in `class` until green.
     DeadlineExceeded = 4,
     NotFound = 5,
     AlreadyExists = 6,
     PermissionDenied = 7,
-    // RED STUB (feat/bug-branches): classed wrongly in `class` until green.
     ResourceExhausted = 8,
     FailedPrecondition = 9,
     Aborted = 10,
@@ -33,25 +31,12 @@ pub enum GrpcCode {
 }
 
 /// The class an error is, decided by its gRPC status alone (decision
-/// 14.37). Four classes (owner's rulings, 2026-10-29, latest): business
-/// fatal, business immediate return, fatal bug, retryable bug; see the RED
-/// STUB variants below, which replace the first three.
+/// 14.37). Four classes (owner's rulings, 2026-10-29, latest). Acting on
+/// the class (the retry, its backoff and cap, the dead letter, the alert,
+/// re-running a policy step) is the runtime's configuration and work; the
+/// router only classifies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorClass {
-    /// FAILED_PRECONDITION, INVALID_ARGUMENT, NOT_FOUND, ALREADY_EXISTS,
-    /// OUT_OF_RANGE, PERMISSION_DENIED.
-    BusinessRefusal,
-    /// INTERNAL, UNKNOWN, DATA_LOSS.
-    Bug,
-    /// UNAVAILABLE, ABORTED, UNIMPLEMENTED and the like. The caller
-    /// retries with backoff up to a configured cap, then dead-letters,
-    /// which makes it visible ("retry with backoff, cap, then dead letter";
-    /// owner ruling, 2026-10-29). The backoff and the cap are the runtime's
-    /// configuration; the router only classifies.
-    Retryable,
-    // RED STUBS (feat/bug-branches): the four classes of decision 14.37
-    // (owner's rulings, 2026-10-29, latest). `class` answers none of them
-    // yet; green replaces the three variants above with these four.
     /// Business, fatal: FAILED_PRECONDITION, INVALID_ARGUMENT, NOT_FOUND,
     /// ALREADY_EXISTS, OUT_OF_RANGE, PERMISSION_DENIED. Final: to the
     /// caller, or the issuing policy's OnRefused; never retried.
@@ -74,7 +59,7 @@ pub enum ErrorClass {
     BugRetryable,
 }
 
-/// RED STUB (feat/bug-branches): the status a handler picks for a bug it
+/// The status a handler picks for a bug it
 /// marks retryable ([`CodedError::retryable_bug`]; decision 14.37, owner's
 /// rulings 2026-10-29, latest). The statuses are not interchangeable, and
 /// a retry loop honours the difference:
@@ -90,11 +75,21 @@ pub enum RetryableStatus {
     ResourceExhausted,
 }
 
+impl From<RetryableStatus> for GrpcCode {
+    fn from(status: RetryableStatus) -> Self {
+        match status {
+            RetryableStatus::Unavailable => GrpcCode::Unavailable,
+            RetryableStatus::DeadlineExceeded => GrpcCode::DeadlineExceeded,
+            RetryableStatus::ResourceExhausted => GrpcCode::ResourceExhausted,
+        }
+    }
+}
+
 impl GrpcCode {
-    /// The class an error with this status is (owner ruling, 2026-10-29).
-    /// UNIMPLEMENTED (a request this router hosts no component for: a
-    /// misroute or a stale deployment) is [`ErrorClass::Retryable`]: retried
-    /// with backoff up to a configured cap, then dead-lettered.
+    /// The class an error with this status is (decision 14.37, owner's
+    /// rulings 2026-10-29, latest). UNIMPLEMENTED (a request this router
+    /// hosts no component for: a misroute or a stale deployment) is
+    /// [`ErrorClass::BugRetryable`].
     pub fn class(self) -> ErrorClass {
         match self {
             GrpcCode::FailedPrecondition
@@ -102,19 +97,21 @@ impl GrpcCode {
             | GrpcCode::NotFound
             | GrpcCode::AlreadyExists
             | GrpcCode::OutOfRange
-            | GrpcCode::PermissionDenied => ErrorClass::BusinessRefusal,
-            GrpcCode::Internal | GrpcCode::Unknown | GrpcCode::DataLoss => ErrorClass::Bug,
-            // RED STUB (feat/bug-branches): wrong until green.
-            GrpcCode::DeadlineExceeded | GrpcCode::ResourceExhausted => ErrorClass::Bug,
-            GrpcCode::Aborted | GrpcCode::Unavailable | GrpcCode::Unimplemented => {
-                ErrorClass::Retryable
-            }
+            | GrpcCode::PermissionDenied => ErrorClass::BusinessFatal,
+            GrpcCode::Aborted => ErrorClass::BusinessImmediate,
+            GrpcCode::Internal | GrpcCode::Unknown | GrpcCode::DataLoss => ErrorClass::BugFatal,
+            GrpcCode::Unavailable
+            | GrpcCode::DeadlineExceeded
+            | GrpcCode::ResourceExhausted
+            | GrpcCode::Unimplemented => ErrorClass::BugRetryable,
         }
     }
 
-    /// True when an error with this status is a business refusal.
+    /// True when an error with this status is a business refusal that
+    /// reaches the issuing policy's OnRefused: [`ErrorClass::BusinessFatal`]
+    /// only.
     pub fn is_business_refusal(self) -> bool {
-        self.class() == ErrorClass::BusinessRefusal
+        self.class() == ErrorClass::BusinessFatal
     }
 }
 
@@ -464,11 +461,17 @@ impl CodedError {
 
     /// Bytes that do not decode as the message `message_type` (its
     /// fully-qualified name): ANY_DECODE_FAILED, a bug (INTERNAL), one
-    /// condition whatever the message, `message_type` its arg.
-    pub fn undecodable(message_type: &str) -> Self {
+    /// condition whatever the message, `message_type` its arg. prost's
+    /// `error` is a third-party library's, so its own text travels
+    /// verbatim as `ext_err_txt` (decision 14.37, owner's rulings
+    /// 2026-10-29, late); prost gives it no numeric code.
+    pub fn undecodable(message_type: &str, error: &prost::DecodeError) -> Self {
         Self::internal(
             codes::ANY_DECODE_FAILED,
-            [(extras::MESSAGE_TYPE.to_string(), message_type.to_string())],
+            [
+                (extras::MESSAGE_TYPE.to_string(), message_type.to_string()),
+                (extras::EXT_ERR_TXT.to_string(), error.to_string()),
+            ],
         )
     }
 
@@ -592,27 +595,31 @@ impl CodedError {
         )
     }
 
-    /// RED STUB (feat/bug-branches): a bug the handler marks retryable (an
-    /// external dependency that is down), under the status it picks
-    /// (decision 14.37, owner's rulings 2026-10-29, latest): that status,
-    /// UNHANDLED_HANDLER_ERROR, `code` and `details` as its cause. The stub
-    /// ignores `status` and answers a fatal bug.
+    /// A bug the handler marks retryable (an external dependency that is
+    /// down), under the status it picks (decision 14.37, owner's rulings
+    /// 2026-10-29, latest): that status, UNHANDLED_HANDLER_ERROR, `code`
+    /// and `details` as its cause, flattened as [`Self::bug`]'s are. The
+    /// runtime retries it with capped backoff, then dead-letters it; it
+    /// never reaches a policy's OnRefused.
     pub fn retryable_bug(
         status: RetryableStatus,
         code: &str,
         details: impl IntoIterator<Item = (String, String)>,
     ) -> Self {
-        let _ = status;
-        Self::bug(code, details)
+        Self::coded(
+            codes::UNHANDLED_HANDLER_ERROR,
+            flatten(extras::CAUSE, code, details),
+            status.into(),
+        )
     }
 
-    /// RED STUB (feat/bug-branches): a handler's immediate-return business
-    /// error, "re-read and re-decide" (decision 14.37, owner's rulings
-    /// 2026-10-29, latest): ABORTED under the handler's own `code`, its
-    /// args `details`. Returned at once to the caller, never a policy's
-    /// OnRefused. The stub answers a FAILED_PRECONDITION rejection.
+    /// A handler's immediate-return business error, "re-read and
+    /// re-decide" (decision 14.37, owner's rulings 2026-10-29, latest):
+    /// ABORTED under the handler's own `code`, its args `details`.
+    /// Returned at once to the caller, never a policy's OnRefused; for a
+    /// policy step the runtime reloads and re-runs the step.
     pub fn immediate(code: &str, details: impl IntoIterator<Item = (String, String)>) -> Self {
-        Self::rejection(BusinessStatus::FailedPrecondition, code, details)
+        Self::coded(code, details, GrpcCode::Aborted)
     }
 
     /// A bug the router itself finds (INTERNAL), under its own code:

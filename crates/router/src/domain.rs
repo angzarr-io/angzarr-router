@@ -511,9 +511,10 @@ impl<S> DomainDispatch<S> {
                     }
                     None if fact_type == <pb::CommandRefused as prost::Name>::full_name() => {
                         let refused =
-                            pb::CommandRefused::decode(any.value.as_slice()).map_err(|_| {
+                            pb::CommandRefused::decode(any.value.as_slice()).map_err(|e| {
                                 CodedError::undecodable(
                                     &<pb::CommandRefused as prost::Name>::full_name(),
+                                    &e,
                                 )
                             })?;
                         let refused_type = refused

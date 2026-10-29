@@ -115,7 +115,7 @@ pub fn input_id(book: &pb::CommandBook) -> Option<pb::Uuid> {
 pub fn decode_message<M: prost::Message + prost::Name + Default>(
     bytes: &[u8],
 ) -> Result<M, error::CodedError> {
-    M::decode(bytes).map_err(|_| error::CodedError::undecodable(&M::full_name()))
+    M::decode(bytes).map_err(|e| error::CodedError::undecodable(&M::full_name(), &e))
 }
 
 /// An upcaster chain a command handler runs on incoming command and fact

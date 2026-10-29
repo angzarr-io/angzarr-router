@@ -16,6 +16,12 @@ fn arg(name: &str, value: &str) -> (String, String) {
     (name.to_string(), value.to_string())
 }
 
+/// A prost DecodeError, as undecodable bytes raise it.
+fn decode_error() -> prost::DecodeError {
+    <pb::ContextualCommand as prost::Message>::decode(&[0xff, 0xff, 0xff][..])
+        .expect_err("undecodable")
+}
+
 fn typed_refusal() -> prost_types::Any {
     prost_types::Any {
         type_url: "/test.wallet.InsufficientFunds".to_string(),
@@ -49,7 +55,7 @@ fn every_constructor() -> Vec<(&'static str, CodedError)> {
         ),
         (
             "undecodable",
-            CodedError::undecodable("io.angzarr.v1.ContextualCommand"),
+            CodedError::undecodable("io.angzarr.v1.ContextualCommand", &decode_error()),
         ),
         ("stale", CodedError::stale(codes::CONFLICT_UNRESOLVED, [])),
         ("persisted_corrupt", CodedError::persisted_corrupt("/a.Evt")),
@@ -209,14 +215,18 @@ fn a_typed_refusal_is_command_refused_naming_its_type() {
 
 #[test]
 fn undecodable_bytes_name_the_message_type() {
-    let err = CodedError::undecodable("io.angzarr.v1.ContextualCommand");
+    let err = CodedError::undecodable("io.angzarr.v1.ContextualCommand", &decode_error());
     // The router's own malformed-input error: a bug (owner ruling,
-    // 2026-10-29).
+    // 2026-10-29). prost's own text rides as ext_err_txt.
     assert_eq!(err.grpc, GrpcCode::Internal);
     assert_eq!(err.code, codes::ANY_DECODE_FAILED);
     assert_eq!(
         err.extras,
-        [arg("message_type", "io.angzarr.v1.ContextualCommand")].into()
+        [
+            arg("message_type", "io.angzarr.v1.ContextualCommand"),
+            arg("ext_err_txt", &decode_error().to_string()),
+        ]
+        .into()
     );
 }
 
@@ -422,7 +432,10 @@ fn the_routers_own_malformed_input_is_a_bug() {
         "/a.B",
         [],
     ));
-    crate::test_support::assert_bug(&CodedError::undecodable("io.angzarr.v1.EventBook"));
+    crate::test_support::assert_bug(&CodedError::undecodable(
+        "io.angzarr.v1.EventBook",
+        &decode_error(),
+    ));
 }
 
 #[test]
