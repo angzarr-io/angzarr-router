@@ -682,3 +682,124 @@ fn apply_page_goes_through_a_batched_fold_when_registered() {
         .expect("folded"));
     assert_eq!(*calls.lock().unwrap(), vec![(vec![4], String::new())]);
 }
+
+// --- a panicking applier or batched fold (decision 14.37) -------------------
+//
+// A panic in a fold is a handler bug like an error is: the fold fails as
+// FOLD_FAILED (FOLD_FAILED_EMITTED for the command's own events) with cause
+// HANDLER_PANICKED, and the router answers rather than unwinding into its
+// host. The panic's message stays in the handler's own log.
+
+/// A rebuilder over "/test.State" whose Cover applier panics.
+fn panicking_applier() -> Rebuilder<TestState> {
+    fresh_rebuilder()
+        .with_state_type("test.State")
+        .apply(&cover_full_name(), |_state: &mut TestState, _event| {
+            panic!("index out of bounds")
+        })
+}
+
+/// A rebuilder over "/test.State" whose batched fold panics.
+fn panicking_fold() -> Rebuilder<TestState> {
+    fresh_rebuilder()
+        .with_state_type("test.State")
+        .with_fold(|_s: &mut TestState, _pages, _cover| panic!("index out of bounds"))
+}
+
+/// The fold failed with cause HANDLER_PANICKED and no other cause args.
+fn assert_panicked_cause(err: &crate::error::CodedError) {
+    assert_eq!(
+        err.extras.get(extras::CAUSE).map(String::as_str),
+        Some(codes::HANDLER_PANICKED),
+        "a panicking fold's cause: {:?}",
+        err.extras
+    );
+    assert!(
+        !err.extras.keys().any(|k| k.starts_with("cause.")),
+        "a panic's message stays in the handler's log: {:?}",
+        err.extras
+    );
+}
+
+/// Runs `fold`, failing the test if its panic escapes.
+fn answered<T>(fold: impl FnOnce() -> T) -> T {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(fold))
+        .unwrap_or_else(|_| panic!("the fold's panic escaped the router"))
+}
+
+#[test]
+fn a_panicking_applier_fails_the_rebuild_naming_the_page() {
+    let r = panicking_applier();
+    let err = answered(|| r.rebuild(Some(&three_pages()))).expect_err("the applier panicked");
+    let type_url = crate::type_url(&cover_full_name());
+    assert_fold_failed(
+        &err,
+        "FOLD_FAILED",
+        &[
+            (extras::SEQUENCE, "4"),
+            (extras::TYPE_URL, type_url.as_str()),
+        ],
+        "/test.State",
+    );
+    assert_panicked_cause(&err);
+}
+
+#[test]
+fn a_panicking_batched_fold_fails_the_rebuild_naming_the_batchs_range() {
+    let r = panicking_fold();
+    let err = answered(|| r.rebuild(Some(&three_pages()))).expect_err("the fold panicked");
+    assert_fold_failed(
+        &err,
+        "FOLD_FAILED",
+        &[(extras::FIRST_SEQUENCE, "4"), (extras::LAST_SEQUENCE, "6")],
+        "/test.State",
+    );
+    assert!(!err.extras.contains_key(extras::SEQUENCE));
+    assert_panicked_cause(&err);
+}
+
+#[test]
+fn a_panicking_batched_fold_of_emitted_pages_is_fold_failed_emitted() {
+    let r = panicking_fold();
+    let mut state = TestState::default();
+    let book = three_pages();
+    let err = answered(|| r.apply_pages(&mut state, &book.pages, None, PageOrigin::Emitted))
+        .expect_err("the fold panicked");
+    assert_fold_failed(
+        &err,
+        "FOLD_FAILED_EMITTED",
+        &[(extras::FIRST_SEQUENCE, "4"), (extras::LAST_SEQUENCE, "6")],
+        "/test.State",
+    );
+    assert_panicked_cause(&err);
+}
+
+#[test]
+fn a_panicking_applier_of_emitted_pages_is_fold_failed_emitted() {
+    let r = panicking_applier();
+    let mut state = TestState::default();
+    let err = answered(|| r.apply_emitted(&mut state, &[event_page(cover_any("a"))], None, 7))
+        .expect_err("the applier panicked");
+    assert_fold_failed(
+        &err,
+        "FOLD_FAILED_EMITTED",
+        &[(extras::SEQUENCE, "7")],
+        "/test.State",
+    );
+    assert_panicked_cause(&err);
+}
+
+#[test]
+fn a_panicking_batched_fold_of_one_page_names_it() {
+    let r = panicking_fold();
+    let mut state = TestState::default();
+    let err = answered(|| r.apply_page(&mut state, &sequenced_event_page(9, cover_any("a")), None))
+        .expect_err("the fold panicked");
+    assert_fold_failed(
+        &err,
+        "FOLD_FAILED",
+        &[(extras::FIRST_SEQUENCE, "9"), (extras::LAST_SEQUENCE, "9")],
+        "/test.State",
+    );
+    assert_panicked_cause(&err);
+}
