@@ -632,9 +632,8 @@ impl<S> DomainDispatch<S> {
                                 [(extras::COMMAND_TYPE.to_string(), refused_type)],
                             ));
                         };
-                        Box::new(move |state, _cctx| {
-                            thunk(&refused, state, CommandContext::default())
-                                .map_err(map_handler_error)
+                        Box::new(move |state, cctx| {
+                            thunk(&refused, state, cctx).map_err(map_handler_error)
                         })
                     }
                     None => return Err(self.unknown(codes::NO_FACT_HANDLER, sent, &any)),
