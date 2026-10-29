@@ -30,7 +30,8 @@ pub enum GrpcCode {
 
 /// The class an error is, decided by its gRPC status alone (owner ruling,
 /// 2026-10-29): a business refusal reaches the issuing policy's OnRefused;
-/// a bug is alerted and dead-lettered; anything else is retried.
+/// a bug is alerted and dead-lettered; anything else is retried with
+/// backoff up to a configured cap, then dead-lettered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorClass {
     /// FAILED_PRECONDITION, INVALID_ARGUMENT, NOT_FOUND, ALREADY_EXISTS,
@@ -38,14 +39,19 @@ pub enum ErrorClass {
     BusinessRefusal,
     /// INTERNAL, UNKNOWN, DATA_LOSS.
     Bug,
-    /// UNAVAILABLE, ABORTED and the like.
+    /// UNAVAILABLE, ABORTED, UNIMPLEMENTED and the like. The caller
+    /// retries with backoff up to a configured cap, then dead-letters,
+    /// which makes it visible ("retry with backoff, cap, then dead letter";
+    /// owner ruling, 2026-10-29). The backoff and the cap are the runtime's
+    /// configuration; the router only classifies.
     Retryable,
 }
 
 impl GrpcCode {
     /// The class an error with this status is (owner ruling, 2026-10-29).
     /// UNIMPLEMENTED (a request this router hosts no component for: a
-    /// misroute or a stale deployment) is retried.
+    /// misroute or a stale deployment) is [`ErrorClass::Retryable`]: retried
+    /// with backoff up to a configured cap, then dead-lettered.
     pub fn class(self) -> ErrorClass {
         match self {
             GrpcCode::FailedPrecondition
