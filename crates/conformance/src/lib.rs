@@ -247,6 +247,10 @@ fn reserve_command_to(domain: &str) -> pb::CommandBook {
     pb::CommandBook {
         cover: Some(pb::Cover {
             domain: domain.to_string(),
+            // A command to an aggregate names its root (decision 14.36).
+            root: Some(pb::Uuid {
+                value: root_of("inv-7").into(),
+            }),
             ..Default::default()
         }),
         page: Some(pb::CommandPage {
@@ -963,6 +967,10 @@ pub fn order_command_for(domain: &str, command: &str) -> pb::CommandBook {
     pb::CommandBook {
         cover: Some(pb::Cover {
             domain: domain.to_string(),
+            // A command to an aggregate names its root (decision 14.36).
+            root: Some(pb::Uuid {
+                value: root_of("inv-7").into(),
+            }),
             ..Default::default()
         }),
         page: Some(pb::CommandPage {

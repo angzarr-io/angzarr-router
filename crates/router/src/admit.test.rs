@@ -309,29 +309,79 @@ fn an_aggregate_has_no_start_rule() {
     );
 }
 
-// A PM's root is its correlation (decision 14.30): a set correlation_id must
-// equal the cover's root; an unset one is the runtime's to fill.
+// A PM instance's root is its correlation by default only (decision 14.36,
+// withdrawing 14.30's rule): an input whose set correlation_id differs from
+// its cover's root is admitted to the root its cover names, keeping its
+// correlation. PM_CORRELATION_NOT_ROOT is gone; the start rule is the only
+// rule a PM adds to an aggregate's.
 #[test]
-fn an_input_to_a_process_manager_with_another_correlation_is_malformed() {
-    let mut command = command_book(
+fn an_input_to_a_process_manager_with_another_correlation_is_admitted() {
+    let mut start = command_book(
         stream("buyin", None, INSTANCE),
         any_of(&StartBuyIn { amount: 5 }),
         1,
+    );
+    start.page.as_mut().unwrap().correlation_id = Some(uuid_of(INSTANCE + 1));
+    assert_eq!(
+        buyin()
+            .admit(&arrival(&start, absent()))
+            .expect("a starting command with another correlation starts the instance"),
+        Admission::Dispatch
+    );
+    assert_eq!(
+        start.page.as_ref().unwrap().correlation_id,
+        Some(uuid_of(INSTANCE + 1)),
+        "admission keeps the input's correlation"
+    );
+}
+
+// C-0659's router half: one instance, named by a root, takes the inputs of
+// several correlations; a non-starting command of another correlation
+// reaches the existing instance, and so does a fact.
+#[test]
+fn an_existing_instance_takes_inputs_of_several_correlations() {
+    let mut command = command_book(
+        stream("buyin", None, INSTANCE),
+        any_of(&RecordFundsHeld { amount: 5 }),
+        2,
+    );
+    command.page.as_mut().unwrap().correlation_id = Some(uuid_of(INSTANCE + 2));
+    assert_eq!(
+        buyin()
+            .admit(&arrival(&command, existing()))
+            .expect("another correlation's command reaches the instance"),
+        Admission::Dispatch
+    );
+    let mut fact = fact_book(
+        stream("buyin", None, INSTANCE),
+        any_of(&BuyInTimedOut::default()),
+        "timer-1",
+    );
+    fact.page.as_mut().unwrap().correlation_id = Some(uuid_of(INSTANCE + 3));
+    assert_eq!(
+        buyin()
+            .admit(&arrival(&fact, existing()))
+            .expect("another correlation's fact reaches the instance"),
+        Admission::Dispatch
+    );
+}
+
+// The start rule stays (decision 14.36): another correlation does not let a
+// non-starting command start an instance.
+#[test]
+fn another_correlation_does_not_bypass_the_start_rule() {
+    let mut command = command_book(
+        stream("buyin", None, INSTANCE),
+        any_of(&RecordFundsHeld { amount: 5 }),
+        3,
     );
     command.page.as_mut().unwrap().correlation_id = Some(uuid_of(INSTANCE + 1));
     refused(
         buyin()
             .admit(&arrival(&command, absent()))
-            .expect_err("malformed"),
-        codes::PM_CORRELATION_NOT_ROOT,
-        GrpcCode::InvalidArgument,
-    );
-    command.page.as_mut().unwrap().correlation_id = Some(uuid_of(INSTANCE));
-    assert_eq!(
-        buyin()
-            .admit(&arrival(&command, absent()))
-            .expect("its root"),
-        Admission::Dispatch
+            .expect_err("no instance, not starting"),
+        codes::PM_NO_INSTANCE,
+        GrpcCode::FailedPrecondition,
     );
 }
 

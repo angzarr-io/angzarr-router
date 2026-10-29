@@ -234,6 +234,7 @@ fn a_router_runs_its_policy() {
                 Ok(vec![pb::CommandBook {
                     cover: Some(pb::Cover {
                         domain: "inventory".to_string(),
+                        root: Some(crate::test_support::uuid_of(1)),
                         ..Default::default()
                     }),
                     ..Default::default()

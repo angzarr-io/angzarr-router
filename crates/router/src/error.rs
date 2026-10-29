@@ -46,6 +46,12 @@ pub mod codes {
     /// ruling, 2026-10-28; types.proto Cover.edition: a policy stays in the
     /// edition of the event it handles).
     pub const POLICY_COMMAND_OUTSIDE_EDITION: &str = "POLICY_COMMAND_OUTSIDE_EDITION";
+    /// A policy's command to an aggregate whose cover names no root
+    /// (decision 14.36; policy.proto PolicyResponse): a policy bug.
+    pub const POLICY_COMMAND_NO_ROOT: &str = "POLICY_COMMAND_NO_ROOT";
+    /// A policy's command carrying a correlation_id other than its
+    /// trigger's (decision 14.36; policy.proto PolicyResponse): a policy bug.
+    pub const POLICY_COMMAND_OTHER_CORRELATION: &str = "POLICY_COMMAND_OTHER_CORRELATION";
     /// A policy's OnRefused answer that is not a bare Fact (no cover, no
     /// identity, no Handling), or a refusal lacking what addressing it needs
     /// (policy.proto, OnRefusedResponse): a policy bug.

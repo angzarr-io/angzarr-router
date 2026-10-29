@@ -39,11 +39,13 @@ fn event_page_of(fq: &str) -> pb::EventPage {
     })
 }
 
-/// A command book targeting `domain` with one command page.
+/// A command book targeting `domain` (root 1: a command to an aggregate
+/// names its root, decision 14.36) with one command page.
 fn command_to(domain: &str) -> pb::CommandBook {
     pb::CommandBook {
         cover: Some(pb::Cover {
             domain: domain.to_string(),
+            root: Some(uuid_of(1)),
             ..Default::default()
         }),
         page: Some(command_page(Any {
@@ -118,13 +120,14 @@ fn every_page_is_a_fresh_trigger() {
 
 #[test]
 fn emitted_commands_pass_through_unstamped_in_emission_order() {
-    // A handler-set correlation survives untouched; nothing is filled in
-    // from the source.
+    // A handler-set correlation equal to its trigger's survives untouched
+    // (another is refused, decision 14.36; addressing.test.rs); nothing is
+    // filled in from the source.
     let policy = PolicyDispatch::new("OrderSplit", "order", "inventory").on_event(
         FQ_ORDER_CREATED,
         |_e, _c| {
             let mut own = command_to("inventory");
-            own.page.as_mut().unwrap().correlation_id = Some(uuid_of(9));
+            own.page.as_mut().unwrap().correlation_id = Some(uuid_of(1));
             Ok(vec![own, command_to("inventory")])
         },
     );
@@ -135,14 +138,16 @@ fn emitted_commands_pass_through_unstamped_in_emission_order() {
             sequenced_page_of(FQ_ORDER_CREATED, 2),
         ],
     );
-    src.pages[0].meta = Some(pb::EventMeta {
-        correlation_id: Some(uuid_of(1)),
-        ..Default::default()
-    });
+    for page in &mut src.pages {
+        page.meta = Some(pb::EventMeta {
+            correlation_id: Some(uuid_of(1)),
+            ..Default::default()
+        });
+    }
     let resp = policy.dispatch(&src).expect("dispatch");
 
     let mut expected_first = command_to("inventory");
-    expected_first.page.as_mut().unwrap().correlation_id = Some(uuid_of(9));
+    expected_first.page.as_mut().unwrap().correlation_id = Some(uuid_of(1));
     assert_eq!(
         resp.commands,
         vec![

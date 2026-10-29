@@ -197,6 +197,17 @@ test_message!(HoldFunds, "test.wallet" { amount: u32 = "1" });
 test_message!(ReleaseFunds, "test.wallet" { amount: u32 = "1" });
 test_message!(InsufficientFunds, "test.wallet" { available: u32 = "1", requested: u32 = "2" });
 
+// --- policy addressing (decision 14.36; policy_addressing.feature) ----------
+//
+// An "order" aggregate whose OrderPlaced feeds two policies: one to the
+// "inventory" aggregate (ReserveStock), one to the "fulfillment" process
+// manager (StartFulfillment, starting; RecordStockReserved, not).
+
+test_message!(OrderPlaced, "test.order" { quantity: u32 = "1" });
+test_message!(ReserveStock, "test.inventory" { quantity: u32 = "1" });
+test_message!(StartFulfillment, "test.fulfillment" { quantity: u32 = "1" });
+test_message!(RecordStockReserved, "test.fulfillment" { quantity: u32 = "1" });
+
 /// The fully-qualified name of a test message.
 pub fn fq<M: prost::Name>() -> String {
     M::full_name()
