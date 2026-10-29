@@ -44,7 +44,9 @@ pub struct RebuildInfo {
 /// events were accepted by the same apply logic, so the failure is a handler
 /// bug (INTERNAL; [`fold_error`]), and so is a page whose applier or batched
 /// fold panics, its cause HANDLER_PANICKED (decision 14.37). A snapshot the
-/// loader cannot load is PERSISTED_EVENT_CORRUPT. Event types with no
+/// loader cannot load is PERSISTED_EVENT_CORRUPT; one whose loader panics is
+/// FOLD_FAILED with cause HANDLER_PANICKED, naming the snapshot's sequence
+/// and its state's type URL. Event types with no
 /// registered applier are skipped: not every event folds into state.
 pub struct Rebuilder<S> {
     factory: Box<dyn Fn() -> S + Send + Sync>,
@@ -337,8 +339,27 @@ impl<S> Rebuilder<S> {
             if let (Some(snap_state), Some(loader)) =
                 (snapshot.state.as_ref(), self.snapshot.as_ref())
             {
-                if loader(&mut state, snap_state).is_err() {
-                    return Err(CodedError::persisted_corrupt(&snap_state.type_url));
+                let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    loader(&mut state, snap_state)
+                }));
+                match loaded {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => {
+                        return Err(CodedError::persisted_corrupt(&snap_state.type_url));
+                    }
+                    // A panic is a defect in the loader, not corrupt data:
+                    // the fold fails, naming the snapshot (decision 14.37).
+                    Err(_) => {
+                        return Err(CodedError::fold_failed(
+                            codes::FOLD_FAILED,
+                            FoldAt::Page {
+                                sequence: snapshot.sequence,
+                                type_url: &snap_state.type_url,
+                            },
+                            &self.state_type_url,
+                            Some(&panicked_cause()),
+                        ));
+                    }
                 }
                 covered_through = Some(snapshot.sequence);
             }
