@@ -42,7 +42,8 @@ pub struct RebuildInfo {
 /// Error semantics: a page that fails to fold FAILS the rebuild —
 /// commands must never validate against silently-truncated state. The
 /// events were accepted by the same apply logic, so the failure is a handler
-/// bug (UNHANDLED_HANDLER_ERROR, INTERNAL; [`fold_error`]). A snapshot the
+/// bug (INTERNAL; [`fold_error`]), and so is a page whose applier or batched
+/// fold panics, its cause HANDLER_PANICKED (decision 14.37). A snapshot the
 /// loader cannot load is PERSISTED_EVENT_CORRUPT. Event types with no
 /// registered applier are skipped: not every event folds into state.
 pub struct Rebuilder<S> {
@@ -120,6 +121,49 @@ fn applier_cause(err: &(dyn std::error::Error + Send + Sync + 'static)) -> Optio
             None
         }
     }
+}
+
+/// A panicking fold's cause: HANDLER_PANICKED, with no args (the panic's
+/// message stays in the handler's own log; decision 14.37).
+fn panicked_cause() -> pb::Diagnostic {
+    pb::Diagnostic {
+        code: codes::HANDLER_PANICKED.to_string(),
+        ..Default::default()
+    }
+}
+
+/// Runs an applier on one event: its failure, or its panic, as the fold's
+/// cause ([`applier_cause`], [`panicked_cause`]). A panic is answered, never
+/// unwound into the host.
+fn run_applier<S>(
+    thunk: &ApplierFn<S>,
+    state: &mut S,
+    event: &Any,
+    ctx: &PageContext<'_>,
+) -> Result<(), Option<pb::Diagnostic>> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| thunk(state, event, ctx))) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(applier_cause(&*err)),
+        Err(_) => Err(Some(panicked_cause())),
+    }
+}
+
+/// Runs a batched fold: its panic is a failure at no known page, caused by
+/// HANDLER_PANICKED ([`panicked_cause`]), answered rather than unwound into
+/// the host.
+fn run_fold<S>(
+    fold: &FoldFn<S>,
+    state: &mut S,
+    pages: &[pb::EventPage],
+    cover: Option<&pb::Cover>,
+) -> Result<(), FoldFailure> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fold(state, pages, cover)))
+        .unwrap_or_else(|_| {
+            Err(FoldFailure {
+                page_index: None,
+                cause: Some(panicked_cause()),
+            })
+        })
 }
 
 /// The type URL a component declares for the message `full_name`: "" (none
@@ -308,7 +352,7 @@ impl<S> Rebuilder<S> {
                 .cloned()
                 .collect();
             if !uncovered.is_empty() {
-                fold(&mut state, &uncovered, book.cover.as_ref()).map_err(|failure| {
+                run_fold(fold, &mut state, &uncovered, book.cover.as_ref()).map_err(|failure| {
                     fold_error(
                         PageOrigin::Persisted,
                         &uncovered,
@@ -339,12 +383,12 @@ impl<S> Rebuilder<S> {
                 sequence: page.sequence,
                 meta: page.meta.as_ref(),
             };
-            if let Err(err) = thunk(&mut state, event, &ctx) {
+            if let Err(cause) = run_applier(thunk, &mut state, event, &ctx) {
                 return Err(page_fold_error(
                     PageOrigin::Persisted,
                     page,
                     &self.state_type_url,
-                    applier_cause(&*err).as_ref(),
+                    cause.as_ref(),
                 ));
             }
             info.applied_count += 1;
@@ -370,7 +414,7 @@ impl<S> Rebuilder<S> {
             if pages.is_empty() {
                 return Ok(());
             }
-            return fold(state, pages, cover)
+            return run_fold(fold, state, pages, cover)
                 .map_err(|failure| fold_error(origin, pages, &failure, &self.state_type_url));
         }
         for page in pages {
@@ -424,7 +468,7 @@ impl<S> Rebuilder<S> {
     ) -> Result<bool, CodedError> {
         if let Some(fold) = self.fold.as_ref() {
             let pages = std::slice::from_ref(page);
-            fold(state, pages, cover)
+            run_fold(fold, state, pages, cover)
                 .map_err(|failure| fold_error(origin, pages, &failure, &self.state_type_url))?;
             return Ok(true);
         }
@@ -442,14 +486,8 @@ impl<S> Rebuilder<S> {
             sequence: page.sequence,
             meta: page.meta.as_ref(),
         };
-        thunk(state, event, &ctx).map_err(|err| {
-            page_fold_error(
-                origin,
-                page,
-                &self.state_type_url,
-                applier_cause(&*err).as_ref(),
-            )
-        })?;
+        run_applier(thunk, state, event, &ctx)
+            .map_err(|cause| page_fold_error(origin, page, &self.state_type_url, cause.as_ref()))?;
         Ok(true)
     }
 }
