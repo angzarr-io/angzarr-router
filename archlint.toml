@@ -78,8 +78,8 @@ allow = ["angzarr_router::error::**"]
 
 [[rule]]
 name = "engine-kernel-below-components"
-why = "the shared kernel (crate-root helpers, rebuild, conflict, descriptor) sits below the component dispatchers and the router"
-from = ["angzarr_router", "angzarr_router::rebuild::**", "angzarr_router::conflict::**", "angzarr_router::descriptor::**"]
+why = "the shared kernel (crate-root helpers, rebuild, conflict, context, descriptor) sits below the component dispatchers and the router"
+from = ["angzarr_router", "angzarr_router::rebuild::**", "angzarr_router::conflict::**", "angzarr_router::context::**", "angzarr_router::descriptor::**"]
 scope = "lib"
 allow = [
     "angzarr_router",
@@ -88,6 +88,7 @@ allow = [
     "angzarr_router::error::**",
     "angzarr_router::rebuild::**",
     "angzarr_router::conflict::**",
+    "angzarr_router::context::**",
     "angzarr_router::descriptor::**",
 ]
 
@@ -108,6 +109,7 @@ allow = [
     "angzarr_router::error::**",
     "angzarr_router::rebuild::**",
     "angzarr_router::conflict::**",
+    "angzarr_router::context::**",
     "angzarr_router::descriptor::**",
 ]
 

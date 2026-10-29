@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod conflict;
+pub mod context;
 pub mod descriptor;
 pub mod domain;
 pub mod error;

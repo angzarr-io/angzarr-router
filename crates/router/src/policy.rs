@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use prost::{Message, Name};
 use prost_types::Any;
 
+use crate::context::CommandContext;
 use crate::error::{codes, extras, map_handler_error, messages, CodedError, HandlerError};
 use crate::pb;
 use crate::PageContext;
@@ -41,9 +42,11 @@ pub type EventFn = Box<
 
 /// A policy's translating callback for one refused command type: reads the
 /// `Refusal` (the triggering event, the command as sent, the target's
-/// response with its typed refusal object) and returns a fact of the policy's
-/// source domain, packed.
-pub type RefusalFn = Box<dyn Fn(&pb::Refusal) -> Result<Any, HandlerError> + Send + Sync>;
+/// response with its typed refusal object) and the refused command's
+/// [`CommandContext`] (as its target's handler was handed it), and returns
+/// a fact of the policy's source domain, packed.
+pub type RefusalFn =
+    Box<dyn Fn(&pb::Refusal, &CommandContext) -> Result<Any, HandlerError> + Send + Sync>;
 
 /// The dispatch table for one policy component.
 pub struct PolicyDispatch {
@@ -109,7 +112,10 @@ impl PolicyDispatch {
     pub fn on_refused(
         mut self,
         command: &str,
-        thunk: impl Fn(&pb::Refusal) -> Result<Any, HandlerError> + Send + Sync + 'static,
+        thunk: impl Fn(&pb::Refusal, &CommandContext) -> Result<Any, HandlerError>
+            + Send
+            + Sync
+            + 'static,
     ) -> Self {
         self.refusals.insert(command.to_string(), Box::new(thunk));
         self
@@ -126,7 +132,9 @@ impl PolicyDispatch {
     pub fn dispatch_refusal(
         &self,
         refusal: &pb::Refusal,
+        ctx: &CommandContext,
     ) -> Result<pb::OnRefusedResponse, CodedError> {
+        let _ = ctx;
         let missing = |what: &str| {
             CodedError::invalid_argument(
                 codes::MISSING_COMMAND_BOOK,
@@ -143,7 +151,9 @@ impl PolicyDispatch {
             .map(|p| crate::type_name_from_url(&p.type_url).to_string())
             .unwrap_or_default();
         let payload = match self.refusals.get(&refused_type) {
-            Some(translate) => translate(refusal).map_err(map_handler_error)?,
+            Some(translate) => {
+                translate(refusal, &CommandContext::default()).map_err(map_handler_error)?
+            }
             None => {
                 let trigger = pb::EventRef {
                     stream: event.cover.clone(),

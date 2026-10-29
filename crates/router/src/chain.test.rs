@@ -10,7 +10,7 @@
 
 use prost::Message;
 
-use crate::domain::{Admission, Arrival, DomainDispatch, FactRecord, StreamStatus};
+use crate::domain::{Admission, Arrival, CommandContext, DomainDispatch, FactRecord, StreamStatus};
 use crate::error::{CodedError, HandlerError};
 use crate::pb;
 use crate::policy::{address_refusal_fact, PolicyDispatch};
@@ -151,7 +151,9 @@ fn run(policy: PolicyDispatch, edition: Option<&str>) -> pb::EventPage {
         command: Some(hold),
         response: Some(refused.refusal_response().expect("a business rejection")),
     };
-    let answer = policy.dispatch_refusal(&refusal).expect("answered");
+    let answer = policy
+        .dispatch_refusal(&refusal, &CommandContext::default())
+        .expect("answered");
     let fact = address_refusal_fact(&refusal, &answer).expect("addressed");
     assert_eq!(fact.cover, Some(instance));
 
@@ -189,7 +191,7 @@ fn a_refusal_passes_through_to_the_policies_source_in_process() {
 
 #[test]
 fn a_refusal_is_translated_for_the_policies_source_in_process() {
-    let policy = buyin_wallet().on_refused(&fq::<HoldFunds>(), |refusal| {
+    let policy = buyin_wallet().on_refused(&fq::<HoldFunds>(), |refusal, _ctx| {
         let typed = refusal
             .response
             .as_ref()

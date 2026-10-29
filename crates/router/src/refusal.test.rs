@@ -7,6 +7,7 @@
 use prost::Message;
 use prost_types::Any;
 
+use crate::domain::CommandContext;
 use crate::error::{codes, CodedError, GrpcCode, HandlerError};
 use crate::pb;
 use crate::policy::{address_refusal_fact, PolicyDispatch};
@@ -163,7 +164,10 @@ fn a_policy_command_naming_another_edition_is_refused() {
 #[test]
 fn pass_through_answers_the_standard_command_refused() {
     let answer = buyin_wallet()
-        .dispatch_refusal(&refusal(None, Some(insufficient())))
+        .dispatch_refusal(
+            &refusal(None, Some(insufficient())),
+            &CommandContext::default(),
+        )
         .expect("answered");
     let fact: pb::CommandRefused = fact_of(&answer);
     assert_eq!(
@@ -183,7 +187,7 @@ fn pass_through_answers_the_standard_command_refused() {
 #[test]
 fn pass_through_without_a_typed_refusal_leaves_refusal_unset() {
     let answer = buyin_wallet()
-        .dispatch_refusal(&refusal(None, None))
+        .dispatch_refusal(&refusal(None, None), &CommandContext::default())
         .expect("answered");
     let fact: pb::CommandRefused = fact_of(&answer);
     assert_eq!(fact.refusal, None);
@@ -194,7 +198,7 @@ fn pass_through_without_a_typed_refusal_leaves_refusal_unset() {
 
 #[test]
 fn translate_answers_the_callbacks_domestic_fact() {
-    let policy = buyin_wallet().on_refused(&fq::<HoldFunds>(), |refusal| {
+    let policy = buyin_wallet().on_refused(&fq::<HoldFunds>(), |refusal, _ctx| {
         let typed = refusal
             .response
             .as_ref()
@@ -207,20 +211,83 @@ fn translate_answers_the_callbacks_domestic_fact() {
         }))
     });
     let answer = policy
-        .dispatch_refusal(&refusal(None, Some(insufficient())))
+        .dispatch_refusal(
+            &refusal(None, Some(insufficient())),
+            &CommandContext::default(),
+        )
         .expect("answered");
     let fact: FundsUnavailable = fact_of(&answer);
     assert_eq!(fact, FundsUnavailable { available: 100 });
 }
 
+// The translating callback reads the refused command's context, whole, as
+// the runtime passes it on from the target's dispatch: its cover, its
+// sequences, history, resolution and conflict, and its identity.
+#[test]
+fn a_translating_callback_reads_the_refused_commands_context() {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let policy = buyin_wallet().on_refused(&fq::<HoldFunds>(), move |_refusal, ctx| {
+        sink.lock().unwrap().push(ctx.clone());
+        Ok(any_of(&FundsUnavailable { available: 0 }))
+    });
+    let window = vec![sequenced_event_page(
+        3,
+        any_of(&FundsUnavailable { available: 1 }),
+    )];
+    let ctx = CommandContext {
+        next_sequence: 4,
+        had_prior_events: true,
+        cover: Some(stream("wallet", None, 1)),
+        expected_sequence: 3,
+        conflict_resolution: pb::ConflictResolution::AggregateHandles,
+        conflict: Some(crate::domain::Conflict::new(window.clone(), vec![7, 7])),
+        command_id: Some(uuid_of(9)),
+        correlation_id: Some(uuid_of(8)),
+        fact_origin: None,
+    };
+    policy
+        .dispatch_refusal(&refusal(None, Some(insufficient())), &ctx)
+        .expect("answered");
+    let seen = seen.lock().unwrap();
+    let [got] = seen.as_slice() else {
+        panic!("the callback ran once");
+    };
+    assert_eq!(
+        (
+            got.next_sequence,
+            got.had_prior_events,
+            got.expected_sequence
+        ),
+        (4, true, 3)
+    );
+    assert_eq!(got.cover, Some(stream("wallet", None, 1)));
+    assert_eq!(
+        got.conflict_resolution,
+        pb::ConflictResolution::AggregateHandles
+    );
+    let conflict = got.conflict.as_ref().expect("the conflict");
+    assert_eq!(
+        (conflict.window(), conflict.nonce()),
+        (window.as_slice(), &[7u8, 7][..])
+    );
+    assert_eq!(
+        (got.command_id.clone(), got.correlation_id.clone()),
+        (Some(uuid_of(9)), Some(uuid_of(8)))
+    );
+}
+
 // The callback's presence is translate mode for THAT command type only.
 #[test]
 fn a_command_type_with_no_callback_is_passed_through() {
-    let policy = buyin_wallet().on_refused(&fq::<ReleaseFunds>(), |_| {
+    let policy = buyin_wallet().on_refused(&fq::<ReleaseFunds>(), |_, _| {
         panic!("not the refused command's type")
     });
     let answer = policy
-        .dispatch_refusal(&refusal(None, Some(insufficient())))
+        .dispatch_refusal(
+            &refusal(None, Some(insufficient())),
+            &CommandContext::default(),
+        )
         .expect("answered");
     let fact: pb::CommandRefused = fact_of(&answer);
     assert_eq!(fact.refusal, Some(insufficient()));
@@ -229,11 +296,14 @@ fn a_command_type_with_no_callback_is_passed_through() {
 // A failing callback is a policy bug: dead-lettered and alerted by the runtime.
 #[test]
 fn a_failing_callback_is_a_policy_bug() {
-    let policy = buyin_wallet().on_refused(&fq::<HoldFunds>(), |_| {
+    let policy = buyin_wallet().on_refused(&fq::<HoldFunds>(), |_, _| {
         Err(HandlerError::Other("cannot translate".to_string()))
     });
     let err = policy
-        .dispatch_refusal(&refusal(None, Some(insufficient())))
+        .dispatch_refusal(
+            &refusal(None, Some(insufficient())),
+            &CommandContext::default(),
+        )
         .expect_err("a bug");
     assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
     assert_eq!(err.grpc, GrpcCode::Internal);
@@ -244,7 +314,9 @@ fn a_failing_callback_is_a_policy_bug() {
 #[test]
 fn the_refusal_fact_goes_to_the_triggers_exact_stream() {
     let refusal = refusal(Some("what-if"), Some(insufficient()));
-    let answer = buyin_wallet().dispatch_refusal(&refusal).expect("answered");
+    let answer = buyin_wallet()
+        .dispatch_refusal(&refusal, &CommandContext::default())
+        .expect("answered");
     let fact = address_refusal_fact(&refusal, &answer).expect("addressed");
     assert_eq!(fact.cover, Some(stream("buyin", Some("what-if"), INSTANCE)));
 }
@@ -254,7 +326,9 @@ fn the_refusal_fact_goes_to_the_triggers_exact_stream() {
 #[test]
 fn the_refusal_facts_id_is_the_refused_commands_id() {
     let refusal = refusal(None, Some(insufficient()));
-    let answer = buyin_wallet().dispatch_refusal(&refusal).expect("answered");
+    let answer = buyin_wallet()
+        .dispatch_refusal(&refusal, &CommandContext::default())
+        .expect("answered");
     let fact = address_refusal_fact(&refusal, &answer).expect("addressed");
     let page = fact.page.as_ref().expect("its page");
     assert_eq!(page.command_id, Some(uuid_of(9)));
@@ -296,7 +370,9 @@ fn an_answer_that_is_not_a_bare_fact_is_refused() {
 #[test]
 fn an_answer_that_sets_any_of_the_facts_identity_is_refused() {
     let refusal = refusal(None, Some(insufficient()));
-    let answered = buyin_wallet().dispatch_refusal(&refusal).expect("answered");
+    let answered = buyin_wallet()
+        .dispatch_refusal(&refusal, &CommandContext::default())
+        .expect("answered");
     let setters: [fn(&mut pb::CommandPage); 4] = [
         |p| p.command_id = Some(uuid_of(1)),
         |p| p.correlation_id = Some(uuid_of(1)),
@@ -322,7 +398,9 @@ fn a_policy_router_answers_a_refusal_and_no_other_router_does() {
         .policy(buyin_wallet())
         .build()
         .expect("build");
-    let answer = router.dispatch_refusal(&refusal).expect("answered");
+    let answer = router
+        .dispatch_refusal(&refusal, &CommandContext::default())
+        .expect("answered");
     let fact: pb::CommandRefused = fact_of(&answer);
     assert_eq!(fact.refusal, Some(insufficient()));
 
@@ -330,6 +408,8 @@ fn a_policy_router_answers_a_refusal_and_no_other_router_does() {
         .projector(crate::projector::ProjectorDispatch::new("p", || ()))
         .build()
         .expect("build");
-    let err = projector.dispatch_refusal(&refusal).expect_err("no policy");
+    let err = projector
+        .dispatch_refusal(&refusal, &CommandContext::default())
+        .expect_err("no policy");
     assert_eq!(err.code, codes::NO_HANDLER_REGISTERED);
 }

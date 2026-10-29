@@ -335,9 +335,10 @@ impl Router {
     pub fn dispatch_refusal(
         &self,
         refusal: &pb::Refusal,
+        ctx: &crate::context::CommandContext,
     ) -> Result<pb::OnRefusedResponse, CodedError> {
         match &self.component {
-            Component::Policy(policy) => policy.dispatch_refusal(refusal),
+            Component::Policy(policy) => policy.dispatch_refusal(refusal, ctx),
             _ => Err(wrong_kind()),
         }
     }

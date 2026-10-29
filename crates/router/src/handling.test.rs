@@ -144,6 +144,68 @@ fn strict_hands_the_handler_its_handling_and_no_conflict() {
     assert!(cctx.conflict.is_none(), "STRICT has no window or nonce");
 }
 
+// --- the context a runtime passes on with a refusal ----------------------------
+
+/// `a` and `b` field by field (a `Conflict` has no equality): its window
+/// and nonce.
+fn same_context(a: &CommandContext, b: &CommandContext) {
+    assert_eq!(
+        (a.next_sequence, a.had_prior_events, a.expected_sequence),
+        (b.next_sequence, b.had_prior_events, b.expected_sequence)
+    );
+    assert_eq!(a.cover, b.cover);
+    assert_eq!(a.conflict_resolution, b.conflict_resolution);
+    assert_eq!(
+        a.conflict
+            .as_ref()
+            .map(|c| (c.window().to_vec(), c.nonce().to_vec())),
+        b.conflict
+            .as_ref()
+            .map(|c| (c.window().to_vec(), c.nonce().to_vec()))
+    );
+    assert_eq!(
+        (&a.command_id, &a.correlation_id, &a.fact_origin),
+        (&b.command_id, &b.correlation_id, &b.fact_origin)
+    );
+}
+
+// command_context answers, from the ContextualCommand alone, the context its
+// handler is handed: under STRICT with history, under AGGREGATE_HANDLES
+// behind the head (a window and the nonce), and on a new stream.
+#[test]
+fn command_context_is_the_context_the_handler_is_handed() {
+    let deliveries = [
+        identified(strict("a", &["x", "y"])),
+        identified(delivery(
+            "a",
+            &["x", "y", "z"],
+            1,
+            pb::ConflictResolution::AggregateHandles,
+            &[5, 5],
+        )),
+        identified(strict("a", &[])),
+    ];
+    for req in deliveries {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let d = DomainDispatch::new("list", "list", list_rebuilder()).on_command(
+            "test.Bump",
+            move |_cmd, _state, cctx| {
+                if let Some(conflict) = &cctx.conflict {
+                    conflict.resolve_conflicts(conflict.window(), conflict.nonce());
+                }
+                sink.lock().unwrap().push(cctx);
+                Ok(None)
+            },
+        );
+        d.dispatch(&req).expect("dispatch");
+        same_context(
+            &crate::domain::command_context(&req),
+            &seen.lock().unwrap()[0],
+        );
+    }
+}
+
 // --- the input's identity (types.proto, CommandPage) ---------------------------
 
 /// `req` with its page identified: command id 0x11, correlation 0x22.
