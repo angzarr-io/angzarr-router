@@ -76,7 +76,9 @@ fmt-check:
     cargo fmt --manifest-path {{TOP}}/Cargo.toml --all --check
 
 # Mutation-test the core modules, the FFI registry's routing/claim rules and
-# the architecture linter (gate: kill >= 0.95).
+# the architecture linter. Gate: any missed mutant fails it (cargo-mutants
+# exits non-zero); only a genuinely equivalent mutant may be excluded, in
+# .cargo/mutants.toml, with the argument for its equivalence.
 # cargo-mutants copies the source tree, so the proto root must be an absolute
 # path that survives the copy — ANGZARR_PROJECT_PROTO points build.rs at the
 # real submodule checkout.

@@ -35,7 +35,7 @@ use crate::rebuild::{PageOrigin, Rebuilder};
 
 /// Per-dispatch facts the business method may need beyond its typed
 /// command and rebuilt state.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct CommandContext {
     /// The aggregate's next event sequence, derived from the prior-events
     /// book the coordinator supplied.
@@ -70,12 +70,6 @@ pub struct Conflict {
     window: Vec<pb::EventPage>,
     nonce: Vec<u8>,
     resolved: Arc<Mutex<Option<Vec<u8>>>>,
-}
-
-impl PartialEq for Conflict {
-    fn eq(&self, other: &Self) -> bool {
-        self.window == other.window && self.nonce == other.nonce
-    }
 }
 
 impl Conflict {
