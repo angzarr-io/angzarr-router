@@ -108,7 +108,8 @@ impl PolicyDispatch {
     /// Registers the translating callback for refusals of the
     /// fully-qualified command type `command` (translate mode; policy.proto,
     /// Refusals). Its presence IS translate mode for that command; a refused
-    /// command of a type with none is passed through.
+    /// command of a type with none is passed through. The callback reads the
+    /// `Refusal` and the refused command's [`CommandContext`], whole.
     pub fn on_refused(
         mut self,
         command: &str,
@@ -127,14 +128,21 @@ impl PolicyDispatch {
     /// Pass-through (no callback for the refused command's type): the
     /// standard `CommandRefused { command, refusal, trigger }`, `refusal`
     /// the typed refusal object still packed, `trigger` the triggering
-    /// event's EventRef. Translate: the callback's fact. A failing callback
-    /// is a policy bug (dead-lettered and alerted).
+    /// event's EventRef. Translate: the callback's fact, the callback handed
+    /// `ctx`, the refused command's context as its target's handler was
+    /// handed it: the runtime passes on
+    /// [`command_context`](crate::context::command_context) of the
+    /// `ContextualCommand` it delivered. Over the wire, policy.proto's
+    /// OnRefused request is the `Refusal` alone, so a server answering it
+    /// knows only what the refused command's book carries (its cover,
+    /// identity and Handling): the next sequence, the history flag and the
+    /// conflict stay unset there. A failing callback is a policy bug
+    /// (dead-lettered and alerted).
     pub fn dispatch_refusal(
         &self,
         refusal: &pb::Refusal,
         ctx: &CommandContext,
     ) -> Result<pb::OnRefusedResponse, CodedError> {
-        let _ = ctx;
         let missing = |what: &str| {
             CodedError::invalid_argument(
                 codes::MISSING_COMMAND_BOOK,
@@ -151,9 +159,7 @@ impl PolicyDispatch {
             .map(|p| crate::type_name_from_url(&p.type_url).to_string())
             .unwrap_or_default();
         let payload = match self.refusals.get(&refused_type) {
-            Some(translate) => {
-                translate(refusal, &CommandContext::default()).map_err(map_handler_error)?
-            }
+            Some(translate) => translate(refusal, ctx).map_err(map_handler_error)?,
             None => {
                 let trigger = pb::EventRef {
                     stream: event.cover.clone(),

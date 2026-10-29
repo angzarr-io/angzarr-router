@@ -508,7 +508,7 @@ impl<S> DomainDispatch<S> {
                 else {
                     return Err(self.unknown(codes::NO_HANDLER_REGISTERED, sent, &any));
                 };
-                self.decide(req, command_book, &any, thunk)?
+                self.decide(req, &any, thunk)?
             }
             Some(pb::command_page::Body::Fact(fact)) => {
                 let sent = non_empty_payload(fact.payload.as_ref())?;
@@ -553,14 +553,8 @@ impl<S> DomainDispatch<S> {
                     }
                     None => return Err(self.unknown(codes::NO_FACT_HANDLER, sent, &any)),
                 };
-                let (mut state, info) = self.rebuilder.rebuild(req.events.as_ref())?;
-                let record = record_with(
-                    &state,
-                    CommandContext {
-                        had_prior_events: info.had_prior_events,
-                        ..input_context(req, command_book)
-                    },
-                )?;
+                let (mut state, _) = self.rebuilder.rebuild(req.events.as_ref())?;
+                let record = record_with(&state, command_context(req))?;
                 let recorded = pb::EventBook {
                     pages: std::iter::once(record.fact)
                         .chain(record.flags)
@@ -645,7 +639,6 @@ impl<S> DomainDispatch<S> {
     fn decide(
         &self,
         req: &pb::ContextualCommand,
-        command_book: &pb::CommandBook,
         any: &Any,
         thunk: &CommandFn<S>,
     ) -> Result<(pb::EventBook, S), CodedError> {
@@ -656,14 +649,9 @@ impl<S> DomainDispatch<S> {
             self.rebuilder
                 .apply_emitted(state, &out.pages, cover, next_sequence)
         };
-        let base = input_context(req, command_book);
+        let base = command_context(req);
         let expected_sequence = base.expected_sequence;
         let conflict_resolution = base.conflict_resolution;
-        let context = |had_prior_events: bool, conflict: Option<Conflict>| CommandContext {
-            had_prior_events,
-            conflict,
-            ..base.clone()
-        };
         let run = |state: &mut S, cctx: CommandContext| -> Result<pb::EventBook, CodedError> {
             Ok(thunk(any, state, cctx)
                 .map_err(map_handler_error)?
@@ -671,16 +659,9 @@ impl<S> DomainDispatch<S> {
         };
         match conflict_resolution {
             pb::ConflictResolution::AggregateHandles => {
-                let (mut state, info) = self.rebuilder.rebuild(events)?;
-                let conflict = Conflict::new(
-                    window_pages(events, expected_sequence),
-                    req.conflict_nonce.to_vec(),
-                );
-                let out = run(
-                    &mut state,
-                    context(info.had_prior_events, Some(conflict.clone())),
-                )?;
-                if !conflict.is_resolved() {
+                let (mut state, _) = self.rebuilder.rebuild(events)?;
+                let out = run(&mut state, base.clone())?;
+                if !base.conflict.as_ref().is_some_and(Conflict::is_resolved) {
                     return Err(CodedError::stale(
                         codes::CONFLICT_UNRESOLVED,
                         messages::CONFLICT_UNRESOLVED,
@@ -698,8 +679,6 @@ impl<S> DomainDispatch<S> {
                         [],
                     ));
                 };
-                let had_prior_events =
-                    events.is_some_and(|b| !b.pages.is_empty() || b.snapshot.is_some());
                 let (prefix, window) = split_at_expected(events, expected_sequence);
                 let (mut state, _) = self.rebuilder.rebuild(Some(&prefix))?;
                 let resolved = resolver.resolve(
@@ -708,7 +687,7 @@ impl<S> DomainDispatch<S> {
                         self.rebuilder
                             .apply_pages(state, &window, cover, PageOrigin::Persisted)
                     },
-                    &mut |state| run(state, context(had_prior_events, None)),
+                    &mut |state| run(state, base.clone()),
                     &mut |state, book| fold_emitted(state, book),
                 )?;
                 if crate::conflict::overlap(&resolved.window, &resolved.mine) {
@@ -726,8 +705,8 @@ impl<S> DomainDispatch<S> {
                 Ok((resolved.events, state))
             }
             _ => {
-                let (mut state, info) = self.rebuilder.rebuild(events)?;
-                let out = run(&mut state, context(info.had_prior_events, None))?;
+                let (mut state, _) = self.rebuilder.rebuild(events)?;
+                let out = run(&mut state, base.clone())?;
                 fold_emitted(&mut state, &out)?;
                 Ok((out, state))
             }
@@ -796,20 +775,6 @@ pub fn admit_rules(
     Ok(Admission::Dispatch)
 }
 
-/// The conflict window: the pages at or after `expected` (types.proto,
-/// ContextualCommand: `expected_sequence .. next_sequence-1`).
-fn window_pages(events: Option<&pb::EventBook>, expected: u64) -> Vec<pb::EventPage> {
-    events
-        .map(|b| {
-            b.pages
-                .iter()
-                .filter(|p| p.sequence >= expected)
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// The prior-events book up to `expected` (its snapshot and earlier pages)
 /// and the window after it.
 fn split_at_expected(
@@ -843,28 +808,6 @@ fn non_empty_payload(payload: Option<&Any>) -> Result<&Any, CodedError> {
             messages::NO_COMMAND_PAGES,
             [],
         )),
-    }
-}
-
-/// What every handler of `req` reads, whatever its arm: the stream's next
-/// sequence, the input's cover, its resolved Handling, and its identity
-/// (command id, correlation, fact origin) as delivered. `had_prior_events`
-/// and `conflict` are the caller's (false and `None` here).
-fn input_context(req: &pb::ContextualCommand, command_book: &pb::CommandBook) -> CommandContext {
-    let next_sequence = crate::next_sequence(req.events.as_ref());
-    let handling = command_book.handling.unwrap_or_default();
-    let page = command_book.page.as_ref();
-    CommandContext {
-        next_sequence,
-        had_prior_events: false,
-        cover: command_book.cover.clone(),
-        expected_sequence: handling.expected_sequence.unwrap_or(next_sequence),
-        conflict_resolution: pb::ConflictResolution::try_from(handling.conflict_resolution)
-            .unwrap_or(pb::ConflictResolution::Unspecified),
-        conflict: None,
-        command_id: page.and_then(|p| p.command_id.clone()),
-        correlation_id: page.and_then(|p| p.correlation_id.clone()),
-        fact_origin: page.and_then(|p| p.fact_origin.clone()),
     }
 }
 

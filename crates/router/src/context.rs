@@ -96,10 +96,51 @@ impl Conflict {
 }
 
 /// The context a handler of `req` is handed, from the `ContextualCommand`
-/// alone: what a runtime passes on with a refusal of `req` to its policy's
-/// translating callback
+/// alone, whole: the next sequence and whether the stream has history
+/// (pages or a snapshot) from its prior-events book; its cover, resolved
+/// Handling and identity as delivered; and, under AGGREGATE_HANDLES only,
+/// the conflict (the window from the expected sequence on, and the
+/// delivered nonce). What a runtime passes on with a refusal of `req` to
+/// its policy's translating callback
 /// ([`crate::policy::PolicyDispatch::dispatch_refusal`]).
 pub fn command_context(req: &pb::ContextualCommand) -> CommandContext {
-    let _ = req;
-    CommandContext::default()
+    let events = req.events.as_ref();
+    let next_sequence = crate::next_sequence(events);
+    let book = req.command.as_ref();
+    let handling = book.and_then(|b| b.handling).unwrap_or_default();
+    let page = book.and_then(|b| b.page.as_ref());
+    let expected_sequence = handling.expected_sequence.unwrap_or(next_sequence);
+    let conflict_resolution = pb::ConflictResolution::try_from(handling.conflict_resolution)
+        .unwrap_or(pb::ConflictResolution::Unspecified);
+    let conflict = (conflict_resolution == pb::ConflictResolution::AggregateHandles).then(|| {
+        Conflict::new(
+            window_pages(events, expected_sequence),
+            req.conflict_nonce.to_vec(),
+        )
+    });
+    CommandContext {
+        next_sequence,
+        had_prior_events: events.is_some_and(|b| !b.pages.is_empty() || b.snapshot.is_some()),
+        cover: book.and_then(|b| b.cover.clone()),
+        expected_sequence,
+        conflict_resolution,
+        conflict,
+        command_id: page.and_then(|p| p.command_id.clone()),
+        correlation_id: page.and_then(|p| p.correlation_id.clone()),
+        fact_origin: page.and_then(|p| p.fact_origin.clone()),
+    }
+}
+
+/// The window under AGGREGATE_HANDLES: the prior-events pages at sequences
+/// `expected..`.
+pub(crate) fn window_pages(events: Option<&pb::EventBook>, expected: u64) -> Vec<pb::EventPage> {
+    events
+        .map(|b| {
+            b.pages
+                .iter()
+                .filter(|p| p.sequence >= expected)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
 }

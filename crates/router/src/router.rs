@@ -330,7 +330,8 @@ impl Router {
     }
 
     /// The policy's OnRefused (policy.proto): the refusal fact for its own
-    /// source domain, passed through or translated
+    /// source domain, passed through or translated, the callback handed the
+    /// refused command's context `ctx`
     /// ([`PolicyDispatch::dispatch_refusal`]).
     pub fn dispatch_refusal(
         &self,
