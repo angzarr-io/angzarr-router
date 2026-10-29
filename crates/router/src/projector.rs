@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 
 use prost_types::Any;
 
-use crate::error::{codes, map_handler_error, messages, CodedError, HandlerError};
+use crate::error::{codes, map_handler_error, CodedError, HandlerError};
 use crate::pb;
 use crate::rebuild::{fold_error, page_fold_error, FoldFailure, PageOrigin};
 
@@ -163,7 +163,6 @@ impl<P> ProjectorDispatch<P> {
         let Some(cover) = events.cover.as_ref() else {
             return Err(CodedError::invalid_argument(
                 codes::MISSING_EVENT_BOOK_COVER,
-                messages::MISSING_EVENT_BOOK_COVER,
                 [],
             ));
         };

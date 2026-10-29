@@ -7,7 +7,7 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 use angzarr_router::domain::{DomainDispatch, FactRecord};
-use angzarr_router::error::{CodedError, HandlerError};
+use angzarr_router::error::{BusinessStatus, CodedError, HandlerError};
 use angzarr_router::policy::PolicyDispatch;
 use angzarr_router::projector::ProjectorDispatch;
 use angzarr_router::rebuild::Rebuilder;
@@ -127,8 +127,8 @@ pub fn counter_aggregate(observed: ObservedSink) -> DomainDispatch<CounterState>
                 .map_err(|e| HandlerError::Other(format!("decode IncreaseBy: {e}")))?;
             if cmd.n == 0 {
                 return Err(HandlerError::Coded(CodedError::rejection(
+                    BusinessStatus::FailedPrecondition,
                     VALUE_NOT_POSITIVE,
-                    "increase amount must be positive",
                     [],
                 )));
             }
@@ -639,6 +639,58 @@ pub struct OrderObserved {
     pub nonce: Option<Vec<u8>>,
     /// The item keys of the state it decided on, sorted.
     pub items: Vec<String>,
+    /// When its input was accepted, as its context said
+    /// (CommandContext.recorded_at; decision 14.37).
+    pub recorded_at: Option<prost_types::Timestamp>,
+}
+
+/// How the order aggregate's AddItem handler fails, when it does (decision
+/// 14.37, C-0667..C-0672). The text each "logs for itself" is for the
+/// handler's own log: it is handed to nothing that crosses a boundary.
+#[derive(Debug, Clone)]
+pub enum AddItemFails {
+    /// An untyped business rejection: `code` and `args`.
+    Rejects {
+        code: String,
+        args: Vec<(String, String)>,
+        logs: String,
+    },
+    /// A typed refusal: the refusal object ItemOutOfStock.
+    Refuses { item: String, on_hand: u32 },
+    /// An unclassified error whose text is `text`.
+    Errs { text: String },
+    /// A panic with `text`.
+    Panics { text: String },
+    /// A bug with its own `code` and `args`.
+    Bug {
+        code: String,
+        args: Vec<(String, String)>,
+        logs: String,
+    },
+}
+
+impl AddItemFails {
+    fn fail(&self) -> HandlerError {
+        match self {
+            AddItemFails::Rejects { code, args, logs } => {
+                let _ = logs; // the handler's own log
+                CodedError::rejection(BusinessStatus::FailedPrecondition, code, args.clone()).into()
+            }
+            AddItemFails::Refuses { item, on_hand } => {
+                CodedError::refused(orders_any(&orders::v1::ItemOutOfStock {
+                    item: item.clone(),
+                    on_hand: *on_hand,
+                }))
+                .into()
+            }
+            AddItemFails::Errs { text } => HandlerError::Other(text.clone()),
+            AddItemFails::Panics { text } => panic!("{text}"),
+            AddItemFails::Bug { code, args, logs } => {
+                let _ = logs; // the handler's own log
+                CodedError::bug(code, args.clone()).into()
+            }
+        }
+    }
 }
 
 /// Sink the harness passes into the order fixtures.
@@ -703,11 +755,29 @@ pub fn order_aggregate(
     settle: Settle,
     seen: OrderSink,
 ) -> DomainDispatch<orders::v1::OrderState> {
+    order_aggregate_with(rules_version, settle, seen, None)
+}
+
+/// The item whose ItemAdded the order aggregate's fold refuses to fold
+/// (C-0670's failing folds).
+pub const ROTTEN_ITEM: &str = "rotten";
+
+/// [`order_aggregate`] whose AddItem fails as `fails` says, when given
+/// (decision 14.37). Its ItemAdded fold fails on the item [`ROTTEN_ITEM`].
+pub fn order_aggregate_with(
+    rules_version: &str,
+    settle: Settle,
+    seen: OrderSink,
+    fails: Option<AddItemFails>,
+) -> DomainDispatch<orders::v1::OrderState> {
     let rebuilder = Rebuilder::of_message()
         .apply(
             "orders.v1.ItemAdded",
             |state: &mut orders::v1::OrderState, event| {
                 let item = orders::v1::ItemAdded::decode(event.value.as_slice())?.item;
+                if item == ROTTEN_ITEM {
+                    return Err(format!("cannot fold the {ROTTEN_ITEM} item").into());
+                }
                 *state.items.entry(item).or_default() += 1;
                 Ok(())
             },
@@ -758,7 +828,11 @@ pub fn order_aggregate(
                     .map(|c| c.window().iter().map(|p| p.sequence).collect()),
                 nonce: cctx.conflict.as_ref().map(|c| c.nonce().to_vec()),
                 items: sorted_items(state),
+                recorded_at: cctx.recorded_at,
             });
+            if let Some(fails) = &fails {
+                return Err(fails.fail());
+            }
             if let Some(conflict) = cctx.conflict.as_ref() {
                 match &settle {
                     Settle::Delivered => {
@@ -778,7 +852,7 @@ pub fn order_aggregate(
         })
         // Acknowledge: business code answers with no events.
         .on_command("orders.v1.Acknowledge", |_cmd, _state, _cctx| Ok(None))
-        .on_fact("orders.v1.ItemDelivered", move |fact, state| {
+        .on_fact_with_context("orders.v1.ItemDelivered", move |fact, state, cctx| {
             let item = orders::v1::ItemDelivered::decode(fact.value.as_slice())
                 .map_err(|e| HandlerError::Other(format!("decode ItemDelivered: {e}")))?
                 .item;
@@ -790,6 +864,7 @@ pub fn order_aggregate(
                 window: None,
                 nonce: None,
                 items: sorted_items(state),
+                recorded_at: cctx.recorded_at,
             });
             Ok(FactRecord::from(fact.clone()))
         })
@@ -863,6 +938,7 @@ pub fn order_command(
             ..Default::default()
         }),
         conflict_nonce: nonce.into(),
+        recorded_at: None,
     }
 }
 

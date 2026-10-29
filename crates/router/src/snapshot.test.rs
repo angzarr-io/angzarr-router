@@ -10,7 +10,6 @@ use prost::Message;
 use prost_types::Any;
 
 use crate::domain::{DomainDispatch, FactRecord};
-use crate::error::codes;
 use crate::pb;
 use crate::rebuild::Rebuilder;
 use crate::test_support::*;
@@ -63,7 +62,11 @@ fn items(rebuilder: Rebuilder<Items>) -> DomainDispatch<Items> {
         .on_command("test.Nothing", |_cmd, _state, _cctx| Ok(None))
         .on_command("test.Refuse", |_cmd, _state, _cctx| {
             Err(crate::error::HandlerError::Coded(
-                crate::error::CodedError::rejection("NO", "no", []),
+                crate::error::CodedError::rejection(
+                    crate::error::BusinessStatus::FailedPrecondition,
+                    "NO",
+                    [],
+                ),
             ))
         })
         .on_fact("test.Note", |fact, _state| {
@@ -238,8 +241,8 @@ fn an_emitted_event_that_does_not_fold_fails_the_command() {
     let err = corrupt
         .dispatch(&command_for(typed("test.Bump", "a")))
         .expect_err("the emitted event does not fold");
-    assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
-    assert_eq!(err.message, crate::error::messages::FOLD_FAILED_EMITTED);
+    // Decision 14.37: its own key, not UNHANDLED_HANDLER_ERROR.
+    assert_eq!(err.code, "FOLD_FAILED_EMITTED");
 }
 
 // The snapshot must equal what a rebuild would fold once the events are

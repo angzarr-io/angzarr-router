@@ -78,11 +78,7 @@ fn unknown_command_coded_before_rebuild() {
     });
 
     let err = d.dispatch(&cmd).expect_err("unknown command must fail");
-    assert_eq!(
-        err.code,
-        codes::NO_HANDLER_REGISTERED,
-        "validate before rebuild"
-    );
+    assert_eq!(err.code, "UNKNOWN_COMMAND_TYPE", "validate before rebuild");
 }
 
 // Spec: command_handler.proto, CommandHandlerService.Handle step 2 ("A type
@@ -100,7 +96,10 @@ fn an_unknown_type_is_invalid_argument_naming_its_type_url() {
         .dispatch(&command_for(unknown.clone()))
         .expect_err("an unknown command type");
     assert_eq!(err.grpc, GrpcCode::InvalidArgument);
-    assert_eq!(err.message, format!("no handler for type URL {url}"));
+    // Decision 14.37: the key is the status message; the args name the type.
+    assert_eq!(err.code, "UNKNOWN_COMMAND_TYPE");
+    assert_eq!(err.status_message(), "UNKNOWN_COMMAND_TYPE");
+    assert_eq!(err.extras.get("type_url"), Some(&url));
     // upcaster.proto (VC-1): the ErrorInfo metadata key upcast_type_url
     // holds the type the chain ended at, the sent one when none applies.
     assert_eq!(
@@ -113,7 +112,8 @@ fn an_unknown_type_is_invalid_argument_naming_its_type_url() {
         .expect_err("an unknown fact type");
     assert_eq!(err.code, codes::NO_FACT_HANDLER);
     assert_eq!(err.grpc, GrpcCode::InvalidArgument);
-    assert_eq!(err.message, format!("no handler for type URL {url}"));
+    assert_eq!(err.status_message(), codes::NO_FACT_HANDLER);
+    assert_eq!(err.extras.get("type_url"), Some(&url));
 }
 
 #[test]
@@ -127,8 +127,7 @@ fn corrupt_prior_event_fails_command() {
 
     let err = d.dispatch(&cmd).expect_err("corrupt prior event must fail");
     assert_eq!(
-        err.code,
-        codes::UNHANDLED_HANDLER_ERROR,
+        err.code, "FOLD_FAILED",
         "never validate against truncated state; a failing fold is a handler bug"
     );
     assert_eq!(err.grpc, crate::error::GrpcCode::Internal);
@@ -304,7 +303,7 @@ fn a_fact_type_sent_as_a_command_is_refused() {
     let err = fact_aggregate()
         .dispatch(&command_for(cover_any("f1")))
         .expect_err("a fact type in the Command arm");
-    assert_eq!(err.code, codes::NO_HANDLER_REGISTERED);
+    assert_eq!(err.code, "UNKNOWN_COMMAND_TYPE");
 }
 
 #[test]
@@ -328,8 +327,8 @@ fn a_corrupt_prior_event_fails_the_fact() {
     let err = fact_aggregate()
         .dispatch(&req)
         .expect_err("corrupt history");
-    assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
-    assert_eq!(err.message, crate::error::messages::FOLD_FAILED);
+    // Decision 14.37: its own key, not UNHANDLED_HANDLER_ERROR.
+    assert_eq!(err.code, "FOLD_FAILED");
 }
 
 #[test]
@@ -342,6 +341,28 @@ fn a_failing_fact_handler_fails_the_request() {
         .dispatch(&fact_delivery("f1", &[]))
         .expect_err("handler error");
     assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
+}
+
+// Decision 14.37: a handler that panics is a bug, UNHANDLED_HANDLER_ERROR
+// with cause HANDLER_PANICKED; the panic's message stays in the handler's
+// own log and the router answers, rather than unwinding into its host.
+#[test]
+fn a_panicking_handler_is_a_bug_caused_by_handler_panicked() {
+    let d = DomainDispatch::new("agg-test", "order", cover_applier(fresh_rebuilder()))
+        .on_command(&cover_full_name(), |_, _, _| panic!("index out of bounds"));
+    let req = command_for(cover_any("a"));
+    let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| d.dispatch(&req)));
+    let err = match answer {
+        Ok(result) => result.expect_err("a panic is no success"),
+        Err(_) => panic!("the handler's panic escaped the router: it answers HANDLER_PANICKED"),
+    };
+    assert_eq!(err.grpc, GrpcCode::Internal);
+    assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
+    assert_eq!(
+        err.extras.get("cause").map(String::as_str),
+        Some("HANDLER_PANICKED")
+    );
+    assert!(!format!("{err:?}").contains("index out of bounds"));
 }
 
 #[test]

@@ -66,6 +66,13 @@ message OrderState {
   repeated string delivered = 4;
 }
 
+// A typed refusal of AddItem (one of its refuses types): the item is out
+// of stock (decision 14.37, C-0668).
+message ItemOutOfStock {
+  string item = 1;
+  uint32 on_hand = 2;
+}
+
 // The Fulfillment process manager's state.
 message FulfillmentState {
   uint32 placed = 1;

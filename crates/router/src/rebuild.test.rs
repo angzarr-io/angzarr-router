@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use prost::Message;
 
-use crate::error::{codes, extras, messages};
+use crate::error::{codes, extras};
 use crate::pb;
 use crate::rebuild::{FoldFailure, PageOrigin, Rebuilder};
 use crate::test_support::*;
@@ -60,16 +60,18 @@ fn an_applier_failing_on_a_persisted_event_is_a_handler_bug_naming_it() {
     let type_url = crate::type_url(&cover_full_name());
     assert_fold_failed(
         &err,
-        messages::FOLD_FAILED,
+        "FOLD_FAILED",
         &[
             (extras::SEQUENCE, "5"),
             (extras::TYPE_URL, type_url.as_str()),
         ],
         "/test.Ledger",
     );
+    // Decision 14.37: the applier's own text stays in its log; none crosses.
     assert!(
-        !err.extras[extras::FOLD_MESSAGE].is_empty(),
-        "the applier's own text rides along"
+        !err.extras.contains_key("fold_message"),
+        "no fold text crosses: {:?}",
+        err.extras
     );
 }
 
@@ -530,13 +532,17 @@ fn a_batched_fold_failure_names_the_page_it_indexes() {
     let type_url = crate::type_url(&cover_full_name());
     assert_fold_failed(
         &err,
-        messages::FOLD_FAILED,
+        "FOLD_FAILED",
         &[
             (extras::SEQUENCE, "5"),
             (extras::TYPE_URL, type_url.as_str()),
-            (extras::FOLD_MESSAGE, "no"),
         ],
         "/test.State",
+    );
+    assert!(
+        !err.extras.contains_key("fold_message"),
+        "no fold text crosses (decision 14.37): {:?}",
+        err.extras
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1, "the fold is never re-run");
 }
@@ -557,7 +563,7 @@ fn an_unlocated_or_out_of_range_fold_failure_names_the_batchs_range() {
             .expect_err("the fold failed");
         assert_fold_failed(
             &err,
-            messages::FOLD_FAILED,
+            "FOLD_FAILED",
             &[(extras::FIRST_SEQUENCE, "4"), (extras::LAST_SEQUENCE, "6")],
             "/test.State",
         );
@@ -582,14 +588,14 @@ fn folding_emitted_pages_says_the_command_emitted_them() {
         .expect_err("failed");
     assert_fold_failed(
         &err,
-        messages::FOLD_FAILED_EMITTED,
+        "FOLD_FAILED_EMITTED",
         &[(extras::SEQUENCE, "4")],
         "/test.State",
     );
     let err = r
         .apply_pages(&mut state, &book.pages, None, PageOrigin::Persisted)
         .expect_err("failed");
-    assert_eq!(err.message, messages::FOLD_FAILED);
+    assert_eq!(err.code, "FOLD_FAILED");
 
     // Per-page appliers say the same.
     let r = cover_applier(fresh_rebuilder());
@@ -601,7 +607,7 @@ fn folding_emitted_pages_says_the_command_emitted_them() {
             PageOrigin::Emitted,
         )
         .expect_err("failed");
-    assert_eq!(err.message, messages::FOLD_FAILED_EMITTED);
+    assert_eq!(err.code, "FOLD_FAILED_EMITTED");
 }
 
 #[test]

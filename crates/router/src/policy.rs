@@ -26,7 +26,7 @@ use prost::{Message, Name};
 use prost_types::Any;
 
 use crate::context::CommandContext;
-use crate::error::{codes, extras, map_handler_error, messages, CodedError, HandlerError};
+use crate::error::{codes, extras, map_handler_error, CodedError, HandlerError};
 use crate::pb;
 use crate::PageContext;
 
@@ -143,13 +143,9 @@ impl PolicyDispatch {
         refusal: &pb::Refusal,
         ctx: &CommandContext,
     ) -> Result<pb::OnRefusedResponse, CodedError> {
-        let missing = |what: &str| {
-            CodedError::invalid_argument(
-                codes::MISSING_COMMAND_BOOK,
-                &format!("a refusal carries its {what}"),
-                [],
-            )
-        };
+        // RED (14.37): still one shared key; REFUSAL_WITHOUT_COMMAND and
+        // REFUSAL_WITHOUT_EVENT tell them apart.
+        let missing = |_what: &str| CodedError::invalid_argument(codes::MISSING_COMMAND_BOOK, []);
         let command = refusal.command.as_ref().ok_or_else(|| missing("command"))?;
         let event = refusal.event.as_ref().ok_or_else(|| missing("event"))?;
         let refused_type = command
@@ -167,7 +163,10 @@ impl PolicyDispatch {
                 };
                 let fact = pb::CommandRefused {
                     command: Some(command.clone()),
-                    refusal: refusal.response.as_ref().and_then(|r| r.refusal.clone()),
+                    refusal: refusal.response.as_ref().and_then(|r| match &r.reason {
+                        Some(pb::refusal_response::Reason::Refusal(any)) => Some(any.clone()),
+                        _ => None,
+                    }),
                     trigger: Some(trigger),
                 };
                 Any {
@@ -243,11 +242,7 @@ impl PolicyDispatch {
     /// EMPTY_POLICY_SOURCE.
     pub fn dispatch(&self, source: &pb::EventBook) -> Result<pb::PolicyResponse, CodedError> {
         if source.pages.is_empty() {
-            return Err(CodedError::invalid_argument(
-                codes::EMPTY_POLICY_SOURCE,
-                messages::EMPTY_POLICY_SOURCE,
-                [],
-            ));
+            return Err(CodedError::invalid_argument(codes::EMPTY_POLICY_SOURCE, []));
         }
 
         let mut resp = pb::PolicyResponse::default();
@@ -312,7 +307,6 @@ impl PolicyDispatch {
         let actual = stray.cover.as_ref().map_or("", |c| c.domain.as_str());
         CodedError::internal(
             codes::POLICY_COMMAND_OUTSIDE_DESTINATION,
-            messages::POLICY_COMMAND_OUTSIDE_DESTINATION,
             [
                 (
                     extras::EXPECTED_DOMAIN.to_string(),
@@ -353,7 +347,6 @@ fn check_root(command: &pb::CommandBook) -> Result<(), CodedError> {
     }
     Err(CodedError::internal(
         codes::POLICY_COMMAND_NO_ROOT,
-        messages::POLICY_COMMAND_NO_ROOT,
         naming(command),
     ))
 }
@@ -372,7 +365,6 @@ fn check_correlation(
     match (carried, trigger) {
         (Some(carried), Some(trigger)) if carried != trigger => Err(CodedError::internal(
             codes::POLICY_COMMAND_OTHER_CORRELATION,
-            messages::POLICY_COMMAND_OTHER_CORRELATION,
             naming(command),
         )),
         _ => Ok(()),
@@ -384,7 +376,6 @@ fn check_correlation(
 fn refuse_outside_edition(expected: &str, actual: &str) -> CodedError {
     CodedError::internal(
         codes::POLICY_COMMAND_OUTSIDE_EDITION,
-        messages::POLICY_COMMAND_OUTSIDE_EDITION,
         [
             (extras::EXPECTED_EDITION.to_string(), expected.to_string()),
             (extras::ACTUAL_EDITION.to_string(), actual.to_string()),
@@ -405,10 +396,11 @@ pub fn address_refusal_fact(
     refusal: &pb::Refusal,
     answer: &pb::OnRefusedResponse,
 ) -> Result<pb::CommandBook, CodedError> {
+    // RED (14.37): still one shared key told apart by text; each condition
+    // gets its own key (REFUSAL_FACT_MISSING, REFUSAL_FACT_ADDRESSED, ...).
     let malformed = |why: &str| {
         CodedError::internal(
             codes::MALFORMED_REFUSAL_FACT,
-            messages::MALFORMED_REFUSAL_FACT,
             [(extras::REASON.to_string(), why.to_string())],
         )
     };

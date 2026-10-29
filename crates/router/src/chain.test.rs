@@ -24,14 +24,12 @@ fn wallet() -> DomainDispatch<TestState> {
         &fq::<HoldFunds>(),
         |command, _state, _ctx| {
             let hold = HoldFunds::decode(command.value.as_slice()).expect("HoldFunds");
-            Err(HandlerError::Coded(
-                CodedError::rejection("INSUFFICIENT_FUNDS", "holds 100", []).with_refusal(any_of(
-                    &InsufficientFunds {
-                        available: 100,
-                        requested: hold.amount,
-                    },
-                )),
-            ))
+            Err(HandlerError::Coded(CodedError::refused(any_of(
+                &InsufficientFunds {
+                    available: 100,
+                    requested: hold.amount,
+                },
+            ))))
         },
     )
 }
@@ -196,7 +194,10 @@ fn a_refusal_is_translated_for_the_policies_source_in_process() {
         let typed = refusal
             .response
             .as_ref()
-            .and_then(|r| r.refusal.as_ref())
+            .and_then(|r| match &r.reason {
+                Some(pb::refusal_response::Reason::Refusal(typed)) => Some(typed),
+                _ => None,
+            })
             .expect("typed");
         let insufficient =
             InsufficientFunds::decode(typed.value.as_slice()).expect("InsufficientFunds");

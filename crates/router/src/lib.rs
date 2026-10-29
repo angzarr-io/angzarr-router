@@ -108,6 +108,16 @@ pub fn input_id(book: &pb::CommandBook) -> Option<pb::Uuid> {
     }
 }
 
+/// Decodes bytes a host handed the router as the message `M`: bytes that do
+/// not decode are ANY_DECODE_FAILED naming `M` as `message_type`
+/// ([`error::CodedError::undecodable`]; decision 14.37), one condition
+/// whatever the message.
+pub fn decode_message<M: prost::Message + prost::Name + Default>(
+    bytes: &[u8],
+) -> Result<M, error::CodedError> {
+    M::decode(bytes).map_err(|_| error::CodedError::undecodable(&M::full_name()))
+}
+
 /// An upcaster chain a command handler runs on incoming command and fact
 /// payloads before dispatch (upcaster.proto; decision 12.11):
 /// [`upcaster::UpcasterDispatch`] is one.

@@ -1,5 +1,6 @@
 //! Binds angzarr-project's handler-contract tier
-//! (features/handler-contract/handling.feature, C-0533..C-0550, C-0565, C-0570, C-0571, C-0580 and C-0583; the spec is
+//! (features/handler-contract/handling.feature, C-0533..C-0550, C-0565, C-0570, C-0571, C-0580, C-0583 and decision
+//! 14.37's C-0667..C-0672; the spec is
 //! the source, read from the submodule) to the Rust core: the order
 //! aggregate and the Fulfillment process manager (a domain, decision 14.31)
 //! built by hand over the orders.v1 fixture messages.
@@ -8,6 +9,7 @@ use angzarr_router::error::{CodedError, GrpcCode};
 use angzarr_router::pb;
 use angzarr_router_conformance as conf;
 use cucumber::{given, then, when, World};
+use prost::Message;
 
 /// The business process's registered component.
 struct Registered(angzarr_router::router::Router);
@@ -34,13 +36,53 @@ struct HandlingWorld {
     registered: Option<Registered>,
     second_refusal: Option<CodedError>,
     described: Vec<pb::ComponentDescriptor>,
+    /// How AddItem fails, when it does (decision 14.37).
+    fails: Option<conf::AddItemFails>,
+    /// When the delivery says its input was accepted (C-0671).
+    recorded_at: Option<prost_types::Timestamp>,
+    /// A handler's panic that escaped the router, with its text.
+    escaped: Option<String>,
+    /// The answer to one of C-0670's conditions: `Ok` when it was not
+    /// refused.
+    outcome: Option<Result<(), CodedError>>,
 }
 
 impl HandlingWorld {
-    fn dispatch(&mut self, req: pb::ContextualCommand) {
-        let order =
-            conf::order_aggregate(&self.rules_version, self.settle.clone(), self.seen.clone());
-        self.result = Some(order.dispatch(&req));
+    fn dispatch(&mut self, mut req: pb::ContextualCommand) {
+        if self.recorded_at.is_some() {
+            req.recorded_at = self.recorded_at;
+        }
+        let order = conf::order_aggregate_with(
+            &self.rules_version,
+            self.settle.clone(),
+            self.seen.clone(),
+            self.fails.clone(),
+        );
+        // A handler's panic is the router's to answer (decision 14.37);
+        // one that escapes is recorded, for the Then steps to fail on.
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| order.dispatch(&req))) {
+            Ok(answer) => self.result = Some(answer),
+            Err(panic) => {
+                self.escaped = Some(
+                    panic
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| panic.downcast_ref::<&str>().map(|t| t.to_string()))
+                        .unwrap_or_default(),
+                )
+            }
+        }
+    }
+
+    /// The error the scenario's input was refused with: one of C-0670's
+    /// conditions, or the handled command's.
+    fn the_error(&self) -> &CodedError {
+        match &self.outcome {
+            Some(outcome) => outcome
+                .as_ref()
+                .expect_err("expected the condition refused, it was not"),
+            None => self.refusal(),
+        }
     }
 
     fn accepted(&self) -> &pb::CommandHandlerResponse {
@@ -52,6 +94,12 @@ impl HandlingWorld {
     }
 
     fn refusal(&self) -> &CodedError {
+        if let Some(text) = &self.escaped {
+            panic!(
+                "the handler's panic escaped the router instead of being answered \
+                 UNHANDLED_HANDLER_ERROR with cause HANDLER_PANICKED: {text:?}"
+            );
+        }
         self.result
             .as_ref()
             .expect("a command was handled")
@@ -406,13 +454,12 @@ async fn second_registered(w: &mut HandlingWorld, kind: String, name: String) {
     w.second_refusal = builder.build().err();
 }
 
-#[then(r#"the registration is refused, naming the "order" aggregate already registered"#)]
-async fn refused_naming_order(w: &mut HandlingWorld) {
+#[then(
+    regex = r#"^the registration is refused with reason (\w+), naming the "order" aggregate already registered$"#
+)]
+async fn refused_naming_order(w: &mut HandlingWorld, reason: String) {
     let err = w.second_refusal.as_ref().expect("refused");
-    assert_eq!(
-        err.code,
-        angzarr_router::error::codes::DUPLICATE_REGISTRATION
-    );
+    assert_eq!(err.code, reason);
     assert_eq!(
         err.extras.get("component").map(String::as_str),
         Some("order")
@@ -463,27 +510,6 @@ async fn ingests(w: &mut HandlingWorld, kind: String, item: String) {
 #[then("the command is refused INVALID_ARGUMENT")]
 async fn refused_invalid(w: &mut HandlingWorld) {
     assert_eq!(w.refusal().grpc, GrpcCode::InvalidArgument);
-}
-
-#[then(regex = r#"^the refusal message names the type URL "([^"]*)"$"#)]
-async fn message_names(w: &mut HandlingWorld, url: String) {
-    assert_eq!(
-        w.refusal().message,
-        format!("no handler for type URL {url}")
-    );
-}
-
-// The extras render as the status's google.rpc.ErrorInfo metadata (see
-// crates/router-ffi/src/abi.rs, coded_to_status_bytes).
-#[then(regex = r#"^the refusal's error info carries upcast_type_url "([^"]*)"$"#)]
-async fn carries_upcast(w: &mut HandlingWorld, url: String) {
-    assert_eq!(
-        w.refusal()
-            .extras
-            .get("upcast_type_url")
-            .map(String::as_str),
-        Some(url.as_str())
-    );
 }
 
 #[then("business code is not invoked")]
@@ -561,6 +587,520 @@ async fn discarded(w: &mut HandlingWorld) {
 #[then(regex = r#"^business code saw items "([^"]*)" and "([^"]*)" in its state$"#)]
 async fn saw_items(w: &mut HandlingWorld, first: String, second: String) {
     assert_eq!(w.observed().items, vec![first, second]);
+}
+
+// --- errors are a key and an argument map (decision 14.37) --------------------
+//
+// The extras render as the status's google.rpc.ErrorInfo metadata (see
+// crates/router-ffi/src/abi.rs, coded_to_status_bytes).
+
+fn grpc_name(code: GrpcCode) -> &'static str {
+    match code {
+        GrpcCode::Unknown => "UNKNOWN",
+        GrpcCode::InvalidArgument => "INVALID_ARGUMENT",
+        GrpcCode::NotFound => "NOT_FOUND",
+        GrpcCode::AlreadyExists => "ALREADY_EXISTS",
+        GrpcCode::PermissionDenied => "PERMISSION_DENIED",
+        GrpcCode::OutOfRange => "OUT_OF_RANGE",
+        GrpcCode::Unavailable => "UNAVAILABLE",
+        GrpcCode::FailedPrecondition => "FAILED_PRECONDITION",
+        GrpcCode::Aborted => "ABORTED",
+        GrpcCode::Unimplemented => "UNIMPLEMENTED",
+        GrpcCode::Internal => "INTERNAL",
+        GrpcCode::DataLoss => "DATA_LOSS",
+    }
+}
+
+/// `name "value"` and bare `name` (present, any value) pairs of
+/// `sequence "3" and state_type_url`.
+fn expected_metadata(text: &str) -> Vec<(String, Option<String>)> {
+    text.split(" and ")
+        .map(|part| {
+            let part = part.trim();
+            match part.split_once(' ') {
+                Some((name, value)) => (
+                    name.to_string(),
+                    Some(value.trim().trim_matches('"').to_string()),
+                ),
+                None => (part.to_string(), None),
+            }
+        })
+        .collect()
+}
+
+fn add_item_fails(w: &mut HandlingWorld, fails: conf::AddItemFails) {
+    w.fails = Some(fails);
+}
+
+#[given(
+    regex = r#"^business code rejects AddItem with code (\w+) and arg (\w+) "([^"]*)", and logs "([^"]*)" for itself$"#
+)]
+async fn rejects_with_code(
+    w: &mut HandlingWorld,
+    code: String,
+    name: String,
+    value: String,
+    logs: String,
+) {
+    add_item_fails(
+        w,
+        conf::AddItemFails::Rejects {
+            code,
+            args: vec![(name, value)],
+            logs,
+        },
+    );
+}
+
+#[given(
+    regex = r#"^business code refuses AddItem with the refusal object ItemOutOfStock with item "([^"]*)" and on_hand (\d+)$"#
+)]
+async fn refuses_typed(w: &mut HandlingWorld, item: String, on_hand: u32) {
+    add_item_fails(w, conf::AddItemFails::Refuses { item, on_hand });
+}
+
+#[given(
+    regex = r#"^business code for AddItem returns an unclassified error whose text is "([^"]*)"$"#
+)]
+async fn errs_with_text(w: &mut HandlingWorld, text: String) {
+    add_item_fails(w, conf::AddItemFails::Errs { text });
+}
+
+#[given(regex = r#"^business code for AddItem panics with "([^"]*)"$"#)]
+async fn panics_with(w: &mut HandlingWorld, text: String) {
+    add_item_fails(w, conf::AddItemFails::Panics { text });
+}
+
+#[given(
+    regex = r#"^business code for AddItem fails with code (\w+) and arg (\w+) "([^"]*)", and logs "([^"]*)" for itself$"#
+)]
+async fn fails_with_bug(
+    w: &mut HandlingWorld,
+    code: String,
+    name: String,
+    value: String,
+    logs: String,
+) {
+    add_item_fails(
+        w,
+        conf::AddItemFails::Bug {
+            code,
+            args: vec![(name, value)],
+            logs,
+        },
+    );
+}
+
+#[then(
+    regex = r"^(?:the command|it) is refused (\w+) with reason (\w+), which is also its status message$"
+)]
+async fn refused_with_reason(w: &mut HandlingWorld, status: String, reason: String) {
+    let err = w.the_error();
+    assert_eq!(err.code, reason, "the reason key ({err:?})");
+    assert_eq!(grpc_name(err.grpc), status, "the gRPC status");
+    assert_eq!(
+        err.status_message(),
+        reason,
+        "the status message IS the reason key (decision 14.37)"
+    );
+}
+
+#[then(regex = r"^the refusal's error info carries (.+)$")]
+async fn error_info_carries(w: &mut HandlingWorld, metadata: String) {
+    let err = w.the_error();
+    match metadata.as_str() {
+        "no other metadata" => assert!(
+            err.extras.is_empty(),
+            "expected no metadata, got {:?}",
+            err.extras
+        ),
+        "no cause" => assert!(
+            !err.extras
+                .keys()
+                .any(|k| k == "cause" || k.starts_with("cause.")),
+            "expected no cause, got {:?}",
+            err.extras
+        ),
+        _ => {
+            for (name, value) in expected_metadata(&metadata) {
+                let carried = err.extras.get(&name);
+                match value {
+                    Some(value) => assert_eq!(
+                        carried,
+                        Some(&value),
+                        "error info {name} (all: {:?})",
+                        err.extras
+                    ),
+                    None => assert!(
+                        carried.is_some_and(|v| !v.is_empty()),
+                        "error info carries {name} (all: {:?})",
+                        err.extras
+                    ),
+                }
+            }
+        }
+    }
+}
+
+#[then(
+    regex = r#"^the refusal's status details carry the ItemOutOfStock with item "([^"]*)" and on_hand (\d+)$"#
+)]
+async fn details_carry_out_of_stock(w: &mut HandlingWorld, item: String, on_hand: u32) {
+    let refusal = w
+        .the_error()
+        .refusal
+        .as_deref()
+        .expect("the typed refusal in the status details");
+    assert_eq!(refusal.type_url, "/orders.v1.ItemOutOfStock");
+    assert_eq!(
+        conf::orders::v1::ItemOutOfStock::decode(refusal.value.as_slice()).expect("ItemOutOfStock"),
+        conf::orders::v1::ItemOutOfStock { item, on_hand }
+    );
+}
+
+#[then(regex = r#"^no part of the answer carries the text "([^"]*)"$"#)]
+async fn no_text(w: &mut HandlingWorld, text: String) {
+    let err = w.the_error();
+    for (part, shown) in [
+        ("status message", err.status_message().to_string()),
+        ("display", err.to_string()),
+        ("error", format!("{err:?}")),
+    ] {
+        assert!(
+            !shown.contains(&text),
+            "the {part} carries {text:?}: {shown}"
+        );
+    }
+}
+
+// C-0670's conditions, each driven through the router's public API.
+
+fn with_payload_type(mut req: pb::ContextualCommand, type_url: &str) -> pb::ContextualCommand {
+    let page = req
+        .command
+        .as_mut()
+        .and_then(|b| b.page.as_mut())
+        .expect("a page");
+    let payload = match page.body.as_mut() {
+        Some(pb::command_page::Body::Command(c)) => c.payload.as_mut(),
+        Some(pb::command_page::Body::Fact(f)) => f.payload.as_mut(),
+        None => None,
+    };
+    payload.expect("a payload").type_url = type_url.to_string();
+    req
+}
+
+fn condition(w: &mut HandlingWorld, outcome: Result<(), CodedError>) {
+    w.outcome = Some(outcome);
+}
+
+fn items(n: u64) -> Vec<(String, String)> {
+    (0..n)
+        .map(|i| ("ItemAdded".to_string(), format!("item-{i}")))
+        .collect()
+}
+
+#[when(regex = r"^the state fold fails on a persisted event at sequence (\d+)$")]
+async fn fold_fails_persisted(w: &mut HandlingWorld, sequence: u64) {
+    let mut history = items(sequence);
+    history.push(("ItemAdded".to_string(), conf::ROTTEN_ITEM.to_string()));
+    w.dispatch(conf::order_command(
+        "AddItem", "apple", &history, None, None,
+    ));
+    let outcome = w.result.take().expect("handled").map(|_| ());
+    condition(w, outcome);
+}
+
+#[when(regex = r"^the state fold fails on an event the command emitted at sequence (\d+)$")]
+async fn fold_fails_emitted(w: &mut HandlingWorld, sequence: u64) {
+    let history = items(sequence);
+    w.dispatch(conf::order_command(
+        "AddItem",
+        conf::ROTTEN_ITEM,
+        &history,
+        None,
+        None,
+    ));
+    let outcome = w.result.take().expect("handled").map(|_| ());
+    condition(w, outcome);
+}
+
+#[when(regex = r#"^a command of type "([^"]*)" arrives$"#)]
+async fn command_of_type(w: &mut HandlingWorld, type_url: String) {
+    w.dispatch(with_payload_type(
+        conf::order_command("AddItem", "apple", &[], None, None),
+        &type_url,
+    ));
+    let outcome = w.result.take().expect("handled").map(|_| ());
+    condition(w, outcome);
+}
+
+#[when(regex = r#"^a fact of type "([^"]*)" arrives$"#)]
+async fn fact_of_type(w: &mut HandlingWorld, type_url: String) {
+    w.dispatch(with_payload_type(
+        conf::order_fact("ItemDelivered", "apple"),
+        &type_url,
+    ));
+    let outcome = w.result.take().expect("handled").map(|_| ());
+    condition(w, outcome);
+}
+
+#[when(regex = r"^a CommandRefused for (\w+) arrives with no on_refused_(\w+)$")]
+async fn command_refused_unhandled(w: &mut HandlingWorld, command: String, _none: String) {
+    let refused = pb::CommandRefused {
+        command: Some(conf::order_command_for("order", &command)),
+        ..Default::default()
+    };
+    let mut req = conf::order_fact("ItemDelivered", "apple");
+    let req_page = req
+        .command
+        .as_mut()
+        .and_then(|b| b.page.as_mut())
+        .expect("a page");
+    req_page.body = Some(pb::command_page::Body::Fact(pb::Fact {
+        payload: Some(prost_types::Any {
+            type_url: angzarr_router::type_url("io.angzarr.v1.CommandRefused"),
+            value: refused.encode_to_vec(),
+        }),
+    }));
+    w.dispatch(req);
+    let outcome = w.result.take().expect("handled").map(|_| ());
+    condition(w, outcome);
+}
+
+#[when(r#"a policy is dispatched to the business process hosting the "order" aggregate"#)]
+async fn policy_to_aggregate(w: &mut HandlingWorld) {
+    let order = conf::order_aggregate(&w.rules_version, w.settle.clone(), w.seen.clone());
+    let router = angzarr_router::router::RouterBuilder::new()
+        .aggregate(order)
+        .build()
+        .expect("the order aggregate");
+    condition(
+        w,
+        router
+            .dispatch_policy(&conf::order_placed_source())
+            .map(|_| ()),
+    );
+}
+
+fn fulfillment_policy(input: &str) -> angzarr_router::router::Router {
+    angzarr_router::router::RouterBuilder::new()
+        .policy(angzarr_router::policy::PolicyDispatch::new(
+            "OrderFulfillment",
+            input,
+            "fulfillment",
+        ))
+        .build()
+        .expect("one policy")
+}
+
+#[when(regex = r#"^a policy consuming "([^"]*)" is given a book of domain "([^"]*)"$"#)]
+async fn policy_given_other_domain(w: &mut HandlingWorld, input: String, domain: String) {
+    let mut source = conf::order_placed_source();
+    source.cover.as_mut().expect("a cover").domain = domain;
+    condition(
+        w,
+        fulfillment_policy(&input)
+            .dispatch_policy(&source)
+            .map(|_| ()),
+    );
+}
+
+#[when("the router is built with two components")]
+async fn built_with_two_components(w: &mut HandlingWorld) {
+    let order = conf::order_aggregate(&w.rules_version, w.settle.clone(), w.seen.clone());
+    let built = angzarr_router::router::RouterBuilder::new()
+        .aggregate(order)
+        .aggregate(angzarr_router::domain::DomainDispatch::new(
+            "payment",
+            "payment",
+            angzarr_router::rebuild::Rebuilder::new(|| ()),
+        ))
+        .build();
+    condition(w, built.map(|_| ()));
+}
+
+#[when("the router is built with two upcaster chains")]
+async fn built_with_two_chains(w: &mut HandlingWorld) {
+    let order = conf::order_aggregate(&w.rules_version, w.settle.clone(), w.seen.clone());
+    let built = angzarr_router::router::RouterBuilder::new()
+        .aggregate(order)
+        .upcaster(angzarr_router::upcaster::UpcasterDispatch::new(
+            "one", "order",
+        ))
+        .upcaster(angzarr_router::upcaster::UpcasterDispatch::new(
+            "two", "order",
+        ))
+        .build();
+    condition(w, built.map(|_| ()));
+}
+
+/// A refusal of a RemoveEverything the order aggregate's policy sent, whole:
+/// its triggering event's stream, the refused command with its command_id.
+fn whole_refusal() -> pb::Refusal {
+    let mut command = conf::order_command_for("inventory", "RemoveEverything");
+    command.page.as_mut().expect("a page").command_id = Some(pb::Uuid {
+        value: conf::root_of("refused-1").into(),
+    });
+    pb::Refusal {
+        event: Some(pb::EventBook {
+            cover: Some(conf::cover_of("order", "order-1")),
+            ..conf::order_placed_source()
+        }),
+        command: Some(command),
+        response: None,
+    }
+}
+
+/// A bare refusal fact, as a policy's OnRefused answers it: a Fact page,
+/// no cover, no identity, no Handling.
+fn bare_fact() -> pb::OnRefusedResponse {
+    pb::OnRefusedResponse {
+        fact: Some(pb::CommandBook {
+            page: Some(pb::CommandPage {
+                body: Some(pb::command_page::Body::Fact(pb::Fact {
+                    payload: Some(prost_types::Any {
+                        type_url: angzarr_router::type_url("orders.v1.ItemDelivered"),
+                        value: Vec::new(),
+                    }),
+                })),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+    }
+}
+
+fn address(w: &mut HandlingWorld, refusal: pb::Refusal, answer: pb::OnRefusedResponse) {
+    condition(
+        w,
+        angzarr_router::policy::address_refusal_fact(&refusal, &answer).map(|_| ()),
+    );
+}
+
+#[when("a policy's OnRefused answer holds no fact")]
+async fn answer_holds_no_fact(w: &mut HandlingWorld) {
+    address(w, whole_refusal(), pb::OnRefusedResponse { fact: None });
+}
+
+#[when("a policy's refusal fact sets its own cover or handling")]
+async fn fact_sets_cover(w: &mut HandlingWorld) {
+    let mut answer = bare_fact();
+    answer.fact.as_mut().expect("a fact").cover = Some(conf::cover_of("order", "order-1"));
+    address(w, whole_refusal(), answer);
+}
+
+#[when("a policy's refusal fact has no page")]
+async fn fact_has_no_page(w: &mut HandlingWorld) {
+    let mut answer = bare_fact();
+    answer.fact.as_mut().expect("a fact").page = None;
+    address(w, whole_refusal(), answer);
+}
+
+#[when("a policy's refusal fact's page is a Command")]
+async fn fact_page_is_command(w: &mut HandlingWorld) {
+    let mut answer = bare_fact();
+    answer.fact = Some(conf::order_command_for("order", "AddItem"));
+    answer.fact.as_mut().expect("a fact").cover = None;
+    address(w, whole_refusal(), answer);
+}
+
+#[when("a policy's refusal fact sets its own command_id")]
+async fn fact_sets_command_id(w: &mut HandlingWorld) {
+    let mut answer = bare_fact();
+    answer
+        .fact
+        .as_mut()
+        .and_then(|f| f.page.as_mut())
+        .expect("a page")
+        .command_id = Some(pb::Uuid {
+        value: conf::root_of("made-up").into(),
+    });
+    address(w, whole_refusal(), answer);
+}
+
+#[when("a refusal to address names no refused command")]
+async fn no_refused_command(w: &mut HandlingWorld) {
+    let refusal = pb::Refusal {
+        command: None,
+        ..whole_refusal()
+    };
+    address(w, refusal, bare_fact());
+}
+
+#[when("a refusal to address names a refused command with no command_id")]
+async fn refused_command_without_id(w: &mut HandlingWorld) {
+    let mut refusal = whole_refusal();
+    refusal
+        .command
+        .as_mut()
+        .and_then(|c| c.page.as_mut())
+        .expect("a page")
+        .command_id = None;
+    address(w, refusal, bare_fact());
+}
+
+#[when("a refusal to address names no triggering stream")]
+async fn no_trigger_stream(w: &mut HandlingWorld) {
+    let refusal = pb::Refusal {
+        event: None,
+        ..whole_refusal()
+    };
+    address(w, refusal, bare_fact());
+}
+
+#[when(regex = r"^a policy is given a Refusal with no (command|event)$")]
+async fn policy_given_partial_refusal(w: &mut HandlingWorld, missing: String) {
+    let mut refusal = whole_refusal();
+    match missing.as_str() {
+        "command" => refusal.command = None,
+        _ => refusal.event = None,
+    }
+    condition(
+        w,
+        fulfillment_policy("order")
+            .dispatch_refusal(
+                &refusal,
+                &angzarr_router::context::CommandContext::default(),
+            )
+            .map(|_| ()),
+    );
+}
+
+#[when("the host gives the router bytes that are no ContextualCommand")]
+async fn undecodable_bytes(w: &mut HandlingWorld) {
+    condition(
+        w,
+        angzarr_router::decode_message::<pb::ContextualCommand>(&[0xff, 0xff, 0xff]).map(|_| ()),
+    );
+}
+
+// --- when the input was accepted (C-0671; decision 14.37) ---------------------
+
+#[given(regex = r#"^the delivery says its input was accepted at "([^"]*)"$"#)]
+async fn accepted_at(w: &mut HandlingWorld, at: String) {
+    w.recorded_at = Some(at.parse().expect("an RFC 3339 timestamp"));
+}
+
+#[then(regex = r#"^business code read "([^"]*)" as when its input was accepted$"#)]
+async fn read_accepted_at(w: &mut HandlingWorld, at: String) {
+    let expected: prost_types::Timestamp = at.parse().expect("an RFC 3339 timestamp");
+    assert_eq!(
+        w.observed().recorded_at,
+        Some(expected),
+        "CommandContext.recorded_at is the delivery's ContextualCommand.recorded_at"
+    );
+}
+
+// The order fixtures read no clock: what business code read is the
+// delivery's acceptance time, exactly.
+#[then("business code read no clock of its own for it")]
+async fn read_no_clock(w: &mut HandlingWorld) {
+    assert_eq!(
+        w.observed().recorded_at,
+        w.recorded_at,
+        "business code read the delivered acceptance time, not a clock"
+    );
 }
 
 #[tokio::main]

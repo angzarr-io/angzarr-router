@@ -81,8 +81,13 @@ fn refusal(edition: Option<&str>, typed: Option<Any>) -> pb::Refusal {
         event: Some(trigger_book(edition)),
         command: Some(sent_command(edition)),
         response: Some(pb::RefusalResponse {
-            refusal: typed,
-            message: "the wallet holds 100".to_string(),
+            reason: Some(match typed {
+                Some(typed) => pb::refusal_response::Reason::Refusal(typed),
+                None => pb::refusal_response::Reason::Diagnostic(pb::Diagnostic {
+                    code: "WALLET_EMPTY".to_string(),
+                    ..Default::default()
+                }),
+            }),
         }),
     }
 }
@@ -202,7 +207,10 @@ fn translate_answers_the_callbacks_domestic_fact() {
         let typed = refusal
             .response
             .as_ref()
-            .and_then(|r| r.refusal.as_ref())
+            .and_then(|r| match &r.reason {
+                Some(pb::refusal_response::Reason::Refusal(typed)) => Some(typed),
+                _ => None,
+            })
             .expect("the typed refusal");
         let insufficient =
             InsufficientFunds::decode(typed.value.as_slice()).expect("InsufficientFunds");
@@ -245,6 +253,7 @@ fn a_translating_callback_reads_the_refused_commands_context() {
         command_id: Some(uuid_of(9)),
         correlation_id: Some(uuid_of(8)),
         fact_origin: None,
+        recorded_at: None,
     };
     policy
         .dispatch_refusal(&refusal(None, Some(insufficient())), &ctx)
@@ -383,11 +392,9 @@ fn an_answer_that_sets_any_of_the_facts_identity_is_refused() {
         let mut answer = answered.clone();
         set(answer.fact.as_mut().unwrap().page.as_mut().unwrap());
         let err: CodedError = address_refusal_fact(&refusal, &answer).expect_err("a policy bug");
-        assert_eq!(err.code, codes::MALFORMED_REFUSAL_FACT);
-        assert_eq!(
-            err.extras[crate::error::extras::REASON],
-            "the policy set the fact's identity"
-        );
+        // Decision 14.37: the condition is its own key; no text tells it apart.
+        assert_eq!(err.code, "REFUSAL_FACT_IDENTIFIED");
+        assert!(err.extras.is_empty(), "no other metadata: {:?}", err.extras);
     }
 }
 
@@ -411,5 +418,5 @@ fn a_policy_router_answers_a_refusal_and_no_other_router_does() {
     let err = projector
         .dispatch_refusal(&refusal, &CommandContext::default())
         .expect_err("no policy");
-    assert_eq!(err.code, codes::NO_HANDLER_REGISTERED);
+    assert_eq!(err.code, "NO_COMPONENT_OF_KIND");
 }

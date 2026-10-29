@@ -137,23 +137,22 @@ impl prost::Name for LedgerState {
     const PACKAGE: &'static str = "test.ledger";
 }
 
-/// Asserts `err` is a failing fold answered INTERNAL as a handler bug, with
-/// `message`, the `located` metadata (sequence and type_url, or the batch's
+/// Asserts `err` is a failing fold answered INTERNAL as a handler bug, under
+/// `code` (FOLD_FAILED or FOLD_FAILED_EMITTED; decision 14.37), the `located` metadata (sequence and type_url, or the batch's
 /// first_sequence and last_sequence) and `state_type_url`.
 pub fn assert_fold_failed(
     err: &crate::error::CodedError,
-    message: &str,
+    code: &str,
     located: &[(&str, &str)],
     state_type_url: &str,
 ) {
-    use crate::error::{codes, extras, GrpcCode};
+    use crate::error::{extras, GrpcCode};
     assert_eq!(
         err.grpc,
         GrpcCode::Internal,
         "a failing fold is a handler bug"
     );
-    assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
-    assert_eq!(err.message, message);
+    assert_eq!(err.code, code);
     for (key, value) in located {
         assert_eq!(
             err.extras.get(*key).map(String::as_str),

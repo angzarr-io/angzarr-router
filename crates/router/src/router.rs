@@ -25,7 +25,7 @@
 //! on). Transport (gRPC servers), health and readiness stay with the host.
 
 use crate::domain::{Admission, Arrival, DomainDispatch};
-use crate::error::{codes, extras, messages, CodedError};
+use crate::error::{codes, extras, CodedError};
 use crate::pb;
 use crate::policy::PolicyDispatch;
 use crate::projector::ProjectorDispatch;
@@ -191,10 +191,12 @@ impl Component {
     /// The refusal of a second component (or a second upcaster chain) beside
     /// this one: DUPLICATE_REGISTRATION naming this component and its kind
     /// (C-0580).
-    fn refuse_another(&self, message: &str) -> CodedError {
+    ///
+    /// RED (14.37): one key for two conditions; DUPLICATE_COMPONENT and
+    /// DUPLICATE_UPCASTER_CHAIN tell them apart.
+    fn refuse_another(&self) -> CodedError {
         CodedError::invalid_argument(
             codes::DUPLICATE_REGISTRATION,
-            message,
             [
                 (extras::COMPONENT.to_string(), self.name().to_string()),
                 (
@@ -261,16 +263,15 @@ impl RouterBuilder {
         if self.components.is_empty() {
             return Err(CodedError::invalid_argument(
                 codes::NO_HANDLERS_REGISTERED,
-                messages::NO_HANDLERS_REGISTERED,
                 [],
             ));
         }
         let component = self.components.remove(0);
         if !self.components.is_empty() {
-            return Err(component.refuse_another("a router hosts one component"));
+            return Err(component.refuse_another());
         }
         if self.upcasters.len() > 1 {
-            return Err(component.refuse_another("a component has one upcaster chain"));
+            return Err(component.refuse_another());
         }
         if let Component::Aggregate(aggregate) = &component {
             aggregate.check_claims()?;
@@ -290,11 +291,7 @@ pub struct Router {
 }
 
 fn wrong_kind() -> CodedError {
-    CodedError::invalid_argument(
-        codes::NO_HANDLER_REGISTERED,
-        messages::NO_COMPONENT_OF_KIND,
-        [],
-    )
+    CodedError::invalid_argument(codes::NO_HANDLER_REGISTERED, [])
 }
 
 impl Router {
@@ -302,8 +299,7 @@ impl Router {
     /// (DUPLICATE_REGISTRATION naming this one; C-0580), for hosts that
     /// register components one at a time (the C ABI).
     pub fn refuse_another_component(&self) -> CodedError {
-        self.component
-            .refuse_another("this business process already hosts its one component")
+        self.component.refuse_another()
     }
 
     /// The component's registration hello (types.proto, ComponentDescriptor),
@@ -370,7 +366,6 @@ impl Router {
         if !source.pages.is_empty() && policy.input_domain() != domain {
             return Err(CodedError::invalid_argument(
                 codes::NO_HANDLER_REGISTERED,
-                "the policy does not consume the source domain",
                 [(extras::DOMAIN.to_string(), domain.to_string())],
             ));
         }

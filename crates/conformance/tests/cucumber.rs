@@ -196,7 +196,13 @@ async fn refused_naming(w: &mut CounterWorld, url: String) {
         .as_ref()
         .expect_err("expected a refusal");
     assert_eq!(err.grpc, angzarr_router::error::GrpcCode::InvalidArgument);
-    assert_eq!(err.message, format!("no handler for type URL {url}"));
+    // Decision 14.37: the type URL is an arg; the status message is the key.
+    assert_eq!(err.extras.get("type_url"), Some(&url), "the type_url arg");
+    assert_eq!(
+        err.status_message(),
+        err.code,
+        "the status message is the key"
+    );
 }
 
 fn assert_failed_with(w: &CounterWorld, code: &str) {

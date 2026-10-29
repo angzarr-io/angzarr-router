@@ -41,6 +41,11 @@ pub struct CommandContext {
     pub correlation_id: Option<pb::Uuid>,
     /// A fact's origin (CommandPage.fact_origin); `None` for a command.
     pub fact_origin: Option<pb::FactOrigin>,
+    /// When the input was accepted (types.proto,
+    /// ContextualCommand.recorded_at; decision 14.37): stamped by the
+    /// coordinator, or the angzarr-embedded kernel, as delivered. Business
+    /// code reads it rather than a clock of its own.
+    pub recorded_at: Option<prost_types::Timestamp>,
 }
 
 /// A stale command's conflict under AGGREGATE_HANDLES (types.proto,
@@ -128,6 +133,8 @@ pub fn command_context(req: &pb::ContextualCommand) -> CommandContext {
         command_id: page.and_then(|p| p.command_id.clone()),
         correlation_id: page.and_then(|p| p.correlation_id.clone()),
         fact_origin: page.and_then(|p| p.fact_origin.clone()),
+        // RED STUB (14.37): not yet read from `req.recorded_at`.
+        recorded_at: None,
     }
 }
 
@@ -144,3 +151,7 @@ pub(crate) fn window_pages(events: Option<&pb::EventBook>, expected: u64) -> Vec
         })
         .unwrap_or_default()
 }
+
+#[cfg(test)]
+#[path = "context.test.rs"]
+mod context_tests;

@@ -206,18 +206,20 @@ fn accessors_report_name_and_registered_types() {
 }
 
 // Owner ruling 2026-10-19: any fold of accepted events that fails is a
-// handler bug, named by its page and the projection type.
+// handler bug, named by its page and the projection type. Decision 14.37:
+// it is FOLD_FAILED, the fold's own failure its cause as a key and args
+// (none for an unclassified error, whose text stays in the handler's log),
+// and no text crosses.
 #[test]
 fn a_failing_fold_is_a_handler_bug_naming_its_page() {
-    for (failure, fold_message) in [
-        (HandlerError::Other("boom".to_string()), "boom"),
+    for (failure, cause) in [
+        (HandlerError::Other("boom".to_string()), vec![]),
         (
             HandlerError::Coded(crate::error::CodedError::invalid_argument(
                 "SOME_CODE",
-                "coded",
-                [],
+                [("x".to_string(), "1".to_string())],
             )),
-            "SOME_CODE: coded",
+            vec![("cause", "SOME_CODE"), ("cause.x", "1")],
         ),
     ] {
         let failure = std::sync::Mutex::new(Some(failure));
@@ -237,17 +239,24 @@ fn a_failing_fold_is_a_handler_bug_naming_its_page() {
         let type_url = crate::type_url(&cover_full_name());
         assert_fold_failed(
             &err,
-            crate::error::messages::FOLD_FAILED,
+            "FOLD_FAILED",
             &[
                 (crate::error::extras::SEQUENCE, "1"),
                 (crate::error::extras::TYPE_URL, type_url.as_str()),
             ],
             "/test.Board",
         );
-        assert_eq!(
-            err.extras[crate::error::extras::FOLD_MESSAGE],
-            fold_message,
-            "the handler's own error text"
+        let caused: Vec<(&str, &str)> = err
+            .extras
+            .iter()
+            .filter(|(k, _)| k.as_str() == "cause" || k.starts_with("cause."))
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(caused, cause, "the fold's own failure, as its cause");
+        assert!(
+            !err.extras.contains_key("fold_message"),
+            "no fold text crosses: {:?}",
+            err.extras
         );
     }
 }
@@ -260,7 +269,6 @@ fn a_finish_failure_is_not_a_fold_failure() {
         .dispatch(&book("order", cover_pages("order", 1)))
         .expect_err("finish failed");
     assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
-    assert_ne!(err.message, crate::error::messages::FOLD_FAILED);
 }
 
 // Each fold sees its page's place: the book's cover (root) and the page's
@@ -378,7 +386,7 @@ fn a_batched_fold_failure_names_its_page_or_the_batchs_range() {
         .expect_err("the fold failed");
     assert_fold_failed(
         &err,
-        crate::error::messages::FOLD_FAILED,
+        "FOLD_FAILED",
         &[(crate::error::extras::SEQUENCE, "6")],
         "/test.Board",
     );
@@ -387,7 +395,7 @@ fn a_batched_fold_failure_names_its_page_or_the_batchs_range() {
         .expect_err("the fold failed");
     assert_fold_failed(
         &err,
-        crate::error::messages::FOLD_FAILED,
+        "FOLD_FAILED",
         &[
             (crate::error::extras::FIRST_SEQUENCE, "4"),
             (crate::error::extras::LAST_SEQUENCE, "6"),

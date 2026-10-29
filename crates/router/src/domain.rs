@@ -28,7 +28,7 @@ use std::collections::{BTreeSet, HashMap};
 use prost::Message;
 use prost_types::Any;
 
-use crate::error::{codes, extras, map_handler_error, messages, CodedError, HandlerError};
+use crate::error::{codes, extras, map_handler_error, BusinessStatus, CodedError, HandlerError};
 use crate::pb;
 use crate::rebuild::{PageOrigin, Rebuilder};
 
@@ -315,7 +315,6 @@ impl<S> DomainDispatch<S> {
         if self.kind != pb::ComponentKind::ProcessManager && !self.starting.is_empty() {
             return Err(CodedError::invalid_argument(
                 codes::STARTING_TYPES_ON_NON_PM,
-                messages::STARTING_TYPES_ON_NON_PM,
                 [(extras::COMPONENT.to_string(), self.name.clone())],
             ));
         }
@@ -453,7 +452,6 @@ impl<S> DomainDispatch<S> {
         {
             Some(old) => Err(CodedError::invalid_argument(
                 codes::DUPLICATE_COMMAND_HANDLER,
-                messages::DUPLICATE_COMMAND_HANDLER,
                 [
                     (extras::DOMAIN.to_string(), self.domain.clone()),
                     (extras::COMMAND_TYPE.to_string(), old),
@@ -488,14 +486,12 @@ impl<S> DomainDispatch<S> {
         let Some(command_book) = req.command.as_ref() else {
             return Err(CodedError::invalid_argument(
                 codes::MISSING_COMMAND_BOOK,
-                messages::NO_COMMAND_PAGES,
                 [],
             ));
         };
         let Some(page) = command_book.page.as_ref() else {
             return Err(CodedError::invalid_argument(
                 codes::MISSING_COMMAND_PAGE,
-                messages::NO_COMMAND_PAGES,
                 [],
             ));
         };
@@ -526,7 +522,6 @@ impl<S> DomainDispatch<S> {
                             pb::CommandRefused::decode(any.value.as_slice()).map_err(|_| {
                                 CodedError::invalid_argument(
                                     codes::ANY_DECODE_FAILED,
-                                    "failed to decode CommandRefused",
                                     [(extras::TYPE_URL.to_string(), any.type_url.clone())],
                                 )
                             })?;
@@ -576,7 +571,6 @@ impl<S> DomainDispatch<S> {
             None => {
                 return Err(CodedError::invalid_argument(
                     codes::MISSING_COMMAND_PAYLOAD,
-                    messages::NO_COMMAND_PAGES,
                     [],
                 ));
             }
@@ -662,11 +656,7 @@ impl<S> DomainDispatch<S> {
                 let (mut state, _) = self.rebuilder.rebuild(events)?;
                 let out = run(&mut state, base.clone())?;
                 if !base.conflict.as_ref().is_some_and(Conflict::is_resolved) {
-                    return Err(CodedError::stale(
-                        codes::CONFLICT_UNRESOLVED,
-                        messages::CONFLICT_UNRESOLVED,
-                        [],
-                    ));
+                    return Err(CodedError::stale(codes::CONFLICT_UNRESOLVED, []));
                 }
                 fold_emitted(&mut state, &out)?;
                 Ok((out, state))
@@ -675,7 +665,6 @@ impl<S> DomainDispatch<S> {
                 let Some(resolver) = self.commutative.as_ref() else {
                     return Err(CodedError::invalid_argument(
                         codes::CONFLICT_RESOLUTION_UNSUPPORTED,
-                        messages::CONFLICT_RESOLUTION_UNSUPPORTED,
                         [],
                     ));
                 };
@@ -693,7 +682,6 @@ impl<S> DomainDispatch<S> {
                 if crate::conflict::overlap(&resolved.window, &resolved.mine) {
                     return Err(CodedError::stale(
                         codes::CONFLICT_OVERLAP,
-                        messages::CONFLICT_OVERLAP,
                         [
                             (extras::WINDOW_UNITS.to_string(), resolved.window.join(",")),
                             (extras::COMMAND_UNITS.to_string(), resolved.mine.join(",")),
@@ -725,7 +713,6 @@ pub fn admit_rules(
     let Some(page) = book.page.as_ref() else {
         return Err(CodedError::invalid_argument(
             codes::MISSING_COMMAND_PAGE,
-            messages::NO_COMMAND_PAGES,
             [],
         ));
     };
@@ -747,7 +734,6 @@ pub fn admit_rules(
         if !same {
             return Err(CodedError::invalid_argument(
                 codes::REFUSAL_FACT_WRONG_STREAM,
-                messages::REFUSAL_FACT_WRONG_STREAM,
                 [(extras::DOMAIN.to_string(), cover.domain.clone())],
             ));
         }
@@ -765,8 +751,8 @@ pub fn admit_rules(
                 return Ok(Admission::Skip);
             }
             return Err(CodedError::rejection(
+                BusinessStatus::FailedPrecondition,
                 codes::PM_NO_INSTANCE,
-                messages::PM_NO_INSTANCE,
                 [(extras::TYPE_URL.to_string(), sent.type_url.clone())],
             ));
         }
@@ -805,7 +791,6 @@ fn non_empty_payload(payload: Option<&Any>) -> Result<&Any, CodedError> {
         Some(any) if !any.type_url.is_empty() => Ok(any),
         _ => Err(CodedError::invalid_argument(
             codes::MISSING_COMMAND_PAYLOAD,
-            messages::NO_COMMAND_PAGES,
             [],
         )),
     }

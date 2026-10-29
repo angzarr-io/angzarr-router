@@ -4,7 +4,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::error::{codes, extras, messages, CodedError};
+use crate::error::{codes, extras, CodedError};
 use crate::pb;
 
 /// A component's ComponentDescriptor. `inputs` are the domains whose events
@@ -24,7 +24,6 @@ pub(crate) fn component_descriptor(
     if rules_version.is_empty() {
         return Err(CodedError::invalid_argument(
             codes::MISSING_RULES_VERSION,
-            messages::MISSING_RULES_VERSION,
             [(extras::COMPONENT.to_string(), name.to_string())],
         ));
     }
@@ -56,7 +55,6 @@ pub(crate) fn state_descriptor(
     if type_url.is_empty() {
         return Err(CodedError::invalid_argument(
             codes::MISSING_STATE_TYPE,
-            messages::MISSING_STATE_TYPE,
             [(extras::COMPONENT.to_string(), component.to_string())],
         ));
     }

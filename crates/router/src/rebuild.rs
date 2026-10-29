@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use prost_types::Any;
 
-use crate::error::{messages, CodedError, FoldAt};
+use crate::error::{codes, CodedError, FoldAt};
 use crate::pb;
 use crate::PageContext;
 
@@ -77,10 +77,15 @@ pub enum PageOrigin {
 }
 
 impl PageOrigin {
-    fn message(self) -> &'static str {
+    /// The key a fold failing on pages from here answers with: FOLD_FAILED
+    /// for persisted events, FOLD_FAILED_EMITTED for emitted ones
+    /// (decision 14.37).
+    ///
+    /// RED STUB (14.37): both still UNHANDLED_HANDLER_ERROR.
+    pub fn code(self) -> &'static str {
         match self {
-            PageOrigin::Persisted => messages::FOLD_FAILED,
-            PageOrigin::Emitted => messages::FOLD_FAILED_EMITTED,
+            PageOrigin::Persisted => codes::UNHANDLED_HANDLER_ERROR,
+            PageOrigin::Emitted => codes::UNHANDLED_HANDLER_ERROR,
         }
     }
 }
@@ -102,7 +107,7 @@ pub fn fold_error(
             last: pages.last().map_or(0, |p| p.sequence),
         },
     };
-    CodedError::fold_failed(origin.message(), at, state_type_url, &failure.message)
+    CodedError::fold_failed(origin.code(), at, state_type_url, None)
 }
 
 /// The type URL a component declares for the message `full_name`: "" (none
@@ -123,14 +128,16 @@ pub fn page_fold_error(
     fold_message: &str,
 ) -> CodedError {
     let type_url = crate::page_event(page).map_or("", |e| e.type_url.as_str());
+    // RED STUB (14.37): the fold's own failure is not yet its cause.
+    let _ = fold_message;
     CodedError::fold_failed(
-        origin.message(),
+        origin.code(),
         FoldAt::Page {
             sequence: page.sequence,
             type_url,
         },
         state_type_url,
-        fold_message,
+        None,
     )
 }
 

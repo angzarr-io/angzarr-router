@@ -37,11 +37,12 @@ Feature: Counter aggregate dispatch
 
   # command_handler.proto, CommandHandlerService.Handle step 2: a type URL
   # that reaches no registered handler is refused INVALID_ARGUMENT, naming the
-  # type URL (decision 12.11; backlog VC-1).
+  # type URL (decision 12.11; backlog VC-1), under its own key
+  # UNKNOWN_COMMAND_TYPE (decision 14.37).
   Scenario: an unknown command is reported before any rebuild
     Given a new counter
     When an unhandled command is dispatched
-    Then the command fails with NO_HANDLER_REGISTERED
+    Then the command fails with UNKNOWN_COMMAND_TYPE
     And the refusal is INVALID_ARGUMENT naming the type URL "type.googleapis.com/test.counter.Reserve"
 
   Scenario: a command carrying no command book is refused

@@ -113,7 +113,7 @@ fn a_router_hosts_one_component_and_refuses_a_second_of_any_kind() {
                 Ok(_) => panic!("a {second} after a {first} must be refused"),
                 Err(err) => err,
             };
-            assert_eq!(err.code, codes::DUPLICATE_REGISTRATION);
+            assert_eq!(err.code, "DUPLICATE_COMPONENT");
             // C-0580: the refusal names the component already registered.
             let (name, kind) = match first {
                 "aggregate" => ("a", "AGGREGATE"),
@@ -178,7 +178,7 @@ fn a_component_has_one_upcaster_chain_and_a_chain_alone_is_no_component() {
                 .upcaster(UpcasterDispatch::new("one", "order"))
                 .upcaster(UpcasterDispatch::new("two", "order"))
         ),
-        codes::DUPLICATE_REGISTRATION
+        "DUPLICATE_UPCASTER_CHAIN"
     );
     assert_eq!(
         build_err(RouterBuilder::new().upcaster(UpcasterDispatch::new("one", "order"))),
@@ -207,7 +207,7 @@ fn a_router_dispatches_commands_and_facts_to_its_aggregate() {
     let err = router
         .dispatch_command(&command("order", "test.Unknown"))
         .unwrap_err();
-    assert_eq!(err.code, codes::NO_HANDLER_REGISTERED);
+    assert_eq!(err.code, "UNKNOWN_COMMAND_TYPE");
     assert_eq!(err.grpc, crate::error::GrpcCode::InvalidArgument);
     let err = router
         .dispatch_command(&fact("order", "test.Unrecorded"))
@@ -253,7 +253,7 @@ fn a_router_runs_its_policy() {
     );
     assert_eq!(
         router.dispatch_policy(&source("billing")).unwrap_err().code,
-        codes::NO_HANDLER_REGISTERED,
+        "POLICY_SOURCE_OUTSIDE_INPUT_DOMAIN",
         "a source outside the policy's input domain"
     );
 }
@@ -309,14 +309,14 @@ fn a_router_refuses_dispatch_of_another_kind() {
             .dispatch_command(&command("order", "test.Create"))
             .unwrap_err()
             .code,
-        codes::NO_HANDLER_REGISTERED
+        "NO_COMPONENT_OF_KIND"
     );
     assert_eq!(
         router
             .dispatch_projector(&source("order"))
             .unwrap_err()
             .code,
-        codes::NO_HANDLER_REGISTERED
+        "NO_COMPONENT_OF_KIND"
     );
     let aggregate_router = with_one(RouterBuilder::new(), "aggregate")
         .build()
@@ -326,7 +326,7 @@ fn a_router_refuses_dispatch_of_another_kind() {
             .dispatch_policy(&source("order"))
             .unwrap_err()
             .code,
-        codes::NO_HANDLER_REGISTERED
+        "NO_COMPONENT_OF_KIND"
     );
 }
 
@@ -450,7 +450,7 @@ fn a_router_admits_through_its_domain() {
         .expect("build");
     assert_eq!(
         projector.admit(&arrival).expect_err("not a domain").code,
-        codes::NO_HANDLER_REGISTERED
+        "NO_COMPONENT_OF_KIND"
     );
 }
 
@@ -521,7 +521,7 @@ fn an_old_type_that_upcasts_to_nothing_is_refused_naming_where_it_ended() {
     let err = router
         .dispatch_command(&command("order", "test.ShipOld"))
         .expect_err("ShipLost reaches no handler");
-    assert_eq!(err.code, codes::NO_HANDLER_REGISTERED);
+    assert_eq!(err.code, "UNKNOWN_COMMAND_TYPE");
     assert_eq!(
         err.extras.get("upcast_type_url").map(String::as_str),
         Some(type_url("test.ShipLost").as_str()),

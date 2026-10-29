@@ -481,7 +481,7 @@ fn commutative_folding_an_emitted_event_that_fails_says_the_command_emitted_it()
     let type_url = type_url(&cover_full_name());
     assert_fold_failed(
         &err,
-        crate::error::messages::FOLD_FAILED_EMITTED,
+        "FOLD_FAILED_EMITTED",
         &[
             (crate::error::extras::SEQUENCE, "1"),
             (crate::error::extras::TYPE_URL, type_url.as_str()),
@@ -503,7 +503,8 @@ fn commutative_folding_a_window_event_that_fails_says_it_was_accepted() {
     let err = commutative(Arc::default())
         .dispatch(&req)
         .expect_err("the window does not fold");
-    assert_eq!(err.message, crate::error::messages::FOLD_FAILED);
+    // Decision 14.37: a failing fold has its own key.
+    assert_eq!(err.code, "FOLD_FAILED");
     assert_eq!(err.extras[crate::error::extras::SEQUENCE], "1");
 }
 
@@ -696,19 +697,17 @@ fn an_old_fact_type_is_upcast_then_recorded_as_the_new_type() {
     );
 }
 
-// Owner ruling: the refusal names both types: the message names the type
-// URL the client sent, the extras carry the last one the chain produced.
+// Owner ruling: the refusal names both types: its args carry the type URL
+// the client sent and the last one the chain produced. Decision 14.37: an
+// unknown command type has its own key, which is also its status message.
 #[test]
 fn an_upcast_type_with_no_handler_is_refused_naming_both_types() {
     let err = upcasting_aggregate(Arc::default())
         .dispatch(&command_for(typed("test.BumpOld")))
         .expect_err("BumpLost reaches no handler");
-    assert_eq!(err.code, codes::NO_HANDLER_REGISTERED);
+    assert_eq!(err.code, "UNKNOWN_COMMAND_TYPE");
     assert_eq!(err.grpc, GrpcCode::InvalidArgument);
-    assert_eq!(
-        err.message,
-        format!("no handler for type URL {}", type_url("test.BumpOld"))
-    );
+    assert_eq!(err.status_message(), "UNKNOWN_COMMAND_TYPE");
     assert_eq!(
         err.extras.get("type_url").map(String::as_str),
         Some(type_url("test.BumpOld").as_str())
@@ -725,9 +724,10 @@ fn a_type_with_no_handler_and_no_upcaster_path_is_refused_naming_the_sent_type()
         .dispatch(&command_for(typed("test.BumpV0")))
         .expect_err("no path to a handler");
     assert_eq!(err.grpc, GrpcCode::InvalidArgument);
+    assert_eq!(err.code, "UNKNOWN_COMMAND_TYPE");
     assert_eq!(
-        err.message,
-        format!("no handler for type URL {}", type_url("test.BumpV0"))
+        err.extras.get("type_url").map(String::as_str),
+        Some(type_url("test.BumpV0").as_str())
     );
     assert_eq!(
         err.extras.get("upcast_type_url").map(String::as_str),
