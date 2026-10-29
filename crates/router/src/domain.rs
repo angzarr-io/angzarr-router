@@ -57,6 +57,16 @@ pub struct CommandContext {
     /// STRICT there is no window, and under COMMUTATIVE the router resolves
     /// the window itself, so the handler never sees the nonce.
     pub conflict: Option<Conflict>,
+    /// The input's command id (types.proto, CommandPage.command_id): a
+    /// client's, a policy's derived one, or a fact's derived from its
+    /// origin. RED: a compile stub, never filled yet.
+    pub command_id: Option<pb::Uuid>,
+    /// The input's correlation (CommandPage.correlation_id). RED: a compile
+    /// stub, never filled yet.
+    pub correlation_id: Option<pb::Uuid>,
+    /// A fact's origin (CommandPage.fact_origin); `None` for a command.
+    /// RED: a compile stub, never filled yet.
+    pub fact_origin: Option<pb::FactOrigin>,
 }
 
 /// A stale command's conflict under AGGREGATE_HANDLES (types.proto,
@@ -481,6 +491,23 @@ impl<S> DomainDispatch<S> {
         self
     }
 
+    /// Registers a fact handler, as [`Self::on_fact`], that also receives
+    /// the fact's [`CommandContext`]: its command id, correlation and
+    /// origin (types.proto, CommandPage). RED: a compile stub; the context
+    /// is never filled yet (always the default).
+    pub fn on_fact_with_context(
+        self,
+        fq_fact_type: &str,
+        thunk: impl Fn(&Any, &S, CommandContext) -> Result<FactRecord, HandlerError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.on_fact(fq_fact_type, move |fact, state| {
+            thunk(fact, state, CommandContext::default())
+        })
+    }
+
     /// The component name.
     pub fn name(&self) -> &str {
         &self.name
@@ -711,6 +738,9 @@ impl<S> DomainDispatch<S> {
             expected_sequence,
             conflict_resolution,
             conflict,
+            command_id: None,
+            correlation_id: None,
+            fact_origin: None,
         };
         let run = |state: &mut S, cctx: CommandContext| -> Result<pb::EventBook, CodedError> {
             Ok(thunk(any, state, cctx)

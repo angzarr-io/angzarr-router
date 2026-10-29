@@ -205,6 +205,7 @@ impl<P> ProjectorDispatch<P> {
                 let ctx = PageContext {
                     cover: Some(cover),
                     sequence: page.sequence,
+                    meta: None,
                 };
                 thunk(&mut projection, event_any, &ctx).map_err(|err| {
                     page_fold_error(

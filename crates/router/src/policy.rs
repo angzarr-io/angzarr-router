@@ -249,6 +249,7 @@ impl PolicyDispatch {
             let context = PageContext {
                 cover: source.cover.as_ref(),
                 sequence: page.sequence,
+                meta: None,
             };
             let commands = thunk(event_any, &context).map_err(map_handler_error)?;
             if let Some(stray) = commands.iter().find(|c| self.outside_destination(c)) {

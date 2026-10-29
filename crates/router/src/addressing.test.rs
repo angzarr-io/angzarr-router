@@ -309,3 +309,35 @@ fn a_process_manager_command_stays_in_its_triggers_edition() {
         codes::POLICY_COMMAND_OUTSIDE_EDITION,
     );
 }
+
+// --- the trigger's metadata: what a policy may name as the root --------------
+
+// Decision 14.36: a policy names the root itself, and for a process manager
+// it may name its trigger's correlation. So the policy reads the triggering
+// page's metadata: its correlation and when it was recorded.
+#[test]
+fn a_policy_reads_its_triggers_correlation_and_recorded_at() {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let policy = PolicyDispatch::new("ByCorrelation", "order", "fulfillment")
+        .on_event_with_context(&fq::<OrderPlaced>(), move |event, ctx| {
+            let meta = ctx.meta.expect("the trigger's metadata");
+            sink.lock().unwrap().push(meta.recorded_at);
+            Ok(vec![start(meta.correlation_id.clone(), quantity_of(event))])
+        });
+    let mut trigger = placed(4, 3, CORRELATION);
+    let recorded_at = prost_types::Timestamp {
+        seconds: 1_700_000_000,
+        nanos: 5,
+    };
+    trigger.meta.as_mut().unwrap().recorded_at = Some(recorded_at);
+    let resp = policy
+        .dispatch(&order_source(None, vec![trigger]))
+        .expect("dispatched");
+    assert_eq!(
+        cover_of(&resp.commands[0]).root,
+        Some(uuid_of(CORRELATION)),
+        "the root the policy named: its trigger's correlation"
+    );
+    assert_eq!(*seen.lock().unwrap(), vec![Some(recorded_at)]);
+}

@@ -144,6 +144,65 @@ fn strict_hands_the_handler_its_handling_and_no_conflict() {
     assert!(cctx.conflict.is_none(), "STRICT has no window or nonce");
 }
 
+// --- the input's identity (types.proto, CommandPage) ---------------------------
+
+/// `req` with its page identified: command id 0x11, correlation 0x22.
+fn identified(mut req: pb::ContextualCommand) -> pb::ContextualCommand {
+    let page = req.command.as_mut().unwrap().page.as_mut().unwrap();
+    page.command_id = Some(uuid_of(0x11));
+    page.correlation_id = Some(uuid_of(0x22));
+    req
+}
+
+// A command handler reads the input's identity: its command id and its
+// correlation (a command has no fact origin).
+#[test]
+fn a_command_handler_reads_the_commands_identity() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    list_aggregate(seen.clone())
+        .dispatch(&identified(strict("a", &["x"])))
+        .expect("dispatch");
+    let cctx = seen.lock().unwrap()[0].clone();
+    assert_eq!(cctx.command_id, Some(uuid_of(0x11)));
+    assert_eq!(cctx.correlation_id, Some(uuid_of(0x22)));
+    assert_eq!(cctx.fact_origin, None, "a command has no fact origin");
+}
+
+// A fact handler gets the same context as a command handler, its origin
+// included (an existing angzarr-embedded handler reads fact_origin).
+#[test]
+fn a_fact_handler_reads_the_facts_identity_and_origin() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let d = DomainDispatch::new("list", "list", list_rebuilder()).on_fact_with_context(
+        "test.Paid",
+        move |fact, _state, cctx| {
+            sink.lock().unwrap().push(cctx);
+            Ok(crate::domain::FactRecord::from(fact.clone()))
+        },
+    );
+    let origin = pb::FactOrigin {
+        external_id: "stripe:evt_1".to_string(),
+        description: "Stripe webhook".to_string(),
+    };
+    let mut req = identified(contextual(fact_page(Any {
+        type_url: type_url("test.Paid"),
+        value: Vec::new(),
+    })));
+    req.command
+        .as_mut()
+        .unwrap()
+        .page
+        .as_mut()
+        .unwrap()
+        .fact_origin = Some(origin.clone());
+    d.dispatch(&req).expect("recorded");
+    let cctx = seen.lock().unwrap()[0].clone();
+    assert_eq!(cctx.command_id, Some(uuid_of(0x11)));
+    assert_eq!(cctx.correlation_id, Some(uuid_of(0x22)));
+    assert_eq!(cctx.fact_origin, Some(origin));
+}
+
 /// An AGGREGATE_HANDLES aggregate whose handler records the window it saw and
 /// acknowledges with `ack(nonce)` (None: never calls resolve_conflicts).
 fn handles(
