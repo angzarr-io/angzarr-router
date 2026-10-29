@@ -612,3 +612,31 @@ fn alias_chains_resolve_up_to_the_depth_bound() {
     );
     assert!(!reaches(&alias_chain(ALIAS_DEPTH + 1)));
 }
+
+/// Like [`alias_chain`], but the last of `hops` first-segment aliases names
+/// a path whose later segments are aliases too (`self::b::c`, with `b` an
+/// alias of the child module `n` and `c` an alias in `n` of `crate::t`): a
+/// chain of `hops + 2` aliases, the last two followed mid-path.
+fn mid_path_alias_chain(hops: usize) -> Model {
+    let mut src = String::from(
+        "pub mod t {}\npub mod m { fn f() { a0::x(); }\npub mod n { use crate::t as c; }\nuse self::n as b;\n",
+    );
+    for i in 0..hops - 1 {
+        src.push_str(&format!("use a{} as a{i};\n", i + 1));
+    }
+    src.push_str(&format!("use self::b::c as a{};\n}}", hops - 1));
+    scan_lib(&[("src/lib.rs", src.as_str())], &[]).0
+}
+
+// An alias followed mid-path counts toward the same bound as one in first
+// position, and so does each alias after it.
+#[test]
+fn mid_path_aliases_count_toward_the_depth_bound() {
+    let reaches = |m: &Model| m.edges.iter().any(|e| e.line == 2 && e.to == "app::t");
+    assert!(
+        reaches(&mid_path_alias_chain(ALIAS_DEPTH - 2)),
+        "{:?}",
+        mid_path_alias_chain(ALIAS_DEPTH - 2).edges
+    );
+    assert!(!reaches(&mid_path_alias_chain(ALIAS_DEPTH - 1)));
+}

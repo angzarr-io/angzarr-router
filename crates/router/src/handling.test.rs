@@ -267,6 +267,29 @@ fn commutative_keeps_a_stale_command_disjoint_from_the_window() {
     );
 }
 
+// The library resolves the window but still tells the handler whether the
+// aggregate exists: the prior-events book carried history.
+#[test]
+fn commutative_tells_the_handler_whether_the_aggregate_exists() {
+    for (history, exists) in [(&["b"][..], true), (&[][..], false)] {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        commutative(seen.clone())
+            .dispatch(&delivery(
+                "a",
+                history,
+                0,
+                pb::ConflictResolution::Commutative,
+                b"n",
+            ))
+            .expect("disjoint");
+        assert_eq!(
+            seen.lock().unwrap()[0].had_prior_events,
+            exists,
+            "history {history:?}"
+        );
+    }
+}
+
 #[test]
 fn commutative_fails_stale_on_overlap() {
     let err = commutative(Arc::default())

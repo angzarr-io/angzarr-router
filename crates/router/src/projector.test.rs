@@ -209,13 +209,16 @@ fn accessors_report_name_and_registered_types() {
 // handler bug, named by its page and the projection type.
 #[test]
 fn a_failing_fold_is_a_handler_bug_naming_its_page() {
-    for failure in [
-        HandlerError::Other("boom".to_string()),
-        HandlerError::Coded(crate::error::CodedError::invalid_argument(
-            "SOME_CODE",
-            "coded",
-            [],
-        )),
+    for (failure, fold_message) in [
+        (HandlerError::Other("boom".to_string()), "boom"),
+        (
+            HandlerError::Coded(crate::error::CodedError::invalid_argument(
+                "SOME_CODE",
+                "coded",
+                [],
+            )),
+            "SOME_CODE: coded",
+        ),
     ] {
         let failure = std::sync::Mutex::new(Some(failure));
         let d = ProjectorDispatch::new("write-model", Folded::default)
@@ -241,7 +244,11 @@ fn a_failing_fold_is_a_handler_bug_naming_its_page() {
             ],
             "/test.Board",
         );
-        assert!(!err.extras[crate::error::extras::FOLD_MESSAGE].is_empty());
+        assert_eq!(
+            err.extras[crate::error::extras::FOLD_MESSAGE],
+            fold_message,
+            "the handler's own error text"
+        );
     }
 }
 

@@ -1,0 +1,13 @@
+# cargo-mutants configuration (read by `just mutation-test`).
+#
+# Only genuinely equivalent mutants are excluded here: ones no input can tell
+# apart from the original. Each carries its argument.
+exclude_re = [
+    # router.rs, the trait's DEFAULT `CommandHandler::upcast_types`: its body
+    # is `Vec::new()`, and cargo-mutants' `vec![]` is that same empty
+    # Vec<String> (vec![] expands to Vec::new()). Equal value, no side
+    # effects: no caller can tell them apart. The other replacements
+    # (vec![String::new()], vec!["xyzzy".into()]) are not excluded and are
+    # killed by router.test.rs a_hand_written_aggregate_builds_a_router.
+    'replace CommandHandler::upcast_types -> Vec<String> with vec!\[\]$',
+]

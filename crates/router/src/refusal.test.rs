@@ -290,3 +290,46 @@ fn an_answer_that_is_not_a_bare_fact_is_refused() {
         assert_eq!(err.grpc, GrpcCode::Internal);
     }
 }
+
+// The fact's identity is the runtime's to set: a policy that sets any one
+// piece of it is a policy bug.
+#[test]
+fn an_answer_that_sets_any_of_the_facts_identity_is_refused() {
+    let refusal = refusal(None, Some(insufficient()));
+    let answered = buyin_wallet().dispatch_refusal(&refusal).expect("answered");
+    let setters: [fn(&mut pb::CommandPage); 4] = [
+        |p| p.command_id = Some(uuid_of(1)),
+        |p| p.correlation_id = Some(uuid_of(1)),
+        |p| p.causation_id = Some(trigger_ref(None)),
+        |p| p.fact_origin = Some(pb::FactOrigin::default()),
+    ];
+    for set in setters {
+        let mut answer = answered.clone();
+        set(answer.fact.as_mut().unwrap().page.as_mut().unwrap());
+        let err: CodedError = address_refusal_fact(&refusal, &answer).expect_err("a policy bug");
+        assert_eq!(err.code, codes::MALFORMED_REFUSAL_FACT);
+        assert_eq!(
+            err.extras[crate::error::extras::REASON],
+            "the policy set the fact's identity"
+        );
+    }
+}
+
+#[test]
+fn a_policy_router_answers_a_refusal_and_no_other_router_does() {
+    let refusal = refusal(None, Some(insufficient()));
+    let router = crate::router::RouterBuilder::new()
+        .policy(buyin_wallet())
+        .build()
+        .expect("build");
+    let answer = router.dispatch_refusal(&refusal).expect("answered");
+    let fact: pb::CommandRefused = fact_of(&answer);
+    assert_eq!(fact.refusal, Some(insufficient()));
+
+    let projector = crate::router::RouterBuilder::new()
+        .projector(crate::projector::ProjectorDispatch::new("p", || ()))
+        .build()
+        .expect("build");
+    let err = projector.dispatch_refusal(&refusal).expect_err("no policy");
+    assert_eq!(err.code, codes::NO_HANDLER_REGISTERED);
+}

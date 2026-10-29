@@ -408,6 +408,52 @@ fn a_hand_written_aggregate_builds_a_router() {
     assert_eq!(router.component_descriptor().expect("hello").name, "plain");
 }
 
+// A hand-written domain is an aggregate unless it says otherwise: the
+// refusal of a second component names it as one (C-0580).
+#[test]
+fn a_hand_written_domain_is_an_aggregate_by_default() {
+    let router = RouterBuilder::new()
+        .aggregate(Plain)
+        .build()
+        .expect("build");
+    let err = router.refuse_another_component();
+    assert_eq!(
+        err.extras
+            .get(crate::error::extras::COMPONENT_KIND)
+            .map(String::as_str),
+        Some("AGGREGATE")
+    );
+}
+
+// The router runs the hosted domain's admission rules, and refuses
+// admission for a component that is not a domain.
+#[test]
+fn a_router_admits_through_its_domain() {
+    let mut book = command("plain", "test.Plain").command.unwrap();
+    book.page.as_mut().unwrap().command_id = Some(crate::test_support::uuid_of(9));
+    let recorded = vec![event_page(any_of_type("test.Plained"))];
+    let arrival = crate::domain::Arrival {
+        command: &book,
+        recorded: &recorded,
+        stream: crate::domain::StreamStatus { exists: true },
+    };
+    let router = RouterBuilder::new()
+        .aggregate(Plain)
+        .build()
+        .expect("build");
+    assert_eq!(
+        router.admit(&arrival).expect("admitted"),
+        crate::domain::Admission::Duplicate(recorded.clone())
+    );
+    let projector = with_one(RouterBuilder::new(), "projector")
+        .build()
+        .expect("build");
+    assert_eq!(
+        projector.admit(&arrival).expect_err("not a domain").code,
+        codes::NO_HANDLER_REGISTERED
+    );
+}
+
 // A hand-written domain meets the framework's rules without reimplementing
 // them: a command already recorded under its id is a duplicate.
 #[test]
@@ -439,6 +485,19 @@ fn renaming(from: &str, to: &'static str) -> UpcasterDispatch {
 
 // An old type its chain accepts must not also be one of the aggregate's
 // current types (owner ruling): the build fails.
+// A domain, boxed or not, reports the old types its chains accept.
+#[test]
+fn a_domain_reports_the_types_its_chain_accepts() {
+    let domain = aggregate("ship", "order", &["test.Ship"])
+        .with_command_upcaster(renaming("test.ShipV1", "test.Ship"));
+    assert_eq!(
+        CommandHandler::upcast_types(&domain),
+        vec!["test.ShipV1".to_string()]
+    );
+    let boxed: Box<dyn CommandHandler> = Box::new(domain);
+    assert_eq!(boxed.upcast_types(), vec!["test.ShipV1".to_string()]);
+}
+
 #[test]
 fn an_old_type_colliding_with_a_current_one_fails_the_build() {
     let err = build_err(
