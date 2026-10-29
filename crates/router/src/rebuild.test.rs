@@ -67,11 +67,45 @@ fn an_applier_failing_on_a_persisted_event_is_a_handler_bug_naming_it() {
         ],
         "/test.Ledger",
     );
-    // Decision 14.37: the applier's own text stays in its log; none crosses.
+    // Decision 14.37: the applier's own text stays in its log; none crosses,
+    // and an unclassified failure has no cause.
     assert!(
         !err.extras.contains_key("fold_message"),
         "no fold text crosses: {:?}",
         err.extras
+    );
+    assert!(
+        !err.extras.contains_key(extras::CAUSE),
+        "an unclassified failure has no cause: {:?}",
+        err.extras
+    );
+}
+
+// An applier that fails with a CodedError hands the fold its key and args:
+// the failing fold's cause (decision 14.37).
+#[test]
+fn an_applier_failing_with_a_coded_error_gives_the_fold_its_cause() {
+    let r = fresh_rebuilder().apply(&cover_full_name(), |_state: &mut TestState, _event| {
+        Err(Box::new(crate::error::CodedError::rejection(
+            crate::error::BusinessStatus::FailedPrecondition,
+            "BAD_COVER",
+            [("field".to_string(), "domain".to_string())],
+        )))
+    });
+    let err = r
+        .rebuild(Some(&pb::EventBook {
+            pages: vec![sequenced_event_page(2, cover_any("a"))],
+            ..Default::default()
+        }))
+        .expect_err("the applier failed");
+    assert_eq!(err.code, "FOLD_FAILED");
+    assert_eq!(
+        err.extras.get("cause").map(String::as_str),
+        Some("BAD_COVER")
+    );
+    assert_eq!(
+        err.extras.get("cause.field").map(String::as_str),
+        Some("domain")
     );
 }
 

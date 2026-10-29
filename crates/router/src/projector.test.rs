@@ -263,6 +263,25 @@ fn a_failing_fold_is_a_handler_bug_naming_its_page() {
     }
 }
 
+// A projector handler that panics is caught: a failing fold whose cause is
+// HANDLER_PANICKED (decision 14.37).
+#[test]
+fn a_panicking_fold_handler_is_a_fold_failure_caused_by_handler_panicked() {
+    let d = ProjectorDispatch::new("write-model", Folded::default)
+        .with_projection_type("test.Board")
+        .on_event(&cover_full_name(), |_p, _any, _ctx| {
+            panic!("index out of bounds")
+        });
+    let err = d
+        .dispatch(&book("order", cover_pages("order", 1)))
+        .expect_err("the handler panicked");
+    assert_eq!(err.code, "FOLD_FAILED");
+    assert_eq!(
+        err.extras.get("cause").map(String::as_str),
+        Some("HANDLER_PANICKED")
+    );
+}
+
 #[test]
 fn a_finish_failure_is_not_a_fold_failure() {
     let d = ProjectorDispatch::new("write-model", Folded::default)
