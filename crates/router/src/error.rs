@@ -127,6 +127,9 @@ pub mod extras {
     pub const FIRST_SEQUENCE: &str = "first_sequence";
     pub const LAST_SEQUENCE: &str = "last_sequence";
     pub const FOLD_MESSAGE: &str = "fold_message";
+    /// A handler's bug's own code, under UNHANDLED_HANDLER_ERROR; its args
+    /// follow as `cause.<arg>` (decision 14.37).
+    pub const CAUSE: &str = "cause";
 }
 
 /// Where a failing fold failed: the page, when known, else the batch's

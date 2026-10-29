@@ -110,17 +110,28 @@ fn a_rejection_is_a_business_refusal() {
     assert_eq!(err.message, "value must be positive");
 }
 
+// Decision 14.37: a handler's bug goes out as UNHANDLED_HANDLER_ERROR
+// (INTERNAL), the handler's own code and args its cause, flattened as
+// `cause=<code>` and `cause.<arg>=<value>`.
 #[test]
-fn a_bug_is_internal() {
+fn a_bug_is_unhandled_handler_error_with_the_handlers_code_as_its_cause() {
     let err = CodedError::bug(
         "LEDGER_INVARIANT_BROKEN",
         "the ledger went negative",
         [("balance".to_string(), "-1".to_string())],
     );
     assert_eq!(err.grpc, GrpcCode::Internal);
-    assert_eq!(err.code, "LEDGER_INVARIANT_BROKEN");
+    assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
     assert_eq!(err.message, "the ledger went negative");
-    assert_eq!(err.extras.get("balance").map(String::as_str), Some("-1"));
+    assert_eq!(
+        err.extras,
+        [
+            ("cause".to_string(), "LEDGER_INVARIANT_BROKEN".to_string()),
+            ("cause.balance".to_string(), "-1".to_string()),
+        ]
+        .into()
+    );
+    assert_eq!(extras::CAUSE, "cause");
 }
 
 #[test]
