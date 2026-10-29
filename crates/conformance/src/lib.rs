@@ -677,7 +677,7 @@ pub enum AddItemFails {
     },
     /// A bug the handler marks retryable, under the `status` it picks,
     /// with its own `code` and `args`.
-    RetryableBug {
+    BugRetryable {
         status: angzarr_router::error::RetryableStatus,
         code: String,
         args: Vec<(String, String)>,
@@ -710,7 +710,7 @@ impl AddItemFails {
                 let _ = logs; // the handler's own log
                 CodedError::bug(code, args.clone()).into()
             }
-            AddItemFails::RetryableBug {
+            AddItemFails::BugRetryable {
                 status,
                 code,
                 args,

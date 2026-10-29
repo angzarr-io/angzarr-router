@@ -65,13 +65,13 @@ pub enum ErrorClass {
     BusinessImmediate,
     /// Bug, fatal: INTERNAL, UNKNOWN, DATA_LOSS. Dead-lettered and alerted
     /// at once.
-    FatalBug,
+    BugFatal,
     /// Bug, retryable: UNAVAILABLE, DEADLINE_EXCEEDED, RESOURCE_EXHAUSTED
     /// (a handler's [`RetryableStatus`]), UNIMPLEMENTED and the remaining
     /// framework statuses. Capped exponential backoff with jitter, then
     /// dead-lettered and alerted. The statuses are not interchangeable:
     /// see [`RetryableStatus`].
-    RetryableBug,
+    BugRetryable,
 }
 
 /// RED STUB (feat/bug-branches): the status a handler picks for a bug it

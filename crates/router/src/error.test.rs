@@ -586,8 +586,8 @@ fn the_status_decides_the_class() {
         .map(|(_, grpc)| (*grpc, ErrorClass::BusinessFatal))
         // Four classes (owner's rulings, 2026-10-29, latest).
         .chain(IMMEDIATE.map(|grpc| (grpc, ErrorClass::BusinessImmediate)))
-        .chain(BUGS.map(|grpc| (grpc, ErrorClass::FatalBug)))
-        .chain(RETRYABLE.map(|grpc| (grpc, ErrorClass::RetryableBug)))
+        .chain(BUGS.map(|grpc| (grpc, ErrorClass::BugFatal)))
+        .chain(RETRYABLE.map(|grpc| (grpc, ErrorClass::BugRetryable)))
         .filter(|(grpc, class)| {
             grpc.class() != *class
                 // Only a fatal business refusal reaches OnRefused.
@@ -615,7 +615,7 @@ fn every_business_refusal_reaches_on_refused() {
 fn a_bug_stays_internal_with_its_cause() {
     let err = CodedError::bug("LEDGER_OFFLINE", [arg("ledger", "main")]);
     assert_eq!(err.grpc, GrpcCode::Internal);
-    assert_eq!(err.grpc.class(), ErrorClass::FatalBug);
+    assert_eq!(err.grpc.class(), ErrorClass::BugFatal);
     assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
     assert_eq!(
         err.extras,
@@ -632,7 +632,7 @@ fn a_retryable_bug_goes_out_under_the_status_the_handler_picks() {
     for (status, grpc) in RETRYABLE_STATUSES {
         let err = CodedError::retryable_bug(status, "LEDGER_OFFLINE", [arg("ledger", "main")]);
         assert_eq!(err.grpc, grpc, "{status:?}: the status the handler picked");
-        assert_eq!(err.grpc.class(), ErrorClass::RetryableBug, "{status:?}");
+        assert_eq!(err.grpc.class(), ErrorClass::BugRetryable, "{status:?}");
         assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR, "{status:?}");
         assert_eq!(err.status_message(), codes::UNHANDLED_HANDLER_ERROR);
         assert_eq!(

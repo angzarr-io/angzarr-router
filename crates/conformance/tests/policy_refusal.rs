@@ -151,7 +151,7 @@ async fn on_refused_not_called(w: &mut RefusalWorld) {
     regex = r"^HoldFunds is retried with backoff up to its configured cap, then dead-lettered and alerted$"
 )]
 async fn retried(w: &mut RefusalWorld) {
-    assert_eq!(w.answer().grpc.class(), ErrorClass::RetryableBug);
+    assert_eq!(w.answer().grpc.class(), ErrorClass::BugRetryable);
 }
 
 // ABORTED: the runtime, as the policy step's caller, reloads and re-runs
@@ -170,7 +170,7 @@ async fn neither(w: &mut RefusalWorld) {
 
 #[then(regex = r"^HoldFunds is dead-lettered and an alert is raised$")]
 async fn dead_lettered(w: &mut RefusalWorld) {
-    assert_eq!(w.answer().grpc.class(), ErrorClass::FatalBug);
+    assert_eq!(w.answer().grpc.class(), ErrorClass::BugFatal);
 }
 
 #[tokio::main]

@@ -704,7 +704,7 @@ async fn fails_with_retryable_bug(
 ) {
     add_item_fails(
         w,
-        conf::AddItemFails::RetryableBug {
+        conf::AddItemFails::BugRetryable {
             status: match status.as_str() {
                 "UNAVAILABLE" => RetryableStatus::Unavailable,
                 "DEADLINE_EXCEEDED" => RetryableStatus::DeadlineExceeded,
