@@ -6,7 +6,10 @@
 //! input. Emitted commands pass through as the handler returned them: the
 //! coordinator stamps their identity, causation and correlation; the router
 //! addresses them in the trigger's edition (a policy stays in the edition of
-//! the event it handles; types.proto, Cover.edition).
+//! the event it handles; types.proto, Cover.edition). Every command must
+//! name its root, whatever its target (POLICY_COMMAND_NO_ROOT), and may not
+//! carry a correlation other than its triggering event's
+//! (POLICY_COMMAND_OTHER_CORRELATION; decision 14.36).
 //!
 //! Refusals (policy.proto, PolicyService, Refusals; decision 14.31): when one of
 //! the policy's commands is refused, [`PolicyDispatch::dispatch_refusal`] (the
@@ -270,6 +273,11 @@ impl PolicyDispatch {
                     Some(_) => {}
                 }
             }
+            let trigger_correlation = page.meta.as_ref().and_then(|m| m.correlation_id.as_ref());
+            for command in &commands {
+                check_root(command)?;
+                check_correlation(command, trigger_correlation)?;
+            }
             resp.commands.extend(commands);
         }
 
@@ -296,6 +304,61 @@ impl PolicyDispatch {
                 (extras::ACTUAL_DOMAIN.to_string(), actual.to_string()),
             ],
         )
+    }
+}
+
+/// The command's domain and type, naming it in a refusal's extras.
+fn naming(command: &pb::CommandBook) -> [(String, String); 2] {
+    let domain = command.cover.as_ref().map_or("", |c| c.domain.as_str());
+    let command_type = command
+        .page
+        .as_ref()
+        .and_then(crate::command_payload)
+        .map_or("", |p| crate::type_name_from_url(&p.type_url));
+    [
+        (extras::DOMAIN.to_string(), domain.to_string()),
+        (extras::COMMAND_TYPE.to_string(), command_type.to_string()),
+    ]
+}
+
+/// Every command a policy sends names its root, whatever its target: an
+/// aggregate's or a process manager's alike (decision 14.36, amended; there
+/// is no default root). An unset root, or a UUID holding no bytes, is a
+/// policy bug, refused INTERNAL.
+fn check_root(command: &pb::CommandBook) -> Result<(), CodedError> {
+    let named = command
+        .cover
+        .as_ref()
+        .and_then(|c| c.root.as_ref())
+        .is_some_and(|r| !r.value.is_empty());
+    if named {
+        return Ok(());
+    }
+    Err(CodedError::internal(
+        codes::POLICY_COMMAND_NO_ROOT,
+        messages::POLICY_COMMAND_NO_ROOT,
+        naming(command),
+    ))
+}
+
+/// Every command a policy sends carries its trigger's correlation unchanged
+/// (decision 14.36): left unset for the coordinator to stamp, or set to
+/// exactly the trigger's. Another one is a policy bug, refused INTERNAL.
+fn check_correlation(
+    command: &pb::CommandBook,
+    trigger: Option<&pb::Uuid>,
+) -> Result<(), CodedError> {
+    let carried = command
+        .page
+        .as_ref()
+        .and_then(|p| p.correlation_id.as_ref());
+    match (carried, trigger) {
+        (Some(carried), Some(trigger)) if carried != trigger => Err(CodedError::internal(
+            codes::POLICY_COMMAND_OTHER_CORRELATION,
+            messages::POLICY_COMMAND_OTHER_CORRELATION,
+            naming(command),
+        )),
+        _ => Ok(()),
     }
 }
 

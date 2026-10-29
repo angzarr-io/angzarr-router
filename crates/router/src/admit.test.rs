@@ -94,7 +94,7 @@ fn buyin() -> DomainDispatch<TestState> {
         .with_rules_version("1")
 }
 
-/// A PM instance's root is its correlation id (decision 14.30).
+/// The PM instance's root: the one its inputs' covers name (decision 14.36).
 const INSTANCE: u8 = 7;
 
 fn arrival<'a>(command: &'a pb::CommandBook, stream: StreamStatus) -> Arrival<'a> {
@@ -309,8 +309,8 @@ fn an_aggregate_has_no_start_rule() {
     );
 }
 
-// A PM instance's root is its correlation by default only (decision 14.36,
-// withdrawing 14.30's rule): an input whose set correlation_id differs from
+// A PM instance's root is the one its input's cover names, not its
+// correlation (decision 14.36, withdrawing 14.30's rule): an input whose set correlation_id differs from
 // its cover's root is admitted to the root its cover names, keeping its
 // correlation. PM_CORRELATION_NOT_ROOT is gone; the start rule is the only
 // rule a PM adds to an aggregate's.

@@ -61,9 +61,6 @@ pub mod codes {
     /// type the PM does not declare as starting (process_manager.proto;
     /// decision 14.31).
     pub const PM_NO_INSTANCE: &str = "PM_NO_INSTANCE";
-    /// An input addressed to a process manager whose set correlation_id
-    /// differs from its cover's root (process_manager.proto, Stream).
-    pub const PM_CORRELATION_NOT_ROOT: &str = "PM_CORRELATION_NOT_ROOT";
     /// A refusal fact addressed to any stream but the exact one its
     /// causation_id names (types.proto, the command_identity region).
     pub const REFUSAL_FACT_WRONG_STREAM: &str = "REFUSAL_FACT_WRONG_STREAM";
@@ -97,12 +94,13 @@ pub mod messages {
     pub const FOLD_FAILED_EMITTED: &str = "the state fold failed on an event this command emitted";
     pub const POLICY_COMMAND_OUTSIDE_EDITION: &str =
         "a policy answered a command for an edition other than its trigger's";
+    pub const POLICY_COMMAND_NO_ROOT: &str = "a policy's command names the root it addresses";
+    pub const POLICY_COMMAND_OTHER_CORRELATION: &str =
+        "a policy's command carries its trigger's correlation_id unchanged";
     pub const MALFORMED_REFUSAL_FACT: &str =
         "a policy's refusal fact must be a bare Fact, addressed and identified by its runtime";
     pub const PM_NO_INSTANCE: &str =
         "no process manager instance for the correlation, and the command does not start one";
-    pub const PM_CORRELATION_NOT_ROOT: &str =
-        "an input to a process manager sets a correlation_id other than its cover's root";
     pub const REFUSAL_FACT_WRONG_STREAM: &str =
         "a refusal fact is accepted only by the exact stream its causation_id names";
     pub const STARTING_TYPES_ON_NON_PM: &str =

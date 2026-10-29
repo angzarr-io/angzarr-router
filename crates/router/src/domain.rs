@@ -297,8 +297,8 @@ impl<S> DomainDispatch<S> {
 
     /// An empty process-manager table over a Rebuilder: a domain (decision
     /// 14.31) whose inputs are commands and facts, whose only output is its
-    /// own events, whose root is its correlation id, and which declares its
-    /// starting inputs ([`Self::starts`]). Registered with kind
+    /// own events, whose stream root is the one its input's cover names
+    /// (decision 14.36), and which declares its starting inputs ([`Self::starts`]). Registered with kind
     /// PROCESS_MANAGER and no inputs (it subscribes to nothing).
     pub fn process_manager(
         name: impl Into<String>,
@@ -351,9 +351,9 @@ impl<S> DomainDispatch<S> {
     /// [`Arrival`] alone (no I/O), in order:
     /// 1. validation: a refusal fact (a Fact with causation_id) is accepted
     ///    only by the exact stream its causation_id names
-    ///    (REFUSAL_FACT_WRONG_STREAM); an input to a process manager whose
-    ///    set correlation_id differs from its cover's root is malformed
-    ///    (PM_CORRELATION_NOT_ROOT);
+    ///    (REFUSAL_FACT_WRONG_STREAM). An input to a process manager is
+    ///    delivered to the root its cover names, whatever its correlation
+    ///    (decision 14.36);
     /// 2. deduplication: events already recorded under the input's id are
     ///    [`Admission::Duplicate`];
     /// 3. a process manager's start rule, by the input's type after
@@ -825,17 +825,6 @@ pub fn admit_rules(
                 messages::REFUSAL_FACT_WRONG_STREAM,
                 [(extras::DOMAIN.to_string(), cover.domain.clone())],
             ));
-        }
-    }
-    if start_rule.is_some() {
-        if let Some(correlation) = page.correlation_id.as_ref() {
-            if Some(correlation) != cover.root.as_ref() {
-                return Err(CodedError::invalid_argument(
-                    codes::PM_CORRELATION_NOT_ROOT,
-                    messages::PM_CORRELATION_NOT_ROOT,
-                    [(extras::DOMAIN.to_string(), cover.domain.clone())],
-                ));
-            }
         }
     }
 
