@@ -659,16 +659,40 @@ impl CodedError {
 }
 
 /// In process too, an error shows as its code then its args, ` name=value`
-/// each, a wrapped cause flattened as on the wire; never English (decision
-/// 14.37, owner's clarification of 2026-10-29).
+/// each, a wrapped cause flattened as on the wire, a value quoted where it
+/// would not parse back ([`write_value`]); never English (decision 14.37,
+/// owner's clarification of 2026-10-29).
 impl std::fmt::Display for CodedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.code)?;
         for (name, value) in &self.extras {
-            write!(f, " {name}={value}")?;
+            write!(f, " {name}=")?;
+            write_value(f, value)?;
         }
         Ok(())
     }
+}
+
+/// `value` as a display writes it (decision 14.37, owner ruling
+/// 2026-10-29): bare, unless it would not parse back (empty, or holding
+/// whitespace, `=`, `"` or `\`), then double-quoted with its `"` and `\`
+/// backslash-escaped.
+fn write_value(f: &mut std::fmt::Formatter<'_>, value: &str) -> std::fmt::Result {
+    let ambiguous = value.is_empty()
+        || value
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '=' | '"' | '\\'));
+    if !ambiguous {
+        return f.write_str(value);
+    }
+    f.write_str("\"")?;
+    for c in value.chars() {
+        if matches!(c, '"' | '\\') {
+            f.write_str("\\")?;
+        }
+        write!(f, "{c}")?;
+    }
+    f.write_str("\"")
 }
 
 /// A CodedError is a std error, so an applier may fail with one: a failing

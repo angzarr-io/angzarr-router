@@ -128,15 +128,34 @@ fn every_constructors_status_message_is_its_code() {
     );
 }
 
+/// `value` as a display shows it: bare, or, where it would not parse back
+/// (empty, or holding whitespace, `=`, `"` or `\`), double-quoted with
+/// its `"` and `\` escaped.
+fn shown_value(value: &str) -> String {
+    let ambiguous = value.is_empty()
+        || value
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '=' | '"' | '\\'));
+    if !ambiguous {
+        return value.to_string();
+    }
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 // In process too, an error shows as its code then its args, ` name=value`
-// each (owner's clarification of 2026-10-29).
+// each (owner's clarification of 2026-10-29), a value quoted where it
+// would not parse back.
 #[test]
 fn every_error_displays_as_its_code_then_its_args() {
     let wrong: Vec<String> = every_constructor()
         .into_iter()
         .filter_map(|(name, err)| {
             let expected: String = std::iter::once(err.code.clone())
-                .chain(err.extras.iter().map(|(k, v)| format!(" {k}={v}")))
+                .chain(
+                    err.extras
+                        .iter()
+                        .map(|(k, v)| format!(" {k}={}", shown_value(v))),
+                )
                 .collect();
             let shown = err.to_string();
             (shown != expected || shown.is_empty())
