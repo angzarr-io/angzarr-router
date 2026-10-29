@@ -128,7 +128,9 @@ libraries.
   interfaces from `conformance/proto/test/counter/counter.proto`, plus
   binding-local tests.
 - `just mutation-test`: cargo-mutants over the core modules, the FFI
-  registry and the architecture linter.
+  registry and the architecture linter, every missed mutant a failure.
+  The pre-push hook runs `just mutation-push`, the same over only what
+  the push adds.
 - `just archlint`: the layering above as checked rules — `archlint.toml`
   (engine below the C ABI, components independent of each other and of the
   router, conformance on the public surfaces, bindings as leaves), enforced

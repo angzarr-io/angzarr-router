@@ -91,6 +91,7 @@ path through that env var so cargo-mutants' copied trees build.
 just build              # cargo build --workspace (also builds the router-ffi cdylib)
 just test               # core + FFI ABI tests + native conformance suite
 just mutation-test      # cargo-mutants over the core, the FFI registry and archlint
+just mutation-push      # pre-push: the same, over what a push adds (stdin: git's pushed refs)
 just lint               # clippy -D warnings
 just archlint           # module-level layer rules (archlint.toml)
 just <lang>-binding-test  # go | java | csharp | cpp | ts: conformance via that binding (parked at ABI 3)

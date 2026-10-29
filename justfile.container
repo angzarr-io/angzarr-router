@@ -75,16 +75,29 @@ test:
 fmt-check:
     cargo fmt --manifest-path {{TOP}}/Cargo.toml --all --check
 
-# Mutation-test the core modules, the FFI registry's routing/claim rules and
-# the architecture linter. Gate: any missed mutant fails it (cargo-mutants
-# exits non-zero); only a genuinely equivalent mutant may be excluded, in
-# .cargo/mutants.toml, with the argument for its equivalence.
+# The files held to mutation testing: the core modules, the FFI registry's
+# routing/claim rules and the architecture linter. Their threshold is 100%:
+# any missed (or timed-out) mutant fails `mutation-test` and `mutation-diff`
+# (cargo-mutants exits non-zero); only a genuinely equivalent mutant may be
+# excluded, in .cargo/mutants.toml, with the argument for its equivalence.
+MUTATED := "-f crates/router/src/rebuild.rs -f crates/router/src/domain.rs -f crates/router/src/context.rs -f crates/router/src/projector.rs -f crates/router/src/policy.rs -f crates/router/src/error.rs -f crates/router/src/lib.rs -f crates/router/src/router.rs -f crates/router/src/upcaster.rs -f crates/router-ffi/src/registry.rs -f tools/archlint/src/rules.rs -f tools/archlint/src/scan.rs -f tools/archlint/src/workspace.rs -f tools/archlint/src/model.rs"
+
+# Mutation-test every file in MUTATED: the full pass.
 # cargo-mutants copies the source tree, so the proto root must be an absolute
 # path that survives the copy — ANGZARR_PROJECT_PROTO points build.rs at the
 # real submodule checkout.
 mutation-test:
     cargo mutants --version >/dev/null 2>&1 || cargo install cargo-mutants --locked --version {{CARGO_MUTANTS}}
-    cd {{TOP}} && ANGZARR_PROJECT_PROTO=${ANGZARR_PROJECT_PROTO:-{{TOP}}/angzarr-project/proto} cargo mutants -f crates/router/src/rebuild.rs -f crates/router/src/domain.rs -f crates/router/src/context.rs -f crates/router/src/projector.rs -f crates/router/src/policy.rs -f crates/router/src/error.rs -f crates/router/src/lib.rs -f crates/router/src/router.rs -f crates/router/src/upcaster.rs -f crates/router-ffi/src/registry.rs -f tools/archlint/src/rules.rs -f tools/archlint/src/scan.rs -f tools/archlint/src/workspace.rs -f tools/archlint/src/model.rs --timeout 120
+    cd {{TOP}} && ANGZARR_PROJECT_PROTO=${ANGZARR_PROJECT_PROTO:-{{TOP}}/angzarr-project/proto} cargo mutants {{MUTATED}} --timeout 120
+
+# Mutation-test only the lines of MUTATED that the diff PATCH (relative to the
+# checkout, a/ and b/ paths, this tree's lines on the b side) changes, held to
+# the same 100%: the host `mutation-push`'s run, in the pushed commit's tree.
+# cargo-mutants' exit code is the verdict (4: the tests fail unmutated). Its
+# mutants.out is target/mutants-push/mutants.out.
+mutation-diff PATCH:
+    cargo mutants --version >/dev/null 2>&1 || cargo install cargo-mutants --locked --version {{CARGO_MUTANTS}}
+    cd {{TOP}} && ANGZARR_PROJECT_PROTO=${ANGZARR_PROJECT_PROTO:-{{TOP}}/angzarr-project/proto} cargo mutants {{MUTATED}} --in-diff {{PATCH}} --timeout 120 --output target/mutants-push
 
 # Format
 fmt:

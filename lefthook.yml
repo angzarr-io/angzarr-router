@@ -1,7 +1,7 @@
 # Lefthook configuration for angzarr-router
 # https://github.com/evilmartians/lefthook
 #
-# Setup: lefthook install
+# Setup: lefthook install (again after a hook is added here: pre-push was)
 # Bypass: none — fix the finding instead.
 
 # Plant the in-submodule pre-commit guard in .git/modules/<name>/hooks/
@@ -32,3 +32,18 @@ pre-commit:
     archlint:
       glob: "*.{rs,toml}"
       run: just archlint
+
+# Mutation testing runs here, not at pre-commit: it is too slow for every
+# commit. `just mutation-push` mutates what each pushed ref adds, in the pushed
+# commit's own tree (the justfile says how), and holds the MUTATED files to
+# 100% (justfile.container). git's pushed refs are on stdin, and {1} is the
+# remote's name. lefthook skips a pre-push command when it finds no files
+# changed between HEAD and the remote, which says nothing of the refs pushed;
+# a `{files}` in `run` turns that off, so `files` names one that is always
+# there, and mutation-push ignores it.
+pre-push:
+  commands:
+    mutation:
+      use_stdin: true
+      files: echo justfile
+      run: just mutation-push {1} {files}
