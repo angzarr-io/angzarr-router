@@ -803,3 +803,34 @@ fn a_panicking_batched_fold_of_one_page_names_it() {
     );
     assert_panicked_cause(&err);
 }
+
+// A panicking snapshot loader is a defect in user code, not corrupt data
+// (corrupt bytes are a decode error): FOLD_FAILED with cause
+// HANDLER_PANICKED, naming the snapshot by its sequence and its state's
+// type URL.
+#[test]
+fn a_panicking_snapshot_loader_fails_the_rebuild_naming_the_snapshot() {
+    let r = cover_applier(fresh_rebuilder().with_state_type("test.State"))
+        .with_snapshot(|_s: &mut TestState, _any| panic!("index out of bounds"));
+    let snap_state = cover_any("snap");
+    let book = pb::EventBook {
+        snapshot: Some(pb::Snapshot {
+            sequence: 3,
+            state: Some(snap_state.clone()),
+            ..Default::default()
+        }),
+        pages: vec![sequenced_event_page(4, cover_any("a"))],
+        ..Default::default()
+    };
+    let err = answered(|| r.rebuild(Some(&book))).expect_err("the loader panicked");
+    assert_fold_failed(
+        &err,
+        "FOLD_FAILED",
+        &[
+            (extras::SEQUENCE, "3"),
+            (extras::TYPE_URL, snap_state.type_url.as_str()),
+        ],
+        "/test.State",
+    );
+    assert_panicked_cause(&err);
+}
