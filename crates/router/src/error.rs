@@ -295,16 +295,6 @@ impl CodedError {
         )
     }
 
-    /// A component bug the client library refuses before it answers
-    /// (INTERNAL).
-    pub fn internal(
-        code: &str,
-        message: &str,
-        extras: impl IntoIterator<Item = (String, String)>,
-    ) -> Self {
-        Self::coded(code, message, extras, GrpcCode::Internal)
-    }
-
     /// An unclassified error that escaped a business handler (INTERNAL).
     pub fn unhandled(message: &str) -> Self {
         Self::coded(
@@ -315,8 +305,12 @@ impl CodedError {
         )
     }
 
-    /// Business rejection: retry after refetching state.
-    pub fn rejection_precondition_failed(
+    /// A business rejection (FAILED_PRECONDITION): the command is refused,
+    /// a business "no", never a fault. One of the two classes a handler
+    /// fails with (the other is [`Self::bug`]). The refusal reaches the
+    /// issuing policy's OnRefused ([`Self::refusal_response`]); carry a
+    /// typed refusal with [`Self::with_refusal`].
+    pub fn rejection(
         code: &str,
         message: &str,
         details: impl IntoIterator<Item = (String, String)>,
@@ -324,22 +318,18 @@ impl CodedError {
         Self::coded(code, message, details, GrpcCode::FailedPrecondition)
     }
 
-    /// Business rejection: bad input, don't retry.
-    pub fn rejection_invalid_argument(
+    /// A bug (INTERNAL): a defect, never a business answer. The other of
+    /// the two classes a handler fails with (the first is
+    /// [`Self::rejection`]); the runtime alerts it and dead-letters the
+    /// input, and it never reaches a policy's OnRefused. The router raises
+    /// its own component bugs (a policy's malformed answer, say) with it
+    /// too.
+    pub fn bug(
         code: &str,
         message: &str,
         details: impl IntoIterator<Item = (String, String)>,
     ) -> Self {
-        Self::coded(code, message, details, GrpcCode::InvalidArgument)
-    }
-
-    /// Business rejection: referenced entity absent.
-    pub fn rejection_not_found(
-        code: &str,
-        message: &str,
-        details: impl IntoIterator<Item = (String, String)>,
-    ) -> Self {
-        Self::coded(code, message, details, GrpcCode::NotFound)
+        Self::coded(code, message, details, GrpcCode::Internal)
     }
 }
 

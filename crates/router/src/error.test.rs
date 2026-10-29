@@ -144,8 +144,8 @@ fn typed_refusal() -> prost_types::Any {
 
 #[test]
 fn a_business_rejection_becomes_the_policies_refusal_response() {
-    let err = CodedError::rejection("INSUFFICIENT_FUNDS", "holds 100", [])
-        .with_refusal(typed_refusal());
+    let err =
+        CodedError::rejection("INSUFFICIENT_FUNDS", "holds 100", []).with_refusal(typed_refusal());
     assert_eq!(err.grpc, GrpcCode::FailedPrecondition, "still a rejection");
     assert_eq!(
         err.refusal_response(),

@@ -764,7 +764,7 @@ pub fn admit_rules(
             if is_fact {
                 return Ok(Admission::Skip);
             }
-            return Err(CodedError::rejection_precondition_failed(
+            return Err(CodedError::rejection(
                 codes::PM_NO_INSTANCE,
                 messages::PM_NO_INSTANCE,
                 [(extras::TYPE_URL.to_string(), sent.type_url.clone())],

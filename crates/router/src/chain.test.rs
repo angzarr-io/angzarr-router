@@ -25,11 +25,12 @@ fn wallet() -> DomainDispatch<TestState> {
         |command, _state, _ctx| {
             let hold = HoldFunds::decode(command.value.as_slice()).expect("HoldFunds");
             Err(HandlerError::Coded(
-                CodedError::rejection("INSUFFICIENT_FUNDS", "holds 100", [])
-                    .with_refusal(any_of(&InsufficientFunds {
+                CodedError::rejection("INSUFFICIENT_FUNDS", "holds 100", []).with_refusal(any_of(
+                    &InsufficientFunds {
                         available: 100,
                         requested: hold.amount,
-                    })),
+                    },
+                )),
             ))
         },
     )

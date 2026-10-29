@@ -126,7 +126,7 @@ pub fn counter_aggregate(observed: ObservedSink) -> DomainDispatch<CounterState>
             let cmd = counter::IncreaseBy::decode(any.value.as_slice())
                 .map_err(|e| HandlerError::Other(format!("decode IncreaseBy: {e}")))?;
             if cmd.n == 0 {
-                return Err(HandlerError::Coded(CodedError::rejection_invalid_argument(
+                return Err(HandlerError::Coded(CodedError::rejection(
                     VALUE_NOT_POSITIVE,
                     "increase amount must be positive",
                     [],
