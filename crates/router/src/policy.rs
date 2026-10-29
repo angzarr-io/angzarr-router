@@ -71,34 +71,6 @@ impl PolicyDispatch {
         }
     }
 
-    /// RED STUB (decision 14.36; not implemented): a policy whose one
-    /// destination is a process manager's domain. Its commands may leave
-    /// their cover's root unset (the default instance, filled by the
-    /// framework's coordinator code, never by the router), or name it
-    /// through a root callback ([`Self::on_root`]). A policy built with
-    /// [`Self::new`] targets an aggregate, and each command must name its
-    /// root.
-    pub fn to_process_manager(
-        name: impl Into<String>,
-        input_domain: impl Into<String>,
-        output_domain: impl Into<String>,
-    ) -> Self {
-        Self::new(name, input_domain, output_domain)
-    }
-
-    /// RED STUB (decision 14.36; not implemented): registers the root
-    /// callback `root_<Command>(event) -> UUID` for the fully-qualified
-    /// command type `command`. Its presence is the opt-in (no flag): each
-    /// command of that type the policy emits is addressed to the root the
-    /// callback derives from the triggering event.
-    pub fn on_root(
-        self,
-        _command: &str,
-        _thunk: impl Fn(&Any) -> Result<pb::Uuid, HandlerError> + Send + Sync + 'static,
-    ) -> Self {
-        self
-    }
-
     /// Registers the translation thunk for a fully-qualified event type; it
     /// receives the source book's cover.
     pub fn on_event(

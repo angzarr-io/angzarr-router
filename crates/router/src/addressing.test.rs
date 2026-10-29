@@ -1,32 +1,38 @@
 //! Who a policy's command addresses, and the correlation it carries
-//! (decision 14.36; angzarr-project spec/20261019-draft at ff562b4:
+//! (decision 14.36 as amended by the owner, 2026-10-28: the router does not
+//! differentiate process managers; angzarr-project spec/20261019-draft:
 //! policy.proto PolicyResponse, process_manager.proto Stream, types.proto
-//! Cover.root; features/coordinator-contract/policy_addressing.feature,
-//! C-0656 to C-0660 and C-0665, the router's half of each).
+//! Cover.root; features/coordinator-contract/policy_addressing.feature, the
+//! router's half of C-0656 to C-0660 and C-0665).
 //!
-//! The router's half: policy dispatch refuses a command that carries a
-//! correlation other than its trigger's; refuses a command to an aggregate
-//! that names no root; leaves a process manager command's root UNSET when
-//! the policy implements no root callback (filling the default, the
-//! trigger's correlation, is the framework coordinator code's, shared from
-//! angzarr-core, never the router's); and addresses it to the root the
-//! callback derives from the triggering event when the policy implements
-//! one (`root_<Command>(event) -> UUID`, opt-in by writing it).
+//! The router's half: every command a policy sends names its root, whatever
+//! its target (aggregate or process manager alike; there is no root
+//! callback and no default root), and one that names none is refused; and
+//! a command carrying a correlation other than its own trigger's is
+//! refused.
 
 use prost::Message;
 use prost_types::Any;
 
-use crate::error::{codes, extras, CodedError, GrpcCode, HandlerError};
+use crate::error::{codes, extras, CodedError, GrpcCode};
 use crate::pb;
 use crate::policy::PolicyDispatch;
 use crate::test_support::*;
 
 /// The trigger's correlation (C-0656's ...0040, as a test UUID).
 const CORRELATION: u8 = 0x40;
-/// The root a root callback names (C-0658's ...00aa).
+/// The fulfillment instance the policy names (C-0658's ...00aa).
 const NAMED: u8 = 0xaa;
 /// The inventory aggregate the policy names ("inv-7").
 const INVENTORY: u8 = 7;
+
+/// A target for the no-root test: its domain, a builder of its command
+/// from a root, and that command's type.
+type Target = (
+    &'static str,
+    fn(Option<pb::Uuid>) -> pb::CommandBook,
+    String,
+);
 
 // --- fixtures ----------------------------------------------------------------
 
@@ -90,13 +96,12 @@ fn order_to_inventory() -> PolicyDispatch {
         })
 }
 
-/// OrderToFulfillment (a process-manager target), naming no root: it
-/// implements no root_StartFulfillment, so its business code leaves the
-/// cover's root unset.
+/// OrderToFulfillment (a process-manager target, built the same way):
+/// StartFulfillment to the instance it names, root 0xaa.
 fn order_to_fulfillment() -> PolicyDispatch {
-    PolicyDispatch::to_process_manager("OrderToFulfillment", "order", "fulfillment")
+    PolicyDispatch::new("OrderToFulfillment", "order", "fulfillment")
         .on_event(&fq::<OrderPlaced>(), |event, _cover| {
-            Ok(vec![start(None, quantity_of(event))])
+            Ok(vec![start(Some(uuid_of(NAMED)), quantity_of(event))])
         })
 }
 
@@ -124,138 +129,61 @@ fn refused_internal(err: CodedError, code: &str) -> CodedError {
     err
 }
 
-// --- an aggregate target: the policy names the root (C-0656, C-0665) ----------
+// --- the policy names the root, for every target (C-0656, C-0658, C-0665) ----
 
-// C-0656: a command to an aggregate lands on the root it names, with the
-// trigger's correlation.
+// C-0656 and C-0658: a command lands on the root it names, an aggregate's
+// or a process manager's alike, with the trigger's correlation.
 #[test]
-fn a_command_to_an_aggregate_keeps_the_root_it_names() {
-    let resp = order_to_inventory()
-        .dispatch(&one_placed())
-        .expect("dispatched");
-    assert_eq!(resp.commands.len(), 1);
-    assert_eq!(cover_of(&resp.commands[0]).root, Some(uuid_of(INVENTORY)));
-    keeps_the_triggers_correlation(&resp.commands[0], CORRELATION);
-}
-
-// C-0665: an aggregate command naming no root is a policy bug: refused
-// INTERNAL (dead-lettered and alerted), with no commands, and no root is
-// filled in. A root whose UUID holds no bytes names none either.
-#[test]
-fn a_command_to_an_aggregate_naming_no_root_is_refused() {
-    for root in [None, Some(pb::Uuid::default())] {
-        let policy = PolicyDispatch::new("OrderToInventory", "order", "inventory")
-            .on_event(&fq::<OrderPlaced>(), move |_event, _cover| {
-                Ok(vec![reserve(root.clone(), 3)])
-            });
-        let err = refused_internal(
-            policy
-                .dispatch(&one_placed())
-                .expect_err("an aggregate command names its root"),
-            codes::POLICY_COMMAND_NO_ROOT,
-        );
-        let extra = |key: &str| err.extras.get(key).map(String::as_str);
-        assert_eq!(extra(extras::DOMAIN), Some("inventory"));
-        assert_eq!(
-            extra(extras::COMMAND_TYPE),
-            Some(fq::<ReserveStock>().as_str())
-        );
+fn a_command_keeps_the_root_it_names_for_any_target() {
+    for (policy, root) in [
+        (order_to_inventory(), INVENTORY),
+        (order_to_fulfillment(), NAMED),
+    ] {
+        let resp = policy.dispatch(&one_placed()).expect("dispatched");
+        assert_eq!(resp.commands.len(), 1);
+        assert_eq!(cover_of(&resp.commands[0]).root, Some(uuid_of(root)));
+        keeps_the_triggers_correlation(&resp.commands[0], CORRELATION);
     }
 }
 
-// --- a process-manager target: naming the root is optional (C-0657, C-0658) ---
-
-// C-0657, the router's half: with no root callback the command leaves its
-// cover's root UNSET on the wire. The router does not fill the default
-// (the trigger's correlation): that is the framework's coordinator code.
-// Unset is the default here, not a policy bug.
+// C-0665, for every target: a command naming no root is a policy bug,
+// refused INTERNAL (dead-lettered and alerted) with no commands, and no
+// root is filled in. A process manager is not differentiated: there is no
+// default root. A root whose UUID holds no bytes names none either.
 #[test]
-fn a_command_to_a_process_manager_naming_no_root_leaves_it_unset() {
-    let resp = order_to_fulfillment()
-        .dispatch(&one_placed())
-        .expect("an unset root to a PM is the default, not malformed");
-    assert_eq!(resp.commands.len(), 1);
-    assert_eq!(
-        cover_of(&resp.commands[0]).root,
-        None,
-        "the router never fills the default root"
-    );
-    keeps_the_triggers_correlation(&resp.commands[0], CORRELATION);
-}
-
-// C-0658: a policy implementing root_StartFulfillment names the instance:
-// the command lands on that root and keeps the trigger's correlation.
-#[test]
-fn a_root_callback_names_the_process_manager_instance() {
-    let policy =
-        order_to_fulfillment().on_root(&fq::<StartFulfillment>(), |_event| Ok(uuid_of(NAMED)));
-    let resp = policy.dispatch(&one_placed()).expect("dispatched");
-    assert_eq!(resp.commands.len(), 1);
-    assert_eq!(cover_of(&resp.commands[0]).root, Some(uuid_of(NAMED)));
-    keeps_the_triggers_correlation(&resp.commands[0], CORRELATION);
-}
-
-// The callback derives the root from its triggering event alone (a policy
-// looks nothing up): each page's command gets the root its own event
-// derives.
-#[test]
-fn a_root_callback_sees_each_triggering_event() {
-    let policy = order_to_fulfillment().on_root(&fq::<StartFulfillment>(), |event| {
-        Ok(uuid_of(quantity_of(event) as u8))
-    });
-    let resp = policy
-        .dispatch(&order_source(
-            None,
-            vec![placed(4, 0x11, CORRELATION), placed(5, 0x22, CORRELATION)],
-        ))
-        .expect("dispatched");
-    let roots: Vec<_> = resp
-        .commands
-        .iter()
-        .map(|c| cover_of(c).root.clone())
-        .collect();
-    assert_eq!(roots, vec![Some(uuid_of(0x11)), Some(uuid_of(0x22))]);
-}
-
-// The callback is per command type: a command of a type with none keeps
-// its root unset, the default instance.
-#[test]
-fn a_root_callback_names_only_its_own_commands_root() {
-    let policy = PolicyDispatch::to_process_manager("OrderToFulfillment", "order", "fulfillment")
-        .on_event(&fq::<OrderPlaced>(), |_event, _cover| {
-            Ok(vec![
-                start(None, 3),
-                command_to(
-                    "fulfillment",
-                    None,
-                    any_of(&RecordStockReserved { quantity: 3 }),
-                ),
-            ])
-        })
-        .on_root(&fq::<StartFulfillment>(), |_event| Ok(uuid_of(NAMED)));
-    let resp = policy.dispatch(&one_placed()).expect("dispatched");
-    assert_eq!(cover_of(&resp.commands[0]).root, Some(uuid_of(NAMED)));
-    assert_eq!(cover_of(&resp.commands[1]).root, None);
-}
-
-// A failing root callback is a policy bug, like a failing event handler.
-#[test]
-fn a_failing_root_callback_is_unhandled() {
-    let policy = order_to_fulfillment().on_root(&fq::<StartFulfillment>(), |_event| {
-        Err(HandlerError::Other("no root".to_string()))
-    });
-    let err = policy
-        .dispatch(&one_placed())
-        .expect_err("a failing root callback");
-    refused_internal(err, codes::UNHANDLED_HANDLER_ERROR);
+fn a_command_naming_no_root_is_refused_for_any_target() {
+    let targets: [Target; 2] = [
+        ("inventory", |root| reserve(root, 3), fq::<ReserveStock>()),
+        (
+            "fulfillment",
+            |root| start(root, 3),
+            fq::<StartFulfillment>(),
+        ),
+    ];
+    for (domain, build, command_type) in targets {
+        for root in [None, Some(pb::Uuid::default())] {
+            let policy = PolicyDispatch::new("OrderTo", "order", domain)
+                .on_event(&fq::<OrderPlaced>(), move |_event, _cover| {
+                    Ok(vec![build(root.clone())])
+                });
+            let err = refused_internal(
+                policy
+                    .dispatch(&one_placed())
+                    .expect_err("a policy's command names its root"),
+                codes::POLICY_COMMAND_NO_ROOT,
+            );
+            let extra = |key: &str| err.extras.get(key).map(String::as_str);
+            assert_eq!(extra(extras::DOMAIN), Some(domain));
+            assert_eq!(extra(extras::COMMAND_TYPE), Some(command_type.as_str()));
+        }
+    }
 }
 
 // --- correlation traces the causal chain --------------------------------------
 
 // Every command a policy sends, to any target, carries its trigger's
 // correlation unchanged: a policy cannot change it. One that sets another
-// is a policy bug, refused INTERNAL with no commands, whether it goes to an
-// aggregate or to a PM (with its root named or not).
+// is a policy bug, refused INTERNAL with no commands.
 #[test]
 fn a_command_carrying_another_correlation_is_refused() {
     let other = |mut book: pb::CommandBook| {
@@ -266,17 +194,11 @@ fn a_command_carrying_another_correlation_is_refused() {
         .on_event(&fq::<OrderPlaced>(), move |_e, _c| {
             Ok(vec![other(reserve(Some(uuid_of(INVENTORY)), 3))])
         });
-    let to_default =
-        PolicyDispatch::to_process_manager("OrderToFulfillment", "order", "fulfillment")
-            .on_event(&fq::<OrderPlaced>(), move |_e, _c| {
-                Ok(vec![other(start(None, 3))])
-            });
-    let to_named = PolicyDispatch::to_process_manager("OrderToFulfillment", "order", "fulfillment")
+    let to_fulfillment = PolicyDispatch::new("OrderToFulfillment", "order", "fulfillment")
         .on_event(&fq::<OrderPlaced>(), move |_e, _c| {
-            Ok(vec![other(start(None, 3))])
-        })
-        .on_root(&fq::<StartFulfillment>(), |_event| Ok(uuid_of(NAMED)));
-    for policy in [to_inventory, to_default, to_named] {
+            Ok(vec![other(start(Some(uuid_of(NAMED)), 3))])
+        });
+    for policy in [to_inventory, to_fulfillment] {
         refused_internal(
             policy
                 .dispatch(&one_placed())
@@ -329,9 +251,9 @@ fn each_command_is_checked_against_its_own_triggers_correlation() {
 
 // --- fan-out (C-0660) --------------------------------------------------------
 
-// C-0660, the router's half: one OrderPlaced feeds both policies; the
-// aggregate's command names inventory 7, the PM's leaves its root unset
-// (the default), and neither carries another correlation.
+// C-0660, the router's half: one OrderPlaced feeds both policies; each
+// command names its root (inventory 7, fulfillment 0xaa), and neither
+// carries another correlation.
 #[test]
 fn one_event_fans_out_to_an_aggregate_and_a_process_manager() {
     let source = one_placed();
@@ -345,34 +267,34 @@ fn one_event_fans_out_to_an_aggregate_and_a_process_manager() {
         cover_of(&inventory.commands[0]).root,
         Some(uuid_of(INVENTORY))
     );
-    assert_eq!(cover_of(&fulfillment.commands[0]).root, None);
+    assert_eq!(
+        cover_of(&fulfillment.commands[0]).root,
+        Some(uuid_of(NAMED))
+    );
     keeps_the_triggers_correlation(&inventory.commands[0], CORRELATION);
     keeps_the_triggers_correlation(&fulfillment.commands[0], CORRELATION);
 }
 
 // --- the edition: unchanged (POLICY_COMMAND_OUTSIDE_EDITION) ------------------
 
-// A PM command, root named or not, stays in its trigger's edition, as an
-// aggregate command does.
+// A process manager's command stays in its trigger's edition, as an
+// aggregate's does.
 #[test]
 fn a_process_manager_command_stays_in_its_triggers_edition() {
-    let named = order_to_fulfillment().on_root(&fq::<StartFulfillment>(), |_e| Ok(uuid_of(NAMED)));
-    for policy in [order_to_fulfillment(), named] {
-        let resp = policy
-            .dispatch(&order_source(
-                Some("what-if"),
-                vec![placed(4, 3, CORRELATION)],
-            ))
-            .expect("dispatched");
-        assert_eq!(
-            cover_of(&resp.commands[0]).edition.as_deref(),
-            Some("what-if")
-        );
-    }
-    let stray = PolicyDispatch::to_process_manager("Stray", "order", "fulfillment").on_event(
+    let resp = order_to_fulfillment()
+        .dispatch(&order_source(
+            Some("what-if"),
+            vec![placed(4, 3, CORRELATION)],
+        ))
+        .expect("dispatched");
+    assert_eq!(
+        cover_of(&resp.commands[0]).edition.as_deref(),
+        Some("what-if")
+    );
+    let stray = PolicyDispatch::new("Stray", "order", "fulfillment").on_event(
         &fq::<OrderPlaced>(),
         |_e, _c| {
-            let mut book = start(None, 3);
+            let mut book = start(Some(uuid_of(NAMED)), 3);
             book.cover.as_mut().unwrap().edition = Some("elsewhere".to_string());
             Ok(vec![book])
         },
