@@ -52,7 +52,7 @@ FFI + conformance — is likewise written once.)
 
 ## The POC line (`poc/dispatch`)
 
-This line brings the pure dispatch to spec 581d23e for the angzarr/annals
+This line brings the pure dispatch to spec 55eab0f for the angzarr/annals
 POC: a process manager is a domain (decision 14.31; the trigger-fed
 `ProcessManagerDispatch` is deleted), refusals are typed and come back
 through a policy's OnRefused, and `DomainDispatch::admit` applies the
