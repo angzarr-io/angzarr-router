@@ -640,6 +640,7 @@ async fn rejects_with_code(
     add_item_fails(
         w,
         conf::AddItemFails::Rejects {
+            status: angzarr_router::error::BusinessStatus::FailedPrecondition,
             code,
             args: vec![(name, value)],
             logs,

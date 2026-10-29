@@ -649,8 +649,9 @@ pub struct OrderObserved {
 /// handler's own log: it is handed to nothing that crosses a boundary.
 #[derive(Debug, Clone)]
 pub enum AddItemFails {
-    /// An untyped business rejection: `code` and `args`.
+    /// An untyped business rejection under `status`: `code` and `args`.
     Rejects {
+        status: BusinessStatus,
         code: String,
         args: Vec<(String, String)>,
         logs: String,
@@ -672,9 +673,14 @@ pub enum AddItemFails {
 impl AddItemFails {
     fn fail(&self) -> HandlerError {
         match self {
-            AddItemFails::Rejects { code, args, logs } => {
+            AddItemFails::Rejects {
+                status,
+                code,
+                args,
+                logs,
+            } => {
                 let _ = logs; // the handler's own log
-                CodedError::rejection(BusinessStatus::FailedPrecondition, code, args.clone()).into()
+                CodedError::rejection(*status, code, args.clone()).into()
             }
             AddItemFails::Refuses { item, on_hand } => {
                 CodedError::refused(orders_any(&orders::v1::ItemOutOfStock {
