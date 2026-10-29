@@ -582,7 +582,8 @@ fn commutative_without_a_changed_function_is_unsupported() {
         ))
         .expect_err("no conflict units registered");
     assert_eq!(err.code, codes::CONFLICT_RESOLUTION_UNSUPPORTED);
-    assert_eq!(err.grpc, GrpcCode::InvalidArgument);
+    crate::test_support::assert_bug(&err);
+    assert_eq!(err.grpc, GrpcCode::Internal);
 }
 
 // --- the overlap rule (options.proto conflict_units, "Overlap") -------------
@@ -706,7 +707,8 @@ fn an_upcast_type_with_no_handler_is_refused_naming_both_types() {
         .dispatch(&command_for(typed("test.BumpOld")))
         .expect_err("BumpLost reaches no handler");
     assert_eq!(err.code, "UNKNOWN_COMMAND_TYPE");
-    assert_eq!(err.grpc, GrpcCode::InvalidArgument);
+    crate::test_support::assert_bug(&err);
+    assert_eq!(err.grpc, GrpcCode::Internal);
     assert_eq!(err.status_message(), "UNKNOWN_COMMAND_TYPE");
     assert_eq!(
         err.extras.get("type_url").map(String::as_str),
@@ -723,8 +725,9 @@ fn a_type_with_no_handler_and_no_upcaster_path_is_refused_naming_the_sent_type()
     let err = upcasting_aggregate(Arc::default())
         .dispatch(&command_for(typed("test.BumpV0")))
         .expect_err("no path to a handler");
-    assert_eq!(err.grpc, GrpcCode::InvalidArgument);
+    assert_eq!(err.grpc, GrpcCode::Internal);
     assert_eq!(err.code, "UNKNOWN_COMMAND_TYPE");
+    crate::test_support::assert_bug(&err);
     assert_eq!(
         err.extras.get("type_url").map(String::as_str),
         Some(type_url("test.BumpV0").as_str())

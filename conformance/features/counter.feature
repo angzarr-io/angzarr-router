@@ -43,7 +43,7 @@ Feature: Counter aggregate dispatch
     Given a new counter
     When an unhandled command is dispatched
     Then the command fails with UNKNOWN_COMMAND_TYPE
-    And the refusal is INVALID_ARGUMENT naming the type URL "type.googleapis.com/test.counter.Reserve"
+    And the refusal is INTERNAL naming the type URL "type.googleapis.com/test.counter.Reserve"
 
   Scenario: a command carrying no command book is refused
     When a command with no command book is dispatched

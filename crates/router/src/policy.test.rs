@@ -169,6 +169,7 @@ fn empty_source_is_empty_policy_source() {
         .dispatch(&source_book("order", vec![]))
         .expect_err("empty source must fail");
     assert_eq!(err.code, codes::EMPTY_POLICY_SOURCE);
+    crate::test_support::assert_bug(&err);
 }
 
 #[test]

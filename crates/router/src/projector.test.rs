@@ -162,6 +162,7 @@ fn missing_cover_is_coded_error() {
     };
     let err = d.dispatch(&no_cover).expect_err("missing cover must fail");
     assert_eq!(err.code, codes::MISSING_EVENT_BOOK_COVER);
+    crate::test_support::assert_bug(&err);
 }
 
 #[test]

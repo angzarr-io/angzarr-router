@@ -187,7 +187,7 @@ fn recorded_book(w: &CounterWorld) -> &pb::EventBook {
     resp.events.as_ref().expect("an events response")
 }
 
-#[then(regex = r#"^the refusal is INVALID_ARGUMENT naming the type URL "([^"]*)"$"#)]
+#[then(regex = r#"^the refusal is INTERNAL naming the type URL "([^"]*)"$"#)]
 async fn refused_naming(w: &mut CounterWorld, url: String) {
     let err = w
         .result
@@ -195,7 +195,8 @@ async fn refused_naming(w: &mut CounterWorld, url: String) {
         .expect("a command was dispatched")
         .as_ref()
         .expect_err("expected a refusal");
-    assert_eq!(err.grpc, angzarr_router::error::GrpcCode::InvalidArgument);
+    // The router's own malformed-input error is a bug (14.37 ruling).
+    assert_eq!(err.grpc, angzarr_router::error::GrpcCode::Internal);
     // Decision 14.37: the type URL is an arg; the status message is the key.
     assert_eq!(err.extras.get("type_url"), Some(&url), "the type_url arg");
     assert_eq!(

@@ -95,9 +95,10 @@ fn an_unknown_type_is_invalid_argument_naming_its_type_url() {
     let err = d
         .dispatch(&command_for(unknown.clone()))
         .expect_err("an unknown command type");
-    assert_eq!(err.grpc, GrpcCode::InvalidArgument);
+    assert_eq!(err.grpc, GrpcCode::Internal);
     // Decision 14.37: the key is the status message; the args name the type.
     assert_eq!(err.code, "UNKNOWN_COMMAND_TYPE");
+    crate::test_support::assert_bug(&err);
     assert_eq!(err.status_message(), "UNKNOWN_COMMAND_TYPE");
     assert_eq!(err.extras.get("type_url"), Some(&url));
     // upcaster.proto (VC-1): the ErrorInfo metadata key upcast_type_url
@@ -111,7 +112,8 @@ fn an_unknown_type_is_invalid_argument_naming_its_type_url() {
         .dispatch(&contextual(fact_page(unknown)))
         .expect_err("an unknown fact type");
     assert_eq!(err.code, codes::NO_FACT_HANDLER);
-    assert_eq!(err.grpc, GrpcCode::InvalidArgument);
+    crate::test_support::assert_bug(&err);
+    assert_eq!(err.grpc, GrpcCode::Internal);
     assert_eq!(err.status_message(), codes::NO_FACT_HANDLER);
     assert_eq!(err.extras.get("type_url"), Some(&url));
 }
@@ -141,6 +143,7 @@ fn missing_command_envelope_guards_exact_codes() {
         .dispatch(&pb::ContextualCommand::default())
         .expect_err("no command book");
     assert_eq!(err.code, codes::MISSING_COMMAND_BOOK);
+    crate::test_support::assert_bug(&err);
 
     let err = d
         .dispatch(&pb::ContextualCommand {
@@ -149,6 +152,7 @@ fn missing_command_envelope_guards_exact_codes() {
         })
         .expect_err("no page");
     assert_eq!(err.code, codes::MISSING_COMMAND_PAGE);
+    crate::test_support::assert_bug(&err);
 }
 
 #[test]
@@ -158,6 +162,7 @@ fn page_without_payload_coded() {
         .dispatch(&contextual(pb::CommandPage::default()))
         .expect_err("page without a body");
     assert_eq!(err.code, codes::MISSING_COMMAND_PAYLOAD);
+    crate::test_support::assert_bug(&err);
 }
 
 #[test]
@@ -167,6 +172,7 @@ fn empty_type_url_coded() {
         .dispatch(&command_for(Any::default()))
         .expect_err("empty type_url");
     assert_eq!(err.code, codes::MISSING_COMMAND_PAYLOAD);
+    crate::test_support::assert_bug(&err);
 }
 
 #[test]
@@ -275,7 +281,8 @@ fn an_undeclared_fact_type_is_refused_before_any_handler_runs() {
     });
     let err = d.dispatch(&req).expect_err("an undeclared fact type");
     assert_eq!(err.code, codes::NO_FACT_HANDLER);
-    assert_eq!(err.grpc, GrpcCode::InvalidArgument);
+    crate::test_support::assert_bug(&err);
+    assert_eq!(err.grpc, GrpcCode::Internal);
     assert_eq!(
         err.extras.get("type_url").map(String::as_str),
         Some(type_url("test.Undeclared").as_str())
@@ -292,6 +299,7 @@ fn a_command_type_sent_as_a_fact_is_refused() {
         .dispatch(&contextual(fact_page(cover_any("x"))))
         .expect_err("a command type in the Fact arm");
     assert_eq!(err.code, codes::NO_FACT_HANDLER);
+    crate::test_support::assert_bug(&err);
     assert!(
         contexts.lock().unwrap().is_empty(),
         "no command handler ran"
@@ -304,6 +312,7 @@ fn a_fact_type_sent_as_a_command_is_refused() {
         .dispatch(&command_for(cover_any("f1")))
         .expect_err("a fact type in the Command arm");
     assert_eq!(err.code, "UNKNOWN_COMMAND_TYPE");
+    crate::test_support::assert_bug(&err);
 }
 
 #[test]
@@ -315,6 +324,7 @@ fn a_fact_without_a_payload_is_coded() {
         }))
         .expect_err("a fact with no payload");
     assert_eq!(err.code, codes::MISSING_COMMAND_PAYLOAD);
+    crate::test_support::assert_bug(&err);
 }
 
 #[test]

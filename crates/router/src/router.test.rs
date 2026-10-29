@@ -208,11 +208,13 @@ fn a_router_dispatches_commands_and_facts_to_its_aggregate() {
         .dispatch_command(&command("order", "test.Unknown"))
         .unwrap_err();
     assert_eq!(err.code, "UNKNOWN_COMMAND_TYPE");
-    assert_eq!(err.grpc, crate::error::GrpcCode::InvalidArgument);
+    crate::test_support::assert_bug(&err);
+    assert_eq!(err.grpc, crate::error::GrpcCode::Internal);
     let err = router
         .dispatch_command(&fact("order", "test.Unrecorded"))
         .unwrap_err();
     assert_eq!(err.code, codes::NO_FACT_HANDLER);
+    crate::test_support::assert_bug(&err);
 }
 
 fn source(domain: &str) -> pb::EventBook {
@@ -507,6 +509,15 @@ fn an_old_type_colliding_with_a_current_one_fails_the_build() {
         ),
     );
     assert_eq!(err, codes::DUPLICATE_COMMAND_HANDLER);
+    let err = RouterBuilder::new()
+        .aggregate(
+            aggregate("a", "order", &["test.Ship", "test.ShipV1"])
+                .with_command_upcaster(renaming("test.ShipV1", "test.Ship")),
+        )
+        .build()
+        .err()
+        .expect("refused");
+    crate::test_support::assert_bug(&err);
 }
 
 #[test]
@@ -522,6 +533,7 @@ fn an_old_type_that_upcasts_to_nothing_is_refused_naming_where_it_ended() {
         .dispatch_command(&command("order", "test.ShipOld"))
         .expect_err("ShipLost reaches no handler");
     assert_eq!(err.code, "UNKNOWN_COMMAND_TYPE");
+    crate::test_support::assert_bug(&err);
     assert_eq!(
         err.extras.get("upcast_type_url").map(String::as_str),
         Some(type_url("test.ShipLost").as_str()),
@@ -609,4 +621,5 @@ fn a_router_refuses_its_components_hello_without_a_rules_version() {
         .component_descriptor()
         .expect_err("refused");
     assert_eq!(err.code, codes::MISSING_RULES_VERSION);
+    crate::test_support::assert_bug(&err);
 }

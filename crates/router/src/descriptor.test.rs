@@ -34,7 +34,8 @@ fn inputs(descriptor: &pb::ComponentDescriptor) -> Vec<&str> {
 fn assert_missing_rules_version(result: Result<pb::ComponentDescriptor, crate::error::CodedError>) {
     let err = result.expect_err("an empty rules version is refused");
     assert_eq!(err.code, codes::MISSING_RULES_VERSION);
-    assert_eq!(err.grpc, GrpcCode::InvalidArgument);
+    crate::test_support::assert_bug(&err);
+    assert_eq!(err.grpc, GrpcCode::Internal);
     assert!(
         err.extras.contains_key(crate::error::extras::COMPONENT),
         "the refusal names the component"
@@ -122,7 +123,8 @@ fn a_stateful_component_whose_rebuilder_declares_no_state_type_is_refused() {
         pm.component_descriptor().expect_err("no state type"),
     ] {
         assert_eq!(err.code, codes::MISSING_STATE_TYPE);
-        assert_eq!(err.grpc, GrpcCode::InvalidArgument);
+        crate::test_support::assert_bug(&err);
+        assert_eq!(err.grpc, GrpcCode::Internal);
         assert!(err.extras.contains_key(crate::error::extras::COMPONENT));
     }
 }
@@ -187,7 +189,8 @@ fn an_aggregate_declaring_a_starting_type_is_refused() {
         .component_descriptor()
         .expect_err("starts is a process manager's");
     assert_eq!(err.code, codes::STARTING_TYPES_ON_NON_PM);
-    assert_eq!(err.grpc, GrpcCode::InvalidArgument);
+    crate::test_support::assert_bug(&err);
+    assert_eq!(err.grpc, GrpcCode::Internal);
 }
 
 #[test]

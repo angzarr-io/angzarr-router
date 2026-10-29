@@ -291,7 +291,7 @@ pub struct Router {
 }
 
 fn wrong_kind() -> CodedError {
-    CodedError::invalid_argument(codes::NO_HANDLER_REGISTERED, [])
+    CodedError::unimplemented(codes::NO_HANDLER_REGISTERED, [])
 }
 
 impl Router {

@@ -509,7 +509,7 @@ fn a_refusal_fact_for_any_other_stream_is_refused() {
                 .admit(&arrival(&refusal_fact(other, trigger.clone()), existing()))
                 .expect_err("another stream"),
             codes::REFUSAL_FACT_WRONG_STREAM,
-            GrpcCode::InvalidArgument,
+            GrpcCode::Internal,
         );
     }
 }
@@ -587,7 +587,10 @@ fn a_passed_through_refusal_of_a_command_with_no_handler_is_no_fact_handler() {
             ..Default::default()
         })
         .expect_err("no handler");
-    assert_eq!(err.code, codes::NO_FACT_HANDLER);
+    // Decision 14.37: its own key, NO_REFUSAL_HANDLER; a bug.
+    assert_eq!(err.code, "NO_REFUSAL_HANDLER");
+    crate::test_support::assert_bug(&err);
+    crate::test_support::assert_bug(&err);
 }
 
 // --- no edition-lifecycle outcome (owner ruling, 2026-10-28) -----------------

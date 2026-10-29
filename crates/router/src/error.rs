@@ -335,6 +335,18 @@ impl CodedError {
         Self::invalid_argument(codes::ANY_DECODE_FAILED, [])
     }
 
+    /// A request the router hosts no component for, or a policy source
+    /// from outside its input domain (UNIMPLEMENTED): a misroute or a
+    /// stale deployment.
+    ///
+    /// RED STUB (ruling 2026-10-29): the old mapping table.
+    pub(crate) fn unimplemented(
+        code: &str,
+        extras: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        Self::invalid_argument(code, extras)
+    }
+
     /// A stale command (ABORTED, as STRICT would answer it): its conflict
     /// window was not resolved, or COMMUTATIVE found an overlap.
     pub fn stale(code: &str, extras: impl IntoIterator<Item = (String, String)>) -> Self {

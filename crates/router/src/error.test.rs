@@ -29,15 +29,19 @@ fn typed_refusal() -> prost_types::Any {
 fn every_constructor() -> Vec<(&'static str, CodedError)> {
     vec![
         (
-            "invalid_argument",
-            CodedError::invalid_argument(codes::MISSING_COMMAND_BOOK, []),
+            "internal",
+            CodedError::internal(codes::MISSING_COMMAND_BOOK, []),
         ),
         (
-            "invalid_argument with args",
-            CodedError::invalid_argument(
+            "internal with args",
+            CodedError::internal(
                 codes::MISSING_RULES_VERSION,
                 [arg(extras::COMPONENT, "order")],
             ),
+        ),
+        (
+            "unimplemented",
+            CodedError::unimplemented("NO_COMPONENT_OF_KIND", []),
         ),
         (
             "unknown_type",
@@ -74,7 +78,7 @@ fn every_constructor() -> Vec<(&'static str, CodedError)> {
             CodedError::bug("LEDGER_OFFLINE", [arg("ledger", "main")]),
         ),
         (
-            "internal",
+            "internal, a policy's",
             CodedError::internal(codes::POLICY_COMMAND_NO_ROOT, []),
         ),
         (
@@ -194,7 +198,9 @@ fn a_typed_refusal_is_command_refused_naming_its_type() {
 #[test]
 fn undecodable_bytes_name_the_message_type() {
     let err = CodedError::undecodable("io.angzarr.v1.ContextualCommand");
-    assert_eq!(err.grpc, GrpcCode::InvalidArgument);
+    // The router's own malformed-input error: a bug (owner ruling,
+    // 2026-10-29).
+    assert_eq!(err.grpc, GrpcCode::Internal);
     assert_eq!(err.code, codes::ANY_DECODE_FAILED);
     assert_eq!(
         err.extras,
@@ -290,10 +296,14 @@ fn every_key_of_the_14_37_inventory_is_a_router_code() {
 
 #[test]
 fn the_retired_keys_are_gone() {
-    let kept: Vec<&str> = ["MALFORMED_REFUSAL_FACT", "DUPLICATE_REGISTRATION"]
-        .into_iter()
-        .filter(|key| codes::ALL.contains(key))
-        .collect();
+    let kept: Vec<&str> = [
+        "MALFORMED_REFUSAL_FACT",
+        "DUPLICATE_REGISTRATION",
+        "NO_HANDLER_REGISTERED",
+    ]
+    .into_iter()
+    .filter(|key| codes::ALL.contains(key))
+    .collect();
     assert!(
         kept.is_empty(),
         "decision 14.37 retired these, still in codes::ALL: {kept:?}"
@@ -376,23 +386,31 @@ fn an_unlocated_fold_failure_names_the_batchs_range() {
 fn no_component_for_the_request_is_unimplemented() {
     for code in ["NO_COMPONENT_OF_KIND", "POLICY_SOURCE_OUTSIDE_INPUT_DOMAIN"] {
         assert_eq!(
-            CodedError::invalid_argument(code, []).grpc,
+            CodedError::unimplemented(code, []).grpc,
             GrpcCode::Unimplemented,
             "{code}: misrouted request / stale deployment, not a malformed payload"
         );
     }
 }
 
+// The router's own errors on malformed input are bugs (owner ruling on
+// decision 14.37, 2026-10-29): INTERNAL, never a policy's OnRefused.
 #[test]
-fn other_coded_client_errors_are_invalid_argument() {
+fn the_routers_own_malformed_input_is_a_bug() {
     for code in [
         codes::MISSING_COMMAND_BOOK,
         codes::MISSING_COMMAND_PAGE,
         codes::MISSING_COMMAND_PAYLOAD,
     ] {
-        let err = CodedError::invalid_argument(code, []);
-        assert_eq!(err.grpc, GrpcCode::InvalidArgument, "code {code}");
+        crate::test_support::assert_bug(&CodedError::internal(code, []));
     }
+    crate::test_support::assert_bug(&CodedError::unknown_type(
+        "UNKNOWN_COMMAND_TYPE",
+        "/a.B",
+        "/a.B",
+        [],
+    ));
+    crate::test_support::assert_bug(&CodedError::undecodable("io.angzarr.v1.EventBook"));
 }
 
 #[test]

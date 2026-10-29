@@ -137,6 +137,26 @@ impl prost::Name for LedgerState {
     const PACKAGE: &'static str = "test.ledger";
 }
 
+/// Asserts `err` is a bug (owner ruling on decision 14.37, 2026-10-29):
+/// the router's own error on malformed input is INTERNAL, alerted and
+/// dead-lettered, and never reaches a policy's OnRefused.
+pub fn assert_bug(err: &crate::error::CodedError) {
+    use crate::error::{ErrorClass, GrpcCode};
+    assert_eq!(
+        err.grpc,
+        GrpcCode::Internal,
+        "{}: the router's own malformed-input error is a bug",
+        err.code
+    );
+    assert_eq!(err.grpc.class(), ErrorClass::Bug, "{}", err.code);
+    assert_eq!(
+        err.refusal_response(),
+        None,
+        "{}: never a policy's OnRefused",
+        err.code
+    );
+}
+
 /// Asserts `err` is a failing fold answered INTERNAL as a handler bug, under
 /// `code` (FOLD_FAILED or FOLD_FAILED_EMITTED; decision 14.37), the `located` metadata (sequence and type_url, or the batch's
 /// first_sequence and last_sequence) and `state_type_url`.
