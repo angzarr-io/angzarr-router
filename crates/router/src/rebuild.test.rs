@@ -522,7 +522,10 @@ fn a_batched_fold_failure_names_the_page_it_indexes() {
     let r = failing_fold(
         FoldFailure {
             page_index: Some(1),
-            message: "no".to_string(),
+            cause: Some(pb::Diagnostic {
+                code: "NO".to_string(),
+                ..Default::default()
+            }),
         },
         calls.clone(),
     );
@@ -544,6 +547,11 @@ fn a_batched_fold_failure_names_the_page_it_indexes() {
         "no fold text crosses (decision 14.37): {:?}",
         err.extras
     );
+    assert_eq!(
+        err.extras.get(extras::CAUSE).map(String::as_str),
+        Some("NO"),
+        "the fold's own failure is its cause"
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 1, "the fold is never re-run");
 }
 
@@ -554,7 +562,7 @@ fn an_unlocated_or_out_of_range_fold_failure_names_the_batchs_range() {
         let r = failing_fold(
             FoldFailure {
                 page_index,
-                message: String::new(),
+                cause: None,
             },
             calls.clone(),
         );
@@ -577,7 +585,7 @@ fn folding_emitted_pages_says_the_command_emitted_them() {
     let r = failing_fold(
         FoldFailure {
             page_index: Some(0),
-            message: String::new(),
+            cause: None,
         },
         Arc::default(),
     );

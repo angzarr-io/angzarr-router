@@ -60,11 +60,12 @@ pub struct Rebuilder<S> {
 pub type ImageFn<S> = Box<dyn Fn(&S) -> Any + Send + Sync>;
 
 /// How a batched fold failed: the index of the failing page within the
-/// batch it was handed, when it knows, and its own text.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// batch it was handed, when it knows, and its own failure as a key and
+/// args, when it has one (decision 14.37: never text).
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct FoldFailure {
     pub page_index: Option<usize>,
-    pub message: String,
+    pub cause: Option<pb::Diagnostic>,
 }
 
 /// Where the pages a fold failed on came from.
@@ -80,12 +81,10 @@ impl PageOrigin {
     /// The key a fold failing on pages from here answers with: FOLD_FAILED
     /// for persisted events, FOLD_FAILED_EMITTED for emitted ones
     /// (decision 14.37).
-    ///
-    /// RED STUB (14.37): both still UNHANDLED_HANDLER_ERROR.
     pub fn code(self) -> &'static str {
         match self {
-            PageOrigin::Persisted => codes::UNHANDLED_HANDLER_ERROR,
-            PageOrigin::Emitted => codes::UNHANDLED_HANDLER_ERROR,
+            PageOrigin::Persisted => codes::FOLD_FAILED,
+            PageOrigin::Emitted => codes::FOLD_FAILED_EMITTED,
         }
     }
 }
@@ -101,13 +100,26 @@ pub fn fold_error(
     state_type_url: &str,
 ) -> CodedError {
     let at = match failure.page_index.and_then(|index| pages.get(index)) {
-        Some(page) => return page_fold_error(origin, page, state_type_url, &failure.message),
+        Some(page) => return page_fold_error(origin, page, state_type_url, failure.cause.as_ref()),
         None => FoldAt::Range {
             first: pages.first().map_or(0, |p| p.sequence),
             last: pages.last().map_or(0, |p| p.sequence),
         },
     };
-    CodedError::fold_failed(origin.code(), at, state_type_url, None)
+    CodedError::fold_failed(origin.code(), at, state_type_url, failure.cause.as_ref())
+}
+
+/// An applier's failure as a fold's cause: its key and args when it failed
+/// with a [`CodedError`], else none (its text stays in its own log;
+/// decision 14.37).
+fn applier_cause(err: &(dyn std::error::Error + Send + Sync + 'static)) -> Option<pb::Diagnostic> {
+    match err.downcast_ref::<CodedError>() {
+        Some(coded) => Some(coded.diagnostic()),
+        None => {
+            tracing::debug!(error = %err, "an applier's unclassified failure");
+            None
+        }
+    }
 }
 
 /// The type URL a component declares for the message `full_name`: "" (none
@@ -125,11 +137,9 @@ pub fn page_fold_error(
     origin: PageOrigin,
     page: &pb::EventPage,
     state_type_url: &str,
-    fold_message: &str,
+    cause: Option<&pb::Diagnostic>,
 ) -> CodedError {
     let type_url = crate::page_event(page).map_or("", |e| e.type_url.as_str());
-    // RED STUB (14.37): the fold's own failure is not yet its cause.
-    let _ = fold_message;
     CodedError::fold_failed(
         origin.code(),
         FoldAt::Page {
@@ -137,7 +147,7 @@ pub fn page_fold_error(
             type_url,
         },
         state_type_url,
-        None,
+        cause,
     )
 }
 
@@ -334,7 +344,7 @@ impl<S> Rebuilder<S> {
                     PageOrigin::Persisted,
                     page,
                     &self.state_type_url,
-                    &err.to_string(),
+                    applier_cause(&*err).as_ref(),
                 ));
             }
             info.applied_count += 1;
@@ -432,8 +442,14 @@ impl<S> Rebuilder<S> {
             sequence: page.sequence,
             meta: page.meta.as_ref(),
         };
-        thunk(state, event, &ctx)
-            .map_err(|err| page_fold_error(origin, page, &self.state_type_url, &err.to_string()))?;
+        thunk(state, event, &ctx).map_err(|err| {
+            page_fold_error(
+                origin,
+                page,
+                &self.state_type_url,
+                applier_cause(&*err).as_ref(),
+            )
+        })?;
         Ok(true)
     }
 }

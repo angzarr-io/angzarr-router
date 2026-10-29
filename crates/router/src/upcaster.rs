@@ -9,7 +9,7 @@
 
 use prost_types::Any;
 
-use crate::error::{map_handler_error, CodedError, HandlerError};
+use crate::error::{call_handler, CodedError, HandlerError};
 use crate::pb;
 
 /// Transforms one event to its next schema version. Generated thunks unpack
@@ -65,7 +65,7 @@ impl UpcasterDispatch {
         let mut current = event.clone();
         for (source, rule) in &self.rules {
             if crate::type_name_from_url(&current.type_url) == source {
-                current = rule(&current).map_err(map_handler_error)?;
+                current = call_handler(|| rule(&current))?;
             }
         }
         Ok(current)

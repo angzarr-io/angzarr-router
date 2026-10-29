@@ -312,7 +312,7 @@ pub fn failhard_command() -> pb::ContextualCommand {
     parse_txtpb(CONTEXTUAL_COMMAND, SKEL_FAILHARD)
 }
 
-/// A command whose type has no registered handler (drives NO_HANDLER_REGISTERED).
+/// A command whose type has no registered handler (drives UNKNOWN_COMMAND_TYPE).
 pub fn unhandled_command() -> pb::ContextualCommand {
     parse_txtpb(CONTEXTUAL_COMMAND, SKEL_UNHANDLED)
 }

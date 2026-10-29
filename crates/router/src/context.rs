@@ -133,8 +133,7 @@ pub fn command_context(req: &pb::ContextualCommand) -> CommandContext {
         command_id: page.and_then(|p| p.command_id.clone()),
         correlation_id: page.and_then(|p| p.correlation_id.clone()),
         fact_origin: page.and_then(|p| p.fact_origin.clone()),
-        // RED STUB (14.37): not yet read from `req.recorded_at`.
-        recorded_at: None,
+        recorded_at: req.recorded_at,
     }
 }
 

@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 
 use prost_types::Any;
 
-use crate::error::{codes, map_handler_error, CodedError, HandlerError};
+use crate::error::{call_handler, codes, map_handler_error, CodedError, HandlerError};
 use crate::pb;
 use crate::rebuild::{fold_error, page_fold_error, FoldFailure, PageOrigin};
 
@@ -161,10 +161,7 @@ impl<P> ProjectorDispatch<P> {
     /// still finishes; an event type with no thunk is skipped.
     pub fn dispatch(&self, events: &pb::EventBook) -> Result<pb::Projection, CodedError> {
         let Some(cover) = events.cover.as_ref() else {
-            return Err(CodedError::invalid_argument(
-                codes::MISSING_EVENT_BOOK_COVER,
-                [],
-            ));
+            return Err(CodedError::internal(codes::MISSING_EVENT_BOOK_COVER, []));
         };
 
         let mut projection = (self.factory)();
@@ -206,19 +203,19 @@ impl<P> ProjectorDispatch<P> {
                     sequence: page.sequence,
                     meta: page.meta.as_ref(),
                 };
-                thunk(&mut projection, event_any, &ctx).map_err(|err| {
+                fold_handler(|| thunk(&mut projection, event_any, &ctx)).map_err(|cause| {
                     page_fold_error(
                         PageOrigin::Persisted,
                         page,
                         &self.projection_type_url,
-                        &handler_error_text(&err),
+                        cause.as_ref(),
                     )
                 })?;
             }
         }
 
         match self.finish.as_ref() {
-            Some(finish) => finish(&mut projection, events).map_err(map_handler_error),
+            Some(finish) => call_handler(|| finish(&mut projection, events)),
             None => Ok(pb::Projection {
                 cover: Some(cover.clone()),
                 projector: self.name.clone(),
@@ -239,11 +236,24 @@ pub fn next_sequence_after(events: &pb::EventBook) -> u64 {
         .map_or(events.next_sequence, |page| page.sequence + 1)
 }
 
-/// A handler error's text, for a failing fold's `fold_message`.
-fn handler_error_text(err: &HandlerError) -> String {
-    match err {
-        HandlerError::Coded(coded) => format!("{}: {}", coded.code, coded.message),
-        HandlerError::Other(text) => text.clone(),
+/// Runs a projector's fold handler: its failure is the fold's cause, a key
+/// and args (decision 14.37): a coded error's own, a panic's
+/// HANDLER_PANICKED, and none for an unclassified error, whose text stays in
+/// its own log.
+fn fold_handler(
+    handler: impl FnOnce() -> Result<(), HandlerError>,
+) -> Result<(), Option<pb::Diagnostic>> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(handler)) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(HandlerError::Coded(coded))) => Err(Some(coded.diagnostic())),
+        Ok(Err(other)) => {
+            map_handler_error(other);
+            Err(None)
+        }
+        Err(_) => Err(Some(pb::Diagnostic {
+            code: codes::HANDLER_PANICKED.to_string(),
+            ..Default::default()
+        })),
     }
 }
 

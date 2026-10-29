@@ -19,12 +19,12 @@ Feature: Facts and handler context
   Scenario: a fact of an undeclared type is refused
     Given a ledger aggregate
     When a Reserve fact is handled over no prior events
-    Then the fact is refused with NO_FACT_HANDLER as INVALID_ARGUMENT
+    Then the fact is refused with NO_FACT_HANDLER as INTERNAL
 
   Scenario: a command delivered as a fact is refused
     Given a ledger aggregate
     When an IncreaseBy fact is handled over no prior events
-    Then the fact is refused with NO_FACT_HANDLER as INVALID_ARGUMENT
+    Then the fact is refused with NO_FACT_HANDLER as INTERNAL
 
   Scenario: an applier reads each event's sequence
     Given a ledger aggregate

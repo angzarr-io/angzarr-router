@@ -44,14 +44,20 @@ pub enum ErrorClass {
 
 impl GrpcCode {
     /// The class an error with this status is (owner ruling, 2026-10-29).
-    ///
-    /// RED STUB (ruling 2026-10-29): the superseded "only
-    /// FAILED_PRECONDITION is a business refusal".
+    /// UNIMPLEMENTED (a request this router hosts no component for: a
+    /// misroute or a stale deployment) is retried.
     pub fn class(self) -> ErrorClass {
         match self {
-            GrpcCode::FailedPrecondition => ErrorClass::BusinessRefusal,
-            GrpcCode::Internal | GrpcCode::DataLoss => ErrorClass::Bug,
-            _ => ErrorClass::Retryable,
+            GrpcCode::FailedPrecondition
+            | GrpcCode::InvalidArgument
+            | GrpcCode::NotFound
+            | GrpcCode::AlreadyExists
+            | GrpcCode::OutOfRange
+            | GrpcCode::PermissionDenied => ErrorClass::BusinessRefusal,
+            GrpcCode::Internal | GrpcCode::Unknown | GrpcCode::DataLoss => ErrorClass::Bug,
+            GrpcCode::Aborted | GrpcCode::Unavailable | GrpcCode::Unimplemented => {
+                ErrorClass::Retryable
+            }
         }
     }
 
@@ -94,98 +100,175 @@ impl From<BusinessStatus> for GrpcCode {
 
 /// A status a host or a binding hands over at run time is checked: a
 /// non-business status is refused with itself.
-///
-/// RED STUB (ruling 2026-10-29): refuses everything.
 impl TryFrom<GrpcCode> for BusinessStatus {
     type Error = GrpcCode;
     fn try_from(code: GrpcCode) -> Result<Self, GrpcCode> {
-        Err(code)
+        match code {
+            GrpcCode::FailedPrecondition => Ok(BusinessStatus::FailedPrecondition),
+            GrpcCode::InvalidArgument => Ok(BusinessStatus::InvalidArgument),
+            GrpcCode::NotFound => Ok(BusinessStatus::NotFound),
+            GrpcCode::AlreadyExists => Ok(BusinessStatus::AlreadyExists),
+            GrpcCode::OutOfRange => Ok(BusinessStatus::OutOfRange),
+            GrpcCode::PermissionDenied => Ok(BusinessStatus::PermissionDenied),
+            other => Err(other),
+        }
     }
 }
 
-/// Cross-language error codes (the slice's subset of the 47-code inventory).
+/// The router's reason keys (decision 14.37): one per condition, each its
+/// own status message and `ErrorInfo` reason.
 pub mod codes {
+    // --- handler failures ---------------------------------------------------
+    /// An error escaped a business handler, or it failed as a bug: its own
+    /// code and args, when it has them, are the `cause`.
+    pub const UNHANDLED_HANDLER_ERROR: &str = "UNHANDLED_HANDLER_ERROR";
+    /// The cause of a handler that panicked.
+    pub const HANDLER_PANICKED: &str = "HANDLER_PANICKED";
+    /// A typed business refusal: its `refusal_type` names the object.
+    pub const COMMAND_REFUSED: &str = "COMMAND_REFUSED";
+    /// A fold failed on persisted events.
+    pub const FOLD_FAILED: &str = "FOLD_FAILED";
+    /// A fold failed on an event the command emitted.
+    pub const FOLD_FAILED_EMITTED: &str = "FOLD_FAILED_EMITTED";
+
+    // --- malformed input (bugs: owner ruling, 2026-10-29) -----------------
     pub const ANY_DECODE_FAILED: &str = "ANY_DECODE_FAILED";
-    pub const NO_HANDLER_REGISTERED: &str = "NO_HANDLER_REGISTERED";
     pub const MISSING_COMMAND_BOOK: &str = "MISSING_COMMAND_BOOK";
     pub const MISSING_COMMAND_PAGE: &str = "MISSING_COMMAND_PAGE";
     pub const MISSING_COMMAND_PAYLOAD: &str = "MISSING_COMMAND_PAYLOAD";
-    pub const PERSISTED_EVENT_CORRUPT: &str = "PERSISTED_EVENT_CORRUPT";
-    pub const UNHANDLED_HANDLER_ERROR: &str = "UNHANDLED_HANDLER_ERROR";
     pub const MISSING_EVENT_BOOK_COVER: &str = "MISSING_EVENT_BOOK_COVER";
     pub const EMPTY_POLICY_SOURCE: &str = "EMPTY_POLICY_SOURCE";
-    pub const DUPLICATE_REGISTRATION: &str = "DUPLICATE_REGISTRATION";
-    pub const NO_HANDLERS_REGISTERED: &str = "NO_HANDLERS_REGISTERED";
-    pub const DUPLICATE_COMMAND_HANDLER: &str = "DUPLICATE_COMMAND_HANDLER";
+    /// A command type no handler claims, after upcasting.
+    pub const UNKNOWN_COMMAND_TYPE: &str = "UNKNOWN_COMMAND_TYPE";
+    /// A fact type no handler claims, after upcasting.
     pub const NO_FACT_HANDLER: &str = "NO_FACT_HANDLER";
-    pub const CONFLICT_UNRESOLVED: &str = "CONFLICT_UNRESOLVED";
-    pub const CONFLICT_OVERLAP: &str = "CONFLICT_OVERLAP";
-    pub const CONFLICT_RESOLUTION_UNSUPPORTED: &str = "CONFLICT_RESOLUTION_UNSUPPORTED";
-    pub const MISSING_RULES_VERSION: &str = "MISSING_RULES_VERSION";
-    pub const MISSING_STATE_TYPE: &str = "MISSING_STATE_TYPE";
-    pub const POLICY_COMMAND_OUTSIDE_DESTINATION: &str = "POLICY_COMMAND_OUTSIDE_DESTINATION";
-    /// A policy command naming an edition other than its trigger's (owner
-    /// ruling, 2026-10-28; types.proto Cover.edition: a policy stays in the
-    /// edition of the event it handles).
-    pub const POLICY_COMMAND_OUTSIDE_EDITION: &str = "POLICY_COMMAND_OUTSIDE_EDITION";
-    /// A policy's command whose cover names no root, whatever its target
-    /// (decision 14.36, amended: a process manager is not differentiated;
-    /// policy.proto PolicyResponse): a policy bug.
-    pub const POLICY_COMMAND_NO_ROOT: &str = "POLICY_COMMAND_NO_ROOT";
-    /// A policy's command carrying a correlation_id other than its
-    /// trigger's (decision 14.36; policy.proto PolicyResponse): a policy bug.
-    pub const POLICY_COMMAND_OTHER_CORRELATION: &str = "POLICY_COMMAND_OTHER_CORRELATION";
-    /// A policy's OnRefused answer that is not a bare Fact (no cover, no
-    /// identity, no Handling), or a refusal lacking what addressing it needs
-    /// (policy.proto, OnRefusedResponse): a policy bug.
-    pub const MALFORMED_REFUSAL_FACT: &str = "MALFORMED_REFUSAL_FACT";
-    /// A command for a process manager's correlation with no instance, of a
-    /// type the PM does not declare as starting (process_manager.proto;
-    /// decision 14.31).
-    pub const PM_NO_INSTANCE: &str = "PM_NO_INSTANCE";
+    /// A pass-through CommandRefused the domain has no handler for.
+    pub const NO_REFUSAL_HANDLER: &str = "NO_REFUSAL_HANDLER";
+    /// A Refusal given to a policy with no command.
+    pub const REFUSAL_WITHOUT_COMMAND: &str = "REFUSAL_WITHOUT_COMMAND";
+    /// A Refusal given to a policy with no event.
+    pub const REFUSAL_WITHOUT_EVENT: &str = "REFUSAL_WITHOUT_EVENT";
     /// A refusal fact addressed to any stream but the exact one its
     /// causation_id names (types.proto, the command_identity region).
     pub const REFUSAL_FACT_WRONG_STREAM: &str = "REFUSAL_FACT_WRONG_STREAM";
+    pub const CONFLICT_RESOLUTION_UNSUPPORTED: &str = "CONFLICT_RESOLUTION_UNSUPPORTED";
+    /// A host callback's status bytes that do not decode (the C ABI).
+    pub const HOST_STATUS_UNDECODABLE: &str = "HOST_STATUS_UNDECODABLE";
+    /// A null pointer crossing the C ABI.
+    pub const NULL_ABI_POINTER: &str = "NULL_ABI_POINTER";
+
+    // --- the store ------------------------------------------------------------
+    pub const PERSISTED_EVENT_CORRUPT: &str = "PERSISTED_EVENT_CORRUPT";
+
+    // --- stale commands ---------------------------------------------------------
+    pub const CONFLICT_UNRESOLVED: &str = "CONFLICT_UNRESOLVED";
+    pub const CONFLICT_OVERLAP: &str = "CONFLICT_OVERLAP";
+
+    // --- misroutes --------------------------------------------------------------
+    /// A dispatch to a kind of component the router does not host.
+    pub const NO_COMPONENT_OF_KIND: &str = "NO_COMPONENT_OF_KIND";
+    /// A policy given a book of a domain it does not consume.
+    pub const POLICY_SOURCE_OUTSIDE_INPUT_DOMAIN: &str = "POLICY_SOURCE_OUTSIDE_INPUT_DOMAIN";
+
+    // --- registration -------------------------------------------------------
+    pub const NO_HANDLERS_REGISTERED: &str = "NO_HANDLERS_REGISTERED";
+    /// A second component beside the one a router (a business process)
+    /// hosts.
+    pub const DUPLICATE_COMPONENT: &str = "DUPLICATE_COMPONENT";
+    /// A second upcaster chain for a component.
+    pub const DUPLICATE_UPCASTER_CHAIN: &str = "DUPLICATE_UPCASTER_CHAIN";
+    pub const DUPLICATE_COMMAND_HANDLER: &str = "DUPLICATE_COMMAND_HANDLER";
+    pub const MISSING_RULES_VERSION: &str = "MISSING_RULES_VERSION";
+    pub const MISSING_STATE_TYPE: &str = "MISSING_STATE_TYPE";
     /// A component other than a process manager declaring starting types
     /// (types.proto, ComponentDescriptor.starting_types).
     pub const STARTING_TYPES_ON_NON_PM: &str = "STARTING_TYPES_ON_NON_PM";
 
+    // --- a policy's bugs ------------------------------------------------------
+    pub const POLICY_COMMAND_OUTSIDE_DESTINATION: &str = "POLICY_COMMAND_OUTSIDE_DESTINATION";
+    /// A policy command naming an edition other than its trigger's (owner
+    /// ruling, 2026-10-28; types.proto Cover.edition).
+    pub const POLICY_COMMAND_OUTSIDE_EDITION: &str = "POLICY_COMMAND_OUTSIDE_EDITION";
+    /// A policy's command whose cover names no root (decision 14.36).
+    pub const POLICY_COMMAND_NO_ROOT: &str = "POLICY_COMMAND_NO_ROOT";
+    /// A policy's command carrying a correlation_id other than its
+    /// trigger's (decision 14.36).
+    pub const POLICY_COMMAND_OTHER_CORRELATION: &str = "POLICY_COMMAND_OTHER_CORRELATION";
+    /// OnRefusedResponse holds no fact (policy.proto, OnRefusedResponse).
+    pub const REFUSAL_FACT_MISSING: &str = "REFUSAL_FACT_MISSING";
+    /// The policy set the refusal fact's cover or handling.
+    pub const REFUSAL_FACT_ADDRESSED: &str = "REFUSAL_FACT_ADDRESSED";
+    /// The refusal fact has no page.
+    pub const REFUSAL_FACT_NO_PAGE: &str = "REFUSAL_FACT_NO_PAGE";
+    /// The refusal fact's page is a Command.
+    pub const REFUSAL_FACT_NOT_A_FACT: &str = "REFUSAL_FACT_NOT_A_FACT";
+    /// The policy set the refusal fact's identity.
+    pub const REFUSAL_FACT_IDENTIFIED: &str = "REFUSAL_FACT_IDENTIFIED";
+    /// The refusal to address carries no refused command.
+    pub const REFUSAL_WITHOUT_REFUSED_COMMAND: &str = "REFUSAL_WITHOUT_REFUSED_COMMAND";
+    /// The refused command carries no command_id.
+    pub const REFUSED_COMMAND_WITHOUT_ID: &str = "REFUSED_COMMAND_WITHOUT_ID";
+    /// The refusal carries no triggering stream.
+    pub const REFUSAL_WITHOUT_TRIGGER_STREAM: &str = "REFUSAL_WITHOUT_TRIGGER_STREAM";
+
+    // --- business rejections the router answers ---------------------------
+    /// A command for a process manager's correlation with no instance, of a
+    /// type the PM does not declare as starting (decision 14.31).
+    pub const PM_NO_INSTANCE: &str = "PM_NO_INSTANCE";
+
     /// The router's complete reason inventory (decision 14.37): every key
     /// the router, or the C ABI over it, answers with. A catalog that
     /// renders the router's errors carries a message for each.
-    ///
-    /// RED STUB (14.37): the pre-14.37 codes, unsplit.
     pub const ALL: &[&str] = &[
+        UNHANDLED_HANDLER_ERROR,
+        HANDLER_PANICKED,
+        COMMAND_REFUSED,
+        FOLD_FAILED,
+        FOLD_FAILED_EMITTED,
         ANY_DECODE_FAILED,
-        NO_HANDLER_REGISTERED,
         MISSING_COMMAND_BOOK,
         MISSING_COMMAND_PAGE,
         MISSING_COMMAND_PAYLOAD,
-        PERSISTED_EVENT_CORRUPT,
-        UNHANDLED_HANDLER_ERROR,
         MISSING_EVENT_BOOK_COVER,
         EMPTY_POLICY_SOURCE,
-        DUPLICATE_REGISTRATION,
-        NO_HANDLERS_REGISTERED,
-        DUPLICATE_COMMAND_HANDLER,
+        UNKNOWN_COMMAND_TYPE,
         NO_FACT_HANDLER,
+        NO_REFUSAL_HANDLER,
+        REFUSAL_WITHOUT_COMMAND,
+        REFUSAL_WITHOUT_EVENT,
+        REFUSAL_FACT_WRONG_STREAM,
+        CONFLICT_RESOLUTION_UNSUPPORTED,
+        HOST_STATUS_UNDECODABLE,
+        NULL_ABI_POINTER,
+        PERSISTED_EVENT_CORRUPT,
         CONFLICT_UNRESOLVED,
         CONFLICT_OVERLAP,
-        CONFLICT_RESOLUTION_UNSUPPORTED,
+        NO_COMPONENT_OF_KIND,
+        POLICY_SOURCE_OUTSIDE_INPUT_DOMAIN,
+        NO_HANDLERS_REGISTERED,
+        DUPLICATE_COMPONENT,
+        DUPLICATE_UPCASTER_CHAIN,
+        DUPLICATE_COMMAND_HANDLER,
         MISSING_RULES_VERSION,
         MISSING_STATE_TYPE,
+        STARTING_TYPES_ON_NON_PM,
         POLICY_COMMAND_OUTSIDE_DESTINATION,
         POLICY_COMMAND_OUTSIDE_EDITION,
         POLICY_COMMAND_NO_ROOT,
         POLICY_COMMAND_OTHER_CORRELATION,
-        MALFORMED_REFUSAL_FACT,
+        REFUSAL_FACT_MISSING,
+        REFUSAL_FACT_ADDRESSED,
+        REFUSAL_FACT_NO_PAGE,
+        REFUSAL_FACT_NOT_A_FACT,
+        REFUSAL_FACT_IDENTIFIED,
+        REFUSAL_WITHOUT_REFUSED_COMMAND,
+        REFUSED_COMMAND_WITHOUT_ID,
+        REFUSAL_WITHOUT_TRIGGER_STREAM,
         PM_NO_INSTANCE,
-        REFUSAL_FACT_WRONG_STREAM,
-        STARTING_TYPES_ON_NON_PM,
     ];
 }
 
-/// Cross-language detail-key constants.
+/// Cross-language arg names: the `ErrorInfo` metadata keys.
 pub mod extras {
     pub const DOMAIN: &str = "domain";
     pub const TYPE_URL: &str = "type_url";
@@ -201,12 +284,14 @@ pub mod extras {
     pub const ACTUAL_DOMAIN: &str = "actual_domain";
     pub const EXPECTED_EDITION: &str = "expected_edition";
     pub const ACTUAL_EDITION: &str = "actual_edition";
-    pub const REASON: &str = "reason";
     pub const FIRST_SEQUENCE: &str = "first_sequence";
     pub const LAST_SEQUENCE: &str = "last_sequence";
-    pub const FOLD_MESSAGE: &str = "fold_message";
-    /// A handler's bug's own code, under UNHANDLED_HANDLER_ERROR; its args
-    /// follow as `cause.<arg>` (decision 14.37).
+    /// A typed refusal's object's fully-qualified type (COMMAND_REFUSED).
+    pub const REFUSAL_TYPE: &str = "refusal_type";
+    /// The message bytes failed to decode as (ANY_DECODE_FAILED).
+    pub const MESSAGE_TYPE: &str = "message_type";
+    /// A wrapped cause's code; its args follow as `cause.<arg>` (decision
+    /// 14.37).
     pub const CAUSE: &str = "cause";
 }
 
@@ -223,16 +308,11 @@ pub enum FoldAt<'a> {
 /// is the cross-language SCREAMING_SNAKE key: the `ErrorInfo.reason` and
 /// the status message alike ([`Self::status_message`]); `extras` are the
 /// args, the `ErrorInfo` metadata, a wrapped cause flattened into them as
-/// `cause` and `cause.<arg>`; `grpc` is resolved by the single mapping
-/// table at construction. No constructor takes text.
-///
-/// RED (14.37): `message` is what the wire still reads as the status
-/// message. No constructor fills it any more; [`map_handler_error`] still
-/// puts an escaped error's text there. The green deletes the field.
+/// `cause` and `cause.<arg>`; `grpc` is resolved at construction, and
+/// decides the error's [`ErrorClass`]. No constructor takes text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodedError {
     pub code: String,
-    pub message: String,
     pub extras: BTreeMap<String, String>,
     pub grpc: GrpcCode,
     /// A business rejection's TYPED refusal object, packed: one of the
@@ -260,6 +340,20 @@ impl From<CodedError> for HandlerError {
     }
 }
 
+/// `cause`'s code under `name`, each of its args under `<name>.<arg>`
+/// (decision 14.37).
+fn flatten(
+    name: &str,
+    code: &str,
+    args: impl IntoIterator<Item = (String, String)>,
+) -> impl Iterator<Item = (String, String)> {
+    let name = name.to_string();
+    std::iter::once((name.clone(), code.to_string())).chain(
+        args.into_iter()
+            .map(move |(arg, value)| (format!("{name}.{arg}"), value)),
+    )
+}
+
 impl CodedError {
     fn coded(
         code: &str,
@@ -268,7 +362,6 @@ impl CodedError {
     ) -> Self {
         CodedError {
             code: code.to_string(),
-            message: String::new(),
             extras: extras.into_iter().collect(),
             grpc,
             refusal: None,
@@ -276,34 +369,24 @@ impl CodedError {
     }
 
     /// The gRPC status message: the reason key itself (decision 14.37).
-    ///
-    /// RED STUB (14.37): still the legacy `message` field.
     pub fn status_message(&self) -> &str {
-        &self.message
+        &self.code
     }
 
-    /// A coded client error. The gRPC code is resolved from the single
-    /// mapping table: a request this router hosts no component for →
-    /// UNIMPLEMENTED (an unknown type URL is [`Self::unknown_type`]
-    /// instead), PERSISTED_EVENT_CORRUPT → DATA_LOSS (store-sourced,
-    /// unrecoverable by retry), everything else → INVALID_ARGUMENT.
-    pub fn invalid_argument(
-        code: &str,
-        extras: impl IntoIterator<Item = (String, String)>,
-    ) -> Self {
-        let grpc = match code {
-            codes::NO_HANDLER_REGISTERED => GrpcCode::Unimplemented,
-            codes::PERSISTED_EVENT_CORRUPT => GrpcCode::DataLoss,
-            _ => GrpcCode::InvalidArgument,
-        };
-        Self::coded(code, extras, grpc)
+    /// This error as a key and args (types.proto, the diagnostic region).
+    pub fn diagnostic(&self) -> angzarr_proto::v1::Diagnostic {
+        angzarr_proto::v1::Diagnostic {
+            code: self.code.clone(),
+            args: self.extras.clone().into_iter().collect(),
+        }
     }
 
     /// A command or fact whose type URL reaches no registered handler
-    /// (`code` UNKNOWN_COMMAND_TYPE or NO_FACT_HANDLER): INVALID_ARGUMENT,
-    /// its args carrying the type URL as sent as `type_url` and the type the
-    /// upcaster chain ended at as `upcast_type_url` (upcaster.proto, VC-1:
-    /// the sent one when no upcaster applies).
+    /// (`code` UNKNOWN_COMMAND_TYPE or NO_FACT_HANDLER): a bug (INTERNAL;
+    /// owner ruling, 2026-10-29), its args carrying the type URL as sent as
+    /// `type_url` and the type the upcaster chain ended at as
+    /// `upcast_type_url` (upcaster.proto, VC-1: the sent one when no
+    /// upcaster applies).
     pub fn unknown_type(
         code: &str,
         type_url: &str,
@@ -321,30 +404,28 @@ impl CodedError {
             ]
             .into_iter()
             .chain(extras),
-            GrpcCode::InvalidArgument,
+            GrpcCode::Internal,
         )
     }
 
     /// Bytes that do not decode as the message `message_type` (its
-    /// fully-qualified name): ANY_DECODE_FAILED (INVALID_ARGUMENT), one
+    /// fully-qualified name): ANY_DECODE_FAILED, a bug (INTERNAL), one
     /// condition whatever the message, `message_type` its arg.
-    ///
-    /// RED STUB (14.37): drops `message_type`.
     pub fn undecodable(message_type: &str) -> Self {
-        let _ = message_type;
-        Self::invalid_argument(codes::ANY_DECODE_FAILED, [])
+        Self::internal(
+            codes::ANY_DECODE_FAILED,
+            [(extras::MESSAGE_TYPE.to_string(), message_type.to_string())],
+        )
     }
 
     /// A request the router hosts no component for, or a policy source
     /// from outside its input domain (UNIMPLEMENTED): a misroute or a
     /// stale deployment.
-    ///
-    /// RED STUB (ruling 2026-10-29): the old mapping table.
     pub(crate) fn unimplemented(
         code: &str,
         extras: impl IntoIterator<Item = (String, String)>,
     ) -> Self {
-        Self::invalid_argument(code, extras)
+        Self::coded(code, extras, GrpcCode::Unimplemented)
     }
 
     /// A stale command (ABORTED, as STRICT would answer it): its conflict
@@ -355,9 +436,10 @@ impl CodedError {
 
     /// Classifies a store-sourced decode failure (DATA_LOSS on the wire).
     pub fn persisted_corrupt(type_url: &str) -> Self {
-        Self::invalid_argument(
+        Self::coded(
             codes::PERSISTED_EVENT_CORRUPT,
             [(extras::TYPE_URL.to_string(), type_url.to_string())],
+            GrpcCode::DataLoss,
         )
     }
 
@@ -368,15 +450,12 @@ impl CodedError {
     /// `at` names the failing page or, when it is unknown, the batch's
     /// range; `cause`, the fold's own failure as a key and args, is
     /// flattened in as `cause` and `cause.<arg>`.
-    ///
-    /// RED STUB (14.37): `cause` is dropped.
     pub fn fold_failed(
         code: &str,
         at: FoldAt<'_>,
         state_type_url: &str,
         cause: Option<&angzarr_proto::v1::Diagnostic>,
     ) -> Self {
-        let _ = cause;
         let mut details = match at {
             FoldAt::Page { sequence, type_url } => vec![
                 (extras::SEQUENCE.to_string(), sequence.to_string()),
@@ -391,6 +470,9 @@ impl CodedError {
             extras::STATE_TYPE_URL.to_string(),
             state_type_url.to_string(),
         ));
+        if let Some(cause) = cause {
+            details.extend(flatten(extras::CAUSE, &cause.code, cause.args.clone()));
+        }
         Self::coded(code, details, GrpcCode::Internal)
     }
 
@@ -404,10 +486,8 @@ impl CodedError {
     /// A business handler that panicked (INTERNAL): UNHANDLED_HANDLER_ERROR
     /// with cause HANDLER_PANICKED. The panic's message stays in the
     /// handler's own log.
-    ///
-    /// RED STUB (14.37): no cause.
     pub fn panicked() -> Self {
-        Self::unhandled()
+        Self::bug(codes::HANDLER_PANICKED, [])
     }
 
     /// A business rejection under `status`, one of the business set: the
@@ -416,16 +496,12 @@ impl CodedError {
     /// its key and `details` its args; a typed refusal is
     /// [`Self::refused`] instead. The refusal reaches the issuing policy's
     /// OnRefused ([`Self::refusal_response`]).
-    ///
-    /// RED STUB (ruling 2026-10-29): `status` is ignored, always
-    /// FAILED_PRECONDITION.
     pub fn rejection(
         status: BusinessStatus,
         code: &str,
         details: impl IntoIterator<Item = (String, String)>,
     ) -> Self {
-        let _ = status;
-        Self::coded(code, details, GrpcCode::FailedPrecondition)
+        Self::coded(code, details, status.into())
     }
 
     /// A typed business refusal (FAILED_PRECONDITION): `refusal` is one of
@@ -433,10 +509,19 @@ impl CodedError {
     /// COMMAND_REFUSED, its `refusal_type` arg the object's fully-qualified
     /// type, and the object itself rides the status details (owner's
     /// ruling on decision 14.37).
-    ///
-    /// RED STUB (14.37): no key, no `refusal_type`.
     pub fn refused(refusal: prost_types::Any) -> Self {
-        Self::rejection(BusinessStatus::FailedPrecondition, "", []).with_refusal(refusal)
+        let full_name = refusal
+            .type_url
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        Self::rejection(
+            BusinessStatus::FailedPrecondition,
+            codes::COMMAND_REFUSED,
+            [(extras::REFUSAL_TYPE.to_string(), full_name)],
+        )
+        .with_refusal(refusal)
     }
 
     /// A bug: a defect, never a business answer. The other of the two
@@ -446,22 +531,21 @@ impl CodedError {
     /// `cause.<arg>=<value>` (decision 14.37); the runtime alerts it and
     /// dead-letters the input, and it never reaches a policy's OnRefused.
     pub fn bug(code: &str, details: impl IntoIterator<Item = (String, String)>) -> Self {
-        let cause = std::iter::once((extras::CAUSE.to_string(), code.to_string())).chain(
-            details
-                .into_iter()
-                .map(|(name, value)| (format!("{}.{name}", extras::CAUSE), value)),
-        );
-        Self::coded(codes::UNHANDLED_HANDLER_ERROR, cause, GrpcCode::Internal)
+        Self::coded(
+            codes::UNHANDLED_HANDLER_ERROR,
+            flatten(extras::CAUSE, code, details),
+            GrpcCode::Internal,
+        )
     }
 
-    /// A component bug the router itself finds (INTERNAL), under its own
-    /// code: a policy's malformed answer, say. Never a handler's.
+    /// A bug the router itself finds (INTERNAL), under its own code:
+    /// malformed input, a component's misconfiguration, a policy's
+    /// malformed answer. Never a handler's, and never a business refusal
+    /// (owner ruling, 2026-10-29).
     pub(crate) fn internal(code: &str, extras: impl IntoIterator<Item = (String, String)>) -> Self {
         Self::coded(code, extras, GrpcCode::Internal)
     }
-}
 
-impl CodedError {
     /// This business rejection carrying its typed refusal object (one of
     /// the command's `refuses` types, packed).
     pub fn with_refusal(self, refusal: prost_types::Any) -> Self {
@@ -473,10 +557,10 @@ impl CodedError {
 
     /// The refused policy's view of this answer (types.proto,
     /// RefusalResponse): `Some` for a business refusal only (its status in
-    /// the business set, [`GrpcCode::is_business_refusal`]), carrying the typed refusal object, or,
-    /// for an untyped rejection, its key and args as a `Diagnostic`; `None`
-    /// for every other failure, which never reaches a policy's OnRefused
-    /// (retried, or dead-lettered as a bug).
+    /// the business set, [`GrpcCode::is_business_refusal`]), carrying the
+    /// typed refusal object, or, for an untyped rejection, its key and args
+    /// as a `Diagnostic`; `None` for every other failure, which never
+    /// reaches a policy's OnRefused (retried, or dead-lettered as a bug).
     pub fn refusal_response(&self) -> Option<angzarr_proto::v1::RefusalResponse> {
         use angzarr_proto::v1::refusal_response::Reason;
         self.grpc
@@ -484,10 +568,7 @@ impl CodedError {
             .then(|| angzarr_proto::v1::RefusalResponse {
                 reason: Some(match self.refusal.as_deref() {
                     Some(refusal) => Reason::Refusal(refusal.clone()),
-                    None => Reason::Diagnostic(angzarr_proto::v1::Diagnostic {
-                        code: self.code.clone(),
-                        args: self.extras.clone().into_iter().collect(),
-                    }),
+                    None => Reason::Diagnostic(self.diagnostic()),
                 }),
             })
     }
@@ -496,27 +577,49 @@ impl CodedError {
 /// In process too, an error shows as its code then its args, ` name=value`
 /// each, a wrapped cause flattened as on the wire; never English (decision
 /// 14.37, owner's clarification of 2026-10-29).
-///
-/// RED STUB (14.37): the legacy `message`.
 impl std::fmt::Display for CodedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
+        f.write_str(&self.code)?;
+        for (name, value) in &self.extras {
+            write!(f, " {name}={value}")?;
+        }
+        Ok(())
     }
 }
+
+/// A CodedError is a std error, so an applier may fail with one: a failing
+/// fold then carries it as its `cause`.
+impl std::error::Error for CodedError {}
 
 /// The single handler-error mapping: coded errors pass through carrying
 /// their resolved gRPC code; unclassified errors become
 /// UNHANDLED_HANDLER_ERROR (INTERNAL) with no cause, their text left to the
 /// handler's own log.
-///
-/// RED STUB (14.37): an escaped error's text still rides `message`.
 pub fn map_handler_error(err: HandlerError) -> CodedError {
     match err {
         HandlerError::Coded(coded) => coded,
-        HandlerError::Other(message) => CodedError {
-            message,
-            ..CodedError::unhandled()
-        },
+        HandlerError::Other(escaped) => {
+            tracing::error!(
+                code = codes::UNHANDLED_HANDLER_ERROR,
+                escaped = %escaped,
+                "a handler's unclassified error"
+            );
+            CodedError::unhandled()
+        }
+    }
+}
+
+/// Runs a business handler, answering its panic as a bug
+/// (UNHANDLED_HANDLER_ERROR, cause HANDLER_PANICKED; decision 14.37) and
+/// mapping its error ([`map_handler_error`]). The panic's message stays in
+/// the handler's own log; the router answers rather than unwinding into its
+/// host.
+pub(crate) fn call_handler<T>(
+    handler: impl FnOnce() -> Result<T, HandlerError>,
+) -> Result<T, CodedError> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(handler)) {
+        Ok(answer) => answer.map_err(map_handler_error),
+        Err(_) => Err(CodedError::panicked()),
     }
 }
 

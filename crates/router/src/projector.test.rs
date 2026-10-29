@@ -216,7 +216,8 @@ fn a_failing_fold_is_a_handler_bug_naming_its_page() {
     for (failure, cause) in [
         (HandlerError::Other("boom".to_string()), vec![]),
         (
-            HandlerError::Coded(crate::error::CodedError::invalid_argument(
+            HandlerError::Coded(crate::error::CodedError::rejection(
+                crate::error::BusinessStatus::FailedPrecondition,
                 "SOME_CODE",
                 [("x".to_string(), "1".to_string())],
             )),
@@ -378,7 +379,7 @@ fn a_batched_fold_failure_names_its_page_or_the_batchs_range() {
             .with_fold(move |_p, _pages, _c| {
                 Err(crate::rebuild::FoldFailure {
                     page_index,
-                    message: "boom".to_string(),
+                    cause: None,
                 })
             })
     };

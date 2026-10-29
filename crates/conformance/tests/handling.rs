@@ -507,11 +507,6 @@ async fn ingests(w: &mut HandlingWorld, kind: String, item: String) {
     assert_eq!(seen.item, item);
 }
 
-#[then("the command is refused INVALID_ARGUMENT")]
-async fn refused_invalid(w: &mut HandlingWorld) {
-    assert_eq!(w.refusal().grpc, GrpcCode::InvalidArgument);
-}
-
 #[then("business code is not invoked")]
 async fn not_invoked(w: &mut HandlingWorld) {
     assert!(w.seen.lock().unwrap().is_empty());

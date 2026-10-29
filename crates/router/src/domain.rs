@@ -20,7 +20,7 @@
 //! ContextualCommand's page picks the pipeline (Command → a command handler,
 //! Fact → a fact handler) and the payload's type URL picks the handler. The
 //! envelope, the arm and the type validate BEFORE state is rebuilt (an
-//! unknown command must report NO_HANDLER_REGISTERED, not whatever the
+//! unknown command must report UNKNOWN_COMMAND_TYPE, not whatever the
 //! rebuild would surface). There is no compensation input.
 
 use std::collections::{BTreeSet, HashMap};
@@ -28,7 +28,7 @@ use std::collections::{BTreeSet, HashMap};
 use prost::Message;
 use prost_types::Any;
 
-use crate::error::{codes, extras, map_handler_error, BusinessStatus, CodedError, HandlerError};
+use crate::error::{call_handler, codes, extras, BusinessStatus, CodedError, HandlerError};
 use crate::pb;
 use crate::rebuild::{PageOrigin, Rebuilder};
 
@@ -74,16 +74,16 @@ impl<S, I> Resolver<S> for CommutativeOps<S, I> {
         decide: &mut dyn FnMut(&mut S) -> Result<pb::EventBook, CodedError>,
         fold_events: &mut dyn FnMut(&mut S, &pb::EventBook) -> Result<(), CodedError>,
     ) -> Result<Resolved, CodedError> {
-        let expected = (self.capture)(state).map_err(map_handler_error)?;
+        let expected = call_handler(|| (self.capture)(state))?;
         fold_window(state)?;
-        let head = (self.capture)(state).map_err(map_handler_error)?;
+        let head = call_handler(|| (self.capture)(state))?;
         let events = decide(state)?;
-        (self.restore)(state, &head).map_err(map_handler_error)?;
+        call_handler(|| (self.restore)(state, &head))?;
         fold_events(state, &events)?;
-        let after = (self.capture)(state).map_err(map_handler_error)?;
+        let after = call_handler(|| (self.capture)(state))?;
         Ok(Resolved {
-            window: (self.changed)(&expected, &head).map_err(map_handler_error)?,
-            mine: (self.changed)(&head, &after).map_err(map_handler_error)?,
+            window: call_handler(|| (self.changed)(&expected, &head))?,
+            mine: call_handler(|| (self.changed)(&head, &after))?,
             events,
         })
     }
@@ -313,7 +313,7 @@ impl<S> DomainDispatch<S> {
     /// without a rules version, MISSING_STATE_TYPE without a state type.
     pub fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError> {
         if self.kind != pb::ComponentKind::ProcessManager && !self.starting.is_empty() {
-            return Err(CodedError::invalid_argument(
+            return Err(CodedError::internal(
                 codes::STARTING_TYPES_ON_NON_PM,
                 [(extras::COMPONENT.to_string(), self.name.clone())],
             ));
@@ -450,7 +450,7 @@ impl<S> DomainDispatch<S> {
             .into_iter()
             .find(|old| self.handlers.contains_key(old))
         {
-            Some(old) => Err(CodedError::invalid_argument(
+            Some(old) => Err(CodedError::internal(
                 codes::DUPLICATE_COMMAND_HANDLER,
                 [
                     (extras::DOMAIN.to_string(), self.domain.clone()),
@@ -469,7 +469,7 @@ impl<S> DomainDispatch<S> {
     /// `CommandHandlerService.Handle`: envelope guards with their exact
     /// codes; the payload upcast through the upcaster chains; the page's
     /// body arm picks the handler table — a Command runs its command handler
-    /// (none: NO_HANDLER_REGISTERED), a Fact its fact handler (none:
+    /// (none: UNKNOWN_COMMAND_TYPE), a Fact its fact handler (none:
     /// NO_FACT_HANDLER, so a fact never reaches a command handler or the
     /// reverse) — before rebuild (a corrupt persisted event fails the
     /// command). A refusal names the type URL the client sent; its extras
@@ -484,16 +484,10 @@ impl<S> DomainDispatch<S> {
         req: &pb::ContextualCommand,
     ) -> Result<pb::CommandHandlerResponse, CodedError> {
         let Some(command_book) = req.command.as_ref() else {
-            return Err(CodedError::invalid_argument(
-                codes::MISSING_COMMAND_BOOK,
-                [],
-            ));
+            return Err(CodedError::internal(codes::MISSING_COMMAND_BOOK, []));
         };
         let Some(page) = command_book.page.as_ref() else {
-            return Err(CodedError::invalid_argument(
-                codes::MISSING_COMMAND_PAGE,
-                [],
-            ));
+            return Err(CodedError::internal(codes::MISSING_COMMAND_PAGE, []));
         };
         let cover = req.events.as_ref().and_then(|b| b.cover.as_ref());
         let (mut events, state) = match &page.body {
@@ -502,7 +496,7 @@ impl<S> DomainDispatch<S> {
                 let any = self.upcast(sent)?;
                 let Some(thunk) = self.handlers.get(crate::type_name_from_url(&any.type_url))
                 else {
-                    return Err(self.unknown(codes::NO_HANDLER_REGISTERED, sent, &any));
+                    return Err(self.unknown(codes::UNKNOWN_COMMAND_TYPE, sent, &any));
                 };
                 self.decide(req, &any, thunk)?
             }
@@ -513,16 +507,13 @@ impl<S> DomainDispatch<S> {
                 let record_with: RecordFn<'_, S> = match self.facts.get(fact_type) {
                     Some(thunk) => {
                         let any = any.clone();
-                        Box::new(move |state, cctx| {
-                            thunk(&any, state, cctx).map_err(map_handler_error)
-                        })
+                        Box::new(move |state, cctx| call_handler(|| thunk(&any, state, cctx)))
                     }
                     None if fact_type == <pb::CommandRefused as prost::Name>::full_name() => {
                         let refused =
                             pb::CommandRefused::decode(any.value.as_slice()).map_err(|_| {
-                                CodedError::invalid_argument(
-                                    codes::ANY_DECODE_FAILED,
-                                    [(extras::TYPE_URL.to_string(), any.type_url.clone())],
+                                CodedError::undecodable(
+                                    &<pb::CommandRefused as prost::Name>::full_name(),
                                 )
                             })?;
                         let refused_type = refused
@@ -535,16 +526,12 @@ impl<S> DomainDispatch<S> {
                         let Some(thunk) =
                             self.refused.get(crate::type_name_from_url(&refused_type))
                         else {
-                            return Err(CodedError::unknown_type(
-                                codes::NO_FACT_HANDLER,
-                                &sent.type_url,
-                                &any.type_url,
+                            return Err(CodedError::internal(
+                                codes::NO_REFUSAL_HANDLER,
                                 [(extras::COMMAND_TYPE.to_string(), refused_type)],
                             ));
                         };
-                        Box::new(move |state, cctx| {
-                            thunk(&refused, state, cctx).map_err(map_handler_error)
-                        })
+                        Box::new(move |state, cctx| call_handler(|| thunk(&refused, state, cctx)))
                     }
                     None => return Err(self.unknown(codes::NO_FACT_HANDLER, sent, &any)),
                 };
@@ -569,10 +556,7 @@ impl<S> DomainDispatch<S> {
                 (recorded, state)
             }
             None => {
-                return Err(CodedError::invalid_argument(
-                    codes::MISSING_COMMAND_PAYLOAD,
-                    [],
-                ));
+                return Err(CodedError::internal(codes::MISSING_COMMAND_PAYLOAD, []));
             }
         };
         // The post-command snapshot, on every answer (owner ruling): the
@@ -647,9 +631,7 @@ impl<S> DomainDispatch<S> {
         let expected_sequence = base.expected_sequence;
         let conflict_resolution = base.conflict_resolution;
         let run = |state: &mut S, cctx: CommandContext| -> Result<pb::EventBook, CodedError> {
-            Ok(thunk(any, state, cctx)
-                .map_err(map_handler_error)?
-                .unwrap_or_default())
+            Ok(call_handler(|| thunk(any, state, cctx))?.unwrap_or_default())
         };
         match conflict_resolution {
             pb::ConflictResolution::AggregateHandles => {
@@ -663,7 +645,7 @@ impl<S> DomainDispatch<S> {
             }
             pb::ConflictResolution::Commutative => {
                 let Some(resolver) = self.commutative.as_ref() else {
-                    return Err(CodedError::invalid_argument(
+                    return Err(CodedError::internal(
                         codes::CONFLICT_RESOLUTION_UNSUPPORTED,
                         [],
                     ));
@@ -711,10 +693,7 @@ pub fn admit_rules(
 ) -> Result<Admission, CodedError> {
     let book = arrival.command;
     let Some(page) = book.page.as_ref() else {
-        return Err(CodedError::invalid_argument(
-            codes::MISSING_COMMAND_PAGE,
-            [],
-        ));
+        return Err(CodedError::internal(codes::MISSING_COMMAND_PAGE, []));
     };
     let (is_fact, sent) = match &page.body {
         Some(pb::command_page::Body::Command(c)) => (false, c.payload.as_ref()),
@@ -732,7 +711,7 @@ pub fn admit_rules(
             && named.root == cover.root
             && named.edition.as_deref().filter(|e| !e.is_empty()) == edition;
         if !same {
-            return Err(CodedError::invalid_argument(
+            return Err(CodedError::internal(
                 codes::REFUSAL_FACT_WRONG_STREAM,
                 [(extras::DOMAIN.to_string(), cover.domain.clone())],
             ));
@@ -789,10 +768,7 @@ fn split_at_expected(
 fn non_empty_payload(payload: Option<&Any>) -> Result<&Any, CodedError> {
     match payload {
         Some(any) if !any.type_url.is_empty() => Ok(any),
-        _ => Err(CodedError::invalid_argument(
-            codes::MISSING_COMMAND_PAYLOAD,
-            [],
-        )),
+        _ => Err(CodedError::internal(codes::MISSING_COMMAND_PAYLOAD, [])),
     }
 }
 

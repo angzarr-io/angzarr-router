@@ -11,7 +11,7 @@ use crate::pb;
 /// it consumes (deduplicated and sorted); `state` is set for aggregates and
 /// process managers only; `starting_types` are a process manager's starting
 /// input types (decision 14.31). An empty `rules_version` is refused
-/// MISSING_RULES_VERSION (INVALID_ARGUMENT), as the coordinator refuses
+/// MISSING_RULES_VERSION (INTERNAL: a misconfiguration is a bug), as the coordinator refuses
 /// such a registration, naming the component.
 pub(crate) fn component_descriptor(
     name: &str,
@@ -22,7 +22,7 @@ pub(crate) fn component_descriptor(
     starting_types: Vec<String>,
 ) -> Result<pb::ComponentDescriptor, CodedError> {
     if rules_version.is_empty() {
-        return Err(CodedError::invalid_argument(
+        return Err(CodedError::internal(
             codes::MISSING_RULES_VERSION,
             [(extras::COMPONENT.to_string(), name.to_string())],
         ));
@@ -45,7 +45,7 @@ pub(crate) fn component_descriptor(
 /// type URL and the full resolved list of supported resolutions, in
 /// enum-number order. The base is STRICT and AGGREGATE_HANDLES; COMMUTATIVE
 /// (number 1) leads when the state has a `changed()`. An undeclared state
-/// type (empty `type_url`) is refused MISSING_STATE_TYPE (INVALID_ARGUMENT),
+/// type (empty `type_url`) is refused MISSING_STATE_TYPE (INTERNAL),
 /// naming the component.
 pub(crate) fn state_descriptor(
     component: &str,
@@ -53,7 +53,7 @@ pub(crate) fn state_descriptor(
     commutative: bool,
 ) -> Result<pb::StateDescriptor, CodedError> {
     if type_url.is_empty() {
-        return Err(CodedError::invalid_argument(
+        return Err(CodedError::internal(
             codes::MISSING_STATE_TYPE,
             [(extras::COMPONENT.to_string(), component.to_string())],
         ));

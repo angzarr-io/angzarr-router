@@ -26,7 +26,7 @@ use prost::{Message, Name};
 use prost_types::Any;
 
 use crate::context::CommandContext;
-use crate::error::{codes, extras, map_handler_error, CodedError, HandlerError};
+use crate::error::{call_handler, codes, extras, CodedError, HandlerError};
 use crate::pb;
 use crate::PageContext;
 
@@ -143,11 +143,15 @@ impl PolicyDispatch {
         refusal: &pb::Refusal,
         ctx: &CommandContext,
     ) -> Result<pb::OnRefusedResponse, CodedError> {
-        // RED (14.37): still one shared key; REFUSAL_WITHOUT_COMMAND and
-        // REFUSAL_WITHOUT_EVENT tell them apart.
-        let missing = |_what: &str| CodedError::invalid_argument(codes::MISSING_COMMAND_BOOK, []);
-        let command = refusal.command.as_ref().ok_or_else(|| missing("command"))?;
-        let event = refusal.event.as_ref().ok_or_else(|| missing("event"))?;
+        let missing = |code: &str| CodedError::internal(code, []);
+        let command = refusal
+            .command
+            .as_ref()
+            .ok_or_else(|| missing(codes::REFUSAL_WITHOUT_COMMAND))?;
+        let event = refusal
+            .event
+            .as_ref()
+            .ok_or_else(|| missing(codes::REFUSAL_WITHOUT_EVENT))?;
         let refused_type = command
             .page
             .as_ref()
@@ -155,7 +159,7 @@ impl PolicyDispatch {
             .map(|p| crate::type_name_from_url(&p.type_url).to_string())
             .unwrap_or_default();
         let payload = match self.refusals.get(&refused_type) {
-            Some(translate) => translate(refusal, ctx).map_err(map_handler_error)?,
+            Some(translate) => call_handler(|| translate(refusal, ctx))?,
             None => {
                 let trigger = pb::EventRef {
                     stream: event.cover.clone(),
@@ -242,7 +246,7 @@ impl PolicyDispatch {
     /// EMPTY_POLICY_SOURCE.
     pub fn dispatch(&self, source: &pb::EventBook) -> Result<pb::PolicyResponse, CodedError> {
         if source.pages.is_empty() {
-            return Err(CodedError::invalid_argument(codes::EMPTY_POLICY_SOURCE, []));
+            return Err(CodedError::internal(codes::EMPTY_POLICY_SOURCE, []));
         }
 
         let mut resp = pb::PolicyResponse::default();
@@ -262,7 +266,7 @@ impl PolicyDispatch {
                 sequence: page.sequence,
                 meta: page.meta.as_ref(),
             };
-            let commands = thunk(event_any, &context).map_err(map_handler_error)?;
+            let commands = call_handler(|| thunk(event_any, &context))?;
             if let Some(stray) = commands.iter().find(|c| self.outside_destination(c)) {
                 return Err(self.refuse_outside_destination(stray));
             }
@@ -396,43 +400,42 @@ pub fn address_refusal_fact(
     refusal: &pb::Refusal,
     answer: &pb::OnRefusedResponse,
 ) -> Result<pb::CommandBook, CodedError> {
-    // RED (14.37): still one shared key told apart by text; each condition
-    // gets its own key (REFUSAL_FACT_MISSING, REFUSAL_FACT_ADDRESSED, ...).
-    let malformed = |why: &str| {
-        CodedError::internal(
-            codes::MALFORMED_REFUSAL_FACT,
-            [(extras::REASON.to_string(), why.to_string())],
-        )
-    };
-    let fact = answer.fact.as_ref().ok_or_else(|| malformed("no fact"))?;
+    let malformed = |code: &str| CodedError::internal(code, []);
+    let fact = answer
+        .fact
+        .as_ref()
+        .ok_or_else(|| malformed(codes::REFUSAL_FACT_MISSING))?;
     if fact.cover.is_some() || fact.handling.is_some() {
-        return Err(malformed("the policy set the fact's cover or handling"));
+        return Err(malformed(codes::REFUSAL_FACT_ADDRESSED));
     }
-    let page = fact.page.as_ref().ok_or_else(|| malformed("no page"))?;
+    let page = fact
+        .page
+        .as_ref()
+        .ok_or_else(|| malformed(codes::REFUSAL_FACT_NO_PAGE))?;
     if crate::fact_payload(page).is_none() {
-        return Err(malformed("the page is not a Fact"));
+        return Err(malformed(codes::REFUSAL_FACT_NOT_A_FACT));
     }
     if page.command_id.is_some()
         || page.correlation_id.is_some()
         || page.causation_id.is_some()
         || page.fact_origin.is_some()
     {
-        return Err(malformed("the policy set the fact's identity"));
+        return Err(malformed(codes::REFUSAL_FACT_IDENTIFIED));
     }
     let refused = refusal
         .command
         .as_ref()
         .and_then(|c| c.page.as_ref())
-        .ok_or_else(|| malformed("the refusal carries no refused command"))?;
+        .ok_or_else(|| malformed(codes::REFUSAL_WITHOUT_REFUSED_COMMAND))?;
     let command_id = refused
         .command_id
         .clone()
-        .ok_or_else(|| malformed("the refused command carries no command_id"))?;
+        .ok_or_else(|| malformed(codes::REFUSED_COMMAND_WITHOUT_ID))?;
     let trigger = refusal
         .event
         .as_ref()
         .and_then(|e| e.cover.clone())
-        .ok_or_else(|| malformed("the refusal carries no triggering stream"))?;
+        .ok_or_else(|| malformed(codes::REFUSAL_WITHOUT_TRIGGER_STREAM))?;
     Ok(pb::CommandBook {
         cover: Some(trigger),
         page: Some(pb::CommandPage {

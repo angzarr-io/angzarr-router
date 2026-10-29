@@ -36,9 +36,9 @@ Feature: Counter aggregate dispatch
     Then the command fails with UNHANDLED_HANDLER_ERROR
 
   # command_handler.proto, CommandHandlerService.Handle step 2: a type URL
-  # that reaches no registered handler is refused INVALID_ARGUMENT, naming the
-  # type URL (decision 12.11; backlog VC-1), under its own key
-  # UNKNOWN_COMMAND_TYPE (decision 14.37).
+  # that reaches no registered handler is refused, naming the type URL
+  # (decision 12.11; backlog VC-1), under its own key UNKNOWN_COMMAND_TYPE,
+  # INTERNAL: the router's own malformed-input error is a bug (decision 14.37).
   Scenario: an unknown command is reported before any rebuild
     Given a new counter
     When an unhandled command is dispatched
@@ -57,10 +57,11 @@ Feature: Counter aggregate dispatch
     When a command whose page carries no payload is dispatched
     Then the command fails with MISSING_COMMAND_PAYLOAD
 
+  # A failing fold has its own key, FOLD_FAILED (decision 14.37).
   Scenario: a persisted event the fold cannot fold fails the command as a handler bug
     Given a counter whose history holds a corrupt event
     When the operator increases the counter by 1
-    Then the command fails with UNHANDLED_HANDLER_ERROR
+    Then the command fails with FOLD_FAILED
 
   Scenario: a fresh counter supplies no prior-history evidence to the handler
     Given a new counter

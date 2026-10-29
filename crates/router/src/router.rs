@@ -5,8 +5,9 @@
 //!
 //! [`RouterBuilder`] takes the component (and, optionally, its upcaster
 //! chain) and validates the configuration at build time: no component is
-//! NO_HANDLERS_REGISTERED (C-0060); a second component, of any kind, or a
-//! second upcaster chain is DUPLICATE_REGISTRATION; an aggregate whose
+//! NO_HANDLERS_REGISTERED (C-0060); a second component, of any kind, is
+//! DUPLICATE_COMPONENT, a second upcaster chain DUPLICATE_UPCASTER_CHAIN; an
+//! aggregate whose
 //! chain accepts one of its own current types is DUPLICATE_COMMAND_HANDLER.
 //! The built [`Router`] dispatches to that component:
 //!
@@ -188,15 +189,13 @@ impl Component {
         }
     }
 
-    /// The refusal of a second component (or a second upcaster chain) beside
-    /// this one: DUPLICATE_REGISTRATION naming this component and its kind
-    /// (C-0580).
-    ///
-    /// RED (14.37): one key for two conditions; DUPLICATE_COMPONENT and
-    /// DUPLICATE_UPCASTER_CHAIN tell them apart.
-    fn refuse_another(&self) -> CodedError {
-        CodedError::invalid_argument(
-            codes::DUPLICATE_REGISTRATION,
+    /// The refusal of a second component (DUPLICATE_COMPONENT) or a second
+    /// upcaster chain (DUPLICATE_UPCASTER_CHAIN) beside this one, naming
+    /// this component and its kind (C-0580, C-0670): a misconfiguration,
+    /// INTERNAL.
+    fn refuse_another(&self, code: &str) -> CodedError {
+        CodedError::internal(
+            code,
             [
                 (extras::COMPONENT.to_string(), self.name().to_string()),
                 (
@@ -261,17 +260,14 @@ impl RouterBuilder {
     /// Validates the configuration and builds the router.
     pub fn build(mut self) -> Result<Router, CodedError> {
         if self.components.is_empty() {
-            return Err(CodedError::invalid_argument(
-                codes::NO_HANDLERS_REGISTERED,
-                [],
-            ));
+            return Err(CodedError::internal(codes::NO_HANDLERS_REGISTERED, []));
         }
         let component = self.components.remove(0);
         if !self.components.is_empty() {
-            return Err(component.refuse_another());
+            return Err(component.refuse_another(codes::DUPLICATE_COMPONENT));
         }
         if self.upcasters.len() > 1 {
-            return Err(component.refuse_another());
+            return Err(component.refuse_another(codes::DUPLICATE_UPCASTER_CHAIN));
         }
         if let Component::Aggregate(aggregate) = &component {
             aggregate.check_claims()?;
@@ -284,22 +280,22 @@ impl RouterBuilder {
 }
 
 /// The one component of one business process, ready to dispatch. Dispatching
-/// a kind the router does not host is NO_HANDLER_REGISTERED.
+/// a kind the router does not host is NO_COMPONENT_OF_KIND (UNIMPLEMENTED).
 pub struct Router {
     component: Component,
     upcaster: Option<UpcasterDispatch>,
 }
 
 fn wrong_kind() -> CodedError {
-    CodedError::unimplemented(codes::NO_HANDLER_REGISTERED, [])
+    CodedError::unimplemented(codes::NO_COMPONENT_OF_KIND, [])
 }
 
 impl Router {
     /// The refusal of another component registered beside this one
-    /// (DUPLICATE_REGISTRATION naming this one; C-0580), for hosts that
+    /// (DUPLICATE_COMPONENT naming this one; C-0580), for hosts that
     /// register components one at a time (the C ABI).
     pub fn refuse_another_component(&self) -> CodedError {
-        self.component.refuse_another()
+        self.component.refuse_another(codes::DUPLICATE_COMPONENT)
     }
 
     /// The component's registration hello (types.proto, ComponentDescriptor),
@@ -353,7 +349,8 @@ impl Router {
     }
 
     /// Runs the policy over a source from its input domain; a source with
-    /// pages from any other domain is NO_HANDLER_REGISTERED (a source with
+    /// pages from any other domain is POLICY_SOURCE_OUTSIDE_INPUT_DOMAIN
+    /// (UNIMPLEMENTED), naming both domains (a source with
     /// none is the policy's EMPTY_POLICY_SOURCE).
     pub fn dispatch_policy(
         &self,
@@ -364,9 +361,15 @@ impl Router {
         };
         let domain = source.cover.as_ref().map_or("", |c| c.domain.as_str());
         if !source.pages.is_empty() && policy.input_domain() != domain {
-            return Err(CodedError::invalid_argument(
-                codes::NO_HANDLER_REGISTERED,
-                [(extras::DOMAIN.to_string(), domain.to_string())],
+            return Err(CodedError::unimplemented(
+                codes::POLICY_SOURCE_OUTSIDE_INPUT_DOMAIN,
+                [
+                    (extras::DOMAIN.to_string(), domain.to_string()),
+                    (
+                        extras::EXPECTED_DOMAIN.to_string(),
+                        policy.input_domain().to_string(),
+                    ),
+                ],
             ));
         }
         policy.dispatch(source)

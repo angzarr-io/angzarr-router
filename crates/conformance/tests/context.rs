@@ -105,7 +105,7 @@ async fn recorded_and_flagged(w: &mut ContextWorld, count: u32) {
     );
 }
 
-#[then(regex = r"^the fact is refused with ([A-Z_]+) as INVALID_ARGUMENT$")]
+#[then(regex = r"^the fact is refused with ([A-Z_]+) as INTERNAL$")]
 async fn fact_refused(w: &mut ContextWorld, code: String) {
     let err = w
         .fact
@@ -114,7 +114,7 @@ async fn fact_refused(w: &mut ContextWorld, code: String) {
         .as_ref()
         .expect_err("the fact is refused");
     assert_eq!(err.code, code);
-    assert_eq!(err.grpc, angzarr_router::error::GrpcCode::InvalidArgument);
+    assert_eq!(err.grpc, angzarr_router::error::GrpcCode::Internal);
 }
 
 fn single_root(sink: &conf::CoverSink) -> Vec<u8> {
