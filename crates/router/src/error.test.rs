@@ -702,3 +702,29 @@ fn a_framework_conflict_is_business_immediate() {
         assert_eq!(err.refusal_response(), None, "{code}: never OnRefused");
     }
 }
+
+// A value that would not parse back is quoted (decision 14.37's display
+// rule, owner ruling 2026-10-29): one empty, or holding whitespace, `=`,
+// `"` or `\`, is written double-quoted, its `"` and `\` escaped with a
+// backslash; any other value stays bare.
+#[test]
+fn a_value_that_would_not_parse_back_is_quoted() {
+    let err = CodedError::bug(
+        "STORE_DOWN",
+        [
+            arg("ext_err_txt", "database is locked"),
+            arg("empty", ""),
+            arg("pair", "k=v"),
+            arg("said", "say \"hi\""),
+            arg("path", "C:\\dir"),
+            arg("tab", "a\tb"),
+            arg("bare", "account/7-x_y.z"),
+        ],
+    );
+    assert_eq!(
+        err.to_string(),
+        "UNHANDLED_HANDLER_ERROR cause=STORE_DOWN cause.bare=account/7-x_y.z \
+         cause.empty=\"\" cause.ext_err_txt=\"database is locked\" cause.pair=\"k=v\" \
+         cause.path=\"C:\\\\dir\" cause.said=\"say \\\"hi\\\"\" cause.tab=\"a\tb\""
+    );
+}
