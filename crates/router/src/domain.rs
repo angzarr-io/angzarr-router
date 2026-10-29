@@ -249,10 +249,14 @@ pub enum Admission {
 }
 
 /// Handles a passed-through refusal (the standard `CommandRefused`) of one
-/// refused command type against the rebuilt state: the source domain's
-/// `on_refused_<Command>`.
-pub type RefusedFn<S> =
-    Box<dyn Fn(&pb::CommandRefused, &S) -> Result<FactRecord, HandlerError> + Send + Sync>;
+/// refused command type against the rebuilt state, with the refusal fact's
+/// [`CommandContext`] (its identity is the refused command's): the source
+/// domain's `on_refused_<Command>`.
+pub type RefusedFn<S> = Box<
+    dyn Fn(&pb::CommandRefused, &S, CommandContext) -> Result<FactRecord, HandlerError>
+        + Send
+        + Sync,
+>;
 
 /// One fact handler, bound to its input: records it against the state.
 type RecordFn<'a, S> = Box<dyn Fn(&S, CommandContext) -> Result<FactRecord, CodedError> + 'a>;
@@ -329,14 +333,16 @@ impl<S> DomainDispatch<S> {
     /// domain's policies: the standard `CommandRefused` whose refused command
     /// is of the fully-qualified type `refused_command` (another domain's
     /// command), the generated `on_refused_<Command>` dispatch (types.proto,
-    /// the refusal_facts region; decision 14.31). An ordinary, infallible
-    /// fact handler: it receives the decoded `CommandRefused` and records
-    /// its events. A `CommandRefused` for a command type with none is
-    /// NO_FACT_HANDLER.
+    /// the refusal_facts region; decision 14.31). An ordinary fact handler:
+    /// it receives the decoded `CommandRefused` and the refusal fact's
+    /// [`CommandContext`] (its command id and correlation the refused
+    /// command's, its cover the stream of the policy's trigger), and records
+    /// its events, or fails as any fact handler may. A `CommandRefused` for
+    /// a command type with none is NO_FACT_HANDLER.
     pub fn on_refused(
         mut self,
         refused_command: &str,
-        thunk: impl Fn(&pb::CommandRefused, &S) -> Result<FactRecord, HandlerError>
+        thunk: impl Fn(&pb::CommandRefused, &S, CommandContext) -> Result<FactRecord, HandlerError>
             + Send
             + Sync
             + 'static,
@@ -627,7 +633,8 @@ impl<S> DomainDispatch<S> {
                             ));
                         };
                         Box::new(move |state, _cctx| {
-                            thunk(&refused, state).map_err(map_handler_error)
+                            thunk(&refused, state, CommandContext::default())
+                                .map_err(map_handler_error)
                         })
                     }
                     None => return Err(self.unknown(codes::NO_FACT_HANDLER, sent, &any)),

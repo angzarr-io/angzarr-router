@@ -74,7 +74,7 @@ fn buyin() -> DomainDispatch<TestState> {
         .on_fact(&fq::<BuyInTimedOut>(), |fact, _state| {
             Ok(FactRecord::from(fact.clone()))
         })
-        .on_refused(&fq::<HoldFunds>(), |refused, _state| {
+        .on_refused(&fq::<HoldFunds>(), |refused, _state, _cctx| {
             let held = refused
                 .command
                 .as_ref()
@@ -534,6 +534,39 @@ fn a_passed_through_refusal_reaches_the_handler_for_the_refused_commands_type() 
         resp.events.expect("its events").pages[0].payload,
         Some(any_of(&BuyInFailed { requested: 150 }))
     );
+}
+
+// The handler for a passed-through refusal reads the refusal fact's
+// context, as any fact handler does: its command id (the refused
+// command's), its cover (the trigger's stream) and whether that stream has
+// history.
+#[test]
+fn a_passed_through_refusals_handler_reads_its_context() {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let buyin = DomainDispatch::process_manager("BuyIn", "buyin", cover_applier(fresh_rebuilder()))
+        .on_refused(&fq::<HoldFunds>(), move |_refused, _state, cctx| {
+            sink.lock().unwrap().push(cctx);
+            Ok(FactRecord::from(any_of(&BuyInFailed { requested: 150 })))
+        })
+        .starts(&fq::<StartBuyIn>())
+        .with_rules_version("1");
+    let trigger = stream("buyin", None, INSTANCE);
+    let req = pb::ContextualCommand {
+        command: Some(refusal_fact(trigger.clone(), trigger.clone())),
+        events: Some(book_of_covers(&["started"])),
+        ..Default::default()
+    };
+    buyin.dispatch(&req).expect("recorded");
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "the handler ran once");
+    assert_eq!(
+        seen[0].command_id,
+        Some(uuid_of(9)),
+        "the refused command's id"
+    );
+    assert_eq!(seen[0].cover, Some(trigger), "the trigger's stream");
+    assert!(seen[0].had_prior_events, "the stream has history");
 }
 
 // A refusal with no path is caught at run time (decision 14.31): NO_FACT_HANDLER.

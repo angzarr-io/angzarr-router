@@ -46,7 +46,7 @@ fn buyin() -> DomainDispatch<TestState> {
                 ..Default::default()
             }))
         })
-        .on_refused(&fq::<HoldFunds>(), |refused, _state| {
+        .on_refused(&fq::<HoldFunds>(), |refused, _state, _cctx| {
             let typed = InsufficientFunds::decode(
                 refused.refusal.as_ref().expect("typed").value.as_slice(),
             )
