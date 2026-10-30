@@ -97,21 +97,6 @@ async fn unhandled_command(w: &mut CounterWorld) {
     w.dispatch(conf::unhandled_command());
 }
 
-#[when("a command with no command book is dispatched")]
-async fn missing_book(w: &mut CounterWorld) {
-    w.dispatch(conf::command_missing_book());
-}
-
-#[when("a command with an empty command book is dispatched")]
-async fn missing_page(w: &mut CounterWorld) {
-    w.dispatch(conf::command_missing_page());
-}
-
-#[when("a command whose page carries no payload is dispatched")]
-async fn missing_payload(w: &mut CounterWorld) {
-    w.dispatch(conf::command_missing_payload());
-}
-
 #[then(regex = r"^(\d+) increases are recorded$")]
 async fn recorded(w: &mut CounterWorld, count: u32) {
     assert_eq!(

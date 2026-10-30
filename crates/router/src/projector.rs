@@ -43,7 +43,6 @@ pub struct ProjectorDispatch<P> {
     handlers: HashMap<String, EventFn<P>>,
     fold: Option<BatchFoldFn<P>>,
     finish: Option<FinishFn<P>>,
-    rules_version: String,
     /// The projection message's type URL ("" when undeclared).
     projection_type_url: String,
 }
@@ -58,7 +57,6 @@ impl<P> ProjectorDispatch<P> {
             handlers: HashMap::new(),
             fold: None,
             finish: None,
-            rules_version: String::new(),
             projection_type_url: String::new(),
         }
     }
@@ -119,13 +117,6 @@ impl<P> ProjectorDispatch<P> {
         self
     }
 
-    /// The rules version the projector registers with: the business
-    /// binary's full version, baked in at build. Empty until declared.
-    pub fn with_rules_version(mut self, rules_version: impl Into<String>) -> Self {
-        self.rules_version = rules_version.into();
-        self
-    }
-
     /// The component name.
     pub fn name(&self) -> &str {
         &self.name
@@ -137,13 +128,13 @@ impl<P> ProjectorDispatch<P> {
     }
 
     /// Folds every page of the book into one projection instance, then runs
-    /// the finisher (or returns a default Projection). A missing cover fails
-    /// with MISSING_EVENT_BOOK_COVER; an undeclared domain folds nothing but
-    /// still finishes; an event type with no thunk is skipped.
+    /// the finisher (or returns a default Projection). An undeclared domain
+    /// folds nothing but still finishes; an event type with no thunk is
+    /// skipped. It guards no envelope (decision 14.42): a book with no
+    /// cover is read as one with an empty cover.
     pub fn dispatch(&self, events: &pb::EventBook) -> Result<pb::Projection, CodedError> {
-        let Some(cover) = events.cover.as_ref() else {
-            return Err(CodedError::internal(codes::MISSING_EVENT_BOOK_COVER, []));
-        };
+        let uncovered = pb::Cover::default();
+        let cover = events.cover.as_ref().unwrap_or(&uncovered);
 
         let mut projection = (self.factory)();
         let consumed = match self.domains.as_ref() {

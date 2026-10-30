@@ -48,11 +48,6 @@ async fn events_delivered(w: &mut ProjectorWorld, count: u32, domain: String) {
     w.dispatch(conf::delivery(&domain, count));
 }
 
-#[when("a delivery arrives with no cover")]
-async fn delivery_no_cover(w: &mut ProjectorWorld) {
-    w.dispatch(conf::delivery_without_cover(1));
-}
-
 #[then(regex = r"^the projection records (\d+) events?$")]
 async fn records_count(w: &mut ProjectorWorld, count: u64) {
     assert_eq!(
@@ -69,18 +64,6 @@ async fn records_nothing(w: &mut ProjectorWorld) {
         0,
         "an undeclared domain folds nothing"
     );
-}
-
-#[then(regex = r"^the delivery fails with ([A-Z_]+)$")]
-async fn fails_with(w: &mut ProjectorWorld, code: String) {
-    let err = w
-        .result
-        .as_ref()
-        .expect("a delivery was dispatched")
-        .as_ref()
-        .err()
-        .unwrap_or_else(|| panic!("expected failure {code}, got a success"));
-    assert_eq!(err.code, code, "coded-error reason");
 }
 
 #[tokio::main]

@@ -332,31 +332,17 @@ impl Router {
         }
     }
 
-    /// Runs the policy over a source from its input domain; a source with
-    /// pages from any other domain is POLICY_SOURCE_OUTSIDE_INPUT_DOMAIN
-    /// (UNIMPLEMENTED), naming both domains (a source with
-    /// none is the policy's EMPTY_POLICY_SOURCE).
+    /// Runs the policy over a source. The coordinator delivers only its
+    /// input domain's events; the router guards no envelope (decision
+    /// 14.42).
     pub fn dispatch_policy(
         &self,
         source: &pb::EventBook,
     ) -> Result<pb::PolicyResponse, CodedError> {
-        let Component::Policy(policy) = &self.component else {
-            return Err(wrong_kind());
-        };
-        let domain = source.cover.as_ref().map_or("", |c| c.domain.as_str());
-        if !source.pages.is_empty() && policy.input_domain() != domain {
-            return Err(CodedError::unimplemented(
-                codes::POLICY_SOURCE_OUTSIDE_INPUT_DOMAIN,
-                [
-                    (extras::DOMAIN.to_string(), domain.to_string()),
-                    (
-                        extras::EXPECTED_DOMAIN.to_string(),
-                        policy.input_domain().to_string(),
-                    ),
-                ],
-            ));
+        match &self.component {
+            Component::Policy(policy) => policy.dispatch(source),
+            _ => Err(wrong_kind()),
         }
-        policy.dispatch(source)
     }
 
     /// Runs the projector over the book: one Projection.

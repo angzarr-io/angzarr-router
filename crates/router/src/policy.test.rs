@@ -163,16 +163,18 @@ fn emitted_commands_pass_through_unstamped_in_emission_order() {
     );
 }
 
-// --- envelope + error guards ---------------------------------------------
+// --- no envelope guards; errors ---------------------------------------------
 
+// Decision 14.42: the router guards no envelope; a source with no pages
+// answers no reactions.
 #[test]
-fn empty_source_is_empty_policy_source() {
-    let policy = PolicyDispatch::new("OrderFulfillment", "order", "inventory");
-    let err = policy
+fn an_empty_source_answers_no_reactions() {
+    let policy = PolicyDispatch::new("OrderFulfillment", "order", "inventory")
+        .on_event(FQ_ORDER_CREATED, |_e, _c| Ok(vec![command_to("inventory")]));
+    let resp = policy
         .dispatch(&source_book("order", vec![]))
-        .expect_err("empty source must fail");
-    assert_eq!(err.code, codes::EMPTY_POLICY_SOURCE);
-    crate::test_support::assert_bug(&err);
+        .expect("answered");
+    assert_eq!(resp, pb::PolicyResponse::default());
 }
 
 #[test]

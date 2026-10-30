@@ -193,10 +193,15 @@ fn a_router_runs_its_policy() {
         .len(),
         1
     );
+    // Decision 14.42: the coordinator delivers only the input domain's
+    // events, and the router guards no envelope: a source from another
+    // domain is handled all the same.
     assert_eq!(
-        router.dispatch_policy(&source("billing")).unwrap_err().code,
-        "POLICY_SOURCE_OUTSIDE_INPUT_DOMAIN",
-        "a source outside the policy's input domain"
+        crate::test_support::commands_of(
+            &router.dispatch_policy(&source("billing")).expect("policy")
+        )
+        .len(),
+        1
     );
 }
 

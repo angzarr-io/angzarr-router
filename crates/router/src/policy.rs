@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use prost_types::Any;
 
 use crate::context::CommandContext;
-use crate::error::{call_handler, codes, CodedError, HandlerError};
+use crate::error::{call_handler, CodedError, HandlerError};
 use crate::pb;
 use crate::PageContext;
 
@@ -52,7 +52,6 @@ pub struct PolicyDispatch {
     output_domain: String,
     handlers: HashMap<String, EventFn>,
     refusals: HashMap<String, RefusalFn>,
-    rules_version: String,
 }
 
 impl PolicyDispatch {
@@ -70,7 +69,6 @@ impl PolicyDispatch {
             output_domain: output_domain.into(),
             handlers: HashMap::new(),
             refusals: HashMap::new(),
-            rules_version: String::new(),
         }
     }
 
@@ -175,13 +173,6 @@ impl PolicyDispatch {
         }
     }
 
-    /// The rules version the policy registers with: the business binary's
-    /// full version, baked in at build. Empty until declared.
-    pub fn with_rules_version(mut self, rules_version: impl Into<String>) -> Self {
-        self.rules_version = rules_version.into();
-        self
-    }
-
     /// The component name.
     pub fn name(&self) -> &str {
         &self.name
@@ -216,13 +207,9 @@ impl PolicyDispatch {
     /// trigger's sequence, an empty one included, and none for an
     /// unhandled page (decision 14.42). Emitted commands pass through as
     /// business code returned them, unchecked and unstamped, in emission
-    /// order (C-0690). A source with no pages is
-    /// EMPTY_POLICY_SOURCE.
+    /// order (C-0690). A source with no pages answers no reactions: the
+    /// router guards no envelope (decision 14.42).
     pub fn dispatch(&self, source: &pb::EventBook) -> Result<pb::PolicyResponse, CodedError> {
-        if source.pages.is_empty() {
-            return Err(CodedError::internal(codes::EMPTY_POLICY_SOURCE, []));
-        }
-
         let mut resp = pb::PolicyResponse::default();
 
         for page in &source.pages {

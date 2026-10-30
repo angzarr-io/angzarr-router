@@ -26,8 +26,3 @@ Feature: Counter projector dispatch
     Given a counter projection over every domain
     When 3 events are delivered in domain "inventory"
     Then the projection records 3 events
-
-  Scenario: a delivery missing its cover is refused
-    Given a counter projection
-    When a delivery arrives with no cover
-    Then the delivery fails with MISSING_EVENT_BOOK_COVER

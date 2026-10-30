@@ -36,12 +36,12 @@ fn every_constructor() -> Vec<(&'static str, CodedError)> {
     vec![
         (
             "internal",
-            CodedError::internal(codes::MISSING_COMMAND_BOOK, []),
+            CodedError::internal(codes::NO_HANDLERS_REGISTERED, []),
         ),
         (
             "internal with args",
             CodedError::internal(
-                codes::MISSING_RULES_VERSION,
+                codes::DUPLICATE_COMPONENT,
                 [arg(extras::COMPONENT, "order")],
             ),
         ),
@@ -93,10 +93,6 @@ fn every_constructor() -> Vec<(&'static str, CodedError)> {
         (
             "immediate",
             CodedError::immediate("PRICE_MOVED", [arg("item", "apple")]),
-        ),
-        (
-            "internal, a policy's",
-            CodedError::internal(codes::POLICY_COMMAND_NO_ROOT, []),
         ),
         (
             "map_handler_error(Other)",
@@ -271,54 +267,6 @@ fn a_fold_failures_own_failure_is_its_cause_not_text() {
     assert_eq!(extra("fold_message"), None, "no fold text");
 }
 
-/// Decision 14.37's reason inventory for the router (its table, and the
-/// codes that keep their key).
-const INVENTORY_14_37: &[&str] = &[
-    "FOLD_FAILED",
-    "FOLD_FAILED_EMITTED",
-    "UNHANDLED_HANDLER_ERROR",
-    "HANDLER_PANICKED",
-    "UNKNOWN_COMMAND_TYPE",
-    "NO_COMPONENT_OF_KIND",
-    "POLICY_SOURCE_OUTSIDE_INPUT_DOMAIN",
-    "NO_FACT_HANDLER",
-    "NO_REFUSAL_HANDLER",
-    "DUPLICATE_COMPONENT",
-    "REFUSAL_WITHOUT_COMMAND",
-    "REFUSAL_WITHOUT_EVENT",
-    "REFUSAL_FACT_MISSING",
-    "REFUSAL_FACT_ADDRESSED",
-    "REFUSAL_FACT_NO_PAGE",
-    "REFUSAL_FACT_NOT_A_FACT",
-    "REFUSAL_FACT_IDENTIFIED",
-    "REFUSAL_WITHOUT_REFUSED_COMMAND",
-    "REFUSED_COMMAND_WITHOUT_ID",
-    "REFUSAL_WITHOUT_TRIGGER_STREAM",
-    "ANY_DECODE_FAILED",
-    "HOST_STATUS_UNDECODABLE",
-    "NULL_ABI_POINTER",
-    "COMMAND_REFUSED",
-    "MISSING_RULES_VERSION",
-    "MISSING_STATE_TYPE",
-    "STARTING_TYPES_ON_NON_PM",
-    "NO_HANDLERS_REGISTERED",
-    "MISSING_COMMAND_BOOK",
-    "MISSING_COMMAND_PAGE",
-    "MISSING_COMMAND_PAYLOAD",
-    "MISSING_EVENT_BOOK_COVER",
-    "EMPTY_POLICY_SOURCE",
-    "PERSISTED_EVENT_CORRUPT",
-    "CONFLICT_UNRESOLVED",
-    "CONFLICT_OVERLAP",
-    "CONFLICT_RESOLUTION_UNSUPPORTED",
-    "POLICY_COMMAND_OUTSIDE_DESTINATION",
-    "POLICY_COMMAND_OUTSIDE_EDITION",
-    "POLICY_COMMAND_NO_ROOT",
-    "POLICY_COMMAND_OTHER_CORRELATION",
-    "PM_NO_INSTANCE",
-    "REFUSAL_FACT_WRONG_STREAM",
-];
-
 /// angzarr-project's reason-key catalog (decisions 14.37, 14.42): the
 /// submodule's, or the one beside `ANGZARR_PROJECT_PROTO`'s proto root.
 fn catalog() -> String {
@@ -368,19 +316,6 @@ fn the_router_answers_exactly_the_catalogs_router_keys() {
     assert_eq!(
         answered, router,
         "codes::ALL is the catalog's router keys, no more and no fewer"
-    );
-}
-
-#[test]
-fn every_key_of_the_14_37_inventory_is_a_router_code() {
-    let missing: Vec<&str> = INVENTORY_14_37
-        .iter()
-        .copied()
-        .filter(|key| !codes::ALL.contains(key))
-        .collect();
-    assert!(
-        missing.is_empty(),
-        "decision 14.37's keys missing from codes::ALL: {missing:?}"
     );
 }
 
@@ -490,13 +425,7 @@ fn no_component_for_the_request_is_unimplemented() {
 // decision 14.37, 2026-10-29): INTERNAL, never a policy's OnRefused.
 #[test]
 fn the_routers_own_malformed_input_is_a_bug() {
-    for code in [
-        codes::MISSING_COMMAND_BOOK,
-        codes::MISSING_COMMAND_PAGE,
-        codes::MISSING_COMMAND_PAYLOAD,
-    ] {
-        crate::test_support::assert_bug(&CodedError::internal(code, []));
-    }
+    crate::test_support::assert_bug(&CodedError::internal(codes::NO_REFUSAL_HANDLER, []));
     crate::test_support::assert_bug(&CodedError::unknown_type("UNKNOWN_COMMAND_TYPE", "/a.B"));
     crate::test_support::assert_bug(&CodedError::undecodable(
         "io.angzarr.v1.EventBook",

@@ -45,18 +45,6 @@ Feature: Counter aggregate dispatch
     Then the command fails with UNKNOWN_COMMAND_TYPE
     And the refusal is INTERNAL naming the type URL "type.googleapis.com/test.counter.Reserve"
 
-  Scenario: a command carrying no command book is refused
-    When a command with no command book is dispatched
-    Then the command fails with MISSING_COMMAND_BOOK
-
-  Scenario: a command book with no pages is refused
-    When a command with an empty command book is dispatched
-    Then the command fails with MISSING_COMMAND_PAGE
-
-  Scenario: a command page with no payload is refused
-    When a command whose page carries no payload is dispatched
-    Then the command fails with MISSING_COMMAND_PAYLOAD
-
   # A failing fold has its own key, FOLD_FAILED (decision 14.37).
   Scenario: a persisted event the fold cannot fold fails the command as a handler bug
     Given a counter whose history holds a corrupt event

@@ -218,13 +218,6 @@ pub fn delivery(domain: &str, n: u32) -> pb::EventBook {
     }
 }
 
-/// A delivery with no cover → drives MISSING_EVENT_BOOK_COVER.
-pub fn delivery_without_cover(n: u32) -> pb::EventBook {
-    let mut book = delivery("counter", n);
-    book.cover = None;
-    book
-}
-
 // ---------------------------------------------------------------------------
 // The fixture: OrderPolicy on the router core (translation-side dispatch).
 // ---------------------------------------------------------------------------
@@ -286,11 +279,6 @@ pub fn policy_event_source(event_fq: &str, seq: u64) -> pb::EventBook {
     }
 }
 
-/// A policy source carrying no pages → EMPTY_POLICY_SOURCE.
-pub fn policy_empty_source() -> pb::EventBook {
-    pb::EventBook::default()
-}
-
 // ---------------------------------------------------------------------------
 // Skeleton → command helpers: parse the orthogonal envelope, then SET the
 // scenario's data by field (never string-templating the textproto).
@@ -319,33 +307,6 @@ pub fn unhandled_command() -> pb::ContextualCommand {
 
 // Envelope-guard negatives: a well-formed skeleton with exactly one structural
 // field cleared, so the guard fires regardless of the rest being valid.
-
-/// No command book at all → MISSING_COMMAND_BOOK.
-pub fn command_missing_book() -> pb::ContextualCommand {
-    let mut cc = increase_command(1);
-    cc.command = None;
-    cc
-}
-
-/// A command book with no page → MISSING_COMMAND_PAGE.
-pub fn command_missing_page() -> pb::ContextualCommand {
-    let mut cc = increase_command(1);
-    cc.command.as_mut().expect("command book").page = None;
-    cc
-}
-
-/// A command page carrying no body → MISSING_COMMAND_PAYLOAD.
-pub fn command_missing_payload() -> pb::ContextualCommand {
-    let mut cc = increase_command(1);
-    cc.command
-        .as_mut()
-        .expect("command book")
-        .page
-        .as_mut()
-        .expect("command page")
-        .body = None;
-    cc
-}
 
 /// Prior history of `n` confirmed increases: the Increased skeleton replayed
 /// at consecutive sequences, with `next_sequence` continuing past them.

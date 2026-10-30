@@ -153,16 +153,22 @@ fn empty_book_finishes_with_zero_folds() {
     assert_eq!(proj.next_sequence, 0);
 }
 
+// Decision 14.42: the router guards no envelope; a book with no cover is
+// read as one with an empty cover, of the domain "".
 #[test]
-fn missing_cover_is_coded_error() {
-    let d = counting_projector(None);
+fn a_book_with_no_cover_is_read_with_an_empty_cover() {
     let no_cover = pb::EventBook {
-        pages: cover_pages("order", 1),
+        pages: cover_pages("order", 2),
         ..Default::default()
     };
-    let err = d.dispatch(&no_cover).expect_err("missing cover must fail");
-    assert_eq!(err.code, codes::MISSING_EVENT_BOOK_COVER);
-    crate::test_support::assert_bug(&err);
+    let proj = counting_projector(None)
+        .dispatch(&no_cover)
+        .expect("folded");
+    assert_eq!(proj.next_sequence, 2, "every domain is consumed");
+    let proj = counting_projector(Some(&["order"]))
+        .dispatch(&no_cover)
+        .expect("finished");
+    assert_eq!(proj.next_sequence, 0, "the empty domain is not order");
 }
 
 #[test]

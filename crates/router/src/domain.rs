@@ -352,11 +352,11 @@ impl<S> DomainDispatch<S> {
         self.facts.keys().cloned().collect()
     }
 
-    /// `CommandHandlerService.Handle`: envelope guards with their exact
-    /// codes; the page's body arm picks the handler table — a Command runs its command handler
-    /// (none: UNKNOWN_COMMAND_TYPE), a Fact its fact handler (none:
-    /// NO_FACT_HANDLER, so a fact never reaches a command handler or the
-    /// reverse) — before rebuild (a corrupt persisted event fails the
+    /// `CommandHandlerService.Handle`: the page's body arm picks the handler
+    /// table — a Command runs its command handler (none:
+    /// UNKNOWN_COMMAND_TYPE), a Fact its fact handler (none: NO_FACT_HANDLER,
+    /// so a fact never reaches a command handler or the reverse) — before
+    /// rebuild (a corrupt persisted event fails the
     /// command). A refusal names the type URL it was given: the coordinator
     /// has upcast it (decision 14.39), and relays the type as sent beside it.
     /// A command is then decided under its resolved conflict resolution
@@ -364,31 +364,24 @@ impl<S> DomainDispatch<S> {
     /// returned it: the coordinator stamps the cover, sequences and meta. A
     /// fact handler's record becomes the book: the fact, then its flags,
     /// payloads only.
+    ///
+    /// It guards no envelope (decision 14.42): the coordinator delivers
+    /// every input well formed. A delivery with no book, page, arm or
+    /// payload is routed as a command of no type, UNKNOWN_COMMAND_TYPE.
     pub fn dispatch(
         &self,
         req: &pb::ContextualCommand,
     ) -> Result<pb::CommandHandlerResponse, CodedError> {
-        let Some(command_book) = req.command.as_ref() else {
-            return Err(CodedError::internal(codes::MISSING_COMMAND_BOOK, []));
-        };
-        let Some(page) = command_book.page.as_ref() else {
-            return Err(CodedError::internal(codes::MISSING_COMMAND_PAGE, []));
-        };
+        let body = req
+            .command
+            .as_ref()
+            .and_then(|b| b.page.as_ref())
+            .and_then(|p| p.body.as_ref());
+        let untyped = Any::default();
         let cover = req.events.as_ref().and_then(|b| b.cover.as_ref());
-        let (mut events, state, conflict) = match &page.body {
-            Some(pb::command_page::Body::Command(command)) => {
-                let any = non_empty_payload(command.payload.as_ref())?;
-                let Some(thunk) = self.handlers.get(crate::type_name_from_url(&any.type_url))
-                else {
-                    return Err(CodedError::unknown_type(
-                        codes::UNKNOWN_COMMAND_TYPE,
-                        &any.type_url,
-                    ));
-                };
-                self.decide(req, any, thunk)?
-            }
+        let (mut events, state, conflict) = match body {
             Some(pb::command_page::Body::Fact(fact)) => {
-                let any = non_empty_payload(fact.payload.as_ref())?;
+                let any = fact.payload.as_ref().unwrap_or(&untyped);
                 let fact_type = crate::type_name_from_url(&any.type_url);
                 let record_with: RecordFn<'_, S> = match self.facts.get(fact_type) {
                     Some(thunk) => {
@@ -447,8 +440,20 @@ impl<S> DomainDispatch<S> {
                 )?;
                 (recorded, state, None)
             }
-            None => {
-                return Err(CodedError::internal(codes::MISSING_COMMAND_PAYLOAD, []));
+            command => {
+                let any = match command {
+                    Some(pb::command_page::Body::Command(command)) => command.payload.as_ref(),
+                    _ => None,
+                }
+                .unwrap_or(&untyped);
+                let Some(thunk) = self.handlers.get(crate::type_name_from_url(&any.type_url))
+                else {
+                    return Err(CodedError::unknown_type(
+                        codes::UNKNOWN_COMMAND_TYPE,
+                        &any.type_url,
+                    ));
+                };
+                self.decide(req, any, thunk)?
             }
         };
         // The state after the input, on every answer (decision 14.12): the
@@ -579,15 +584,6 @@ fn split_at_expected(
         },
         window,
     )
-}
-
-/// A body arm's payload, refused MISSING_COMMAND_PAYLOAD when absent or
-/// untyped.
-fn non_empty_payload(payload: Option<&Any>) -> Result<&Any, CodedError> {
-    match payload {
-        Some(any) if !any.type_url.is_empty() => Ok(any),
-        _ => Err(CodedError::internal(codes::MISSING_COMMAND_PAYLOAD, [])),
-    }
 }
 
 #[cfg(test)]

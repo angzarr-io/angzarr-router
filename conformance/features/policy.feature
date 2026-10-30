@@ -18,11 +18,6 @@ Feature: Order policy dispatch
     When a Reserve event is dispatched
     Then the policy emits no commands
 
-  Scenario: a source with no pages is refused
-    Given an order policy delivering to "inventory"
-    When a source with no pages is dispatched
-    Then the dispatch fails with EMPTY_POLICY_SOURCE
-
   Scenario: a policy handler sees the triggering event's sequence
     Given an order policy delivering to "inventory"
     When an Increased event at sequence 7 is dispatched

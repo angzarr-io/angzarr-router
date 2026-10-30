@@ -57,11 +57,6 @@ async fn reserve_event(w: &mut PolicyWorld) {
     w.dispatch(conf::policy_event_source("test.counter.Reserve", 0));
 }
 
-#[when("a source with no pages is dispatched")]
-async fn empty_source(w: &mut PolicyWorld) {
-    w.dispatch(conf::policy_empty_source());
-}
-
 #[then(regex = r#"^the policy emits one command to "([^"]*)"$"#)]
 async fn emits_one_command(w: &mut PolicyWorld, target: String) {
     let commands = w.commands();
@@ -115,18 +110,6 @@ async fn no_stamped_provenance(w: &mut PolicyWorld) {
 #[then("the policy emits no commands")]
 async fn emits_no_commands(w: &mut PolicyWorld) {
     assert!(w.commands().is_empty(), "no commands emitted");
-}
-
-#[then(regex = r"^the dispatch fails with ([A-Z_]+)$")]
-async fn fails_with(w: &mut PolicyWorld, code: String) {
-    let err = w
-        .result
-        .as_ref()
-        .expect("a source was dispatched")
-        .as_ref()
-        .err()
-        .unwrap_or_else(|| panic!("expected failure {code}, got a success"));
-    assert_eq!(err.code, code, "coded-error reason");
 }
 
 #[tokio::main]

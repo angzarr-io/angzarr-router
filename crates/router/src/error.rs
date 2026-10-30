@@ -163,8 +163,12 @@ impl TryFrom<GrpcCode> for BusinessStatus {
     }
 }
 
-/// The router's reason keys (decision 14.37): one per condition, each its
-/// own status message and `ErrorInfo` reason.
+/// The router's reason keys (decisions 14.37, 14.42): one per condition,
+/// each its own status message and `ErrorInfo` reason, exactly the keys
+/// angzarr-project's `catalog/reasons.toml` lists with `owner = "router"`.
+/// The coordinator's keys (admission, descriptor validation, policy output
+/// checks, refusal facts, conflict judgement) are its own; the retired ones
+/// are never answered again.
 pub mod codes {
     // --- handler failures ---------------------------------------------------
     /// An error escaped a business handler, or it failed as a bug: its own
@@ -178,158 +182,62 @@ pub mod codes {
     pub const FOLD_FAILED: &str = "FOLD_FAILED";
     /// A fold failed on an event the command emitted.
     pub const FOLD_FAILED_EMITTED: &str = "FOLD_FAILED_EMITTED";
+    /// A starting state the state's codec cannot decode.
+    pub const PERSISTED_EVENT_CORRUPT: &str = "PERSISTED_EVENT_CORRUPT";
 
-    // --- malformed input (bugs: owner ruling, 2026-10-29) -----------------
+    // --- routing ------------------------------------------------------------
+    /// A payload that does not decode as the message it claims.
     pub const ANY_DECODE_FAILED: &str = "ANY_DECODE_FAILED";
-    pub const MISSING_COMMAND_BOOK: &str = "MISSING_COMMAND_BOOK";
-    pub const MISSING_COMMAND_PAGE: &str = "MISSING_COMMAND_PAGE";
-    pub const MISSING_COMMAND_PAYLOAD: &str = "MISSING_COMMAND_PAYLOAD";
-    pub const MISSING_EVENT_BOOK_COVER: &str = "MISSING_EVENT_BOOK_COVER";
-    pub const EMPTY_POLICY_SOURCE: &str = "EMPTY_POLICY_SOURCE";
     /// A command type no handler claims.
     pub const UNKNOWN_COMMAND_TYPE: &str = "UNKNOWN_COMMAND_TYPE";
     /// A fact type no handler claims.
     pub const NO_FACT_HANDLER: &str = "NO_FACT_HANDLER";
     /// A pass-through CommandRefused the domain has no handler for.
     pub const NO_REFUSAL_HANDLER: &str = "NO_REFUSAL_HANDLER";
-    /// A Refusal given to a policy with no command.
-    pub const REFUSAL_WITHOUT_COMMAND: &str = "REFUSAL_WITHOUT_COMMAND";
-    /// A Refusal given to a policy with no event.
-    pub const REFUSAL_WITHOUT_EVENT: &str = "REFUSAL_WITHOUT_EVENT";
-    /// A refusal fact addressed to any stream but the exact one its
-    /// causation_id names (types.proto, the command_identity region).
-    pub const REFUSAL_FACT_WRONG_STREAM: &str = "REFUSAL_FACT_WRONG_STREAM";
+    /// A COMMUTATIVE delivery to a state with no resolver.
     pub const CONFLICT_RESOLUTION_UNSUPPORTED: &str = "CONFLICT_RESOLUTION_UNSUPPORTED";
-    /// A host callback's status bytes that do not decode (the C ABI).
-    pub const HOST_STATUS_UNDECODABLE: &str = "HOST_STATUS_UNDECODABLE";
-    /// A null pointer crossing the C ABI.
-    pub const NULL_ABI_POINTER: &str = "NULL_ABI_POINTER";
-
-    // --- the store ------------------------------------------------------------
-    pub const PERSISTED_EVENT_CORRUPT: &str = "PERSISTED_EVENT_CORRUPT";
-
-    // --- stale commands ---------------------------------------------------------
-    pub const CONFLICT_UNRESOLVED: &str = "CONFLICT_UNRESOLVED";
-    pub const CONFLICT_OVERLAP: &str = "CONFLICT_OVERLAP";
-
-    // --- misroutes --------------------------------------------------------------
     /// A dispatch to a kind of component the router does not host.
     pub const NO_COMPONENT_OF_KIND: &str = "NO_COMPONENT_OF_KIND";
-    /// A policy given a book of a domain it does not consume.
-    pub const POLICY_SOURCE_OUTSIDE_INPUT_DOMAIN: &str = "POLICY_SOURCE_OUTSIDE_INPUT_DOMAIN";
 
     // --- registration -------------------------------------------------------
     pub const NO_HANDLERS_REGISTERED: &str = "NO_HANDLERS_REGISTERED";
     /// A second component beside the one a router (a business process)
     /// hosts.
     pub const DUPLICATE_COMPONENT: &str = "DUPLICATE_COMPONENT";
-    pub const MISSING_RULES_VERSION: &str = "MISSING_RULES_VERSION";
-    pub const MISSING_STATE_TYPE: &str = "MISSING_STATE_TYPE";
-    /// A component other than a process manager declaring starting types
-    /// (types.proto, ComponentDescriptor.starting_types).
-    pub const STARTING_TYPES_ON_NON_PM: &str = "STARTING_TYPES_ON_NON_PM";
 
-    // --- a policy's bugs ------------------------------------------------------
-    pub const POLICY_COMMAND_OUTSIDE_DESTINATION: &str = "POLICY_COMMAND_OUTSIDE_DESTINATION";
-    /// A policy command naming an edition other than its trigger's (owner
-    /// ruling, 2026-10-28; types.proto Cover.edition).
-    pub const POLICY_COMMAND_OUTSIDE_EDITION: &str = "POLICY_COMMAND_OUTSIDE_EDITION";
-    /// A policy's command whose cover names no root (decision 14.36).
-    pub const POLICY_COMMAND_NO_ROOT: &str = "POLICY_COMMAND_NO_ROOT";
-    /// A policy's command carrying a correlation_id other than its
-    /// trigger's (decision 14.36).
-    pub const POLICY_COMMAND_OTHER_CORRELATION: &str = "POLICY_COMMAND_OTHER_CORRELATION";
-    /// OnRefusedResponse holds no fact (policy.proto, OnRefusedResponse).
-    pub const REFUSAL_FACT_MISSING: &str = "REFUSAL_FACT_MISSING";
-    /// The policy set the refusal fact's cover or handling.
-    pub const REFUSAL_FACT_ADDRESSED: &str = "REFUSAL_FACT_ADDRESSED";
-    /// The refusal fact has no page.
-    pub const REFUSAL_FACT_NO_PAGE: &str = "REFUSAL_FACT_NO_PAGE";
-    /// The refusal fact's page is a Command.
-    pub const REFUSAL_FACT_NOT_A_FACT: &str = "REFUSAL_FACT_NOT_A_FACT";
-    /// The policy set the refusal fact's identity.
-    pub const REFUSAL_FACT_IDENTIFIED: &str = "REFUSAL_FACT_IDENTIFIED";
-    /// The refusal to address carries no refused command.
-    pub const REFUSAL_WITHOUT_REFUSED_COMMAND: &str = "REFUSAL_WITHOUT_REFUSED_COMMAND";
-    /// The refused command carries no command_id.
-    pub const REFUSED_COMMAND_WITHOUT_ID: &str = "REFUSED_COMMAND_WITHOUT_ID";
-    /// The refusal carries no triggering stream.
-    pub const REFUSAL_WITHOUT_TRIGGER_STREAM: &str = "REFUSAL_WITHOUT_TRIGGER_STREAM";
-
-    // --- business rejections the router answers ---------------------------
-    /// A command for a process manager's correlation with no instance, of a
-    /// type the PM does not declare as starting (decision 14.31).
-    pub const PM_NO_INSTANCE: &str = "PM_NO_INSTANCE";
-
-    /// The router's complete reason inventory (decision 14.37): every key
-    /// the router, or the C ABI over it, answers with. A catalog that
-    /// renders the router's errors carries a message for each.
+    /// The router's complete reason inventory: every key the router answers
+    /// with, and the catalog's router keys (decision 14.42).
     pub const ALL: &[&str] = &[
         UNHANDLED_HANDLER_ERROR,
         HANDLER_PANICKED,
         COMMAND_REFUSED,
         FOLD_FAILED,
         FOLD_FAILED_EMITTED,
+        PERSISTED_EVENT_CORRUPT,
         ANY_DECODE_FAILED,
-        MISSING_COMMAND_BOOK,
-        MISSING_COMMAND_PAGE,
-        MISSING_COMMAND_PAYLOAD,
-        MISSING_EVENT_BOOK_COVER,
-        EMPTY_POLICY_SOURCE,
         UNKNOWN_COMMAND_TYPE,
         NO_FACT_HANDLER,
         NO_REFUSAL_HANDLER,
-        REFUSAL_WITHOUT_COMMAND,
-        REFUSAL_WITHOUT_EVENT,
-        REFUSAL_FACT_WRONG_STREAM,
         CONFLICT_RESOLUTION_UNSUPPORTED,
-        HOST_STATUS_UNDECODABLE,
-        NULL_ABI_POINTER,
-        PERSISTED_EVENT_CORRUPT,
-        CONFLICT_UNRESOLVED,
-        CONFLICT_OVERLAP,
         NO_COMPONENT_OF_KIND,
-        POLICY_SOURCE_OUTSIDE_INPUT_DOMAIN,
         NO_HANDLERS_REGISTERED,
         DUPLICATE_COMPONENT,
-        MISSING_RULES_VERSION,
-        MISSING_STATE_TYPE,
-        STARTING_TYPES_ON_NON_PM,
-        POLICY_COMMAND_OUTSIDE_DESTINATION,
-        POLICY_COMMAND_OUTSIDE_EDITION,
-        POLICY_COMMAND_NO_ROOT,
-        POLICY_COMMAND_OTHER_CORRELATION,
-        REFUSAL_FACT_MISSING,
-        REFUSAL_FACT_ADDRESSED,
-        REFUSAL_FACT_NO_PAGE,
-        REFUSAL_FACT_NOT_A_FACT,
-        REFUSAL_FACT_IDENTIFIED,
-        REFUSAL_WITHOUT_REFUSED_COMMAND,
-        REFUSED_COMMAND_WITHOUT_ID,
-        REFUSAL_WITHOUT_TRIGGER_STREAM,
-        PM_NO_INSTANCE,
     ];
 }
 
-/// Cross-language arg names: the `ErrorInfo` metadata keys.
+/// Cross-language arg names: the `ErrorInfo` metadata keys of the router's
+/// reasons (the catalog's `args`).
 pub mod extras {
-    pub const DOMAIN: &str = "domain";
     pub const TYPE_URL: &str = "type_url";
     pub const COMMAND_TYPE: &str = "command_type";
     /// The type an upcaster sidecar returned: never the router's, which
     /// upcasts nothing; the coordinator relays it beside `type_url` on an
     /// unknown type (decision 14.39).
     pub const UPCAST_TYPE_URL: &str = "upcast_type_url";
-    pub const WINDOW_UNITS: &str = "window_units";
-    pub const COMMAND_UNITS: &str = "command_units";
     pub const SEQUENCE: &str = "sequence";
     pub const STATE_TYPE_URL: &str = "state_type_url";
     pub const COMPONENT: &str = "component";
     pub const COMPONENT_KIND: &str = "component_kind";
-    pub const EXPECTED_DOMAIN: &str = "expected_domain";
-    pub const ACTUAL_DOMAIN: &str = "actual_domain";
-    pub const EXPECTED_EDITION: &str = "expected_edition";
-    pub const ACTUAL_EDITION: &str = "actual_edition";
     pub const FIRST_SEQUENCE: &str = "first_sequence";
     pub const LAST_SEQUENCE: &str = "last_sequence";
     /// A typed refusal's object's fully-qualified type (COMMAND_REFUSED).

@@ -132,44 +132,32 @@ fn corrupt_prior_event_fails_command() {
     assert_eq!(err.grpc, crate::error::GrpcCode::Internal);
 }
 
+// Decision 14.42: the router guards no envelope. A delivery with no book,
+// no page, no arm, or no payload is routed as a command of no type, and no
+// handler claims one; the handler never runs.
 #[test]
-fn missing_command_envelope_guards_exact_codes() {
-    let (d, _) = test_agg_dispatch();
-
-    let err = d
-        .dispatch(&pb::ContextualCommand::default())
-        .expect_err("no command book");
-    assert_eq!(err.code, codes::MISSING_COMMAND_BOOK);
-    crate::test_support::assert_bug(&err);
-
-    let err = d
-        .dispatch(&pb::ContextualCommand {
+fn a_delivery_missing_its_input_is_a_command_of_no_type() {
+    let (d, seen) = test_agg_dispatch();
+    for req in [
+        pb::ContextualCommand::default(),
+        pb::ContextualCommand {
             command: Some(pb::CommandBook::default()),
             ..Default::default()
-        })
-        .expect_err("no page");
-    assert_eq!(err.code, codes::MISSING_COMMAND_PAGE);
-    crate::test_support::assert_bug(&err);
-}
-
-#[test]
-fn page_without_payload_coded() {
-    let (d, _) = test_agg_dispatch();
-    let err = d
-        .dispatch(&contextual(pb::CommandPage::default()))
-        .expect_err("page without a body");
-    assert_eq!(err.code, codes::MISSING_COMMAND_PAYLOAD);
-    crate::test_support::assert_bug(&err);
-}
-
-#[test]
-fn empty_type_url_coded() {
-    let (d, _) = test_agg_dispatch();
-    let err = d
-        .dispatch(&command_for(Any::default()))
-        .expect_err("empty type_url");
-    assert_eq!(err.code, codes::MISSING_COMMAND_PAYLOAD);
-    crate::test_support::assert_bug(&err);
+        },
+        contextual(pb::CommandPage::default()),
+        command_for(Any::default()),
+        contextual(pb::CommandPage {
+            body: Some(pb::command_page::Body::Command(pb::Command {
+                payload: None,
+            })),
+            ..Default::default()
+        }),
+    ] {
+        let err = d.dispatch(&req).expect_err("no type");
+        assert_eq!(err.code, codes::UNKNOWN_COMMAND_TYPE);
+        assert_eq!(err.extras.get("type_url").map(String::as_str), Some(""));
+    }
+    assert!(seen.lock().unwrap().is_empty(), "the handler never ran");
 }
 
 #[test]
@@ -313,14 +301,14 @@ fn a_fact_type_sent_as_a_command_is_refused() {
 }
 
 #[test]
-fn a_fact_without_a_payload_is_coded() {
+fn a_fact_without_a_payload_is_a_fact_of_no_type() {
     let err = fact_aggregate()
         .dispatch(&contextual(pb::CommandPage {
             body: Some(pb::command_page::Body::Fact(pb::Fact { payload: None })),
             ..Default::default()
         }))
         .expect_err("a fact with no payload");
-    assert_eq!(err.code, codes::MISSING_COMMAND_PAYLOAD);
+    assert_eq!(err.code, codes::NO_FACT_HANDLER);
     crate::test_support::assert_bug(&err);
 }
 
