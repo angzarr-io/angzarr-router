@@ -71,9 +71,14 @@ wasm: (_container "wasm")
 # Mutation-test the core modules and the architecture linter: the full pass
 mutation-test: (_container "mutation-test")
 
-# Mutation-test what a push adds: lefthook's pre-push step (the full pass,
-# `mutation-test`, is too slow for a hook). For each ref pushed (git's pushed
-# refs on stdin), the diff from its base to the commit pushed is mutated
+# Mutation-test what a push would add, by hand: no git hook runs mutation (it
+# runs while tests are written and judged, at the end of an unattended run,
+# and in the scheduled full pass, `mutation-test`). It reads git's pre-push
+# refs on stdin; for the current branch against origin:
+#
+#     echo "refs/heads/B $(git rev-parse HEAD) refs/heads/B 0" | just mutation-push origin
+#
+# For each ref given, the diff from its base to the commit pushed is mutated
 # (`mutation-diff`: the MUTATED files only, held to 100%), in that commit's
 # tree checked out alone at target/push-tree, so an unpushed edit cannot pass
 # or fail it. The base is the merge base of the commit pushed and the remote's
@@ -88,8 +93,7 @@ mutation-test: (_container "mutation-test")
 # Red tests (cargo-mutants' baseline fails, exit 4) cannot be judged: pushed
 # to a branch other than the default one they pass, with a warning that the
 # branch cannot merge until they pass; pushed to the default branch they are
-# refused. `lefthook` is what lefthook.yml passes to stop lefthook skipping
-# it, and is ignored.
+# refused. `lefthook` is ignored.
 [positional-arguments]
 mutation-push remote *lefthook:
     #!/usr/bin/env bash
