@@ -16,13 +16,7 @@ use cucumber::gherkin;
 
 /// Tier scenarios held out until a later removal step: (scenario ID, the
 /// removal they wait on).
-pub const LATER_STEPS: &[(&str, &str)] = &[
-    ("C-0543", "conflict judgement moves out (14.42)"),
-    ("C-0544", "conflict judgement moves out (14.42)"),
-    ("C-0545", "conflict judgement moves out (14.42)"),
-    ("C-0547", "conflict judgement moves out (14.42)"),
-    ("C-0550", "conflict judgement moves out (14.42)"),
-];
+pub const LATER_STEPS: &[(&str, &str)] = &[];
 
 /// A path under the workspace root.
 pub fn path(relative: &str) -> PathBuf {
