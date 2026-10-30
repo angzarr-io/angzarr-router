@@ -113,62 +113,6 @@ fn a_policy_translates_an_event_into_a_command_for_its_destination() {
     );
 }
 
-// A policy stays in the edition of the event it handles, and so do its
-// commands (types.proto, Cover.edition, What-if execution).
-#[test]
-fn a_policies_commands_stay_in_their_triggers_edition() {
-    let resp = buyin_wallet()
-        .dispatch(&trigger_book(Some("what-if")))
-        .expect("translated");
-    assert_eq!(
-        commands_of(&resp)[0]
-            .cover
-            .as_ref()
-            .unwrap()
-            .edition
-            .as_deref(),
-        Some("what-if")
-    );
-}
-
-// A command that names a different edition from its trigger's is a policy bug
-// (owner ruling, 2026-10-28): the whole answer is refused INTERNAL, as a
-// command outside the policy's destination is. An unset edition is stamped with
-// the trigger's (above); only an explicit different one is refused, from main
-// or from an edition alike.
-#[test]
-fn a_policy_command_naming_another_edition_is_refused() {
-    let policy = PolicyDispatch::new("Stray", "buyin", "wallet").on_event(
-        &fq::<BuyInStarted>(),
-        |_event, _cover| {
-            Ok(vec![pb::CommandBook {
-                cover: Some(stream("wallet", Some("elsewhere"), 1)),
-                page: Some(command_page(any_of(&HoldFunds { amount: 1 }))),
-                ..Default::default()
-            }])
-        },
-    );
-    for trigger_edition in [None, Some("what-if")] {
-        let err = policy
-            .dispatch(&trigger_book(trigger_edition))
-            .expect_err("another edition");
-        assert_eq!(err.code, codes::POLICY_COMMAND_OUTSIDE_EDITION);
-        assert_eq!(err.grpc, GrpcCode::Internal);
-    }
-    // Naming its trigger's own edition is not a different one.
-    let own = PolicyDispatch::new("Own", "buyin", "wallet").on_event(
-        &fq::<BuyInStarted>(),
-        |_event, _cover| {
-            Ok(vec![pb::CommandBook {
-                cover: Some(stream("wallet", Some("what-if"), 1)),
-                page: Some(command_page(any_of(&HoldFunds { amount: 1 }))),
-                ..Default::default()
-            }])
-        },
-    );
-    assert!(own.dispatch(&trigger_book(Some("what-if"))).is_ok());
-}
-
 // --- pass-through ----------------------------------------------------------------------
 
 #[test]

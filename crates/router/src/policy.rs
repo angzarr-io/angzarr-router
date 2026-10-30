@@ -3,13 +3,11 @@
 //! A policy holds NO state and rebuilds nothing: every page of the source book
 //! is a fresh trigger. Declared event types emit commands; an undeclared
 //! event type is skipped (C-0051), not an error. There is no compensation
-//! input. Emitted commands pass through as the handler returned them: the
-//! coordinator stamps their identity, causation and correlation; the router
-//! addresses them in the trigger's edition (a policy stays in the edition of
-//! the event it handles; types.proto, Cover.edition). Every command must
-//! name its root, whatever its target (POLICY_COMMAND_NO_ROOT), and may not
-//! carry a correlation other than its triggering event's
-//! (POLICY_COMMAND_OTHER_CORRELATION; decision 14.36).
+//! input. Emitted commands pass through as the handler returned them,
+//! grouped by the page that triggered them (decision 14.42): the policy's
+//! coordinator checks each one's destination, edition, root and
+//! correlation, stamps the trigger's edition, and stamps its identity,
+//! causation and correlation.
 //!
 //! Refusals (policy.proto, PolicyService, Refusals; decision 14.31): when one of
 //! the policy's commands is refused, [`PolicyDispatch::dispatch_refusal`] (the
@@ -26,7 +24,7 @@ use prost::{Message, Name};
 use prost_types::Any;
 
 use crate::context::CommandContext;
-use crate::error::{call_handler, codes, extras, CodedError, HandlerError};
+use crate::error::{call_handler, codes, CodedError, HandlerError};
 use crate::pb;
 use crate::PageContext;
 
@@ -246,7 +244,8 @@ impl PolicyDispatch {
         &self.input_domain
     }
 
-    /// The one domain its commands go to.
+    /// The one domain its commands go to: the descriptor's output domain,
+    /// which the coordinator checks them against (decision 14.42).
     pub fn output_domain(&self) -> &str {
         &self.output_domain
     }
@@ -267,8 +266,9 @@ impl PolicyDispatch {
     /// undeclared types are skipped. The answer holds one
     /// `PolicyReaction` per handled page, in page order, naming its
     /// trigger's sequence, an empty one included, and none for an
-    /// unhandled page (decision 14.42). Emitted commands pass through
-    /// unstamped, in emission order. A source with no pages is
+    /// unhandled page (decision 14.42). Emitted commands pass through as
+    /// business code returned them, unchecked and unstamped, in emission
+    /// order (C-0690). A source with no pages is
     /// EMPTY_POLICY_SOURCE.
     pub fn dispatch(&self, source: &pb::EventBook) -> Result<pb::PolicyResponse, CodedError> {
         if source.pages.is_empty() {
@@ -293,33 +293,6 @@ impl PolicyDispatch {
                 meta: page.meta.as_ref(),
             };
             let commands = call_handler(|| thunk(event_any, &context))?;
-            if let Some(stray) = commands.iter().find(|c| self.outside_destination(c)) {
-                return Err(self.refuse_outside_destination(stray));
-            }
-            let edition = source
-                .cover
-                .as_ref()
-                .and_then(|c| c.edition.clone())
-                .filter(|e| !e.is_empty());
-            let mut commands = commands;
-            for command in &mut commands {
-                let cover = command.cover.get_or_insert_with(Default::default);
-                match cover.edition.as_deref().filter(|e| !e.is_empty()) {
-                    None => cover.edition = edition.clone(),
-                    Some(named) if Some(named) != edition.as_deref() => {
-                        return Err(refuse_outside_edition(
-                            edition.as_deref().unwrap_or_default(),
-                            named,
-                        ));
-                    }
-                    Some(_) => {}
-                }
-            }
-            let trigger_correlation = page.meta.as_ref().and_then(|m| m.correlation_id.as_ref());
-            for command in &commands {
-                check_root(command)?;
-                check_correlation(command, trigger_correlation)?;
-            }
             // One reaction per handled page, an empty one included
             // (decision 14.42).
             resp.reactions.push(pb::PolicyReaction {
@@ -330,92 +303,6 @@ impl PolicyDispatch {
 
         Ok(resp)
     }
-
-    fn outside_destination(&self, command: &pb::CommandBook) -> bool {
-        command.cover.as_ref().map_or("", |c| c.domain.as_str()) != self.output_domain
-    }
-
-    /// A command for any domain but the policy's one destination is a policy
-    /// bug (policy.proto PolicyResponse; decision 14.24): the whole answer is
-    /// refused INTERNAL, carrying no commands, naming both domains.
-    fn refuse_outside_destination(&self, stray: &pb::CommandBook) -> CodedError {
-        let actual = stray.cover.as_ref().map_or("", |c| c.domain.as_str());
-        CodedError::internal(
-            codes::POLICY_COMMAND_OUTSIDE_DESTINATION,
-            [
-                (
-                    extras::EXPECTED_DOMAIN.to_string(),
-                    self.output_domain.clone(),
-                ),
-                (extras::ACTUAL_DOMAIN.to_string(), actual.to_string()),
-            ],
-        )
-    }
-}
-
-/// The command's domain and type, naming it in a refusal's extras.
-fn naming(command: &pb::CommandBook) -> [(String, String); 2] {
-    let domain = command.cover.as_ref().map_or("", |c| c.domain.as_str());
-    let command_type = command
-        .page
-        .as_ref()
-        .and_then(crate::command_payload)
-        .map_or("", |p| crate::type_name_from_url(&p.type_url));
-    [
-        (extras::DOMAIN.to_string(), domain.to_string()),
-        (extras::COMMAND_TYPE.to_string(), command_type.to_string()),
-    ]
-}
-
-/// Every command a policy sends names its root, whatever its target: an
-/// aggregate's or a process manager's alike (decision 14.36, amended; there
-/// is no default root). An unset root, or a UUID holding no bytes, is a
-/// policy bug, refused INTERNAL.
-fn check_root(command: &pb::CommandBook) -> Result<(), CodedError> {
-    let named = command
-        .cover
-        .as_ref()
-        .and_then(|c| c.root.as_ref())
-        .is_some_and(|r| !r.value.is_empty());
-    if named {
-        return Ok(());
-    }
-    Err(CodedError::internal(
-        codes::POLICY_COMMAND_NO_ROOT,
-        naming(command),
-    ))
-}
-
-/// Every command a policy sends carries its trigger's correlation unchanged
-/// (decision 14.36): left unset for the coordinator to stamp, or set to
-/// exactly the trigger's. Another one is a policy bug, refused INTERNAL.
-fn check_correlation(
-    command: &pb::CommandBook,
-    trigger: Option<&pb::Uuid>,
-) -> Result<(), CodedError> {
-    let carried = command
-        .page
-        .as_ref()
-        .and_then(|p| p.correlation_id.as_ref());
-    match (carried, trigger) {
-        (Some(carried), Some(trigger)) if carried != trigger => Err(CodedError::internal(
-            codes::POLICY_COMMAND_OTHER_CORRELATION,
-            naming(command),
-        )),
-        _ => Ok(()),
-    }
-}
-
-/// A command naming an edition other than its
-/// trigger's: a policy bug, refused INTERNAL.
-fn refuse_outside_edition(expected: &str, actual: &str) -> CodedError {
-    CodedError::internal(
-        codes::POLICY_COMMAND_OUTSIDE_EDITION,
-        [
-            (extras::EXPECTED_EDITION.to_string(), expected.to_string()),
-            (extras::ACTUAL_EDITION.to_string(), actual.to_string()),
-        ],
-    )
 }
 
 /// Addresses and identifies the refusal fact OnRefused answered, as the

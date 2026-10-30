@@ -5,16 +5,16 @@
 //! Cover.root; features/coordinator-contract/policy_addressing.feature, the
 //! router's half of C-0656 to C-0660 and C-0665).
 //!
-//! The router's half: every command a policy sends names its root, whatever
-//! its target (aggregate or process manager alike; there is no root
-//! callback and no default root), and one that names none is refused; and
-//! a command carrying a correlation other than its own trigger's is
-//! refused.
+//! The router's half (decision 14.42): a policy names its commands' roots
+//! itself, whatever the target (aggregate or process manager alike; there is
+//! no root callback and no default root), reading its trigger's metadata to
+//! do so, and the router answers its commands as business code returned
+//! them. Checking the destination, edition, root and correlation, and
+//! stamping the trigger's edition, are the policy's coordinator's.
 
 use prost::Message;
 use prost_types::Any;
 
-use crate::error::{codes, extras, CodedError, GrpcCode};
 use crate::pb;
 use crate::policy::PolicyDispatch;
 use crate::test_support::*;
@@ -25,14 +25,6 @@ const CORRELATION: u8 = 0x40;
 const NAMED: u8 = 0xaa;
 /// The inventory aggregate the policy names ("inv-7").
 const INVENTORY: u8 = 7;
-
-/// A target for the no-root test: its domain, a builder of its command
-/// from a root, and that command's type.
-type Target = (
-    &'static str,
-    fn(Option<pb::Uuid>) -> pb::CommandBook,
-    String,
-);
 
 // --- fixtures ----------------------------------------------------------------
 
@@ -123,12 +115,6 @@ fn keeps_the_triggers_correlation(book: &pb::CommandBook, trigger: u8) {
     );
 }
 
-fn refused_internal(err: CodedError, code: &str) -> CodedError {
-    assert_eq!(err.code, code);
-    assert_eq!(err.grpc, GrpcCode::Internal, "a policy bug");
-    err
-}
-
 // --- the policy names the root, for every target (C-0656, C-0658, C-0665) ----
 
 // C-0656 and C-0658: a command lands on the root it names, an aggregate's
@@ -146,107 +132,49 @@ fn a_command_keeps_the_root_it_names_for_any_target() {
     }
 }
 
-// C-0665, for every target: a command naming no root is a policy bug,
-// refused INTERNAL (dead-lettered and alerted) with no commands, and no
-// root is filled in. A process manager is not differentiated: there is no
-// default root. A root whose UUID holds no bytes names none either.
+// C-0690: a command naming no root, carrying another correlation, naming
+// another edition or bound for another domain is answered unchanged, for
+// any target; the coordinator refuses it (decision 14.42).
 #[test]
-fn a_command_naming_no_root_is_refused_for_any_target() {
-    let targets: [Target; 2] = [
-        ("inventory", |root| reserve(root, 3), fq::<ReserveStock>()),
-        (
-            "fulfillment",
-            |root| start(root, 3),
-            fq::<StartFulfillment>(),
-        ),
-    ];
-    for (domain, build, command_type) in targets {
-        for root in [None, Some(pb::Uuid::default())] {
-            let policy = PolicyDispatch::new("OrderTo", "order", domain)
-                .on_event(&fq::<OrderPlaced>(), move |_event, _cover| {
-                    Ok(vec![build(root.clone())])
-                });
-            let err = refused_internal(
-                policy
-                    .dispatch(&one_placed())
-                    .expect_err("a policy's command names its root"),
-                codes::POLICY_COMMAND_NO_ROOT,
-            );
-            let extra = |key: &str| err.extras.get(key).map(String::as_str);
-            assert_eq!(extra(extras::DOMAIN), Some(domain));
-            assert_eq!(extra(extras::COMMAND_TYPE), Some(command_type.as_str()));
-        }
-    }
-}
-
-// --- correlation traces the causal chain --------------------------------------
-
-// Every command a policy sends, to any target, carries its trigger's
-// correlation unchanged: a policy cannot change it. One that sets another
-// is a policy bug, refused INTERNAL with no commands.
-#[test]
-fn a_command_carrying_another_correlation_is_refused() {
-    let other = |mut book: pb::CommandBook| {
+fn a_command_is_answered_as_business_code_returned_it_for_any_target() {
+    let unchecked = |mut book: pb::CommandBook| {
+        let cover = book.cover.as_mut().unwrap();
+        cover.root = None;
+        cover.domain = "elsewhere".to_string();
+        cover.edition = Some("another".to_string());
         book.page.as_mut().unwrap().correlation_id = Some(uuid_of(CORRELATION + 1));
         book
     };
-    let to_inventory = PolicyDispatch::new("OrderToInventory", "order", "inventory")
-        .on_event(&fq::<OrderPlaced>(), move |_e, _c| {
-            Ok(vec![other(reserve(Some(uuid_of(INVENTORY)), 3))])
-        });
-    let to_fulfillment = PolicyDispatch::new("OrderToFulfillment", "order", "fulfillment")
-        .on_event(&fq::<OrderPlaced>(), move |_e, _c| {
-            Ok(vec![other(start(Some(uuid_of(NAMED)), 3))])
-        });
-    for policy in [to_inventory, to_fulfillment] {
-        refused_internal(
-            policy
-                .dispatch(&one_placed())
-                .expect_err("another correlation"),
-            codes::POLICY_COMMAND_OTHER_CORRELATION,
-        );
+    for (domain, command) in [
+        ("inventory", unchecked(reserve(None, 3))),
+        ("fulfillment", unchecked(start(None, 3))),
+    ] {
+        let sent = command.clone();
+        let policy = PolicyDispatch::new("OrderTo", "order", domain)
+            .on_event(&fq::<OrderPlaced>(), move |_event, _cover| {
+                Ok(vec![sent.clone()])
+            });
+        let resp = policy
+            .dispatch(&order_source(
+                Some("what-if"),
+                vec![placed(4, 3, CORRELATION)],
+            ))
+            .expect("answered unchecked");
+        assert_eq!(commands_of(&resp), vec![command]);
     }
 }
 
-// Setting exactly the trigger's correlation is not changing it.
+// The router stamps nothing: a command naming no edition is answered with
+// none, in an edition's trigger too; the coordinator stamps the trigger's.
 #[test]
-fn a_command_carrying_its_triggers_correlation_passes() {
-    let policy = PolicyDispatch::new("OrderToInventory", "order", "inventory").on_event(
-        &fq::<OrderPlaced>(),
-        |_e, _c| {
-            let mut book = reserve(Some(uuid_of(INVENTORY)), 3);
-            book.page.as_mut().unwrap().correlation_id = Some(uuid_of(CORRELATION));
-            Ok(vec![book])
-        },
-    );
-    let resp = policy.dispatch(&one_placed()).expect("its trigger's own");
-    assert_eq!(
-        correlation_of(&commands_of(&resp)[0]),
-        Some(&uuid_of(CORRELATION))
-    );
-}
-
-// Each page is its own trigger: a command is checked against the
-// correlation of the event it was built from, not the book's first.
-#[test]
-fn each_command_is_checked_against_its_own_triggers_correlation() {
-    let policy = PolicyDispatch::new("OrderToInventory", "order", "inventory").on_event(
-        &fq::<OrderPlaced>(),
-        |_event, _c| {
-            let mut book = reserve(Some(uuid_of(INVENTORY)), 3);
-            // The business code wrongly sets the first page's correlation
-            // on every command.
-            book.page.as_mut().unwrap().correlation_id = Some(uuid_of(CORRELATION));
-            Ok(vec![book])
-        },
-    );
-    let err = policy
+fn a_command_naming_no_edition_is_answered_with_none() {
+    let resp = order_to_fulfillment()
         .dispatch(&order_source(
-            None,
-            vec![placed(4, 3, CORRELATION), placed(5, 3, CORRELATION + 2)],
+            Some("what-if"),
+            vec![placed(4, 3, CORRELATION)],
         ))
-        .expect_err("the second page's command carries the first's correlation");
-    refused_internal(err, codes::POLICY_COMMAND_OTHER_CORRELATION);
+        .expect("dispatched");
+    assert_eq!(cover_of(&commands_of(&resp)[0]).edition, None);
 }
 
 // --- fan-out (C-0660) --------------------------------------------------------
@@ -273,41 +201,6 @@ fn one_event_fans_out_to_an_aggregate_and_a_process_manager() {
     );
     keeps_the_triggers_correlation(&commands_of(&inventory)[0], CORRELATION);
     keeps_the_triggers_correlation(&commands_of(&fulfillment)[0], CORRELATION);
-}
-
-// --- the edition: unchanged (POLICY_COMMAND_OUTSIDE_EDITION) ------------------
-
-// A process manager's command stays in its trigger's edition, as an
-// aggregate's does.
-#[test]
-fn a_process_manager_command_stays_in_its_triggers_edition() {
-    let resp = order_to_fulfillment()
-        .dispatch(&order_source(
-            Some("what-if"),
-            vec![placed(4, 3, CORRELATION)],
-        ))
-        .expect("dispatched");
-    assert_eq!(
-        cover_of(&commands_of(&resp)[0]).edition.as_deref(),
-        Some("what-if")
-    );
-    let stray = PolicyDispatch::new("Stray", "order", "fulfillment").on_event(
-        &fq::<OrderPlaced>(),
-        |_e, _c| {
-            let mut book = start(Some(uuid_of(NAMED)), 3);
-            book.cover.as_mut().unwrap().edition = Some("elsewhere".to_string());
-            Ok(vec![book])
-        },
-    );
-    refused_internal(
-        stray
-            .dispatch(&order_source(
-                Some("what-if"),
-                vec![placed(4, 3, CORRELATION)],
-            ))
-            .expect_err("another edition"),
-        codes::POLICY_COMMAND_OUTSIDE_EDITION,
-    );
 }
 
 // --- the trigger's metadata: what a policy may name as the root --------------

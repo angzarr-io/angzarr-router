@@ -107,12 +107,11 @@ fn run(policy: PolicyDispatch, edition: Option<&str>) -> pb::EventPage {
     trigger.pages[0].sequence = 0;
     let sent = commands_of(&policy.dispatch(&trigger).expect("translated"));
     assert_eq!(sent.len(), 1);
-    assert_eq!(
-        sent[0].cover.as_ref().and_then(|c| c.edition.as_deref()),
-        edition,
-        "a policy's command stays in its trigger's edition"
-    );
-    let mut hold = caused_by(sent[0].clone(), instance.clone(), 0);
+    // The runtime checks the command and stamps its trigger's edition
+    // (decision 14.42): a policy's command stays in that edition.
+    let mut hold = sent[0].clone();
+    hold.cover.as_mut().unwrap().edition = edition.map(str::to_string);
+    let mut hold = caused_by(hold, instance.clone(), 0);
     let page = hold.page.as_mut().unwrap();
     page.command_id = Some(uuid_of(9));
     page.correlation_id = Some(uuid_of(INSTANCE));
@@ -185,8 +184,9 @@ fn a_refusal_is_translated_for_the_policies_source_in_process() {
 }
 
 // The same chain in an edition: the policy's command stays in its trigger's
-// edition, and the refusal fact returns to the buy-in's stream in the
-// edition. (Forking the wallet there is the runtime's.)
+// edition (the runtime stamps it), and the refusal fact returns to the
+// buy-in's stream in the edition. (Forking the wallet there is the
+// runtime's.)
 #[test]
 fn the_refusal_path_stays_in_its_edition() {
     let recorded = run(buyin_wallet(), Some(EDITION));

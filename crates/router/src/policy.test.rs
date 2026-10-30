@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use prost_types::Any;
 
-use crate::error::{codes, extras, GrpcCode, HandlerError};
+use crate::error::{codes, HandlerError};
 use crate::pb;
 use crate::policy::PolicyDispatch;
 use crate::test_support::{command_page, commands_of, event_page, uuid_of};
@@ -124,9 +124,8 @@ fn every_page_is_a_fresh_trigger() {
 
 #[test]
 fn emitted_commands_pass_through_unstamped_in_emission_order() {
-    // A handler-set correlation equal to its trigger's survives untouched
-    // (another is refused, decision 14.36; addressing.test.rs); nothing is
-    // filled in from the source.
+    // A handler-set correlation survives untouched (the coordinator checks
+    // it, decision 14.42); nothing is filled in from the source.
     let policy = PolicyDispatch::new("OrderSplit", "order", "inventory").on_event(
         FQ_ORDER_CREATED,
         |_e, _c| {
@@ -186,40 +185,6 @@ fn handler_error_propagates_as_unhandled() {
         .dispatch(&source_book("order", vec![event_page_of(FQ_ORDER_CREATED)]))
         .expect_err("handler error must fail dispatch");
     assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
-}
-
-// --- one destination (policy.proto PolicyResponse; decision 14.24, C-0583) -----
-
-// A policy translates between exactly two domains: a command for any domain
-// but its one destination is a policy bug, refused before it answers.
-#[test]
-fn a_command_for_a_domain_other_than_the_destination_is_refused_with_no_commands() {
-    for stray in ["shipping", ""] {
-        let policy = PolicyDispatch::new("OrderFulfillment", "order", "inventory")
-            .on_event(FQ_ORDER_CREATED, move |_e, _c| {
-                Ok(vec![command_to("inventory"), command_to(stray)])
-            });
-        let err = policy
-            .dispatch(&source_book("order", vec![event_page_of(FQ_ORDER_CREATED)]))
-            .expect_err("a command outside the destination");
-        assert_eq!(err.code, codes::POLICY_COMMAND_OUTSIDE_DESTINATION);
-        assert_eq!(err.grpc, GrpcCode::Internal);
-        let extra = |key: &str| err.extras.get(key).map(String::as_str);
-        assert_eq!(extra(extras::EXPECTED_DOMAIN), Some("inventory"));
-        assert_eq!(extra(extras::ACTUAL_DOMAIN), Some(stray));
-    }
-}
-
-#[test]
-fn a_command_with_no_cover_is_outside_the_destination() {
-    let policy = PolicyDispatch::new("OrderFulfillment", "order", "inventory")
-        .on_event(FQ_ORDER_CREATED, |_e, _c| {
-            Ok(vec![pb::CommandBook::default()])
-        });
-    let err = policy
-        .dispatch(&source_book("order", vec![event_page_of(FQ_ORDER_CREATED)]))
-        .expect_err("no cover names no destination");
-    assert_eq!(err.code, codes::POLICY_COMMAND_OUTSIDE_DESTINATION);
 }
 
 // --- accessors ------------------------------------------------------------
