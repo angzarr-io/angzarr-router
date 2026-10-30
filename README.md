@@ -10,8 +10,8 @@ The router keeps dispatch, and only dispatch. For one component (an
 aggregate, a process manager, a policy or a projector) it:
 
 - routes an input by its type URL to the business code registered for it,
-  refusing a type nothing handles (`UNKNOWN_COMMAND_TYPE`,
-  `NO_FACT_HANDLER`, `NO_REFUSAL_HANDLER`);
+  refusing a type nothing handles (`ROUTER_REASON_UNKNOWN_COMMAND_TYPE`,
+  `ROUTER_REASON_NO_FACT_HANDLER`, `ROUTER_REASON_NO_REFUSAL_HANDLER`);
 - folds the starting state and every page it is given;
 - runs decide (a command) or ingest (a fact), and answers the events, the
   state after them and the build's rules version;
@@ -59,8 +59,9 @@ set. The io.angzarr.v1 wire types are angzarr-project's `rust/angzarr-proto`
 crate at the submodule's commit (re-exported as `angzarr_router::pb`);
 `crates/router/build.rs` generates only the service-proto messages that
 crate does not compile (`CommandHandlerResponse`, `PolicyResponse`,
-`Refusal`, `OnRefusedResponse`), against its types. The reason keys are the
-submodule's `catalog/reasons.toml` router keys, checked by a test. The
+`Refusal`, `OnRefusedResponse`), against its types. The reason keys are
+reasons.proto's `RouterReason` (decision 14.44), each answered as its full
+value name (`as_str_name()`, e.g. `ROUTER_REASON_DUPLICATE_COMPONENT`). The
 `mutation-test` target passes the submodule's absolute path through
 `ANGZARR_PROJECT_PROTO` so cargo-mutants' copied trees build.
 

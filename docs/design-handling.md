@@ -9,16 +9,16 @@
 > answers the one it was given), checks no policy command, builds no
 > refusal fact, guards no envelope, and judges no conflict: it reports
 > the nonce or the unit sets, and the coordinator refuses
-> `CONFLICT_UNRESOLVED` and `CONFLICT_OVERLAP`. router-ffi, its C ABI and
+> `COORDINATOR_REASON_CONFLICT_UNRESOLVED` and `COORDINATOR_REASON_CONFLICT_OVERLAP`. router-ffi, its C ABI and
 > its router-owned state are deleted. The current contract is
 > docs/architecture.md; this note is the record of how it got there.
 
 > **Superseded in part by decision 14.37 (errors are a key and an argument
 > map):** every error code, status and message below is historical. A
-> failing fold is `FOLD_FAILED` / `FOLD_FAILED_EMITTED` with the fold's own
+> failing fold is `ROUTER_REASON_FOLD_FAILED` / `ROUTER_REASON_FOLD_FAILED_EMITTED` with the fold's own
 > failure as `cause` (no `fold_message`; `FoldFailure` carries a `cause`, not
-> a `message`); `DUPLICATE_REGISTRATION` is `DUPLICATE_COMPONENT` or
-> `DUPLICATE_UPCASTER_CHAIN`; an unknown type is `UNKNOWN_COMMAND_TYPE`; the
+> a `message`); `DUPLICATE_REGISTRATION` is `ROUTER_REASON_DUPLICATE_COMPONENT` or
+> `DUPLICATE_UPCASTER_CHAIN`; an unknown type is `ROUTER_REASON_UNKNOWN_COMMAND_TYPE`; the
 > router's own malformed-input and misconfiguration errors are INTERNAL. The
 > current contract is docs/architecture.md's Errors row.
 
@@ -78,7 +78,7 @@ Source: angzarr-project `spec/20261019-draft` (9a84005).
    - **STRICT:** no extra step.
    - **AGGREGATE_HANDLES:** the handler receives the window and nonce. If it
      does not call `resolve_conflicts` with exactly that nonce, the command
-     fails `CONFLICT_UNRESOLVED` (ABORTED). An empty `resolved_nonce` counts
+     fails `COORDINATOR_REASON_CONFLICT_UNRESOLVED` (ABORTED). An empty `resolved_nonce` counts
      as unresolved.
    - **COMMUTATIVE:** the router runs these steps:
      1. Fold to the expected sequence and capture.
@@ -86,10 +86,10 @@ Source: angzarr-project `spec/20261019-draft` (9a84005).
      3. Decide on the head, then restore the head.
      4. Fold the command's events and capture.
      5. If `changed(expected, head)` and `changed(head, after)` overlap, fail
-        with `CONFLICT_OVERLAP` (ABORTED).
+        with `COORDINATOR_REASON_CONFLICT_OVERLAP` (ABORTED).
 
      If no `changed` is registered, the command fails
-     `CONFLICT_RESOLUTION_UNSUPPORTED` (INVALID_ARGUMENT). If an emitted event
+     `ROUTER_REASON_CONFLICT_RESOLUTION_UNSUPPORTED` (INVALID_ARGUMENT). If an emitted event
      fails to fold, the error is INTERNAL.
 5. **Rules version.** The router always sets the binary's declared version on
    every aggregate and PM response, overwriting whatever a handler set, even
@@ -115,7 +115,7 @@ Native aggregates keep typed state.
 | `CommandHandler::upcast_types`, `CommandHandler::check_claims` | The old types an aggregate accepts, and the build-time check above. Defaults: empty, and nothing to check. |
 | `Rebuilder::with_fold(fold)` | A batched fold, `fold(&mut S, &[EventPage], cover)`, called once over every uncovered page. It replaces per-type appliers. The C ABI uses it over `prost_types::Any` state. |
 | `conflict::overlap` | The overlap rule. |
-| Error codes | `CONFLICT_UNRESOLVED` and `CONFLICT_OVERLAP` (both ABORTED); `CONFLICT_RESOLUTION_UNSUPPORTED` (INVALID_ARGUMENT). |
+| Error codes | `COORDINATOR_REASON_CONFLICT_UNRESOLVED` and `COORDINATOR_REASON_CONFLICT_OVERLAP` (both ABORTED); `ROUTER_REASON_CONFLICT_RESOLUTION_UNSUPPORTED` (INVALID_ARGUMENT). |
 
 ## C ABI: router-owned state (ABI 4, language-neutral)
 
@@ -186,7 +186,7 @@ aggregates or PMs. Projectors are unchanged; see Open.
 ## Rulings applied
 
 - **Stale results:** two codes, both ABORTED.
-- **COMMUTATIVE without `changed`:** `CONFLICT_RESOLUTION_UNSUPPORTED`.
+- **COMMUTATIVE without `changed`:** `ROUTER_REASON_CONFLICT_RESOLUTION_UNSUPPORTED`.
 - **Upcasting:** applies to both arms. A refusal names the sent type, and the
   type a chain produced goes in the extras.
 - **Old types:** claimed at registration.
@@ -227,7 +227,7 @@ language. Hosts only send it.
       order. The base is STRICT and AGGREGATE_HANDLES; COMMUTATIVE is added
       first when a `changed()` is registered (`with_commutative`).
 - **Refusal.** A descriptor with an empty `rules_version` is refused
-  `INVALID_ARGUMENT` (`MISSING_RULES_VERSION`), mirroring the coordinator.
+  `INVALID_ARGUMENT` (`COORDINATOR_REASON_MISSING_RULES_VERSION`), mirroring the coordinator.
   The ErrorInfo metadata names the `component`.
   Every kind needs one, so sagas and projectors gain `with_rules_version`
   too.
@@ -239,7 +239,7 @@ language. Hosts only send it.
     since round 10). It fills `out` with a serialized
     `io.angzarr.v1.ComponentDescriptor` (the spec's
     `ComponentService.Describe` answer, spec 825311f), or with a status: the
-    component's refusal, or `NO_HANDLERS_REGISTERED` before one registers.
+    component's refusal, or `ROUTER_REASON_NO_HANDLERS_REGISTERED` before one registers.
   - The saga and projector descriptors gain `rules_version`.
 - **Binding.** C-0535 and C-0565 (describing the process gives its one
   component, spec 825311f) bind against a native `Router` hosting the order
@@ -294,7 +294,7 @@ search of round 5, which is deleted.
 
 ### Every failing fold is a handler bug
 
-Any fold of events that fails answers `UNHANDLED_HANDLER_ERROR` (INTERNAL):
+Any fold of events that fails answers `ROUTER_REASON_UNHANDLED_HANDLER_ERROR` (INTERNAL):
 the native per-event appliers, the C-ABI aggregate and process-manager folds,
 and the C-ABI projector fold (which no longer passes the host's status
 through), and the native projector's per-event folds.
@@ -311,7 +311,7 @@ through), and the native projector's per-event folds.
     when the component declared none.
   - `fold_message`, when the fold gave one (a native applier's error text,
     or `FoldFailure.message`).
-- **`PERSISTED_EVENT_CORRUPT`** keeps one producer: a snapshot whose state
+- **`ROUTER_REASON_PERSISTED_EVENT_CORRUPT`** keeps one producer: a snapshot whose state
   the native snapshot loader cannot load. That is not a fold of events, so
   the code stays (DATA_LOSS) for it alone.
 
@@ -346,7 +346,7 @@ projection type.
 
 `component_descriptor()` on aggregates and process managers takes the state
 type from the rebuilder; a component that declared none is refused
-`MISSING_STATE_TYPE` (INVALID_ARGUMENT, metadata `component`), since the
+`COORDINATOR_REASON_MISSING_STATE_TYPE` (INVALID_ARGUMENT, metadata `component`), since the
 spec sets `StateDescriptor` for both kinds.
 
 ### `Router::component_descriptor()`
@@ -404,7 +404,7 @@ domains, stays.)
 
 - **Native `Router`.** `RouterBuilder` takes one component (and, optionally,
   its upcaster chain); a second component of any kind, or a second chain, is
-  `DUPLICATE_REGISTRATION`; none is `NO_HANDLERS_REGISTERED`. The router
+  `DUPLICATE_REGISTRATION`; none is `ROUTER_REASON_NO_HANDLERS_REGISTERED`. The router
   dispatches to that component: commands and facts to the aggregate, a saga
   source (from the saga's input domain) to the saga, a PM request to the PM,
   an EventBook to the projector (`dispatch_projector`, one `Projection`), and
@@ -449,7 +449,7 @@ Choices no ruling covers, reported for sign-off:
 - **`fold_message`.** The fold's own text rides in ErrorInfo metadata
   `fold_message`; the coded message stays the fixed cross-language text.
 - **Range keys.** `first_sequence` and `last_sequence`.
-- **`MISSING_STATE_TYPE`.** A native aggregate or process manager whose
+- **`COORDINATOR_REASON_MISSING_STATE_TYPE`.** A native aggregate or process manager whose
   rebuilder declares no state type cannot build its hello.
 - **Snapshot loads.** A snapshot the native loader cannot load stays
-  `PERSISTED_EVENT_CORRUPT` (DATA_LOSS); it is not a fold of events.
+  `ROUTER_REASON_PERSISTED_EVENT_CORRUPT` (DATA_LOSS); it is not a fold of events.
