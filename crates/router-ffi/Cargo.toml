@@ -6,7 +6,7 @@ license.workspace = true
 description = "C-ABI surface over angzarr-router — no semantics in this layer"
 
 [lib]
-crate-type = ["cdylib", "staticlib", "rlib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 angzarr-router = { path = "../router" }
