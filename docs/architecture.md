@@ -100,6 +100,9 @@ coordinator.
   architecture linter, every missed mutant a failure; weekly in CI.
   `just mutation-push`, by hand, is the same over only what a push adds.
   No git hook runs mutation.
+- `just push-check` (pre-push): every test, in each pushed commit's tree
+  checked out alone. Red tests pushed to a branch pass with a warning;
+  pushed to the default branch they are refused.
 - `just archlint`: the layering as checked rules (`archlint.toml`: the
   router below the harness, its components independent of each other and
   of the `Router` that composes them, the harness on the public surface),
