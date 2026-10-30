@@ -131,6 +131,73 @@ impl<S> CommandHandler for DomainDispatch<S> {
     }
 }
 
+/// A policy as the router sees it: a [`PolicyDispatch`], or one written by
+/// hand (a policy in another process, behind its `PolicyService`). The
+/// router checks a source's domain against [`Self::input_domain`] before
+/// [`Self::dispatch`] (POLICY_SOURCE_OUTSIDE_INPUT_DOMAIN).
+pub trait PolicyComponent: Send + Sync {
+    /// The component's name.
+    fn name(&self) -> &str;
+    /// The one domain whose events it handles, and to which its refusal
+    /// facts go.
+    fn input_domain(&self) -> &str;
+    /// `PolicyService.Handle`: the commands for one source book.
+    fn dispatch(&self, source: &pb::EventBook) -> Result<pb::PolicyResponse, CodedError>;
+    /// `PolicyService.OnRefused`: the refusal fact for its own source
+    /// domain, the refused command's context `ctx` beside it.
+    fn dispatch_refusal(
+        &self,
+        refusal: &pb::Refusal,
+        ctx: &crate::context::CommandContext,
+    ) -> Result<pb::OnRefusedResponse, CodedError>;
+    /// The registration hello (types.proto, ComponentDescriptor).
+    fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError>;
+}
+
+impl<T: PolicyComponent + ?Sized> PolicyComponent for Box<T> {
+    fn name(&self) -> &str {
+        (**self).name()
+    }
+    fn input_domain(&self) -> &str {
+        (**self).input_domain()
+    }
+    fn dispatch(&self, source: &pb::EventBook) -> Result<pb::PolicyResponse, CodedError> {
+        (**self).dispatch(source)
+    }
+    fn dispatch_refusal(
+        &self,
+        refusal: &pb::Refusal,
+        ctx: &crate::context::CommandContext,
+    ) -> Result<pb::OnRefusedResponse, CodedError> {
+        (**self).dispatch_refusal(refusal, ctx)
+    }
+    fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError> {
+        (**self).component_descriptor()
+    }
+}
+
+impl PolicyComponent for PolicyDispatch {
+    fn name(&self) -> &str {
+        PolicyDispatch::name(self)
+    }
+    fn input_domain(&self) -> &str {
+        PolicyDispatch::input_domain(self)
+    }
+    fn dispatch(&self, source: &pb::EventBook) -> Result<pb::PolicyResponse, CodedError> {
+        PolicyDispatch::dispatch(self, source)
+    }
+    fn dispatch_refusal(
+        &self,
+        refusal: &pb::Refusal,
+        ctx: &crate::context::CommandContext,
+    ) -> Result<pb::OnRefusedResponse, CodedError> {
+        PolicyDispatch::dispatch_refusal(self, refusal, ctx)
+    }
+    fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError> {
+        PolicyDispatch::component_descriptor(self)
+    }
+}
+
 /// A projector as the router sees it, whatever its projection type.
 pub trait ProjectorHandler: Send + Sync {
     /// The component's name.
@@ -168,7 +235,7 @@ impl<P> ProjectorHandler for ProjectorDispatch<P> {
 /// The one component a router hosts.
 enum Component {
     Aggregate(Box<dyn CommandHandler>),
-    Policy(PolicyDispatch),
+    Policy(Box<dyn PolicyComponent>),
     Projector(Box<dyn ProjectorHandler>),
 }
 
@@ -231,9 +298,9 @@ impl RouterBuilder {
         self
     }
 
-    /// Hosts a policy.
-    pub fn policy(mut self, policy: PolicyDispatch) -> Self {
-        self.components.push(Component::Policy(policy));
+    /// Hosts a policy: a [`PolicyDispatch`], or one written by hand.
+    pub fn policy(mut self, policy: impl PolicyComponent + 'static) -> Self {
+        self.components.push(Component::Policy(Box::new(policy)));
         self
     }
 
@@ -324,7 +391,7 @@ impl Router {
     /// The policy's OnRefused (policy.proto): the refusal fact for its own
     /// source domain, passed through or translated, the callback handed the
     /// refused command's context `ctx`
-    /// ([`PolicyDispatch::dispatch_refusal`]).
+    /// ([`PolicyComponent::dispatch_refusal`]).
     pub fn dispatch_refusal(
         &self,
         refusal: &pb::Refusal,

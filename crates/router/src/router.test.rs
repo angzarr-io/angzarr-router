@@ -724,9 +724,23 @@ fn boxed_policies_build_routers() {
     assert_eq!(boxed.input_domain(), "order");
     let router = RouterBuilder::new().policy(boxed).build().expect("build");
     assert_eq!(
-        router.dispatch_policy(&source("order")).expect("policy").commands.len(),
+        router
+            .dispatch_policy(&source("order"))
+            .expect("policy")
+            .commands
+            .len(),
         1
     );
+
+    assert!(router
+        .dispatch_refusal(
+            &pb::Refusal::default(),
+            &crate::context::CommandContext::default()
+        )
+        .expect("answered")
+        .fact
+        .is_some());
+    assert_eq!(router.component_descriptor().expect("hello").name, "relay");
 
     let dispatch: &dyn PolicyComponent = &PolicyDispatch::new("s", "order", "inventory");
     assert_eq!(dispatch.name(), "s");
