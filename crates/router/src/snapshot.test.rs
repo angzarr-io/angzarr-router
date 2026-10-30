@@ -1,8 +1,9 @@
-//! The post-command snapshot (owner ruling, round 7): the router fills
-//! `events.snapshot.state` with the state after the emitted events on every
-//! domain's answer (an aggregate's or a process manager's, a PM being a domain;
-//! decision 14.31). Business code never decides when; the
-//! coordinator stamps the snapshot's sequence and rules version.
+//! The state on every answer (owner ruling, round 7; decision 14.12): the
+//! router fills `events.snapshot.state` with the state after the emitted
+//! events, encoded by the state's codec, on every domain's answer (an
+//! aggregate's or a process manager's, a PM being a domain; decision 14.31).
+//! Business code never decides when; the coordinator decides whether to
+//! write it and stamps its sequence and rules version (decision 14.40).
 
 use std::collections::BTreeMap;
 
@@ -35,7 +36,7 @@ fn items_rebuilder() -> Rebuilder<Items> {
     })
 }
 
-/// The snapshot image of an Items state.
+/// An Items state, encoded.
 fn image(pairs: &[(&str, u32)]) -> Any {
     Any {
         type_url: "/test.items.Items".to_string(),
@@ -221,10 +222,30 @@ fn a_rebuilder_with_no_state_message_answers_no_snapshot() {
 }
 
 #[test]
-fn a_rebuilder_states_its_image_through_with_state_image() {
-    let r: Rebuilder<Any> = Rebuilder::new(Any::default).with_state_image(|s: &Any| s.clone());
-    assert_eq!(r.state_image(&image(&[])), Some(image(&[])));
-    assert_eq!(fresh_rebuilder().state_image(&TestState::default()), None);
+fn a_rebuilder_encodes_state_through_its_codec() {
+    let r: Rebuilder<Any> =
+        Rebuilder::new(Any::default).with_state_codec(|a: &Any| Ok(a.clone()), |s: &Any| s.clone());
+    assert_eq!(r.encode_state(&image(&[])), Some(image(&[])));
+    assert_eq!(fresh_rebuilder().encode_state(&TestState::default()), None);
+}
+
+// The codec's decode is the inverse of its encode (decision 14.40): the
+// state an answer carries, delivered back as the starting state, rebuilds
+// the same state.
+#[test]
+fn of_messages_codec_decodes_the_state_it_encodes() {
+    let r = items_rebuilder();
+    let state = Items {
+        items: [("a".to_string(), 2)].into_iter().collect(),
+    };
+    let book = pb::EventBook {
+        snapshot: Some(pb::Snapshot {
+            state: r.encode_state(&state),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert_eq!(r.rebuild(Some(&book)).expect("rebuild").0, state);
 }
 
 #[test]

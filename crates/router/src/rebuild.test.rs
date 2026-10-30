@@ -1,18 +1,32 @@
 //! Rebuilder contracts, transliterated from client-go's engine_test.go +
 //! engine_boundaries_test.go (mutation-hardened bank, kill 0.972). The
-//! boundary knowledge these encode — covered-page inclusivity,
-//! HadPriorEvents shapes, gap pages never terminal — is the contract the
-//! shared core must satisfy byte-for-byte.
+//! boundary knowledge these encode — HadPriorEvents shapes, gap pages never
+//! terminal, every given page folded onto the starting state (decision
+//! 14.40) — is the contract the shared core must satisfy byte-for-byte.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use prost::Message;
+use prost_types::Any;
 
 use crate::error::{codes, extras};
 use crate::pb;
 use crate::rebuild::{FoldFailure, PageOrigin, Rebuilder};
 use crate::test_support::*;
+
+/// `r` with a state codec whose decode answers a state that has applied
+/// only `label`, and whose encode answers an empty `Any`.
+fn starting_at(r: Rebuilder<TestState>, label: &'static str) -> Rebuilder<TestState> {
+    r.with_state_codec(
+        move |_| {
+            Ok(TestState {
+                applied: vec![label.to_string()],
+            })
+        },
+        |_| Any::default(),
+    )
+}
 
 #[test]
 fn applies_all_pages_in_order() {
@@ -131,8 +145,8 @@ fn of_message_takes_the_state_type_from_the_prost_name() {
 }
 
 #[test]
-fn a_snapshot_the_loader_cannot_load_is_persisted_event_corrupt() {
-    let r = fresh_rebuilder().with_snapshot(|_s, _any| Err("bad snapshot".into()));
+fn a_starting_state_the_codec_cannot_decode_is_persisted_event_corrupt() {
+    let r = fresh_rebuilder().with_state_codec(|_any| Err("bad state".into()), |_| Any::default());
     let book = pb::EventBook {
         snapshot: Some(pb::Snapshot {
             state: Some(cover_any("snap")),
@@ -169,12 +183,16 @@ fn unknown_event_type_skipped() {
 }
 
 #[test]
-fn snapshot_applied_before_pages() {
-    let r = cover_applier(fresh_rebuilder().with_snapshot(|s, payload| {
-        let c = pb::Cover::decode(payload.value.as_slice())?;
-        s.applied.push(format!("snap:{}", c.domain));
-        Ok(())
-    }));
+fn the_starting_state_is_decoded_before_the_pages_fold() {
+    let r = cover_applier(fresh_rebuilder().with_state_codec(
+        |start| {
+            let c = pb::Cover::decode(start.value.as_slice())?;
+            Ok(TestState {
+                applied: vec![format!("snap:{}", c.domain)],
+            })
+        },
+        |_| Any::default(),
+    ));
 
     let book = pb::EventBook {
         snapshot: Some(pb::Snapshot {
@@ -189,65 +207,6 @@ fn snapshot_applied_before_pages() {
     let (state, info) = r.rebuild(Some(&book)).expect("rebuild");
     assert_eq!(state.applied, vec!["snap:base", "after"]);
     assert!(info.had_prior_events, "a snapshot alone is prior history");
-}
-
-#[test]
-fn pages_covered_by_snapshot_are_skipped() {
-    let r = cover_applier(fresh_rebuilder().with_snapshot(|s, _| {
-        s.applied.push("snap".to_string());
-        Ok(())
-    }));
-
-    // Pages 1..3; snapshot covers through sequence 2 — re-applying covered
-    // pages would double-fold their effects into state.
-    let book = pb::EventBook {
-        snapshot: Some(pb::Snapshot {
-            sequence: 2,
-            state: Some(cover_any("")),
-            ..Default::default()
-        }),
-        pages: vec![
-            sequenced_event_page(1, cover_any("covered1")),
-            sequenced_event_page(2, cover_any("covered2")),
-            sequenced_event_page(3, cover_any("after")),
-        ],
-        ..Default::default()
-    };
-    let (state, _) = r.rebuild(Some(&book)).expect("rebuild");
-    assert_eq!(
-        state.applied,
-        vec!["snap", "after"],
-        "covered pages skipped"
-    );
-}
-
-// The covered-page skip is an exact boundary: a snapshot covering through
-// sequence 1 skips the sequence-1 page and nothing after it.
-#[test]
-fn covered_boundary_exact_sequence_skipped() {
-    let r = cover_applier(fresh_rebuilder().with_snapshot(|s, _| {
-        s.applied.push("snap".to_string());
-        Ok(())
-    }));
-
-    let book = pb::EventBook {
-        snapshot: Some(pb::Snapshot {
-            sequence: 1,
-            state: Some(cover_any("")),
-            ..Default::default()
-        }),
-        pages: vec![
-            sequenced_event_page(1, cover_any("covered")),
-            sequenced_event_page(2, cover_any("after")),
-        ],
-        ..Default::default()
-    };
-    let (state, _) = r.rebuild(Some(&book)).expect("rebuild");
-    assert_eq!(
-        state.applied,
-        vec!["snap", "after"],
-        "sequence 1 covered, sequence 2 not"
-    );
 }
 
 // Decision 14.40: the coordinator drops the pages a snapshot covers, and the
@@ -269,11 +228,7 @@ fn every_given_page_is_folded_even_at_or_below_the_starting_states_sequence() {
         ],
         ..Default::default()
     };
-    let starting = |s: &mut TestState, _: &prost_types::Any| {
-        s.applied.push("start".to_string());
-        Ok(())
-    };
-    let (state, info) = cover_applier(fresh_rebuilder().with_snapshot(starting))
+    let (state, info) = cover_applier(starting_at(fresh_rebuilder(), "start"))
         .rebuild(Some(&book))
         .expect("rebuild");
     assert_eq!(state.applied, vec!["start", "one", "two", "three"]);
@@ -314,29 +269,21 @@ fn snapshot_only_is_prior_history() {
 }
 
 #[test]
-fn no_snapshot_in_book_loader_not_invoked() {
+fn no_starting_state_in_book_decode_not_invoked() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let seen = calls.clone();
-    let r = fresh_rebuilder().with_snapshot(move |_, _| {
-        seen.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    });
+    let r = counting_decode(calls.clone());
     r.rebuild(Some(&book_of_covers(&["a"]))).expect("rebuild");
     assert_eq!(
         calls.load(Ordering::SeqCst),
         0,
-        "snapshot loader ran with no snapshot in the book"
+        "the codec decoded with no starting state in the book"
     );
 }
 
 #[test]
-fn snapshot_without_state_loader_not_invoked() {
+fn snapshot_without_state_decode_not_invoked() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let seen = calls.clone();
-    let r = fresh_rebuilder().with_snapshot(move |_, _| {
-        seen.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    });
+    let r = counting_decode(calls.clone());
     let book = pb::EventBook {
         snapshot: Some(pb::Snapshot {
             sequence: 3, // no state payload
@@ -348,12 +295,23 @@ fn snapshot_without_state_loader_not_invoked() {
     assert_eq!(
         calls.load(Ordering::SeqCst),
         0,
-        "snapshot loader ran for a stateless snapshot"
+        "the codec decoded a stateless snapshot"
     );
 }
 
+/// A rebuilder whose codec counts its decodes.
+fn counting_decode(calls: Arc<AtomicUsize>) -> Rebuilder<TestState> {
+    fresh_rebuilder().with_state_codec(
+        move |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(TestState::default())
+        },
+        |_| Any::default(),
+    )
+}
+
 #[test]
-fn snapshot_without_loader_ignored_safely() {
+fn a_starting_state_without_a_codec_is_ignored_safely() {
     let r = cover_applier(fresh_rebuilder());
     let mut book = book_of_covers(&["after"]);
     book.snapshot = Some(pb::Snapshot {
@@ -365,7 +323,7 @@ fn snapshot_without_loader_ignored_safely() {
     assert_eq!(
         state.applied,
         vec!["after"],
-        "no loader registered — snapshot state cannot fold"
+        "no codec declared — the starting state cannot decode"
     );
 }
 
@@ -388,34 +346,10 @@ fn pageless_entries_do_not_end_the_fold() {
     );
 }
 
-// A snapshot at sequence 0 covers page 0: the loaded state already holds it.
+// Without a codec the starting state never decodes, and every page folds
+// onto fresh state.
 #[test]
-fn snapshot_at_sequence_zero_covers_page_zero() {
-    let r = cover_applier(fresh_rebuilder().with_snapshot(|s, _| {
-        s.applied.push("snapshot".to_string());
-        Ok(())
-    }));
-    let book = pb::EventBook {
-        snapshot: Some(pb::Snapshot {
-            sequence: 0,
-            state: Some(cover_any("snap")),
-            ..Default::default()
-        }),
-        pages: vec![
-            sequenced_event_page(0, cover_any("covered0")),
-            sequenced_event_page(1, cover_any("after")),
-        ],
-        ..Default::default()
-    };
-    let (state, info) = r.rebuild(Some(&book)).expect("rebuild");
-    assert_eq!(state.applied, vec!["snapshot", "after"]);
-    assert_eq!(info.applied_count, 1);
-}
-
-// Without a loader the snapshot state never folds, so no page is covered by
-// it: skipping would silently lose that history.
-#[test]
-fn snapshot_without_loader_covers_no_pages() {
+fn without_a_codec_every_page_folds_onto_fresh_state() {
     let r = cover_applier(fresh_rebuilder());
     let book = pb::EventBook {
         snapshot: Some(pb::Snapshot {
@@ -434,13 +368,11 @@ fn snapshot_without_loader_covers_no_pages() {
     assert_eq!(state.applied, vec!["one", "two", "three"]);
 }
 
-// A snapshot with no state payload loads nothing, so it covers nothing.
+// A snapshot with no state decodes nothing: every page folds onto fresh
+// state.
 #[test]
-fn stateless_snapshot_covers_no_pages() {
-    let r = cover_applier(fresh_rebuilder().with_snapshot(|s, _| {
-        s.applied.push("snapshot".to_string());
-        Ok(())
-    }));
+fn a_stateless_snapshot_folds_every_page_onto_fresh_state() {
+    let r = cover_applier(starting_at(fresh_rebuilder(), "snapshot"));
     let book = pb::EventBook {
         snapshot: Some(pb::Snapshot {
             sequence: 2,
@@ -514,23 +446,18 @@ type FoldCalls = Arc<std::sync::Mutex<Vec<(Vec<u64>, String)>>>;
 
 /// A fold recording each call's page sequences and the cover domain.
 fn batch_rebuilder(calls: FoldCalls) -> crate::rebuild::Rebuilder<TestState> {
-    fresh_rebuilder()
-        .with_snapshot(|s, _| {
-            s.applied.push("snap".to_string());
-            Ok(())
-        })
-        .with_fold(move |s: &mut TestState, pages, cover| {
-            calls.lock().unwrap().push((
-                pages.iter().map(|p| p.sequence).collect(),
-                cover.map(|c| c.domain.clone()).unwrap_or_default(),
-            ));
-            s.applied.push(format!("fold{}", pages.len()));
-            Ok(())
-        })
+    starting_at(fresh_rebuilder(), "snap").with_fold(move |s: &mut TestState, pages, cover| {
+        calls.lock().unwrap().push((
+            pages.iter().map(|p| p.sequence).collect(),
+            cover.map(|c| c.domain.clone()).unwrap_or_default(),
+        ));
+        s.applied.push(format!("fold{}", pages.len()));
+        Ok(())
+    })
 }
 
 #[test]
-fn a_batched_fold_sees_every_uncovered_page_in_one_call() {
+fn a_batched_fold_sees_every_page_in_one_call() {
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
     let r = batch_rebuilder(calls.clone());
     let book = pb::EventBook {
@@ -544,19 +471,19 @@ fn a_batched_fold_sees_every_uncovered_page_in_one_call() {
             ..Default::default()
         }),
         pages: vec![
-            sequenced_event_page(1, cover_any("covered")),
+            sequenced_event_page(1, cover_any("at-the-snapshot")),
             sequenced_event_page(2, cover_any("a")),
             sequenced_event_page(3, pb::EventPage::default().payload.unwrap_or_default()),
         ],
         ..Default::default()
     };
     let (state, info) = r.rebuild(Some(&book)).expect("rebuild");
-    assert_eq!(state.applied, vec!["snap", "fold2"]);
+    assert_eq!(state.applied, vec!["snap", "fold3"]);
     assert_eq!(
         *calls.lock().unwrap(),
-        vec![(vec![2, 3], "ledger".to_string())]
+        vec![(vec![1, 2, 3], "ledger".to_string())]
     );
-    assert_eq!(info.applied_count, 2, "every folded page counts");
+    assert_eq!(info.applied_count, 3, "every folded page counts");
 }
 
 #[test]
@@ -842,14 +769,13 @@ fn a_panicking_batched_fold_of_one_page_names_it() {
     assert_panicked_cause(&err);
 }
 
-// A panicking snapshot loader is a defect in user code, not corrupt data
-// (corrupt bytes are a decode error): FOLD_FAILED with cause
-// HANDLER_PANICKED, naming the snapshot by its sequence and its state's
-// type URL.
+// A panicking codec is a defect in user code, not corrupt data (corrupt
+// bytes are a decode error): FOLD_FAILED with cause HANDLER_PANICKED, naming
+// the snapshot by its sequence and its state's type URL.
 #[test]
-fn a_panicking_snapshot_loader_fails_the_rebuild_naming_the_snapshot() {
+fn a_panicking_codec_fails_the_rebuild_naming_the_snapshot() {
     let r = cover_applier(fresh_rebuilder().with_state_type("test.State"))
-        .with_snapshot(|_s: &mut TestState, _any| panic!("index out of bounds"));
+        .with_state_codec(|_any| panic!("index out of bounds"), |_| Any::default());
     let snap_state = cover_any("snap");
     let book = pb::EventBook {
         snapshot: Some(pb::Snapshot {
@@ -860,7 +786,7 @@ fn a_panicking_snapshot_loader_fails_the_rebuild_naming_the_snapshot() {
         pages: vec![sequenced_event_page(4, cover_any("a"))],
         ..Default::default()
     };
-    let err = answered(|| r.rebuild(Some(&book))).expect_err("the loader panicked");
+    let err = answered(|| r.rebuild(Some(&book))).expect_err("the codec panicked");
     assert_fold_failed(
         &err,
         "FOLD_FAILED",

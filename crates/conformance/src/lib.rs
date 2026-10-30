@@ -101,25 +101,18 @@ where
 
 /// Build the CounterAggregate dispatch table (appliers and handlers).
 pub fn counter_aggregate(observed: ObservedSink) -> DomainDispatch<CounterState> {
-    let rebuilder = Rebuilder::of_message()
-        .apply(
-            "test.counter.Increased",
-            |state: &mut CounterState, event| {
-                // Decode the payload so a corrupt persisted event fails the fold
-                // (UNHANDLED_HANDLER_ERROR: a failing fold is a handler bug).
-                // Increased is empty, so every
-                // well-formed event decodes and simply increments.
-                counter::Increased::decode(event.value.as_slice())?;
-                state.count += 1;
-                Ok(())
-            },
-        )
-        .with_snapshot(|state: &mut CounterState, snapshot| {
-            // Seed state from the snapshot; pages at or below its sequence are
-            // already folded in and must not re-apply (covered-page boundary).
-            state.count = counter::CounterState::decode(snapshot.value.as_slice())?.count;
+    let rebuilder = Rebuilder::of_message().apply(
+        "test.counter.Increased",
+        |state: &mut CounterState, event| {
+            // Decode the payload so a corrupt persisted event fails the fold
+            // (UNHANDLED_HANDLER_ERROR: a failing fold is a handler bug).
+            // Increased is empty, so every
+            // well-formed event decodes and simply increments.
+            counter::Increased::decode(event.value.as_slice())?;
+            state.count += 1;
             Ok(())
-        });
+        },
+    );
 
     DomainDispatch::new("counter-aggregate", "counter", rebuilder)
         // n > 0 emits n Increased; n == 0 rejects VALUE_NOT_POSITIVE.
@@ -390,30 +383,6 @@ pub fn corrupt_prior_history() -> Option<pb::EventBook> {
     })
 }
 
-/// Prior history seeded by a snapshot of `count == 10` at sequence 10, plus a
-/// covered page (sequence 10, already in the snapshot → skipped) and one
-/// uncovered page (sequence 11 → applied). A rebuild therefore observes
-/// `count == 11`: snapshot loaded, covered page not refolded, newer page applied.
-pub fn snapshot_history() -> Option<pb::EventBook> {
-    let increased_at = |seq: u64| pb::EventPage {
-        sequence: seq,
-        ..parse_txtpb(EVENT_PAGE, SKEL_INCREASED_EVENT)
-    };
-    Some(pb::EventBook {
-        snapshot: Some(pb::Snapshot {
-            state: Some(prost_types::Any {
-                type_url: angzarr_router::type_url("test.counter.CounterState"),
-                value: CounterState { count: 10 }.encode_to_vec(),
-            }),
-            sequence: 10,
-            ..Default::default()
-        }),
-        pages: vec![increased_at(10), increased_at(11)],
-        next_sequence: 12,
-        ..Default::default()
-    })
-}
-
 /// A counter delivered a starting state of `count` at `sequence` and one
 /// `Increased` event at `event_at`: the pages after the snapshot only, as
 /// the coordinator delivers them (decision 14.40).
@@ -509,24 +478,19 @@ fn increased_page(seq: u64) -> pb::EventPage {
 }
 
 /// The ledger aggregate (domain "ledger") over CounterState: Increased folds
-/// count += 1 and records the page sequence it applied; a snapshot loads
-/// CounterState; IncreaseBy records the handled cover and emits one
+/// count += 1 and records the page sequence it applied; a starting state
+/// decodes as CounterState; IncreaseBy records the handled cover and emits one
 /// Increased; the only fact, Increased, is recorded as received and flagged
 /// by a CounterState carrying the count it brings the ledger to.
 pub fn ledger_aggregate(seen: CoverSink, applied: SequenceSink) -> DomainDispatch<CounterState> {
-    let rebuilder = Rebuilder::of_message()
-        .apply_with_context(
-            "test.counter.Increased",
-            move |state: &mut CounterState, _, ctx| {
-                state.count += 1;
-                applied.lock().unwrap().push(ctx.sequence);
-                Ok(())
-            },
-        )
-        .with_snapshot(|state: &mut CounterState, any| {
-            *state = CounterState::decode(any.value.as_slice())?;
+    let rebuilder = Rebuilder::of_message().apply_with_context(
+        "test.counter.Increased",
+        move |state: &mut CounterState, _, ctx| {
+            state.count += 1;
+            applied.lock().unwrap().push(ctx.sequence);
             Ok(())
-        });
+        },
+    );
     DomainDispatch::new("Ledger", "ledger", rebuilder)
         .on_command("test.counter.IncreaseBy", move |_cmd, _state, cctx| {
             seen.lock().unwrap().push(cctx.cover.clone());
@@ -796,7 +760,8 @@ fn sorted_items(state: &orders::v1::OrderState) -> Vec<String> {
 }
 
 /// The order aggregate (domain "order") at `rules_version`: ItemAdded bumps
-/// an item, OrderNoteAdded sets the notes, a snapshot loads OrderState;
+/// an item, OrderNoteAdded sets the notes, a starting state decodes as
+/// OrderState;
 /// AddItem records what business code saw in `seen`, settles per `settle`
 /// and records ItemAdded; the fact ItemDelivered is recorded as received;
 /// COMMUTATIVE runs through [`order_changed`].
@@ -846,11 +811,7 @@ pub fn order_aggregate_with(
                 state.notes = orders::v1::OrderNoteAdded::decode(event.value.as_slice())?.note;
                 Ok(())
             },
-        )
-        .with_snapshot(|state: &mut orders::v1::OrderState, any| {
-            *state = orders::v1::OrderState::decode(any.value.as_slice())?;
-            Ok(())
-        });
+        );
     let facts = seen.clone();
     DomainDispatch::new("order", "order", rebuilder)
         .with_rules_version(rules_version)

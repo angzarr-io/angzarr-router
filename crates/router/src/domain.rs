@@ -530,11 +530,12 @@ impl<S> DomainDispatch<S> {
                 return Err(CodedError::internal(codes::MISSING_COMMAND_PAYLOAD, []));
             }
         };
-        // The post-command snapshot, on every answer (owner ruling): the
-        // coordinator stamps its sequence and rules version.
-        if let Some(image) = self.rebuilder.state_image(&state) {
+        // The state after the input, on every answer (decision 14.12): the
+        // coordinator decides whether to write it, and stamps its sequence
+        // and rules version (decision 14.40).
+        if let Some(after) = self.rebuilder.encode_state(&state) {
             events.snapshot = Some(pb::Snapshot {
-                state: Some(image),
+                state: Some(after),
                 ..Default::default()
             });
         }

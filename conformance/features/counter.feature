@@ -73,11 +73,6 @@ Feature: Counter aggregate dispatch
     When the operator increases the counter by 1
     Then the handler saw prior history, at next sequence 2
 
-  Scenario: a snapshot seeds state and its covered page is not refolded
-    Given a counter restored from a snapshot of 10 with one newer event
-    When the operator increases the counter by 1
-    Then the handler saw a counter of 11, at next sequence 12
-
   Scenario Outline: commands and events route by fully-qualified name under any type-URL prefix
     Given a counter that has already recorded 2 increases under the "<prefix>" type-URL prefix
     When the operator increases the counter by 1 under the "<prefix>" type-URL prefix

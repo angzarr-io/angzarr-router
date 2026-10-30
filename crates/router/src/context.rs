@@ -17,9 +17,9 @@ pub struct CommandContext {
     /// book the coordinator supplied.
     pub next_sequence: u64,
     /// The "does this aggregate exist" signal — true when the prior-events
-    /// book carried any history (pages or snapshot). Exposed because state
-    /// factories produce non-default zero states, so business code cannot
-    /// infer existence from state.
+    /// book carried any history (pages or a starting state). Exposed
+    /// because state factories produce non-default zero states, so business
+    /// code cannot infer existence from state.
     pub had_prior_events: bool,
     /// The cover of the command being handled: the aggregate's own domain
     /// and root.
@@ -114,7 +114,7 @@ impl Conflict {
 
 /// The context a handler of `req` is handed, from the `ContextualCommand`
 /// alone, whole: the next sequence and whether the stream has history
-/// (pages or a snapshot) from its prior-events book; its cover, resolved
+/// (pages or a starting state) from its prior-events book; its cover, resolved
 /// Handling and identity as delivered; and, under AGGREGATE_HANDLES only,
 /// the conflict (the window from the expected sequence on, and the
 /// delivered nonce). What a runtime passes on with a refusal of `req` to

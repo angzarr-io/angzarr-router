@@ -1,5 +1,8 @@
-//! Rebuilder — state reconstruction from an EventBook: snapshot first
-//! (when configured), then every event page in order.
+//! Rebuilder — state reconstruction from an EventBook: the starting state
+//! the coordinator delivered (decoded with the state's codec, when it has
+//! one), then every event page it is given, in order (decision 14.40). The
+//! coordinator chose the snapshot and dropped the pages it covers; the
+//! router compares no sequence with it.
 
 use std::collections::HashMap;
 
@@ -22,15 +25,27 @@ pub type ApplierFn<S> = Box<
         + Sync,
 >;
 
-/// Loads snapshot state into fresh state.
-pub type SnapshotFn<S> =
-    Box<dyn Fn(&mut S, &Any) -> Result<(), Box<dyn std::error::Error + Send + Sync>> + Send + Sync>;
+/// Decodes a delivered starting state (an `Any` of the state message) into
+/// state: the inverse of [`EncodeFn`].
+pub type DecodeFn<S> =
+    Box<dyn Fn(&Any) -> Result<S, Box<dyn std::error::Error + Send + Sync>> + Send + Sync>;
+
+/// Encodes state as an `Any` of the state message: what every answer
+/// carries as the state after it (decision 14.12).
+pub type EncodeFn<S> = Box<dyn Fn(&S) -> Any + Send + Sync>;
+
+/// The state's one codec (decision 14.40): decodes the starting state it is
+/// delivered and encodes the state it answers.
+struct StateCodec<S> {
+    decode: DecodeFn<S>,
+    encode: EncodeFn<S>,
+}
 
 /// What the rebuild consumed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RebuildInfo {
-    /// True when the book carried any history (pages or a snapshot) — the
-    /// "does this aggregate exist" signal. Reflects page presence, not
+    /// True when the book carried any history (pages or a starting state)
+    /// — the "does this aggregate exist" signal. Reflects page presence, not
     /// applier hits.
     pub had_prior_events: bool,
     /// Number of pages whose type had a registered applier.
@@ -43,24 +58,19 @@ pub struct RebuildInfo {
 /// commands must never validate against silently-truncated state. The
 /// events were accepted by the same apply logic, so the failure is a handler
 /// bug (INTERNAL; [`fold_error`]), and so is a page whose applier or batched
-/// fold panics, its cause HANDLER_PANICKED (decision 14.37). A snapshot the
-/// loader cannot load is PERSISTED_EVENT_CORRUPT; one whose loader panics is
-/// FOLD_FAILED with cause HANDLER_PANICKED, naming the snapshot's sequence
-/// and its state's type URL. Event types with no
+/// fold panics, its cause HANDLER_PANICKED (decision 14.37). A starting
+/// state the codec cannot decode is PERSISTED_EVENT_CORRUPT; one whose decode
+/// panics is FOLD_FAILED with cause HANDLER_PANICKED, naming the delivered
+/// snapshot's sequence and its state's type URL. Event types with no
 /// registered applier are skipped: not every event folds into state.
 pub struct Rebuilder<S> {
     factory: Box<dyn Fn() -> S + Send + Sync>,
-    snapshot: Option<SnapshotFn<S>>,
+    codec: Option<StateCodec<S>>,
     appliers: HashMap<String, ApplierFn<S>>,
     fold: Option<FoldFn<S>>,
     /// The state message's type URL ("" when undeclared).
     state_type_url: String,
-    /// The state's snapshot image (none when undeclared).
-    image: Option<ImageFn<S>>,
 }
-
-/// A state's snapshot image: the serialized state message as an `Any`.
-pub type ImageFn<S> = Box<dyn Fn(&S) -> Any + Send + Sync>;
 
 /// How a batched fold failed: the index of the failing page within the
 /// batch it was handed, when it knows, and its own failure as a key and
@@ -209,39 +219,55 @@ impl<S> Rebuilder<S> {
     pub fn new(factory: impl Fn() -> S + Send + Sync + 'static) -> Self {
         Rebuilder {
             factory: Box::new(factory),
-            snapshot: None,
+            codec: None,
             appliers: HashMap::new(),
             fold: None,
             state_type_url: String::new(),
-            image: None,
         }
     }
 
     /// A Rebuilder starting from `S::default()` whose state type comes from
-    /// `S`'s prost name: nobody declares the string by hand.
-    /// Its snapshot image is the prost-encoded state.
+    /// `S`'s prost name: nobody declares the string by hand. Its codec is
+    /// the state message's own protobuf encoding.
     pub fn of_message() -> Self
     where
         S: prost::Name + Default + 'static,
     {
         Rebuilder::new(S::default)
             .with_state_type(&S::full_name())
-            .with_state_image(|state: &S| Any {
-                type_url: crate::type_url(&S::full_name()),
-                value: prost::Message::encode_to_vec(state),
-            })
+            .with_state_codec(
+                |start: &Any| Ok(S::decode(start.value.as_slice())?),
+                |state: &S| Any {
+                    type_url: crate::type_url(&S::full_name()),
+                    value: prost::Message::encode_to_vec(state),
+                },
+            )
     }
 
-    /// Declares how the state becomes a snapshot image (an `Any` of the state
-    /// message), for state held as something other than its own message.
-    pub fn with_state_image(mut self, image: impl Fn(&S) -> Any + Send + Sync + 'static) -> Self {
-        self.image = Some(Box::new(image));
+    /// Declares the state's codec (decision 14.40), for state held as
+    /// something other than its own message: `decode` turns a delivered
+    /// starting state (an `Any` of the state message) into state, and
+    /// `encode` is its inverse, the state every answer carries. Without
+    /// one, a delivered starting state is ignored and no answer carries a
+    /// state.
+    pub fn with_state_codec(
+        mut self,
+        decode: impl Fn(&Any) -> Result<S, Box<dyn std::error::Error + Send + Sync>>
+            + Send
+            + Sync
+            + 'static,
+        encode: impl Fn(&S) -> Any + Send + Sync + 'static,
+    ) -> Self {
+        self.codec = Some(StateCodec {
+            decode: Box::new(decode),
+            encode: Box::new(encode),
+        });
         self
     }
 
-    /// The snapshot image of `state`, when the rebuilder declares one.
-    pub fn state_image(&self, state: &S) -> Option<Any> {
-        self.image.as_ref().map(|image| image(state))
+    /// `state` encoded by the state's codec, when the rebuilder has one.
+    pub fn encode_state(&self, state: &S) -> Option<Any> {
+        self.codec.as_ref().map(|codec| (codec.encode)(state))
     }
 
     /// Declares the state message's fully-qualified name, for state held as
@@ -292,7 +318,7 @@ impl<S> Rebuilder<S> {
     }
 
     /// Folds pages through one batched `fold` instead of the per-type
-    /// appliers: a rebuild hands it every uncovered page (and the book's
+    /// appliers: a rebuild hands it every page (and the book's
     /// cover) in a single call, and none when there are none. Its failure
     /// fails the rebuild as a handler bug ([`fold_error`]); it is never
     /// called again for the same pages.
@@ -307,21 +333,10 @@ impl<S> Rebuilder<S> {
         self
     }
 
-    /// Registers the snapshot loader, applied before any pages.
-    pub fn with_snapshot(
-        mut self,
-        thunk: impl Fn(&mut S, &Any) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-            + Send
-            + Sync
-            + 'static,
-    ) -> Self {
-        self.snapshot = Some(Box::new(thunk));
-        self
-    }
-
-    /// Folds the book into fresh state. An absent book normalizes to an
-    /// empty one (fresh state, no prior events) — callers never need
-    /// their own guard.
+    /// Folds the book into state: the starting state it carries (decoded by
+    /// the codec), else fresh state, then every page in order. An absent
+    /// book normalizes to an empty one (fresh state, no prior events) —
+    /// callers never need their own guard.
     pub fn rebuild(&self, book: Option<&pb::EventBook>) -> Result<(S, RebuildInfo), CodedError> {
         let mut state = (self.factory)();
         let mut info = RebuildInfo::default();
@@ -330,58 +345,44 @@ impl<S> Rebuilder<S> {
         };
         info.had_prior_events = !book.pages.is_empty() || book.snapshot.is_some();
 
-        // Pages a LOADED snapshot already folded must not re-apply — their
-        // effects are in the snapshot state; double-folding corrupts it. A
-        // snapshot that did not load (no loader, no state) covers nothing.
-        // Every persisted page carries its definite sequence.
-        let mut covered_through: Option<u64> = None;
-        if let Some(snapshot) = book.snapshot.as_ref() {
-            if let (Some(snap_state), Some(loader)) =
-                (snapshot.state.as_ref(), self.snapshot.as_ref())
-            {
-                let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    loader(&mut state, snap_state)
+        if let (Some(snapshot), Some(codec)) = (book.snapshot.as_ref(), self.codec.as_ref()) {
+            if let Some(start) = snapshot.state.as_ref() {
+                let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    (codec.decode)(start)
                 }));
-                match loaded {
-                    Ok(Ok(())) => {}
-                    Ok(Err(_)) => {
-                        return Err(CodedError::persisted_corrupt(&snap_state.type_url));
-                    }
-                    // A panic is a defect in the loader, not corrupt data:
+                state = match decoded {
+                    Ok(Ok(decoded)) => decoded,
+                    Ok(Err(_)) => return Err(CodedError::persisted_corrupt(&start.type_url)),
+                    // A panic is a defect in the codec, not corrupt data:
                     // the fold fails, naming the snapshot (decision 14.37).
                     Err(_) => {
                         return Err(CodedError::fold_failed(
                             codes::FOLD_FAILED,
                             FoldAt::Page {
                                 sequence: snapshot.sequence,
-                                type_url: &snap_state.type_url,
+                                type_url: &start.type_url,
                             },
                             &self.state_type_url,
                             Some(&panicked_cause()),
                         ));
                     }
-                }
-                covered_through = Some(snapshot.sequence);
+                };
             }
         }
 
         if let Some(fold) = self.fold.as_ref() {
-            let uncovered: Vec<pb::EventPage> = book
-                .pages
-                .iter()
-                .filter(|p| covered_through.is_none_or(|covered| p.sequence > covered))
-                .cloned()
-                .collect();
-            if !uncovered.is_empty() {
-                run_fold(fold, &mut state, &uncovered, book.cover.as_ref()).map_err(|failure| {
-                    fold_error(
-                        PageOrigin::Persisted,
-                        &uncovered,
-                        &failure,
-                        &self.state_type_url,
-                    )
-                })?;
-                info.applied_count = uncovered.len();
+            if !book.pages.is_empty() {
+                run_fold(fold, &mut state, &book.pages, book.cover.as_ref()).map_err(
+                    |failure| {
+                        fold_error(
+                            PageOrigin::Persisted,
+                            &book.pages,
+                            &failure,
+                            &self.state_type_url,
+                        )
+                    },
+                )?;
+                info.applied_count = book.pages.len();
             }
             return Ok((state, info));
         }
@@ -390,9 +391,6 @@ impl<S> Rebuilder<S> {
             let Some(event) = crate::page_event(page) else {
                 continue;
             };
-            if covered_through.is_some_and(|covered| page.sequence <= covered) {
-                continue;
-            }
             let Some(thunk) = self
                 .appliers
                 .get(crate::type_name_from_url(&event.type_url))

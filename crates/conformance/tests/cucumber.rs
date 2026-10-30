@@ -65,11 +65,6 @@ async fn corrupt_history(w: &mut CounterWorld) {
     w.prior = conf::corrupt_prior_history();
 }
 
-#[given("a counter restored from a snapshot of 10 with one newer event")]
-async fn snapshot_history(w: &mut CounterWorld) {
-    w.prior = conf::snapshot_history();
-}
-
 #[given(
     regex = r"^a counter delivered a starting state of (\d+) at sequence (\d+) and one Increased event at sequence (\d+)$"
 )]
@@ -166,7 +161,7 @@ async fn observed_count(w: &mut CounterWorld, count: u32, next_sequence: u64) {
     let obs = w.last_observed();
     assert_eq!(
         obs.count, count,
-        "rebuilt count (snapshot + uncovered pages only)"
+        "rebuilt count (the starting state + every page given)"
     );
     assert_eq!(obs.next_sequence, next_sequence, "next_sequence evidence");
     assert!(obs.had_prior_events, "a snapshot implies had_prior_events");

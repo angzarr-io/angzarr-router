@@ -15,8 +15,8 @@
 //! The behaviour-level scenarios are angzarr-project's handler-contract
 //! tier (features/handler-contract/handling.feature, C-0533..C-0550), bound
 //! by crates/conformance/tests/handling.rs. Snapshot selection is the
-//! coordinator's (decision 14.1): the router folds a delivered snapshot
-//! unchecked.
+//! coordinator's (decisions 14.1, 14.40): the router folds the starting
+//! state it is delivered unchecked.
 
 use std::sync::{Arc, Mutex};
 
@@ -53,16 +53,11 @@ pub(crate) fn bump(key: &str) -> Any {
 }
 
 pub(crate) fn list_rebuilder() -> Rebuilder<ListState> {
-    Rebuilder::new(ListState::default)
-        .apply(&cover_full_name(), |s: &mut ListState, any| {
-            let key = <pb::Cover as prost::Message>::decode(any.value.as_slice())?.domain;
-            *s.items.entry(key).or_default() += 1;
-            Ok(())
-        })
-        .with_snapshot(|s: &mut ListState, _any| {
-            s.items.insert("snap".to_string(), 1);
-            Ok(())
-        })
+    Rebuilder::new(ListState::default).apply(&cover_full_name(), |s: &mut ListState, any| {
+        let key = <pb::Cover as prost::Message>::decode(any.value.as_slice())?.domain;
+        *s.items.entry(key).or_default() += 1;
+        Ok(())
+    })
 }
 
 /// A list aggregate whose `test.Bump` command bumps the item named in the
