@@ -352,7 +352,6 @@ fn the_refusal_facts_id_is_the_refused_commands_id() {
         page.fact_origin.as_ref().map(|o| o.external_id.as_str()),
         Some("09090909-0909-0909-0909-090909090909")
     );
-    assert_eq!(crate::input_id(&fact), Some(uuid_of(9)));
 }
 
 // The policy builds Facts only through OnRefused: an answer that is not a Fact,

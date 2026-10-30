@@ -1,15 +1,15 @@
 //! DomainDispatch — a domain's command → events table: an aggregate's,
 //! or a process manager's, since a process manager is a domain (decision
-//! 14.31), served by the same table with its start rule
-//! ([`DomainDispatch::process_manager`]).
+//! 14.31), served by the same table ([`DomainDispatch::process_manager`]).
+//! There is no trigger-fed process manager:
 //!
-//! Two calls per input, both pure: [`DomainDispatch::admit`] applies the
-//! rules an input meets before its handler runs (deduplication by its id, a
-//! process manager's start rule), from what the runtime read of the
-//! addressed stream; then
-//! [`DomainDispatch::dispatch`] runs the handler. The runtime (annals'
-//! kernel, or core's coordinator) owns the store reads and writes between
-//! and after them.
+//! ```compile_fail
+//! use angzarr_router::process_manager::ProcessManagerDispatch;
+//! ```
+//!
+//! One call per input, pure: [`DomainDispatch::dispatch`] runs the handler.
+//! The runtime (the angzarr-embedded kernel, or core's coordinator) owns the
+//! store reads and writes around it, and admits the input first.
 //!
 //! The router never sees a meta-event and has no edition-lifecycle outcome
 //! (owner ruling, 2026-10-28): creating, forking, refusing an unforked or
@@ -54,7 +54,7 @@ use std::collections::{BTreeSet, HashMap};
 use prost::Message;
 use prost_types::Any;
 
-use crate::error::{call_handler, codes, extras, BusinessStatus, CodedError, HandlerError};
+use crate::error::{call_handler, codes, extras, CodedError, HandlerError};
 use crate::pb;
 use crate::rebuild::{PageOrigin, Rebuilder};
 
@@ -149,46 +149,6 @@ impl From<Any> for FactRecord {
 pub type FactFn<S> =
     Box<dyn Fn(&Any, &S, CommandContext) -> Result<FactRecord, HandlerError> + Send + Sync>;
 
-/// What the runtime knows when an input reaches a domain, before its
-/// handler runs: the input and what it read of the addressed stream.
-#[derive(Debug, Clone, Copy)]
-pub struct Arrival<'a> {
-    /// The input as delivered: its cover names the addressed stream
-    /// (domain, edition, root); its identity is stamped (command_id; and
-    /// causation_id for a policy's command or a refusal fact).
-    pub command: &'a pb::CommandBook,
-    /// The events the addressed stream already holds under this input's id
-    /// ([`crate::input_id`]; the store's `find_command`), in sequence
-    /// order. Empty when none.
-    pub recorded: &'a [pb::EventPage],
-    /// The addressed stream, as read in the input's edition.
-    pub stream: StreamStatus,
-}
-
-/// The addressed stream as the runtime read it in the input's edition.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct StreamStatus {
-    /// The stream holds any event, as read in the input's edition: for a
-    /// process manager, its instance exists (process_manager.proto,
-    /// Starting an instance).
-    pub exists: bool,
-}
-
-/// What [`DomainDispatch::admit`] decides for an input. A refusal is the
-/// `Err` beside it. No edition-lifecycle outcome: those are the runtime's.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Admission {
-    /// Run the handler ([`DomainDispatch::dispatch`]).
-    Dispatch,
-    /// Already applied: the runtime answers these events, DUPLICATE, and the
-    /// handler does not run (types.proto, the command_identity region).
-    Duplicate(Vec<pb::EventPage>),
-    /// A process manager's fact for a correlation with no instance, of a
-    /// type it does not declare as starting: skipped silently, answered
-    /// APPLIED with no events (process_manager.proto).
-    Skip,
-}
-
 /// Handles a passed-through refusal (the standard `CommandRefused`) of one
 /// refused command type against the rebuilt state, with the refusal fact's
 /// [`CommandContext`] (its identity is the refused command's): the source
@@ -201,10 +161,6 @@ pub type RefusedFn<S> = Box<
 
 /// One fact handler, bound to its input: records it against the state.
 type RecordFn<'a, S> = Box<dyn Fn(&S, CommandContext) -> Result<FactRecord, CodedError> + 'a>;
-
-/// A process manager's start rule: whether an input payload is of a type
-/// that may start an instance. `None` for an aggregate, which has none.
-pub type StartRule<'a> = Option<&'a dyn Fn(&Any) -> Result<bool, CodedError>>;
 
 /// The dispatch table for one domain: an aggregate or a process manager.
 pub struct DomainDispatch<S> {
@@ -293,31 +249,6 @@ impl<S> DomainDispatch<S> {
     /// AGGREGATE or PROCESS_MANAGER.
     pub fn kind(&self) -> pb::ComponentKind {
         self.kind
-    }
-
-    /// The rules an input meets before its handler runs, decided from the
-    /// [`Arrival`] alone (no I/O), in order:
-    /// 1. validation: a refusal fact (a Fact with causation_id) is accepted
-    ///    only by the exact stream its causation_id names
-    ///    (REFUSAL_FACT_WRONG_STREAM). An input to a process manager is
-    ///    delivered to the root its cover names, whatever its correlation
-    ///    (decision 14.36);
-    /// 2. deduplication: events already recorded under the input's id are
-    ///    [`Admission::Duplicate`];
-    /// 3. a process manager's start rule, by the input's type (the
-    ///    coordinator has upcast it; decision 14.39): with no instance, a
-    ///    starting type is dispatched; any other command is refused FAILED_PRECONDITION, PM_NO_INSTANCE, and
-    ///    any other fact is [`Admission::Skip`].
-    pub fn admit(&self, arrival: &Arrival<'_>) -> Result<Admission, CodedError> {
-        if self.kind != pb::ComponentKind::ProcessManager {
-            return admit_rules(arrival, None);
-        }
-        let starts = |sent: &Any| -> Result<bool, CodedError> {
-            Ok(self
-                .starting
-                .contains(crate::type_name_from_url(&sent.type_url)))
-        };
-        admit_rules(arrival, Some(&starts))
     }
 
     /// The rules version reported on every response
@@ -671,62 +602,6 @@ impl<S> DomainDispatch<S> {
     }
 }
 
-/// The rules every domain's input meets before its handler runs
-/// ([`DomainDispatch::admit`]), with a process manager's `start_rule`
-/// (`None` for an aggregate, or a hand-written domain with no start rule).
-pub fn admit_rules(
-    arrival: &Arrival<'_>,
-    start_rule: StartRule<'_>,
-) -> Result<Admission, CodedError> {
-    let book = arrival.command;
-    let Some(page) = book.page.as_ref() else {
-        return Err(CodedError::internal(codes::MISSING_COMMAND_PAGE, []));
-    };
-    let (is_fact, sent) = match &page.body {
-        Some(pb::command_page::Body::Command(c)) => (false, c.payload.as_ref()),
-        Some(pb::command_page::Body::Fact(f)) => (true, f.payload.as_ref()),
-        None => (false, None),
-    };
-    let sent = non_empty_payload(sent)?;
-    let cover = book.cover.clone().unwrap_or_default();
-    let edition = cover.edition.as_deref().filter(|e| !e.is_empty());
-
-    // 1. Validation.
-    if let (true, Some(cause)) = (is_fact, page.causation_id.as_ref()) {
-        let named = cause.stream.clone().unwrap_or_default();
-        let same = named.domain == cover.domain
-            && named.root == cover.root
-            && named.edition.as_deref().filter(|e| !e.is_empty()) == edition;
-        if !same {
-            return Err(CodedError::internal(
-                codes::REFUSAL_FACT_WRONG_STREAM,
-                [(extras::DOMAIN.to_string(), cover.domain.clone())],
-            ));
-        }
-    }
-
-    // 2. Deduplication.
-    if !arrival.recorded.is_empty() {
-        return Ok(Admission::Duplicate(arrival.recorded.to_vec()));
-    }
-
-    // 3. A process manager's start rule.
-    if let Some(starts) = start_rule {
-        if !arrival.stream.exists && !starts(sent)? {
-            if is_fact {
-                return Ok(Admission::Skip);
-            }
-            return Err(CodedError::rejection(
-                BusinessStatus::FailedPrecondition,
-                codes::PM_NO_INSTANCE,
-                [(extras::TYPE_URL.to_string(), sent.type_url.clone())],
-            ));
-        }
-    }
-
-    Ok(Admission::Dispatch)
-}
-
 /// The prior-events book up to `expected` (its snapshot and earlier pages)
 /// and the window after it.
 fn split_at_expected(
@@ -762,7 +637,3 @@ fn non_empty_payload(payload: Option<&Any>) -> Result<&Any, CodedError> {
 #[cfg(test)]
 #[path = "domain.test.rs"]
 mod domain_tests;
-
-#[cfg(test)]
-#[path = "admit.test.rs"]
-mod admit_tests;

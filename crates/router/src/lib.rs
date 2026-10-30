@@ -79,34 +79,6 @@ pub fn fact_payload(page: &pb::CommandPage) -> Option<&Any> {
     }
 }
 
-/// An input's deduplication key on its addressed stream (types.proto, the
-/// command_identity region): a command's `command_id`; a fact's
-/// `command_id` when set, else UUIDv5 of its `fact_origin.external_id`
-/// (`angzarr_proto::ids::fact_command_id`); a refusal fact's is the refused
-/// command's id, which the policy's runtime stamped as its `command_id`.
-/// `None` when the input carries no identity to key on.
-///
-/// There is no trigger-fed process manager to key by trigger (decision
-/// 14.31: a process manager is a domain, deduplicated like any other):
-///
-/// ```compile_fail
-/// use angzarr_router::process_manager::ProcessManagerDispatch;
-/// ```
-pub fn input_id(book: &pb::CommandBook) -> Option<pb::Uuid> {
-    let page = book.page.as_ref()?;
-    if let Some(id) = page.command_id.as_ref() {
-        return Some(id.clone());
-    }
-    match &page.body {
-        Some(pb::command_page::Body::Fact(_)) => page
-            .fact_origin
-            .as_ref()
-            .filter(|origin| !origin.external_id.is_empty())
-            .map(|origin| angzarr_proto::ids::fact_command_id(&origin.external_id)),
-        _ => None,
-    }
-}
-
 /// Decodes bytes a host handed the router as the message `M`: bytes that do
 /// not decode are ANY_DECODE_FAILED naming `M` as `message_type`
 /// ([`error::CodedError::undecodable`]; decision 14.37), one condition

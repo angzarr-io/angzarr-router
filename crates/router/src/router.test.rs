@@ -363,52 +363,6 @@ fn a_hand_written_domain_is_an_aggregate_by_default() {
     );
 }
 
-// The router runs the hosted domain's admission rules, and refuses
-// admission for a component that is not a domain.
-#[test]
-fn a_router_admits_through_its_domain() {
-    let mut book = command("plain", "test.Plain").command.unwrap();
-    book.page.as_mut().unwrap().command_id = Some(crate::test_support::uuid_of(9));
-    let recorded = vec![event_page(any_of_type("test.Plained"))];
-    let arrival = crate::domain::Arrival {
-        command: &book,
-        recorded: &recorded,
-        stream: crate::domain::StreamStatus { exists: true },
-    };
-    let router = RouterBuilder::new()
-        .aggregate(Plain)
-        .build()
-        .expect("build");
-    assert_eq!(
-        router.admit(&arrival).expect("admitted"),
-        crate::domain::Admission::Duplicate(recorded.clone())
-    );
-    let projector = with_one(RouterBuilder::new(), "projector")
-        .build()
-        .expect("build");
-    assert_eq!(
-        projector.admit(&arrival).expect_err("not a domain").code,
-        "NO_COMPONENT_OF_KIND"
-    );
-}
-
-// A hand-written domain meets the framework's rules without reimplementing
-// them: a command already recorded under its id is a duplicate.
-#[test]
-fn a_hand_written_aggregate_meets_the_framework_rules() {
-    let mut book = command("plain", "test.Plain").command.unwrap();
-    book.page.as_mut().unwrap().command_id = Some(crate::test_support::uuid_of(9));
-    let recorded = vec![event_page(any_of_type("test.Plained"))];
-    let admission = Plain
-        .admit(&crate::domain::Arrival {
-            command: &book,
-            recorded: &recorded,
-            stream: crate::domain::StreamStatus { exists: true },
-        })
-        .expect("admitted");
-    assert_eq!(admission, crate::domain::Admission::Duplicate(recorded));
-}
-
 // --- the registration hello (types.proto ComponentDescriptor) ----------------
 
 fn ledger(version: &str) -> DomainDispatch<LedgerState> {

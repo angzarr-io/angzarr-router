@@ -207,10 +207,8 @@ macro_rules! test_message {
 }
 
 test_message!(StartBuyIn, "test.buyin" { amount: u32 = "1" });
-test_message!(RecordFundsHeld, "test.buyin" { amount: u32 = "1" });
 test_message!(BuyInStarted, "test.buyin" { amount: u32 = "1" });
 test_message!(BuyInFailed, "test.buyin" { requested: u32 = "1" });
-test_message!(BuyInTimedOut, "test.buyin" {});
 test_message!(FundsUnavailable, "test.buyin" { available: u32 = "1" });
 test_message!(HoldFunds, "test.wallet" { amount: u32 = "1" });
 test_message!(ReleaseFunds, "test.wallet" { amount: u32 = "1" });
@@ -252,21 +250,6 @@ pub fn command_book(cover: pb::Cover, command: Any, id: u8) -> pb::CommandBook {
     }
 }
 
-/// A fact book addressed to `cover`, its Fact arm carrying `fact`, from the
-/// external id `external_id` (command_id left for the runtime to derive).
-pub fn fact_book(cover: pb::Cover, fact: Any, external_id: &str) -> pb::CommandBook {
-    let mut page = fact_page(fact);
-    page.fact_origin = Some(pb::FactOrigin {
-        external_id: external_id.to_string(),
-        ..Default::default()
-    });
-    pb::CommandBook {
-        cover: Some(cover),
-        page: Some(page),
-        ..Default::default()
-    }
-}
-
 /// `book` as a policy's command: caused by the event at `sequence` of
 /// `trigger`.
 pub fn caused_by(mut book: pb::CommandBook, trigger: pb::Cover, sequence: u64) -> pb::CommandBook {
@@ -275,18 +258,6 @@ pub fn caused_by(mut book: pb::CommandBook, trigger: pb::Cover, sequence: u64) -
         sequence,
     });
     book
-}
-
-/// An event page at `sequence` recorded by the command `command_id`.
-pub fn recorded_page(sequence: u64, event: Any, command_id: u8) -> pb::EventPage {
-    pb::EventPage {
-        payload: Some(event),
-        sequence,
-        meta: Some(pb::EventMeta {
-            causation: Some(pb::event_meta::Causation::CommandId(uuid_of(command_id))),
-            ..Default::default()
-        }),
-    }
 }
 
 /// Every command a policy answered, in page order: its reactions' commands,

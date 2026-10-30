@@ -11,8 +11,7 @@
 //!
 //! - a command or a fact (a page's Fact arm) to the domain: an aggregate, or
 //!   a process manager, which is a domain (decision 14.31) served the same
-//!   way, after [`Router::admit`] has applied the rules a domain's input
-//!   meets before its handler runs;
+//!   way, once the coordinator has admitted it (decision 14.42);
 //! - a policy source to the policy, when it comes from the policy's input domain,
 //!   and a refusal of one of its commands to the policy's OnRefused;
 //! - an EventBook to the projector, one Projection.
@@ -20,7 +19,7 @@
 //! The component may be registered boxed (`Box<dyn CommandHandler>` and so
 //! on). Transport (gRPC servers), health and readiness stay with the host.
 
-use crate::domain::{Admission, Arrival, DomainDispatch};
+use crate::domain::DomainDispatch;
 use crate::error::{codes, extras, CodedError};
 use crate::pb;
 use crate::policy::PolicyDispatch;
@@ -34,14 +33,6 @@ pub trait CommandHandler: Send + Sync {
     /// AGGREGATE or PROCESS_MANAGER.
     fn kind(&self) -> pb::ComponentKind {
         pb::ComponentKind::Aggregate
-    }
-    /// The rules an input meets before its handler runs (deduplication,
-    /// editions, a process manager's start rule): [`DomainDispatch::admit`].
-    /// A hand-written domain gets the framework's rules for a domain with
-    /// no start rule (validation, deduplication, editions); it never
-    /// reimplements them.
-    fn admit(&self, arrival: &Arrival<'_>) -> Result<Admission, CodedError> {
-        crate::domain::admit_rules(arrival, None)
     }
     /// The fully-qualified command types it handles.
     fn command_types(&self) -> Vec<String>;
@@ -60,9 +51,6 @@ impl<T: CommandHandler + ?Sized> CommandHandler for Box<T> {
     }
     fn kind(&self) -> pb::ComponentKind {
         (**self).kind()
-    }
-    fn admit(&self, arrival: &Arrival<'_>) -> Result<Admission, CodedError> {
-        (**self).admit(arrival)
     }
     fn command_types(&self) -> Vec<String> {
         (**self).command_types()
@@ -84,9 +72,6 @@ impl<S> CommandHandler for DomainDispatch<S> {
     }
     fn kind(&self) -> pb::ComponentKind {
         DomainDispatch::kind(self)
-    }
-    fn admit(&self, arrival: &Arrival<'_>) -> Result<Admission, CodedError> {
-        DomainDispatch::admit(self, arrival)
     }
     fn command_types(&self) -> Vec<String> {
         DomainDispatch::command_types(self)
@@ -322,18 +307,6 @@ impl Router {
             Component::Aggregate(aggregate) => aggregate.component_descriptor(),
             Component::Policy(policy) => policy.component_descriptor(),
             Component::Projector(projector) => projector.component_descriptor(),
-        }
-    }
-
-    /// The rules the domain's input meets before its handler runs
-    /// ([`DomainDispatch::admit`]): the runtime calls it first, acts on
-    /// the [`Admission`] (appending a fork, answering a duplicate or a
-    /// skip), and only then reads the stream and calls
-    /// [`Self::dispatch_command`].
-    pub fn admit(&self, arrival: &Arrival<'_>) -> Result<Admission, CodedError> {
-        match &self.component {
-            Component::Aggregate(domain) => domain.admit(arrival),
-            _ => Err(wrong_kind()),
         }
     }
 
