@@ -250,6 +250,44 @@ fn covered_boundary_exact_sequence_skipped() {
     );
 }
 
+// Decision 14.40: the coordinator drops the pages a snapshot covers, and the
+// router folds every page it is given onto the starting state, without
+// comparing sequences with the snapshot's: per-type appliers and a batched
+// fold alike.
+#[test]
+fn every_given_page_is_folded_even_at_or_below_the_starting_states_sequence() {
+    let book = pb::EventBook {
+        snapshot: Some(pb::Snapshot {
+            sequence: 2,
+            state: Some(cover_any("start")),
+            ..Default::default()
+        }),
+        pages: vec![
+            sequenced_event_page(1, cover_any("one")),
+            sequenced_event_page(2, cover_any("two")),
+            sequenced_event_page(3, cover_any("three")),
+        ],
+        ..Default::default()
+    };
+    let starting = |s: &mut TestState, _: &prost_types::Any| {
+        s.applied.push("start".to_string());
+        Ok(())
+    };
+    let (state, info) = cover_applier(fresh_rebuilder().with_snapshot(starting))
+        .rebuild(Some(&book))
+        .expect("rebuild");
+    assert_eq!(state.applied, vec!["start", "one", "two", "three"]);
+    assert_eq!(info.applied_count, 3);
+
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (state, info) = batch_rebuilder(calls.clone())
+        .rebuild(Some(&book))
+        .expect("rebuild");
+    assert_eq!(state.applied, vec!["snap", "fold3"]);
+    assert_eq!(*calls.lock().unwrap(), vec![(vec![1, 2, 3], String::new())]);
+    assert_eq!(info.applied_count, 3);
+}
+
 #[test]
 fn empty_book_no_prior_history() {
     let r = fresh_rebuilder();
