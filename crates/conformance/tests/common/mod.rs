@@ -22,7 +22,6 @@ pub const LATER_STEPS: &[(&str, &str)] = &[
     ("C-0545", "conflict judgement moves out (14.42)"),
     ("C-0547", "conflict judgement moves out (14.42)"),
     ("C-0550", "conflict judgement moves out (14.42)"),
-    ("C-0682", "upcasting leaves the router (14.39)"),
     ("C-0688", "the covered-page guard leaves the router (14.40)"),
     (
         "C-0690",
