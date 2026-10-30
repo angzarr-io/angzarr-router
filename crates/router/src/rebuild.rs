@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use prost_types::Any;
 
-use crate::error::{codes, CodedError, FoldAt};
+use crate::error::{CodedError, FoldAt, RouterReason};
 use crate::pb;
 use crate::PageContext;
 
@@ -58,9 +58,9 @@ pub struct RebuildInfo {
 /// commands must never validate against silently-truncated state. The
 /// events were accepted by the same apply logic, so the failure is a handler
 /// bug (INTERNAL; [`fold_error`]), and so is a page whose applier or batched
-/// fold panics, its cause HANDLER_PANICKED (decision 14.37). A starting
-/// state the codec cannot decode is PERSISTED_EVENT_CORRUPT; one whose decode
-/// panics is FOLD_FAILED with cause HANDLER_PANICKED, naming the delivered
+/// fold panics, its cause ROUTER_REASON_HANDLER_PANICKED (decision 14.37). A starting
+/// state the codec cannot decode is ROUTER_REASON_PERSISTED_EVENT_CORRUPT; one whose decode
+/// panics is ROUTER_REASON_FOLD_FAILED with cause ROUTER_REASON_HANDLER_PANICKED, naming the delivered
 /// snapshot's sequence and its state's type URL. Event types with no
 /// registered applier are skipped: not every event folds into state.
 pub struct Rebuilder<S> {
@@ -91,13 +91,13 @@ pub enum PageOrigin {
 }
 
 impl PageOrigin {
-    /// The key a fold failing on pages from here answers with: FOLD_FAILED
-    /// for persisted events, FOLD_FAILED_EMITTED for emitted ones
+    /// The key a fold failing on pages from here answers with: ROUTER_REASON_FOLD_FAILED
+    /// for persisted events, ROUTER_REASON_FOLD_FAILED_EMITTED for emitted ones
     /// (decision 14.37).
-    pub fn code(self) -> &'static str {
+    pub fn reason(self) -> RouterReason {
         match self {
-            PageOrigin::Persisted => codes::FOLD_FAILED,
-            PageOrigin::Emitted => codes::FOLD_FAILED_EMITTED,
+            PageOrigin::Persisted => RouterReason::FoldFailed,
+            PageOrigin::Emitted => RouterReason::FoldFailedEmitted,
         }
     }
 }
@@ -119,7 +119,7 @@ pub fn fold_error(
             last: pages.last().map_or(0, |p| p.sequence),
         },
     };
-    CodedError::fold_failed(origin.code(), at, state_type_url, failure.cause.as_ref())
+    CodedError::fold_failed(origin.reason(), at, state_type_url, failure.cause.as_ref())
 }
 
 /// An applier's failure as a fold's cause: its key and args when it failed
@@ -135,11 +135,11 @@ fn applier_cause(err: &(dyn std::error::Error + Send + Sync + 'static)) -> Optio
     }
 }
 
-/// A panicking fold's cause: HANDLER_PANICKED, with no args (the panic's
+/// A panicking fold's cause: ROUTER_REASON_HANDLER_PANICKED, with no args (the panic's
 /// message stays in the handler's own log; decision 14.37).
 fn panicked_cause() -> pb::Diagnostic {
     pb::Diagnostic {
-        code: codes::HANDLER_PANICKED.to_string(),
+        code: RouterReason::HandlerPanicked.as_str_name().to_string(),
         ..Default::default()
     }
 }
@@ -161,7 +161,7 @@ fn run_applier<S>(
 }
 
 /// Runs a batched fold: its panic is a failure at no known page, caused by
-/// HANDLER_PANICKED ([`panicked_cause`]), answered rather than unwound into
+/// ROUTER_REASON_HANDLER_PANICKED ([`panicked_cause`]), answered rather than unwound into
 /// the host.
 fn run_fold<S>(
     fold: &FoldFn<S>,
@@ -197,7 +197,7 @@ pub fn page_fold_error(
 ) -> CodedError {
     let type_url = crate::page_event(page).map_or("", |e| e.type_url.as_str());
     CodedError::fold_failed(
-        origin.code(),
+        origin.reason(),
         FoldAt::Page {
             sequence: page.sequence,
             type_url,
@@ -357,7 +357,7 @@ impl<S> Rebuilder<S> {
                     // the fold fails, naming the snapshot (decision 14.37).
                     Err(_) => {
                         return Err(CodedError::fold_failed(
-                            codes::FOLD_FAILED,
+                            RouterReason::FoldFailed,
                             FoldAt::Page {
                                 sequence: snapshot.sequence,
                                 type_url: &start.type_url,

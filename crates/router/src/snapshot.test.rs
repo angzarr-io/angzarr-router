@@ -262,8 +262,8 @@ fn an_emitted_event_that_does_not_fold_fails_the_command() {
     let err = corrupt
         .dispatch(&command_for(typed("test.Bump", "a")))
         .expect_err("the emitted event does not fold");
-    // Decision 14.37: its own key, not UNHANDLED_HANDLER_ERROR.
-    assert_eq!(err.code, "FOLD_FAILED_EMITTED");
+    // Decision 14.37: its own key, not ROUTER_REASON_UNHANDLED_HANDLER_ERROR.
+    assert_eq!(err.code, "ROUTER_REASON_FOLD_FAILED_EMITTED");
 }
 
 // The snapshot must equal what a rebuild would fold once the events are

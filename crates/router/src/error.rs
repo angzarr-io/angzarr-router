@@ -130,70 +130,18 @@ impl TryFrom<GrpcCode> for BusinessStatus {
     }
 }
 
-/// The router's reason keys (decisions 14.37, 14.42): one per condition,
-/// each its own status message and `ErrorInfo` reason, exactly the keys
-/// angzarr-project's `catalog/reasons.toml` lists with `owner = "router"`.
-/// The coordinator's keys (admission, descriptor validation, policy output
+/// The router's reason keys (decisions 14.37, 14.42, 14.44) are
+/// [`RouterReason`], reasons.proto's enum: one value per condition, each
+/// answered as its full value name ([`RouterReason::as_str_name`],
+/// prefix included), its own status message and `ErrorInfo` reason. The
+/// coordinator's keys (admission, descriptor validation, policy output
 /// checks, refusal facts, conflict judgement) are its own; the retired ones
-/// are never answered again.
-pub mod codes {
-    // --- handler failures ---------------------------------------------------
-    /// An error escaped a business handler, or it failed as a bug: its own
-    /// code and args, when it has them, are the `cause`.
-    pub const UNHANDLED_HANDLER_ERROR: &str = "UNHANDLED_HANDLER_ERROR";
-    /// The cause of a handler that panicked.
-    pub const HANDLER_PANICKED: &str = "HANDLER_PANICKED";
-    /// A typed business refusal: its `refusal_type` names the object.
-    pub const COMMAND_REFUSED: &str = "COMMAND_REFUSED";
-    /// A fold failed on persisted events.
-    pub const FOLD_FAILED: &str = "FOLD_FAILED";
-    /// A fold failed on an event the command emitted.
-    pub const FOLD_FAILED_EMITTED: &str = "FOLD_FAILED_EMITTED";
-    /// A starting state the state's codec cannot decode.
-    pub const PERSISTED_EVENT_CORRUPT: &str = "PERSISTED_EVENT_CORRUPT";
-
-    // --- routing ------------------------------------------------------------
-    /// A payload that does not decode as the message it claims.
-    pub const ANY_DECODE_FAILED: &str = "ANY_DECODE_FAILED";
-    /// A command type no handler claims.
-    pub const UNKNOWN_COMMAND_TYPE: &str = "UNKNOWN_COMMAND_TYPE";
-    /// A fact type no handler claims.
-    pub const NO_FACT_HANDLER: &str = "NO_FACT_HANDLER";
-    /// A pass-through CommandRefused the domain has no handler for.
-    pub const NO_REFUSAL_HANDLER: &str = "NO_REFUSAL_HANDLER";
-    /// A COMMUTATIVE delivery to a state with no resolver.
-    pub const CONFLICT_RESOLUTION_UNSUPPORTED: &str = "CONFLICT_RESOLUTION_UNSUPPORTED";
-    /// A dispatch to a kind of component the router does not host.
-    pub const NO_COMPONENT_OF_KIND: &str = "NO_COMPONENT_OF_KIND";
-
-    // --- registration -------------------------------------------------------
-    pub const NO_HANDLERS_REGISTERED: &str = "NO_HANDLERS_REGISTERED";
-    /// A second component beside the one a router (a business process)
-    /// hosts.
-    pub const DUPLICATE_COMPONENT: &str = "DUPLICATE_COMPONENT";
-
-    /// The router's complete reason inventory: every key the router answers
-    /// with, and the catalog's router keys (decision 14.42).
-    pub const ALL: &[&str] = &[
-        UNHANDLED_HANDLER_ERROR,
-        HANDLER_PANICKED,
-        COMMAND_REFUSED,
-        FOLD_FAILED,
-        FOLD_FAILED_EMITTED,
-        PERSISTED_EVENT_CORRUPT,
-        ANY_DECODE_FAILED,
-        UNKNOWN_COMMAND_TYPE,
-        NO_FACT_HANDLER,
-        NO_REFUSAL_HANDLER,
-        CONFLICT_RESOLUTION_UNSUPPORTED,
-        NO_COMPONENT_OF_KIND,
-        NO_HANDLERS_REGISTERED,
-        DUPLICATE_COMPONENT,
-    ];
-}
+/// are reserved there and never answered again.
+pub use angzarr_proto::v1::RouterReason;
 
 /// Cross-language arg names: the `ErrorInfo` metadata keys of the router's
-/// reasons (the catalog's `args`).
+/// reasons (the args each `RouterReason` value's comment in reasons.proto
+/// names).
 pub mod extras {
     pub const TYPE_URL: &str = "type_url";
     pub const COMMAND_TYPE: &str = "command_type";
@@ -207,9 +155,9 @@ pub mod extras {
     pub const COMPONENT_KIND: &str = "component_kind";
     pub const FIRST_SEQUENCE: &str = "first_sequence";
     pub const LAST_SEQUENCE: &str = "last_sequence";
-    /// A typed refusal's object's fully-qualified type (COMMAND_REFUSED).
+    /// A typed refusal's object's fully-qualified type (ROUTER_REASON_COMMAND_REFUSED).
     pub const REFUSAL_TYPE: &str = "refusal_type";
-    /// The message bytes failed to decode as (ANY_DECODE_FAILED).
+    /// The message bytes failed to decode as (ROUTER_REASON_ANY_DECODE_FAILED).
     pub const MESSAGE_TYPE: &str = "message_type";
     /// A wrapped cause's code; its args follow as `cause.<arg>` (decision
     /// 14.37).
@@ -249,7 +197,7 @@ pub struct CodedError {
 
 /// What a business handler may fail with: a coded error (rejections and
 /// classified failures keep their code and gRPC code) or an unclassified
-/// error, which the boundary maps to UNHANDLED_HANDLER_ERROR with no cause.
+/// error, which the boundary maps to ROUTER_REASON_UNHANDLED_HANDLER_ERROR with no cause.
 /// `Other`'s text is for the handler's own log; it never crosses a
 /// boundary (decision 14.37).
 #[derive(Debug)]
@@ -306,27 +254,27 @@ impl CodedError {
     }
 
     /// A command or fact whose type URL reaches no registered handler
-    /// (`code` UNKNOWN_COMMAND_TYPE or NO_FACT_HANDLER): a bug (INTERNAL;
+    /// (`code` ROUTER_REASON_UNKNOWN_COMMAND_TYPE or ROUTER_REASON_NO_FACT_HANDLER): a bug (INTERNAL;
     /// owner ruling, 2026-10-29), its one arg `type_url` the type it was
     /// given (C-0682). The coordinator upcast it, and relays the type as sent
     /// beside it (decision 14.39).
-    pub fn unknown_type(code: &str, type_url: &str) -> Self {
+    pub fn unknown_type(reason: RouterReason, type_url: &str) -> Self {
         Self::coded(
-            code,
+            reason.as_str_name(),
             [(extras::TYPE_URL.to_string(), type_url.to_string())],
             GrpcCode::Internal,
         )
     }
 
     /// Bytes that do not decode as the message `message_type` (its
-    /// fully-qualified name): ANY_DECODE_FAILED, a bug (INTERNAL), one
+    /// fully-qualified name): ROUTER_REASON_ANY_DECODE_FAILED, a bug (INTERNAL), one
     /// condition whatever the message, `message_type` its arg. prost's
     /// `error` is a third-party library's, so its own text travels
     /// verbatim as `ext_err_txt` (decision 14.37, owner's rulings
     /// 2026-10-29, late); prost gives it no numeric code.
     pub fn undecodable(message_type: &str, error: &prost::DecodeError) -> Self {
         Self::internal(
-            codes::ANY_DECODE_FAILED,
+            RouterReason::AnyDecodeFailed,
             [
                 (extras::MESSAGE_TYPE.to_string(), message_type.to_string()),
                 (extras::EXT_ERR_TXT.to_string(), error.to_string()),
@@ -334,34 +282,33 @@ impl CodedError {
         )
     }
 
-    /// A request the router hosts no component for, or a policy source
-    /// from outside its input domain (UNIMPLEMENTED): a misroute or a
-    /// stale deployment.
+    /// A request the router hosts no component for (UNIMPLEMENTED): a
+    /// misroute or a stale deployment.
     pub(crate) fn unimplemented(
-        code: &str,
+        reason: RouterReason,
         extras: impl IntoIterator<Item = (String, String)>,
     ) -> Self {
-        Self::coded(code, extras, GrpcCode::Unimplemented)
+        Self::coded(reason.as_str_name(), extras, GrpcCode::Unimplemented)
     }
 
     /// Classifies a store-sourced decode failure (DATA_LOSS on the wire).
     pub fn persisted_corrupt(type_url: &str) -> Self {
         Self::coded(
-            codes::PERSISTED_EVENT_CORRUPT,
+            RouterReason::PersistedEventCorrupt.as_str_name(),
             [(extras::TYPE_URL.to_string(), type_url.to_string())],
             GrpcCode::DataLoss,
         )
     }
 
-    /// A fold of events that failed (INTERNAL), under `code`: FOLD_FAILED
-    /// for persisted events, FOLD_FAILED_EMITTED for the events the command
+    /// A fold of events that failed (INTERNAL), under `code`: ROUTER_REASON_FOLD_FAILED
+    /// for persisted events, ROUTER_REASON_FOLD_FAILED_EMITTED for the events the command
     /// emitted. Those events were accepted (or emitted) by the same apply
     /// logic, so the failure is a handler regression, never corrupt data.
     /// `at` names the failing page or, when it is unknown, the batch's
     /// range; `cause`, the fold's own failure as a key and args, is
     /// flattened in as `cause` and `cause.<arg>`.
     pub fn fold_failed(
-        code: &str,
+        reason: RouterReason,
         at: FoldAt<'_>,
         state_type_url: &str,
         cause: Option<&angzarr_proto::v1::Diagnostic>,
@@ -383,21 +330,25 @@ impl CodedError {
         if let Some(cause) = cause {
             details.extend(flatten(extras::CAUSE, &cause.code, cause.args.clone()));
         }
-        Self::coded(code, details, GrpcCode::Internal)
+        Self::coded(reason.as_str_name(), details, GrpcCode::Internal)
     }
 
     /// An unclassified error that escaped a business handler (INTERNAL):
-    /// UNHANDLED_HANDLER_ERROR with no cause. What escaped stays in the
+    /// ROUTER_REASON_UNHANDLED_HANDLER_ERROR with no cause. What escaped stays in the
     /// handler's own log.
     pub fn unhandled() -> Self {
-        Self::coded(codes::UNHANDLED_HANDLER_ERROR, [], GrpcCode::Internal)
+        Self::coded(
+            RouterReason::UnhandledHandlerError.as_str_name(),
+            [],
+            GrpcCode::Internal,
+        )
     }
 
-    /// A business handler that panicked (INTERNAL): UNHANDLED_HANDLER_ERROR
-    /// with cause HANDLER_PANICKED. The panic's message stays in the
+    /// A business handler that panicked (INTERNAL): ROUTER_REASON_UNHANDLED_HANDLER_ERROR
+    /// with cause ROUTER_REASON_HANDLER_PANICKED. The panic's message stays in the
     /// handler's own log.
     pub fn panicked() -> Self {
-        Self::bug(codes::HANDLER_PANICKED, [])
+        Self::bug(RouterReason::HandlerPanicked.as_str_name(), [])
     }
 
     /// A business rejection under `status`, one of the business set: the
@@ -416,7 +367,7 @@ impl CodedError {
 
     /// A typed business refusal (FAILED_PRECONDITION): `refusal` is one of
     /// the command's `refuses` types, packed. Its wire reason is
-    /// COMMAND_REFUSED, its `refusal_type` arg the object's fully-qualified
+    /// ROUTER_REASON_COMMAND_REFUSED, its `refusal_type` arg the object's fully-qualified
     /// type, and the object itself rides the status details (owner's
     /// ruling on decision 14.37).
     pub fn refused(refusal: prost_types::Any) -> Self {
@@ -428,7 +379,7 @@ impl CodedError {
             .to_string();
         Self::rejection(
             BusinessStatus::FailedPrecondition,
-            codes::COMMAND_REFUSED,
+            RouterReason::CommandRefused.as_str_name(),
             [(extras::REFUSAL_TYPE.to_string(), full_name)],
         )
         .with_refusal(refusal)
@@ -436,13 +387,13 @@ impl CodedError {
 
     /// A bug: a defect, never a business answer. The other of the two
     /// classes a handler fails with (the first is [`Self::rejection`]). It
-    /// goes out as UNHANDLED_HANDLER_ERROR (INTERNAL), with `code` and
+    /// goes out as ROUTER_REASON_UNHANDLED_HANDLER_ERROR (INTERNAL), with `code` and
     /// `details` as its cause, flattened as `cause=<code>` and
     /// `cause.<arg>=<value>` (decision 14.37); the runtime alerts it and
     /// dead-letters the input, and it never reaches a policy's OnRefused.
     pub fn bug(code: &str, details: impl IntoIterator<Item = (String, String)>) -> Self {
         Self::coded(
-            codes::UNHANDLED_HANDLER_ERROR,
+            RouterReason::UnhandledHandlerError.as_str_name(),
             flatten(extras::CAUSE, code, details),
             GrpcCode::Internal,
         )
@@ -450,7 +401,7 @@ impl CodedError {
 
     /// A bug the handler marks retryable (an external dependency that is
     /// down), under the status it picks (decision 14.37, owner's rulings
-    /// 2026-10-29, latest): that status, UNHANDLED_HANDLER_ERROR, `code`
+    /// 2026-10-29, latest): that status, ROUTER_REASON_UNHANDLED_HANDLER_ERROR, `code`
     /// and `details` as its cause, flattened as [`Self::bug`]'s are. The
     /// runtime retries it with capped backoff, then dead-letters it; it
     /// never reaches a policy's OnRefused.
@@ -460,7 +411,7 @@ impl CodedError {
         details: impl IntoIterator<Item = (String, String)>,
     ) -> Self {
         Self::coded(
-            codes::UNHANDLED_HANDLER_ERROR,
+            RouterReason::UnhandledHandlerError.as_str_name(),
             flatten(extras::CAUSE, code, details),
             status.into(),
         )
@@ -478,8 +429,11 @@ impl CodedError {
     /// A bug the router itself finds (INTERNAL), under its own code: a
     /// type no handler claims, a component's misconfiguration. Never a
     /// handler's, and never a business refusal (owner ruling, 2026-10-29).
-    pub(crate) fn internal(code: &str, extras: impl IntoIterator<Item = (String, String)>) -> Self {
-        Self::coded(code, extras, GrpcCode::Internal)
+    pub(crate) fn internal(
+        reason: RouterReason,
+        extras: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        Self::coded(reason.as_str_name(), extras, GrpcCode::Internal)
     }
 
     /// This business rejection carrying its typed refusal object (one of
@@ -535,14 +489,14 @@ impl std::error::Error for CodedError {}
 
 /// The single handler-error mapping: coded errors pass through carrying
 /// their resolved gRPC code; unclassified errors become
-/// UNHANDLED_HANDLER_ERROR (INTERNAL) with no cause, their text left to the
+/// ROUTER_REASON_UNHANDLED_HANDLER_ERROR (INTERNAL) with no cause, their text left to the
 /// handler's own log.
 pub fn map_handler_error(err: HandlerError) -> CodedError {
     match err {
         HandlerError::Coded(coded) => coded,
         HandlerError::Other(escaped) => {
             tracing::error!(
-                code = codes::UNHANDLED_HANDLER_ERROR,
+                code = RouterReason::UnhandledHandlerError.as_str_name(),
                 escaped = %escaped,
                 "a handler's unclassified error"
             );
@@ -552,7 +506,7 @@ pub fn map_handler_error(err: HandlerError) -> CodedError {
 }
 
 /// Runs a business handler, answering its panic as a bug
-/// (UNHANDLED_HANDLER_ERROR, cause HANDLER_PANICKED; decision 14.37) and
+/// (ROUTER_REASON_UNHANDLED_HANDLER_ERROR, cause ROUTER_REASON_HANDLER_PANICKED; decision 14.37) and
 /// mapping its error ([`map_handler_error`]). The panic's message stays in
 /// the handler's own log; the router answers rather than unwinding into its
 /// host.

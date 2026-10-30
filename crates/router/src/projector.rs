@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 
 use prost_types::Any;
 
-use crate::error::{call_handler, codes, map_handler_error, CodedError, HandlerError};
+use crate::error::{call_handler, map_handler_error, CodedError, HandlerError, RouterReason};
 use crate::pb;
 use crate::rebuild::{fold_error, page_fold_error, FoldFailure, PageOrigin};
 
@@ -210,7 +210,7 @@ pub fn next_sequence_after(events: &pb::EventBook) -> u64 {
 
 /// Runs a projector's fold handler: its failure is the fold's cause, a key
 /// and args (decision 14.37): a coded error's own, a panic's
-/// HANDLER_PANICKED, and none for an unclassified error, whose text stays in
+/// ROUTER_REASON_HANDLER_PANICKED, and none for an unclassified error, whose text stays in
 /// its own log.
 fn fold_handler(
     handler: impl FnOnce() -> Result<(), HandlerError>,
@@ -223,7 +223,7 @@ fn fold_handler(
             Err(None)
         }
         Err(_) => Err(Some(pb::Diagnostic {
-            code: codes::HANDLER_PANICKED.to_string(),
+            code: RouterReason::HandlerPanicked.as_str_name().to_string(),
             ..Default::default()
         })),
     }

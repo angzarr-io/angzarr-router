@@ -2,14 +2,14 @@
 //! dispatch (engine.go ProjectorDispatch.Dispatch + features/projector.go):
 //! one instance folds every declared page (C-0086), undeclared domains fold
 //! nothing but still finish (C-0032), unhandled event types are skipped
-//! (C-0031), and a missing cover is the coded MISSING_EVENT_BOOK_COVER.
+//! (C-0031).
 
 use std::sync::{Arc, Mutex};
 
 use prost::Message;
 use prost_types::Any;
 
-use crate::error::{codes, HandlerError};
+use crate::error::{HandlerError, RouterReason};
 use crate::pb;
 use crate::projector::{PageContext, ProjectorDispatch};
 use crate::test_support::*;
@@ -214,7 +214,7 @@ fn accessors_report_name_and_registered_types() {
 
 // Owner ruling 2026-10-19: any fold of accepted events that fails is a
 // handler bug, named by its page and the projection type. Decision 14.37:
-// it is FOLD_FAILED, the fold's own failure its cause as a key and args
+// it is ROUTER_REASON_FOLD_FAILED, the fold's own failure its cause as a key and args
 // (none for an unclassified error, whose text stays in the handler's log),
 // and no text crosses.
 #[test]
@@ -247,7 +247,7 @@ fn a_failing_fold_is_a_handler_bug_naming_its_page() {
         let type_url = crate::type_url(&cover_full_name());
         assert_fold_failed(
             &err,
-            "FOLD_FAILED",
+            "ROUTER_REASON_FOLD_FAILED",
             &[
                 (crate::error::extras::SEQUENCE, "1"),
                 (crate::error::extras::TYPE_URL, type_url.as_str()),
@@ -270,7 +270,7 @@ fn a_failing_fold_is_a_handler_bug_naming_its_page() {
 }
 
 // A projector handler that panics is caught: a failing fold whose cause is
-// HANDLER_PANICKED (decision 14.37).
+// ROUTER_REASON_HANDLER_PANICKED (decision 14.37).
 #[test]
 fn a_panicking_fold_handler_is_a_fold_failure_caused_by_handler_panicked() {
     let d = ProjectorDispatch::new("write-model", Folded::default)
@@ -281,10 +281,10 @@ fn a_panicking_fold_handler_is_a_fold_failure_caused_by_handler_panicked() {
     let err = d
         .dispatch(&book("order", cover_pages("order", 1)))
         .expect_err("the handler panicked");
-    assert_eq!(err.code, "FOLD_FAILED");
+    assert_eq!(err.code, "ROUTER_REASON_FOLD_FAILED");
     assert_eq!(
         err.extras.get("cause").map(String::as_str),
-        Some("HANDLER_PANICKED")
+        Some("ROUTER_REASON_HANDLER_PANICKED")
     );
 }
 
@@ -295,7 +295,7 @@ fn a_finish_failure_is_not_a_fold_failure() {
     let err = d
         .dispatch(&book("order", cover_pages("order", 1)))
         .expect_err("finish failed");
-    assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
+    assert_eq!(err.code, RouterReason::UnhandledHandlerError.as_str_name());
 }
 
 // Each fold sees its page's place: the book's cover (root) and the page's
@@ -413,7 +413,7 @@ fn a_batched_fold_failure_names_its_page_or_the_batchs_range() {
         .expect_err("the fold failed");
     assert_fold_failed(
         &err,
-        "FOLD_FAILED",
+        "ROUTER_REASON_FOLD_FAILED",
         &[(crate::error::extras::SEQUENCE, "6")],
         "/test.Board",
     );
@@ -422,7 +422,7 @@ fn a_batched_fold_failure_names_its_page_or_the_batchs_range() {
         .expect_err("the fold failed");
     assert_fold_failed(
         &err,
-        "FOLD_FAILED",
+        "ROUTER_REASON_FOLD_FAILED",
         &[
             (crate::error::extras::FIRST_SEQUENCE, "4"),
             (crate::error::extras::LAST_SEQUENCE, "6"),

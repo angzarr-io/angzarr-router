@@ -28,7 +28,7 @@ fn next_sequence_absent_book_is_zero() {
 }
 
 // Host bytes decode as the message asked for; bytes that do not are
-// ANY_DECODE_FAILED naming it (decision 14.37).
+// ROUTER_REASON_ANY_DECODE_FAILED naming it (decision 14.37).
 #[test]
 fn decode_message_decodes_or_names_the_message_type() {
     use prost::Message;
@@ -42,7 +42,7 @@ fn decode_message_decodes_or_names_the_message_type() {
     );
     let err =
         decode_message::<pb::ContextualCommand>(&[0xff, 0xff, 0xff]).expect_err("undecodable");
-    assert_eq!(err.code, error::codes::ANY_DECODE_FAILED);
+    assert_eq!(err.code, error::RouterReason::AnyDecodeFailed.as_str_name());
     assert_eq!(
         err.extras.get("message_type").map(String::as_str),
         Some("io.angzarr.v1.ContextualCommand")

@@ -54,7 +54,7 @@ pub struct CommandContext {
 /// [`Conflict::resolve_conflicts`] before returning. The router reports the
 /// nonce it handed back (`ConflictReport.resolved_nonce`); a coordinator
 /// that finds any other value than the delivered one discards the output,
-/// CONFLICT_UNRESOLVED (ABORTED; decision 14.42).
+/// COORDINATOR_REASON_CONFLICT_UNRESOLVED (ABORTED; decision 14.42).
 #[derive(Debug, Clone, Default)]
 pub struct Conflict {
     window: Vec<pb::EventPage>,

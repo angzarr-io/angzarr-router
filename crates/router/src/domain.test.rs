@@ -10,7 +10,7 @@ use prost::Message;
 use prost_types::Any;
 
 use crate::domain::{CommandContext, DomainDispatch, FactRecord};
-use crate::error::{codes, GrpcCode};
+use crate::error::{GrpcCode, RouterReason};
 use crate::pb;
 use crate::test_support::*;
 use crate::{page_event, type_url, TYPE_URL_PREFIX};
@@ -69,7 +69,7 @@ fn prior_events_reach_state_and_context() {
 fn unknown_command_coded_before_rebuild() {
     let (d, _) = test_agg_dispatch();
     // No handler for Snapshot; corrupt prior events would surface
-    // PERSISTED_EVENT_CORRUPT if the dispatcher rebuilt before validating
+    // ROUTER_REASON_PERSISTED_EVENT_CORRUPT if the dispatcher rebuilt before validating
     // the command type.
     let mut cmd = command_for(any_of(&pb::Snapshot::default()));
     cmd.events = Some(pb::EventBook {
@@ -78,7 +78,10 @@ fn unknown_command_coded_before_rebuild() {
     });
 
     let err = d.dispatch(&cmd).expect_err("unknown command must fail");
-    assert_eq!(err.code, "UNKNOWN_COMMAND_TYPE", "validate before rebuild");
+    assert_eq!(
+        err.code, "ROUTER_REASON_UNKNOWN_COMMAND_TYPE",
+        "validate before rebuild"
+    );
 }
 
 // Spec: command_handler.proto, CommandHandlerService.Handle step 2 ("A type
@@ -97,9 +100,9 @@ fn an_unknown_type_is_invalid_argument_naming_its_type_url() {
         .expect_err("an unknown command type");
     assert_eq!(err.grpc, GrpcCode::Internal);
     // Decision 14.37: the key is the status message; the args name the type.
-    assert_eq!(err.code, "UNKNOWN_COMMAND_TYPE");
+    assert_eq!(err.code, "ROUTER_REASON_UNKNOWN_COMMAND_TYPE");
     crate::test_support::assert_bug(&err);
-    assert_eq!(err.status_message(), "UNKNOWN_COMMAND_TYPE");
+    assert_eq!(err.status_message(), "ROUTER_REASON_UNKNOWN_COMMAND_TYPE");
     assert_eq!(err.extras.get("type_url"), Some(&url));
     // C-0682: the router upcasts nothing, so names no upcast type; the
     // coordinator relays the type as sent beside it (decision 14.39).
@@ -108,10 +111,13 @@ fn an_unknown_type_is_invalid_argument_naming_its_type_url() {
     let err = d
         .dispatch(&contextual(fact_page(unknown)))
         .expect_err("an unknown fact type");
-    assert_eq!(err.code, codes::NO_FACT_HANDLER);
+    assert_eq!(err.code, RouterReason::NoFactHandler.as_str_name());
     crate::test_support::assert_bug(&err);
     assert_eq!(err.grpc, GrpcCode::Internal);
-    assert_eq!(err.status_message(), codes::NO_FACT_HANDLER);
+    assert_eq!(
+        err.status_message(),
+        RouterReason::NoFactHandler.as_str_name()
+    );
     assert_eq!(err.extras.get("type_url"), Some(&url));
 }
 
@@ -126,7 +132,7 @@ fn corrupt_prior_event_fails_command() {
 
     let err = d.dispatch(&cmd).expect_err("corrupt prior event must fail");
     assert_eq!(
-        err.code, "FOLD_FAILED",
+        err.code, "ROUTER_REASON_FOLD_FAILED",
         "never validate against truncated state; a failing fold is a handler bug"
     );
     assert_eq!(err.grpc, crate::error::GrpcCode::Internal);
@@ -154,7 +160,7 @@ fn a_delivery_missing_its_input_is_a_command_of_no_type() {
         }),
     ] {
         let err = d.dispatch(&req).expect_err("no type");
-        assert_eq!(err.code, codes::UNKNOWN_COMMAND_TYPE);
+        assert_eq!(err.code, RouterReason::UnknownCommandType.as_str_name());
         assert_eq!(err.extras.get("type_url").map(String::as_str), Some(""));
     }
     assert!(seen.lock().unwrap().is_empty(), "the handler never ran");
@@ -258,14 +264,14 @@ fn an_undeclared_fact_type_is_refused_before_any_handler_runs() {
         type_url: type_url("test.Undeclared"),
         value: Vec::new(),
     }));
-    // A corrupt history would surface PERSISTED_EVENT_CORRUPT had the
+    // A corrupt history would surface ROUTER_REASON_PERSISTED_EVENT_CORRUPT had the
     // dispatcher rebuilt before refusing the fact.
     req.events = Some(pb::EventBook {
         pages: vec![event_page(corrupt_cover_any())],
         ..Default::default()
     });
     let err = d.dispatch(&req).expect_err("an undeclared fact type");
-    assert_eq!(err.code, codes::NO_FACT_HANDLER);
+    assert_eq!(err.code, RouterReason::NoFactHandler.as_str_name());
     crate::test_support::assert_bug(&err);
     assert_eq!(err.grpc, GrpcCode::Internal);
     assert_eq!(
@@ -283,7 +289,7 @@ fn a_command_type_sent_as_a_fact_is_refused() {
     let err = d
         .dispatch(&contextual(fact_page(cover_any("x"))))
         .expect_err("a command type in the Fact arm");
-    assert_eq!(err.code, codes::NO_FACT_HANDLER);
+    assert_eq!(err.code, RouterReason::NoFactHandler.as_str_name());
     crate::test_support::assert_bug(&err);
     assert!(
         contexts.lock().unwrap().is_empty(),
@@ -296,7 +302,7 @@ fn a_fact_type_sent_as_a_command_is_refused() {
     let err = fact_aggregate()
         .dispatch(&command_for(cover_any("f1")))
         .expect_err("a fact type in the Command arm");
-    assert_eq!(err.code, "UNKNOWN_COMMAND_TYPE");
+    assert_eq!(err.code, "ROUTER_REASON_UNKNOWN_COMMAND_TYPE");
     crate::test_support::assert_bug(&err);
 }
 
@@ -308,7 +314,7 @@ fn a_fact_without_a_payload_is_a_fact_of_no_type() {
             ..Default::default()
         }))
         .expect_err("a fact with no payload");
-    assert_eq!(err.code, codes::NO_FACT_HANDLER);
+    assert_eq!(err.code, RouterReason::NoFactHandler.as_str_name());
     crate::test_support::assert_bug(&err);
 }
 
@@ -322,8 +328,8 @@ fn a_corrupt_prior_event_fails_the_fact() {
     let err = fact_aggregate()
         .dispatch(&req)
         .expect_err("corrupt history");
-    // Decision 14.37: its own key, not UNHANDLED_HANDLER_ERROR.
-    assert_eq!(err.code, "FOLD_FAILED");
+    // Decision 14.37: its own key, not ROUTER_REASON_UNHANDLED_HANDLER_ERROR.
+    assert_eq!(err.code, "ROUTER_REASON_FOLD_FAILED");
 }
 
 #[test]
@@ -335,11 +341,11 @@ fn a_failing_fact_handler_fails_the_request() {
     let err = d
         .dispatch(&fact_delivery("f1", &[]))
         .expect_err("handler error");
-    assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
+    assert_eq!(err.code, RouterReason::UnhandledHandlerError.as_str_name());
 }
 
-// Decision 14.37: a handler that panics is a bug, UNHANDLED_HANDLER_ERROR
-// with cause HANDLER_PANICKED; the panic's message stays in the handler's
+// Decision 14.37: a handler that panics is a bug, ROUTER_REASON_UNHANDLED_HANDLER_ERROR
+// with cause ROUTER_REASON_HANDLER_PANICKED; the panic's message stays in the handler's
 // own log and the router answers, rather than unwinding into its host.
 #[test]
 fn a_panicking_handler_is_a_bug_caused_by_handler_panicked() {
@@ -349,13 +355,15 @@ fn a_panicking_handler_is_a_bug_caused_by_handler_panicked() {
     let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| d.dispatch(&req)));
     let err = match answer {
         Ok(result) => result.expect_err("a panic is no success"),
-        Err(_) => panic!("the handler's panic escaped the router: it answers HANDLER_PANICKED"),
+        Err(_) => panic!(
+            "the handler's panic escaped the router: it answers ROUTER_REASON_HANDLER_PANICKED"
+        ),
     };
     assert_eq!(err.grpc, GrpcCode::Internal);
-    assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
+    assert_eq!(err.code, RouterReason::UnhandledHandlerError.as_str_name());
     assert_eq!(
         err.extras.get("cause").map(String::as_str),
-        Some("HANDLER_PANICKED")
+        Some("ROUTER_REASON_HANDLER_PANICKED")
     );
     assert!(!format!("{err:?}").contains("index out of bounds"));
 }

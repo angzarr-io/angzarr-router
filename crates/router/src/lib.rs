@@ -83,7 +83,7 @@ pub fn fact_payload(page: &pb::CommandPage) -> Option<&Any> {
 }
 
 /// Decodes bytes a host handed the router as the message `M`: bytes that do
-/// not decode are ANY_DECODE_FAILED naming `M` as `message_type`
+/// not decode are ROUTER_REASON_ANY_DECODE_FAILED naming `M` as `message_type`
 /// ([`error::CodedError::undecodable`]; decision 14.37), one condition
 /// whatever the message.
 pub fn decode_message<M: prost::Message + prost::Name + Default>(

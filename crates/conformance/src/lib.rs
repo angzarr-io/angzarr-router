@@ -105,7 +105,7 @@ pub fn counter_aggregate(observed: ObservedSink) -> DomainDispatch<CounterState>
         "test.counter.Increased",
         |state: &mut CounterState, event| {
             // Decode the payload so a corrupt persisted event fails the fold
-            // (UNHANDLED_HANDLER_ERROR: a failing fold is a handler bug).
+            // (ROUTER_REASON_UNHANDLED_HANDLER_ERROR: a failing fold is a handler bug).
             // Increased is empty, so every
             // well-formed event decodes and simply increments.
             counter::Increased::decode(event.value.as_slice())?;
@@ -143,7 +143,7 @@ pub fn counter_aggregate(observed: ObservedSink) -> DomainDispatch<CounterState>
                 ..Default::default()
             }))
         })
-        // Unclassified failure → UNHANDLED_HANDLER_ERROR.
+        // Unclassified failure → ROUTER_REASON_UNHANDLED_HANDLER_ERROR.
         .on_command("test.counter.FailHard", |_any, _state, _ctx| {
             Err(HandlerError::Other("hard failure".to_string()))
         })
@@ -300,7 +300,7 @@ pub fn failhard_command() -> pb::ContextualCommand {
     parse_txtpb(CONTEXTUAL_COMMAND, SKEL_FAILHARD)
 }
 
-/// A command whose type has no registered handler (drives UNKNOWN_COMMAND_TYPE).
+/// A command whose type has no registered handler (drives ROUTER_REASON_UNKNOWN_COMMAND_TYPE).
 pub fn unhandled_command() -> pb::ContextualCommand {
     parse_txtpb(CONTEXTUAL_COMMAND, SKEL_UNHANDLED)
 }
@@ -330,7 +330,7 @@ pub fn prior_history(n: u32) -> Option<pb::EventBook> {
 
 /// Prior history whose single Increased event carries undecodable payload
 /// bytes (a truncated varint) → the applier fails the fold, surfacing
-/// UNHANDLED_HANDLER_ERROR (a handler bug) when a known command rebuilds
+/// ROUTER_REASON_UNHANDLED_HANDLER_ERROR (a handler bug) when a known command rebuilds
 /// over it.
 pub fn corrupt_prior_history() -> Option<pb::EventBook> {
     let mut page: pb::EventPage = parse_txtpb(EVENT_PAGE, SKEL_INCREASED_EVENT);

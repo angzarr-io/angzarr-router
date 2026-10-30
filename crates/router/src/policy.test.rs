@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use prost_types::Any;
 
-use crate::error::{codes, HandlerError};
+use crate::error::{HandlerError, RouterReason};
 use crate::pb;
 use crate::policy::PolicyDispatch;
 use crate::test_support::{command_page, commands_of, event_page, uuid_of};
@@ -186,7 +186,7 @@ fn handler_error_propagates_as_unhandled() {
     let err = policy
         .dispatch(&source_book("order", vec![event_page_of(FQ_ORDER_CREATED)]))
         .expect_err("handler error must fail dispatch");
-    assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
+    assert_eq!(err.code, RouterReason::UnhandledHandlerError.as_str_name());
 }
 
 // --- accessors ------------------------------------------------------------

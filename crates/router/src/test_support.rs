@@ -150,7 +150,7 @@ pub fn assert_bug(err: &crate::error::CodedError) {
 }
 
 /// Asserts `err` is a failing fold answered INTERNAL as a handler bug, under
-/// `code` (FOLD_FAILED or FOLD_FAILED_EMITTED; decision 14.37), the `located` metadata (sequence and type_url, or the batch's
+/// `code` (ROUTER_REASON_FOLD_FAILED or ROUTER_REASON_FOLD_FAILED_EMITTED; decision 14.37), the `located` metadata (sequence and type_url, or the batch's
 /// first_sequence and last_sequence) and `state_type_url`.
 pub fn assert_fold_failed(
     err: &crate::error::CodedError,

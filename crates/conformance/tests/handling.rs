@@ -111,7 +111,7 @@ impl HandlingWorld {
         if let Some(text) = &self.escaped {
             panic!(
                 "the handler's panic escaped the router instead of being answered \
-                 UNHANDLED_HANDLER_ERROR with cause HANDLER_PANICKED: {text:?}"
+                 ROUTER_REASON_UNHANDLED_HANDLER_ERROR with cause ROUTER_REASON_HANDLER_PANICKED: {text:?}"
             );
         }
         self.result

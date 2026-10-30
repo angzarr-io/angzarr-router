@@ -20,7 +20,7 @@
 //! ContextualCommand's page picks the pipeline (Command → a command handler,
 //! Fact → a fact handler) and the payload's type URL picks the handler. The
 //! envelope, the arm and the type validate BEFORE state is rebuilt (an
-//! unknown command must report UNKNOWN_COMMAND_TYPE, not whatever the
+//! unknown command must report ROUTER_REASON_UNKNOWN_COMMAND_TYPE, not whatever the
 //! rebuild would surface). There is no compensation input.
 //!
 //! The router admits nothing (decision 14.42): deduplication, the refusal
@@ -54,7 +54,7 @@ use std::collections::HashMap;
 use prost::Message;
 use prost_types::Any;
 
-use crate::error::{call_handler, codes, extras, CodedError, HandlerError};
+use crate::error::{call_handler, extras, CodedError, HandlerError, RouterReason};
 use crate::pb;
 use crate::rebuild::{PageOrigin, Rebuilder};
 
@@ -221,7 +221,7 @@ impl<S> DomainDispatch<S> {
     /// [`CommandContext`] (its command id and correlation the refused
     /// command's, its cover the stream of the policy's trigger), and records
     /// its events, or fails as any fact handler may. A `CommandRefused` for
-    /// a command type with none is NO_FACT_HANDLER.
+    /// a command type with none is ROUTER_REASON_NO_FACT_HANDLER.
     pub fn on_refused(
         mut self,
         refused_command: &str,
@@ -354,7 +354,7 @@ impl<S> DomainDispatch<S> {
 
     /// `CommandHandlerService.Handle`: the page's body arm picks the handler
     /// table — a Command runs its command handler (none:
-    /// UNKNOWN_COMMAND_TYPE), a Fact its fact handler (none: NO_FACT_HANDLER,
+    /// ROUTER_REASON_UNKNOWN_COMMAND_TYPE), a Fact its fact handler (none: ROUTER_REASON_NO_FACT_HANDLER,
     /// so a fact never reaches a command handler or the reverse) — before
     /// rebuild (a corrupt persisted event fails the
     /// command). A refusal names the type URL it was given: the coordinator
@@ -367,7 +367,7 @@ impl<S> DomainDispatch<S> {
     ///
     /// It guards no envelope (decision 14.42): the coordinator delivers
     /// every input well formed. A delivery with no book, page, arm or
-    /// payload is routed as a command of no type, UNKNOWN_COMMAND_TYPE.
+    /// payload is routed as a command of no type, ROUTER_REASON_UNKNOWN_COMMAND_TYPE.
     pub fn dispatch(
         &self,
         req: &pb::ContextualCommand,
@@ -407,7 +407,7 @@ impl<S> DomainDispatch<S> {
                             self.refused.get(crate::type_name_from_url(&refused_type))
                         else {
                             return Err(CodedError::internal(
-                                codes::NO_REFUSAL_HANDLER,
+                                RouterReason::NoRefusalHandler,
                                 [(extras::COMMAND_TYPE.to_string(), refused_type)],
                             ));
                         };
@@ -415,7 +415,7 @@ impl<S> DomainDispatch<S> {
                     }
                     None => {
                         return Err(CodedError::unknown_type(
-                            codes::NO_FACT_HANDLER,
+                            RouterReason::NoFactHandler,
                             &any.type_url,
                         ))
                     }
@@ -449,7 +449,7 @@ impl<S> DomainDispatch<S> {
                 let Some(thunk) = self.handlers.get(crate::type_name_from_url(&any.type_url))
                 else {
                     return Err(CodedError::unknown_type(
-                        codes::UNKNOWN_COMMAND_TYPE,
+                        RouterReason::UnknownCommandType,
                         &any.type_url,
                     ));
                 };
@@ -479,13 +479,13 @@ impl<S> DomainDispatch<S> {
     ///   [`CommandContext::conflict`];
     /// - COMMUTATIVE: the registered resolver ([`Self::with_commutative`])
     ///   decides on the head and computes the window's units and the
-    ///   command's; with none registered, CONFLICT_RESOLUTION_UNSUPPORTED,
+    ///   command's; with none registered, ROUTER_REASON_CONFLICT_RESOLUTION_UNSUPPORTED,
     ///   before rebuild.
     ///
     /// It judges nothing (decision 14.42): the coordinator accepts the
     /// events only if the reported nonce is the one it delivered
-    /// (CONFLICT_UNRESOLVED), or the two unit sets do not overlap
-    /// (CONFLICT_OVERLAP).
+    /// (COORDINATOR_REASON_CONFLICT_UNRESOLVED), or the two unit sets do not overlap
+    /// (COORDINATOR_REASON_CONFLICT_OVERLAP).
     ///
     /// Answers decide's events, the state after them (the head with the
     /// events folded in, origin Emitted) and the conflict report (decision
@@ -529,7 +529,7 @@ impl<S> DomainDispatch<S> {
             pb::ConflictResolution::Commutative => {
                 let Some(resolver) = self.commutative.as_ref() else {
                     return Err(CodedError::internal(
-                        codes::CONFLICT_RESOLUTION_UNSUPPORTED,
+                        RouterReason::ConflictResolutionUnsupported,
                         [],
                     ));
                 };

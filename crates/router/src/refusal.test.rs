@@ -8,7 +8,7 @@ use prost::Message;
 use prost_types::Any;
 
 use crate::domain::CommandContext;
-use crate::error::{codes, GrpcCode, HandlerError};
+use crate::error::{GrpcCode, HandlerError, RouterReason};
 use crate::pb;
 use crate::policy::PolicyDispatch;
 use crate::test_support::*;
@@ -241,7 +241,7 @@ fn a_failing_callback_is_a_policy_bug() {
             &CommandContext::default(),
         )
         .expect_err("a bug");
-    assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
+    assert_eq!(err.code, RouterReason::UnhandledHandlerError.as_str_name());
     assert_eq!(err.grpc, GrpcCode::Internal);
 }
 
@@ -267,5 +267,5 @@ fn a_policy_router_answers_a_refusal_and_no_other_router_does() {
     let err = projector
         .dispatch_refusal(&refusal, &CommandContext::default())
         .expect_err("no policy");
-    assert_eq!(err.code, "NO_COMPONENT_OF_KIND");
+    assert_eq!(err.code, "ROUTER_REASON_NO_COMPONENT_OF_KIND");
 }

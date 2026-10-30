@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use prost_types::Any;
 
 use crate::domain::{CommandContext, DomainDispatch};
-use crate::error::{codes, GrpcCode};
+use crate::error::{GrpcCode, RouterReason};
 use crate::pb;
 use crate::rebuild::Rebuilder;
 use crate::test_support::*;
@@ -519,7 +519,7 @@ fn commutative_folding_an_emitted_event_that_fails_says_the_command_emitted_it()
     let type_url = type_url(&cover_full_name());
     assert_fold_failed(
         &err,
-        "FOLD_FAILED_EMITTED",
+        "ROUTER_REASON_FOLD_FAILED_EMITTED",
         &[
             (crate::error::extras::SEQUENCE, "1"),
             (crate::error::extras::TYPE_URL, type_url.as_str()),
@@ -542,7 +542,7 @@ fn commutative_folding_a_window_event_that_fails_says_it_was_accepted() {
         .dispatch(&req)
         .expect_err("the window does not fold");
     // Decision 14.37: a failing fold has its own key.
-    assert_eq!(err.code, "FOLD_FAILED");
+    assert_eq!(err.code, "ROUTER_REASON_FOLD_FAILED");
     assert_eq!(err.extras[crate::error::extras::SEQUENCE], "1");
 }
 
@@ -619,7 +619,10 @@ fn commutative_without_a_changed_function_is_unsupported() {
             b"n",
         ))
         .expect_err("no conflict units registered");
-    assert_eq!(err.code, codes::CONFLICT_RESOLUTION_UNSUPPORTED);
+    assert_eq!(
+        err.code,
+        RouterReason::ConflictResolutionUnsupported.as_str_name()
+    );
     crate::test_support::assert_bug(&err);
     assert_eq!(err.grpc, GrpcCode::Internal);
 }

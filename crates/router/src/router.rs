@@ -5,8 +5,8 @@
 //! upcaster sidecar before the router sees it (decision 14.39).
 //!
 //! [`RouterBuilder`] takes the component and validates the configuration at
-//! build time: no component is NO_HANDLERS_REGISTERED (C-0060); a second
-//! component, of any kind, is DUPLICATE_COMPONENT.
+//! build time: no component is ROUTER_REASON_NO_HANDLERS_REGISTERED (C-0060); a second
+//! component, of any kind, is ROUTER_REASON_DUPLICATE_COMPONENT.
 //! The built [`Router`] dispatches to that component:
 //!
 //! - a command or a fact (a page's Fact arm) to the domain: an aggregate, or
@@ -20,7 +20,7 @@
 //! on). Transport (gRPC servers), health and readiness stay with the host.
 
 use crate::domain::DomainDispatch;
-use crate::error::{codes, extras, CodedError};
+use crate::error::{extras, CodedError, RouterReason};
 use crate::pb;
 use crate::policy::PolicyDispatch;
 use crate::projector::ProjectorDispatch;
@@ -193,12 +193,12 @@ impl Component {
         }
     }
 
-    /// The refusal of a second component (DUPLICATE_COMPONENT) beside this
+    /// The refusal of a second component (ROUTER_REASON_DUPLICATE_COMPONENT) beside this
     /// one, naming this component and its kind (C-0580, C-0670): a
     /// misconfiguration, INTERNAL.
-    fn refuse_another(&self, code: &str) -> CodedError {
+    fn refuse_another(&self, reason: RouterReason) -> CodedError {
         CodedError::internal(
-            code,
+            reason,
             [
                 (extras::COMPONENT.to_string(), self.name().to_string()),
                 (
@@ -266,11 +266,11 @@ impl RouterBuilder {
     /// Validates the configuration and builds the router.
     pub fn build(mut self) -> Result<Router, CodedError> {
         if self.components.is_empty() {
-            return Err(CodedError::internal(codes::NO_HANDLERS_REGISTERED, []));
+            return Err(CodedError::internal(RouterReason::NoHandlersRegistered, []));
         }
         let component = self.components.remove(0);
         if !self.components.is_empty() {
-            return Err(component.refuse_another(codes::DUPLICATE_COMPONENT));
+            return Err(component.refuse_another(RouterReason::DuplicateComponent));
         }
         Ok(Router {
             component,
@@ -280,22 +280,23 @@ impl RouterBuilder {
 }
 
 /// The one component of one business process, ready to dispatch. Dispatching
-/// a kind the router does not host is NO_COMPONENT_OF_KIND (UNIMPLEMENTED).
+/// a kind the router does not host is ROUTER_REASON_NO_COMPONENT_OF_KIND (UNIMPLEMENTED).
 pub struct Router {
     component: Component,
     descriptor: Option<pb::ComponentDescriptor>,
 }
 
 fn wrong_kind() -> CodedError {
-    CodedError::unimplemented(codes::NO_COMPONENT_OF_KIND, [])
+    CodedError::unimplemented(RouterReason::NoComponentOfKind, [])
 }
 
 impl Router {
     /// The refusal of another component registered beside this one
-    /// (DUPLICATE_COMPONENT naming this one; C-0580), for hosts that
+    /// (ROUTER_REASON_DUPLICATE_COMPONENT naming this one; C-0580), for hosts that
     /// register components one at a time (the C ABI).
     pub fn refuse_another_component(&self) -> CodedError {
-        self.component.refuse_another(codes::DUPLICATE_COMPONENT)
+        self.component
+            .refuse_another(RouterReason::DuplicateComponent)
     }
 
     /// The descriptor `ComponentService.Describe` answers: the one the

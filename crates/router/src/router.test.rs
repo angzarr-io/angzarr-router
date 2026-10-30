@@ -5,7 +5,7 @@
 use prost_types::Any;
 
 use crate::domain::DomainDispatch;
-use crate::error::{codes, CodedError};
+use crate::error::{CodedError, RouterReason};
 use crate::pb;
 use crate::policy::PolicyDispatch;
 use crate::projector::ProjectorDispatch;
@@ -80,7 +80,7 @@ fn build_err(builder: RouterBuilder) -> String {
 fn an_empty_configuration_fails_to_build() {
     assert_eq!(
         build_err(RouterBuilder::new()),
-        codes::NO_HANDLERS_REGISTERED,
+        RouterReason::NoHandlersRegistered.as_str_name(),
         "C-0060"
     );
 }
@@ -112,7 +112,7 @@ fn a_router_hosts_one_component_and_refuses_a_second_of_any_kind() {
                 Ok(_) => panic!("a {second} after a {first} must be refused"),
                 Err(err) => err,
             };
-            assert_eq!(err.code, "DUPLICATE_COMPONENT");
+            assert_eq!(err.code, "ROUTER_REASON_DUPLICATE_COMPONENT");
             // C-0580: the refusal names the component already registered.
             let (name, kind) = match first {
                 "aggregate" => ("a", "AGGREGATE"),
@@ -148,13 +148,13 @@ fn a_router_dispatches_commands_and_facts_to_its_aggregate() {
     let err = router
         .dispatch_command(&command("order", "test.Unknown"))
         .unwrap_err();
-    assert_eq!(err.code, "UNKNOWN_COMMAND_TYPE");
+    assert_eq!(err.code, "ROUTER_REASON_UNKNOWN_COMMAND_TYPE");
     crate::test_support::assert_bug(&err);
     assert_eq!(err.grpc, crate::error::GrpcCode::Internal);
     let err = router
         .dispatch_command(&fact("order", "test.Unrecorded"))
         .unwrap_err();
-    assert_eq!(err.code, codes::NO_FACT_HANDLER);
+    assert_eq!(err.code, RouterReason::NoFactHandler.as_str_name());
     crate::test_support::assert_bug(&err);
 }
 
@@ -251,14 +251,14 @@ fn a_router_refuses_dispatch_of_another_kind() {
             .dispatch_command(&command("order", "test.Create"))
             .unwrap_err()
             .code,
-        "NO_COMPONENT_OF_KIND"
+        "ROUTER_REASON_NO_COMPONENT_OF_KIND"
     );
     assert_eq!(
         router
             .dispatch_projector(&source("order"))
             .unwrap_err()
             .code,
-        "NO_COMPONENT_OF_KIND"
+        "ROUTER_REASON_NO_COMPONENT_OF_KIND"
     );
     let aggregate_router = with_one(RouterBuilder::new(), "aggregate")
         .build()
@@ -268,7 +268,7 @@ fn a_router_refuses_dispatch_of_another_kind() {
             .dispatch_policy(&source("order"))
             .unwrap_err()
             .code,
-        "NO_COMPONENT_OF_KIND"
+        "ROUTER_REASON_NO_COMPONENT_OF_KIND"
     );
 }
 

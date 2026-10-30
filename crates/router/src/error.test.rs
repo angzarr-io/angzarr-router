@@ -2,7 +2,7 @@
 //! adapter-level contracts client-go's engine_test.go checks through its
 //! gRPC handler (DATA_LOSS for corrupt persisted events, UNIMPLEMENTED
 //! for a request the router hosts no component for, INTERNAL +
-//! UNHANDLED_HANDLER_ERROR for unclassified failures), asserted here
+//! ROUTER_REASON_UNHANDLED_HANDLER_ERROR for unclassified failures), asserted here
 //! directly on the coded form the FFI boundary will serialize.
 //!
 //! Decision 14.37: every error is a key and an argument map, never English.
@@ -36,22 +36,22 @@ fn every_constructor() -> Vec<(&'static str, CodedError)> {
     vec![
         (
             "internal",
-            CodedError::internal(codes::NO_HANDLERS_REGISTERED, []),
+            CodedError::internal(RouterReason::NoHandlersRegistered, []),
         ),
         (
             "internal with args",
             CodedError::internal(
-                codes::DUPLICATE_COMPONENT,
+                RouterReason::DuplicateComponent,
                 [arg(extras::COMPONENT, "order")],
             ),
         ),
         (
             "unimplemented",
-            CodedError::unimplemented("NO_COMPONENT_OF_KIND", []),
+            CodedError::unimplemented(RouterReason::NoComponentOfKind, []),
         ),
         (
             "unknown_type",
-            CodedError::unknown_type("UNKNOWN_COMMAND_TYPE", "/a.Sent"),
+            CodedError::unknown_type(RouterReason::UnknownCommandType, "/a.Sent"),
         ),
         (
             "undecodable",
@@ -61,7 +61,7 @@ fn every_constructor() -> Vec<(&'static str, CodedError)> {
         (
             "fold_failed",
             CodedError::fold_failed(
-                "FOLD_FAILED",
+                RouterReason::FoldFailed,
                 FoldAt::Range { first: 1, last: 2 },
                 "/a.State",
                 None,
@@ -169,7 +169,7 @@ fn a_bug_displays_its_cause_flattened() {
     let err = CodedError::bug("LEDGER_OFFLINE", [arg("ledger", "main")]);
     assert_eq!(
         err.to_string(),
-        "UNHANDLED_HANDLER_ERROR cause=LEDGER_OFFLINE cause.ledger=main"
+        "ROUTER_REASON_UNHANDLED_HANDLER_ERROR cause=LEDGER_OFFLINE cause.ledger=main"
     );
 }
 
@@ -179,7 +179,7 @@ fn a_bug_displays_its_cause_flattened() {
 fn an_unclassified_handler_errors_text_never_leaves_the_handler() {
     let err = map_handler_error(HandlerError::Other("connection reset".to_string()));
     assert_eq!(err.grpc, GrpcCode::Internal);
-    assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
+    assert_eq!(err.code, RouterReason::UnhandledHandlerError.as_str_name());
     assert!(
         !err.extras.contains_key(extras::CAUSE),
         "no cause: {:?}",
@@ -192,28 +192,28 @@ fn an_unclassified_handler_errors_text_never_leaves_the_handler() {
     );
 }
 
-// A panic's cause is HANDLER_PANICKED; its message stays in the handler's
+// A panic's cause is ROUTER_REASON_HANDLER_PANICKED; its message stays in the handler's
 // log (decision 14.37).
 #[test]
 fn a_panic_is_unhandled_handler_error_caused_by_handler_panicked() {
     let err = CodedError::panicked();
     assert_eq!(err.grpc, GrpcCode::Internal);
-    assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
+    assert_eq!(err.code, RouterReason::UnhandledHandlerError.as_str_name());
     assert_eq!(
         err.extras,
-        [arg("cause", "HANDLER_PANICKED")].into(),
+        [arg("cause", "ROUTER_REASON_HANDLER_PANICKED")].into(),
         "the panic's cause"
     );
 }
 
-// Owner's ruling on 14.37: a typed refusal's reason is COMMAND_REFUSED,
+// Owner's ruling on 14.37: a typed refusal's reason is ROUTER_REASON_COMMAND_REFUSED,
 // `refusal_type` its object's fully-qualified type, the object in the
 // status details.
 #[test]
 fn a_typed_refusal_is_command_refused_naming_its_type() {
     let err = CodedError::refused(typed_refusal());
     assert_eq!(err.grpc, GrpcCode::FailedPrecondition, "a rejection");
-    assert_eq!(err.code, "COMMAND_REFUSED");
+    assert_eq!(err.code, "ROUTER_REASON_COMMAND_REFUSED");
     assert_eq!(
         err.extras,
         [arg("refusal_type", "test.wallet.InsufficientFunds")].into()
@@ -227,7 +227,7 @@ fn undecodable_bytes_name_the_message_type() {
     // The router's own malformed-input error: a bug (owner ruling,
     // 2026-10-29). prost's own text rides as ext_err_txt.
     assert_eq!(err.grpc, GrpcCode::Internal);
-    assert_eq!(err.code, codes::ANY_DECODE_FAILED);
+    assert_eq!(err.code, RouterReason::AnyDecodeFailed.as_str_name());
     assert_eq!(
         err.extras,
         [
@@ -247,7 +247,7 @@ fn a_fold_failures_own_failure_is_its_cause_not_text() {
         args: [arg("offset", "3")].into_iter().collect(),
     };
     let err = CodedError::fold_failed(
-        "FOLD_FAILED",
+        RouterReason::FoldFailed,
         FoldAt::Page {
             sequence: 7,
             type_url: "/test.Evt",
@@ -261,88 +261,133 @@ fn a_fold_failures_own_failure_is_its_cause_not_text() {
     assert_eq!(extra("fold_message"), None, "no fold text");
 }
 
-/// angzarr-project's reason-key catalog (decisions 14.37, 14.42): the
-/// submodule's, or the one beside `ANGZARR_PROJECT_PROTO`'s proto root.
-fn catalog() -> String {
-    let root = match std::env::var("ANGZARR_PROJECT_PROTO") {
-        Ok(proto) => std::path::PathBuf::from(proto).join(".."),
-        Err(_) => std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../angzarr-project"),
-    };
-    let path = root.join("catalog/reasons.toml");
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+/// Every value of reasons.proto's `RouterReason` but its proto3 zero
+/// (decision 14.44): read from the enum itself, numbered from 1 with no
+/// gaps.
+fn router_reasons() -> Vec<RouterReason> {
+    (1..)
+        .map_while(|number| RouterReason::try_from(number).ok())
+        .collect()
 }
 
-/// The catalog's keys whose `owner` is `owner`: each `[keys.NAME]` table's
-/// name, read line by line (scripts/check_reasons.py holds the file to
-/// that shape).
-fn owned_by(catalog: &str, owner: &str) -> std::collections::BTreeSet<String> {
-    let mut owned = std::collections::BTreeSet::new();
-    let mut key = None;
-    for line in catalog.lines().map(str::trim) {
-        if line.starts_with('[') {
-            key = line
-                .strip_prefix("[keys.")
-                .and_then(|rest| rest.strip_suffix(']'))
-                .map(str::to_string);
-        } else if let (Some(name), Some(value)) = (&key, line.strip_prefix("owner")) {
-            let value = value.trim_start().trim_start_matches('=').trim_start();
-            if value.split('#').next().map(str::trim) == Some(format!("\"{owner}\"").as_str()) {
-                owned.insert(name.clone());
-            }
+/// The answer the router gives with `reason`, from the constructor that
+/// answers it, and the key it carries for it: its code, or for
+/// ROUTER_REASON_HANDLER_PANICKED, which travels only as a cause, its
+/// `cause`. Exhaustive, so a value added to the enum fails to compile here
+/// until the router answers it.
+fn answer(reason: RouterReason) -> String {
+    let err = match reason {
+        RouterReason::Unspecified => unreachable!("proto3's zero is never answered"),
+        RouterReason::UnhandledHandlerError => CodedError::unhandled(),
+        RouterReason::HandlerPanicked => {
+            return CodedError::panicked().extras[extras::CAUSE].clone();
         }
-    }
-    owned
+        RouterReason::CommandRefused => CodedError::refused(typed_refusal()),
+        RouterReason::FoldFailed | RouterReason::FoldFailedEmitted => CodedError::fold_failed(
+            reason,
+            FoldAt::Range { first: 1, last: 2 },
+            "/a.State",
+            None,
+        ),
+        RouterReason::PersistedEventCorrupt => CodedError::persisted_corrupt("/a.Evt"),
+        RouterReason::AnyDecodeFailed => {
+            CodedError::undecodable("io.angzarr.v1.ContextualCommand", &decode_error())
+        }
+        RouterReason::UnknownCommandType | RouterReason::NoFactHandler => {
+            CodedError::unknown_type(reason, "/a.Sent")
+        }
+        RouterReason::NoComponentOfKind => CodedError::unimplemented(reason, []),
+        RouterReason::NoRefusalHandler
+        | RouterReason::ConflictResolutionUnsupported
+        | RouterReason::NoHandlersRegistered
+        | RouterReason::DuplicateComponent => CodedError::internal(reason, []),
+    };
+    err.code
 }
 
-// Decision 14.42: the catalog lists every framework key once, with the
-// component that answers it. The router answers its own keys, all of them,
-// and no other: none the coordinator answers, none retired.
+// Decisions 14.42 and 14.44: reasons.proto's RouterReason holds every key
+// the router answers, once. The router answers each of its values but the
+// zero, under the value's full name, and no other key: none the
+// coordinator answers, none retired.
 #[test]
-fn the_router_answers_exactly_the_catalogs_router_keys() {
-    let catalog = catalog();
-    let router = owned_by(&catalog, "router");
+fn the_router_answers_exactly_the_non_unspecified_router_reasons() {
+    let reasons = router_reasons();
     assert!(
-        router.contains("UNKNOWN_COMMAND_TYPE") && !owned_by(&catalog, "coordinator").is_empty(),
-        "the catalog parses: {router:?}"
+        reasons.contains(&RouterReason::UnknownCommandType)
+            && !reasons.contains(&RouterReason::Unspecified),
+        "the enum reads: {reasons:?}"
     );
-    let answered: std::collections::BTreeSet<String> =
-        codes::ALL.iter().map(|code| code.to_string()).collect();
-    assert_eq!(
-        answered, router,
-        "codes::ALL is the catalog's router keys, no more and no fewer"
+    for reason in &reasons {
+        assert_eq!(answer(*reason), reason.as_str_name(), "{reason:?}");
+    }
+    let unanswered: Vec<String> = every_constructor()
+        .into_iter()
+        .flat_map(|(name, err)| {
+            let keys =
+                std::iter::once(err.code.clone()).chain(err.extras.get(extras::CAUSE).cloned());
+            keys.map(move |key| (name, key)).collect::<Vec<_>>()
+        })
+        .filter(|(_, key)| key.starts_with("ROUTER_REASON_"))
+        .filter(|(_, key)| {
+            RouterReason::from_str_name(key).is_none_or(|r| r == RouterReason::Unspecified)
+        })
+        .map(|(name, key)| format!("{name}: {key}"))
+        .collect();
+    assert!(
+        unanswered.is_empty(),
+        "router keys outside RouterReason's answered values: {unanswered:?}"
     );
 }
 
 #[test]
 fn the_retired_keys_are_gone() {
-    let kept: Vec<&str> = [
+    let kept: Vec<String> = [
         "MALFORMED_REFUSAL_FACT",
         "DUPLICATE_REGISTRATION",
         "NO_HANDLER_REGISTERED",
         // Retired by decision 14.39 with the router's upcaster chain.
         "DUPLICATE_UPCASTER_CHAIN",
         "DUPLICATE_COMMAND_HANDLER",
+        // Retired by decision 14.42 with the router's envelope checks.
+        "MISSING_COMMAND_BOOK",
+        "MISSING_COMMAND_PAGE",
+        "MISSING_COMMAND_PAYLOAD",
+        "MISSING_EVENT_BOOK_COVER",
+        "EMPTY_POLICY_SOURCE",
+        "POLICY_SOURCE_OUTSIDE_INPUT_DOMAIN",
+        "REFUSAL_FACT_MISSING",
+        "REFUSAL_WITHOUT_COMMAND",
+        "REFUSAL_WITHOUT_EVENT",
+        "REFUSAL_WITHOUT_REFUSED_COMMAND",
+        "REFUSED_COMMAND_WITHOUT_ID",
+        "REFUSAL_WITHOUT_TRIGGER_STREAM",
+        "HOST_STATUS_UNDECODABLE",
+        "NULL_ABI_POINTER",
     ]
     .into_iter()
-    .filter(|key| codes::ALL.contains(key))
+    .flat_map(|key| [key.to_string(), format!("ROUTER_REASON_{key}")])
+    .filter(|key| RouterReason::from_str_name(key).is_some())
     .collect();
     assert!(
         kept.is_empty(),
-        "decisions 14.37 and 14.39 retired these, still in codes::ALL: {kept:?}"
+        "decisions 14.37, 14.39 and 14.42 retired these, still in RouterReason: {kept:?}"
     );
 }
 
 #[test]
-fn every_router_code_is_a_screaming_snake_key_listed_once() {
+fn every_router_reason_is_a_prefixed_screaming_snake_key_listed_once() {
     let mut seen = std::collections::BTreeSet::new();
-    for code in codes::ALL {
+    for reason in router_reasons() {
+        let code = reason.as_str_name();
         assert!(
-            !code.is_empty()
+            code.strip_prefix("ROUTER_REASON_")
+                .is_some_and(|rest| !rest.is_empty())
                 && code
                     .chars()
                     .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'),
-            "{code:?} is no SCREAMING_SNAKE key"
+            "{code:?} is no ROUTER_REASON_ SCREAMING_SNAKE key"
         );
+        assert_eq!(RouterReason::from_str_name(code), Some(reason), "{code}");
         assert!(seen.insert(code), "{code} listed twice");
     }
 }
@@ -353,7 +398,7 @@ fn every_router_code_is_a_screaming_snake_key_listed_once() {
 fn persisted_corrupt_is_data_loss() {
     let err = CodedError::persisted_corrupt("type.googleapis.com/test.Evt");
     assert_eq!(err.grpc, GrpcCode::DataLoss);
-    assert_eq!(err.code, codes::PERSISTED_EVENT_CORRUPT);
+    assert_eq!(err.code, RouterReason::PersistedEventCorrupt.as_str_name());
     assert_eq!(
         err.extras.get(extras::TYPE_URL).map(String::as_str),
         Some("type.googleapis.com/test.Evt")
@@ -366,7 +411,7 @@ fn persisted_corrupt_is_data_loss() {
 #[test]
 fn fold_failed_is_internal_naming_the_event_and_state() {
     let err = CodedError::fold_failed(
-        "FOLD_FAILED",
+        RouterReason::FoldFailed,
         FoldAt::Page {
             sequence: 7,
             type_url: "/test.Evt",
@@ -375,7 +420,7 @@ fn fold_failed_is_internal_naming_the_event_and_state() {
         None,
     );
     assert_eq!(err.grpc, GrpcCode::Internal);
-    assert_eq!(err.code, "FOLD_FAILED");
+    assert_eq!(err.code, "ROUTER_REASON_FOLD_FAILED");
     let extra = |key: &str| err.extras.get(key).map(String::as_str);
     assert_eq!(extra(extras::SEQUENCE), Some("7"));
     assert_eq!(extra(extras::TYPE_URL), Some("/test.Evt"));
@@ -387,13 +432,13 @@ fn fold_failed_is_internal_naming_the_event_and_state() {
 #[test]
 fn an_unlocated_fold_failure_names_the_batchs_range() {
     let err = CodedError::fold_failed(
-        "FOLD_FAILED_EMITTED",
+        RouterReason::FoldFailedEmitted,
         FoldAt::Range { first: 3, last: 5 },
         "",
         None,
     );
     assert_eq!(err.grpc, GrpcCode::Internal);
-    assert_eq!(err.code, "FOLD_FAILED_EMITTED");
+    assert_eq!(err.code, "ROUTER_REASON_FOLD_FAILED_EMITTED");
     let extra = |key: &str| err.extras.get(key).map(String::as_str);
     assert_eq!(extra(extras::FIRST_SEQUENCE), Some("3"));
     assert_eq!(extra(extras::LAST_SEQUENCE), Some("5"));
@@ -401,26 +446,28 @@ fn an_unlocated_fold_failure_names_the_batchs_range() {
     assert_eq!(extra(extras::STATE_TYPE_URL), Some(""));
 }
 
-// A request the router hosts no component for, or a policy source from
-// outside its input domain: a misroute or a stale deployment, not a
-// malformed payload (C-0670).
+// A request the router hosts no component for: a misroute or a stale
+// deployment, not a malformed payload (C-0670).
 #[test]
 fn no_component_for_the_request_is_unimplemented() {
-    for code in ["NO_COMPONENT_OF_KIND", "POLICY_SOURCE_OUTSIDE_INPUT_DOMAIN"] {
-        assert_eq!(
-            CodedError::unimplemented(code, []).grpc,
-            GrpcCode::Unimplemented,
-            "{code}: misrouted request / stale deployment, not a malformed payload"
-        );
-    }
+    let err = CodedError::unimplemented(RouterReason::NoComponentOfKind, []);
+    assert_eq!(
+        err.grpc,
+        GrpcCode::Unimplemented,
+        "misrouted request / stale deployment, not a malformed payload"
+    );
+    assert_eq!(err.code, "ROUTER_REASON_NO_COMPONENT_OF_KIND");
 }
 
 // The router's own errors on malformed input are bugs (owner ruling on
 // decision 14.37, 2026-10-29): INTERNAL, never a policy's OnRefused.
 #[test]
 fn the_routers_own_malformed_input_is_a_bug() {
-    crate::test_support::assert_bug(&CodedError::internal(codes::NO_REFUSAL_HANDLER, []));
-    crate::test_support::assert_bug(&CodedError::unknown_type("UNKNOWN_COMMAND_TYPE", "/a.B"));
+    crate::test_support::assert_bug(&CodedError::internal(RouterReason::NoRefusalHandler, []));
+    crate::test_support::assert_bug(&CodedError::unknown_type(
+        RouterReason::UnknownCommandType,
+        "/a.B",
+    ));
     crate::test_support::assert_bug(&CodedError::undecodable(
         "io.angzarr.v1.EventBook",
         &decode_error(),
@@ -449,14 +496,14 @@ fn a_rejection_is_a_business_refusal() {
     assert_eq!(err.extras.get("input").map(String::as_str), Some("0"));
 }
 
-// Decision 14.37: a handler's bug goes out as UNHANDLED_HANDLER_ERROR
+// Decision 14.37: a handler's bug goes out as ROUTER_REASON_UNHANDLED_HANDLER_ERROR
 // (INTERNAL), the handler's own code and args its cause, flattened as
 // `cause=<code>` and `cause.<arg>=<value>`.
 #[test]
 fn a_bug_is_unhandled_handler_error_with_the_handlers_code_as_its_cause() {
     let err = CodedError::bug("LEDGER_INVARIANT_BROKEN", [arg("balance", "-1")]);
     assert_eq!(err.grpc, GrpcCode::Internal);
-    assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
+    assert_eq!(err.code, RouterReason::UnhandledHandlerError.as_str_name());
     assert_eq!(
         err.extras,
         [
@@ -550,7 +597,7 @@ fn only_a_business_status_converts_to_a_business_status() {
 fn a_bug_stays_internal_with_its_cause() {
     let err = CodedError::bug("LEDGER_OFFLINE", [arg("ledger", "main")]);
     assert_eq!(err.grpc, GrpcCode::Internal);
-    assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
+    assert_eq!(err.code, RouterReason::UnhandledHandlerError.as_str_name());
     assert_eq!(
         err.extras,
         [arg("cause", "LEDGER_OFFLINE"), arg("cause.ledger", "main")].into()
@@ -559,15 +606,22 @@ fn a_bug_stays_internal_with_its_cause() {
 
 // Decision 14.37 (owner's rulings, 2026-10-29, latest): a bug the handler
 // marks retryable (its ledger service is down) goes out under the status
-// the handler PICKS, under UNHANDLED_HANDLER_ERROR with its own code and
+// the handler PICKS, under ROUTER_REASON_UNHANDLED_HANDLER_ERROR with its own code and
 // args as the cause. Never OnRefused.
 #[test]
 fn a_retryable_bug_goes_out_under_the_status_the_handler_picks() {
     for (status, grpc) in RETRYABLE_STATUSES {
         let err = CodedError::retryable_bug(status, "LEDGER_OFFLINE", [arg("ledger", "main")]);
         assert_eq!(err.grpc, grpc, "{status:?}: the status the handler picked");
-        assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR, "{status:?}");
-        assert_eq!(err.status_message(), codes::UNHANDLED_HANDLER_ERROR);
+        assert_eq!(
+            err.code,
+            RouterReason::UnhandledHandlerError.as_str_name(),
+            "{status:?}"
+        );
+        assert_eq!(
+            err.status_message(),
+            RouterReason::UnhandledHandlerError.as_str_name()
+        );
         assert_eq!(
             err.extras,
             [arg("cause", "LEDGER_OFFLINE"), arg("cause.ledger", "main")].into(),
@@ -590,7 +644,7 @@ fn a_handlers_retryable_bug_keeps_its_status_through_the_boundary() {
     })
     .expect_err("the handler failed");
     assert_eq!(err.grpc, GrpcCode::ResourceExhausted);
-    assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
+    assert_eq!(err.code, RouterReason::UnhandledHandlerError.as_str_name());
     assert_eq!(
         err.extras.get("cause").map(String::as_str),
         Some("LEDGER_OFFLINE")
@@ -629,7 +683,7 @@ fn a_value_that_would_not_parse_back_is_quoted() {
     );
     assert_eq!(
         err.to_string(),
-        "UNHANDLED_HANDLER_ERROR cause=STORE_DOWN cause.bare=account/7-x_y.z \
+        "ROUTER_REASON_UNHANDLED_HANDLER_ERROR cause=STORE_DOWN cause.bare=account/7-x_y.z \
          cause.empty=\"\" cause.ext_err_txt=\"database is locked\" cause.pair=\"k=v\" \
          cause.path=\"C:\\\\dir\" cause.said=\"say \\\"hi\\\"\" cause.tab=\"a\tb\""
     );
