@@ -72,6 +72,7 @@ just build              # cargo build --workspace
 just test               # the unit bank and the handler-contract tier
 just mutation-test      # cargo-mutants over the router and archlint, 100%
 just mutation-push      # by hand: the same, over what a push adds (stdin: git's pushed refs)
+just push-check origin  # pre-push: every test of each pushed commit; red refused on main only
 just lint               # clippy -D warnings
 just archlint           # module-level layer rules (archlint.toml)
 just fmt-check          # rustfmt, no rewrite
