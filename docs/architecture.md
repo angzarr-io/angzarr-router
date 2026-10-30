@@ -97,8 +97,9 @@ coordinator.
   handler-contract tier, run whole from the submodule by cucumber-rs
   (`crates/conformance`, one harness per tier feature).
 - `just mutation-test`: cargo-mutants over the router's modules and the
-  architecture linter, every missed mutant a failure. The pre-push hook
-  runs `just mutation-push`, the same over only what the push adds.
+  architecture linter, every missed mutant a failure; weekly in CI.
+  `just mutation-push`, by hand, is the same over only what a push adds.
+  No git hook runs mutation.
 - `just archlint`: the layering as checked rules (`archlint.toml`: the
   router below the harness, its components independent of each other and
   of the `Router` that composes them, the harness on the public surface),

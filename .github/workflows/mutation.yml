@@ -1,7 +1,7 @@
 # The mutation full pass, weekly and by hand: `just mutation-test` mutates
 # every file in MUTATED (justfile.container) and fails on any surviving
-# mutant. The pre-push gate (`mutation-push`) judges only what a push adds;
-# this pass catches what has drifted under it. Set up as ci.yml is: the recipe
+# mutant. No git hook runs mutation; `mutation-push` judges what a push adds,
+# by hand, and this pass catches what has drifted under it. Set up as ci.yml is: the recipe
 # runs in the org's pinned toolchain image, protos from the angzarr-project
 # submodule.
 name: mutation

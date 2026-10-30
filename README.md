@@ -71,7 +71,7 @@ value name (`as_str_name()`, e.g. `ROUTER_REASON_DUPLICATE_COMPONENT`). The
 just build              # cargo build --workspace
 just test               # the unit bank and the handler-contract tier
 just mutation-test      # cargo-mutants over the router and archlint, 100%
-just mutation-push      # pre-push: the same, over what a push adds (stdin: git's pushed refs)
+just mutation-push      # by hand: the same, over what a push adds (stdin: git's pushed refs)
 just lint               # clippy -D warnings
 just archlint           # module-level layer rules (archlint.toml)
 just fmt-check          # rustfmt, no rewrite
