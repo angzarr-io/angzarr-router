@@ -490,7 +490,7 @@ impl<S> DomainDispatch<S> {
             return Err(CodedError::internal(codes::MISSING_COMMAND_PAGE, []));
         };
         let cover = req.events.as_ref().and_then(|b| b.cover.as_ref());
-        let (mut events, state) = match &page.body {
+        let (mut events, state, conflict) = match &page.body {
             Some(pb::command_page::Body::Command(command)) => {
                 let sent = non_empty_payload(command.payload.as_ref())?;
                 let any = self.upcast(sent)?;
@@ -554,7 +554,7 @@ impl<S> DomainDispatch<S> {
                     cover,
                     crate::next_sequence(req.events.as_ref()),
                 )?;
-                (recorded, state)
+                (recorded, state, None)
             }
             None => {
                 return Err(CodedError::internal(codes::MISSING_COMMAND_PAYLOAD, []));
@@ -571,7 +571,7 @@ impl<S> DomainDispatch<S> {
         Ok(pb::CommandHandlerResponse {
             events: Some(events),
             rules_version: self.rules_version.clone(),
-            conflict: None,
+            conflict,
         })
     }
 
@@ -614,14 +614,17 @@ impl<S> DomainDispatch<S> {
     ///   the command's do not overlap (else CONFLICT_OVERLAP); with none
     ///   registered, CONFLICT_RESOLUTION_UNSUPPORTED, before rebuild.
     ///
-    /// Answers decide's events and the state after them: the head with the
-    /// events folded in (origin Emitted).
+    /// Answers decide's events, the state after them (the head with the
+    /// events folded in, origin Emitted) and the conflict report (decision
+    /// 14.42): under AGGREGATE_HANDLES the nonce the handler passed to
+    /// `resolve_conflicts` (empty if it never called it), under COMMUTATIVE
+    /// the window's units and the command's; none under STRICT.
     fn decide(
         &self,
         req: &pb::ContextualCommand,
         any: &Any,
         thunk: &CommandFn<S>,
-    ) -> Result<(pb::EventBook, S), CodedError> {
+    ) -> Result<(pb::EventBook, S, Option<pb::ConflictReport>), CodedError> {
         let events = req.events.as_ref();
         let next_sequence = crate::next_sequence(events);
         let cover = events.and_then(|b| b.cover.as_ref());
@@ -642,8 +645,16 @@ impl<S> DomainDispatch<S> {
                 if !base.conflict.as_ref().is_some_and(Conflict::is_resolved) {
                     return Err(CodedError::stale(codes::CONFLICT_UNRESOLVED, []));
                 }
+                let report = pb::ConflictReport {
+                    resolved_nonce: base
+                        .conflict
+                        .as_ref()
+                        .map(Conflict::resolved_nonce)
+                        .unwrap_or_default(),
+                    ..Default::default()
+                };
                 fold_emitted(&mut state, &out)?;
-                Ok((out, state))
+                Ok((out, state, Some(report)))
             }
             pb::ConflictResolution::Commutative => {
                 let Some(resolver) = self.commutative.as_ref() else {
@@ -674,13 +685,18 @@ impl<S> DomainDispatch<S> {
                 }
                 // The resolver leaves the state at the head plus the
                 // command's events.
-                Ok((resolved.events, state))
+                let report = pb::ConflictReport {
+                    window_units: resolved.window,
+                    command_units: resolved.mine,
+                    ..Default::default()
+                };
+                Ok((resolved.events, state, Some(report)))
             }
             _ => {
                 let (mut state, _) = self.rebuilder.rebuild(events)?;
                 let out = run(&mut state, base.clone())?;
                 fold_emitted(&mut state, &out)?;
-                Ok((out, state))
+                Ok((out, state, None))
             }
         }
     }
