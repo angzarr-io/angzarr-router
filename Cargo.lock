@@ -14,7 +14,7 @@ dependencies = [
 [[package]]
 name = "angzarr-proto"
 version = "0.1.0"
-source = "git+https://github.com/angzarr-io/angzarr-project?rev=603e2a542b528892d85a1bd856c1fc8b2d9a20f7#603e2a542b528892d85a1bd856c1fc8b2d9a20f7"
+source = "git+https://github.com/angzarr-io/angzarr-project?rev=b0a680fd1d8cdfaef9baace879b6b6adbeeca22a#b0a680fd1d8cdfaef9baace879b6b6adbeeca22a"
 dependencies = [
  "bytes",
  "prost",
