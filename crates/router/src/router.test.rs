@@ -637,7 +637,10 @@ impl PolicyComponent for Relay {
     }
     fn dispatch(&self, _: &pb::EventBook) -> Result<pb::PolicyResponse, CodedError> {
         Ok(pb::PolicyResponse {
-            commands: vec![pb::CommandBook::default()],
+            reactions: vec![pb::PolicyReaction {
+                trigger_sequence: 0,
+                commands: vec![pb::CommandBook::default()],
+            }],
         })
     }
     fn dispatch_refusal(
@@ -675,11 +678,7 @@ fn a_hand_written_policy_answers_through_policy_component() {
     assert_eq!(boxed.name(), "relay");
     assert_eq!(boxed.input_domain(), "order");
     assert_eq!(
-        boxed
-            .dispatch(&source("order"))
-            .expect("policy")
-            .commands
-            .len(),
+        crate::test_support::commands_of(&boxed.dispatch(&source("order")).expect("policy")).len(),
         1
     );
     assert_eq!(
@@ -715,11 +714,7 @@ fn a_policy_dispatch_answers_through_policy_component() {
     assert_eq!(policy.name(), "s");
     assert_eq!(policy.input_domain(), "order");
     assert_eq!(
-        policy
-            .dispatch(&source("order"))
-            .expect("policy")
-            .commands
-            .len(),
+        crate::test_support::commands_of(&policy.dispatch(&source("order")).expect("policy")).len(),
         1
     );
     let ctx = crate::context::CommandContext::default();
