@@ -371,6 +371,38 @@ fn ledger(version: &str) -> DomainDispatch<LedgerState> {
         .on_command("test.Ledger", |_, _, _| Ok(None))
 }
 
+// Decision 14.42: angzarr-cli generates the descriptor at build time; the
+// business process answers Describe with it unchanged, and the router builds
+// and checks none. One the router's own descriptor logic would have refused
+// (no rules version, starting types on an aggregate, no state, an output
+// domain) or rebuilt (its inputs) is answered as given, and a router given
+// none answers none.
+#[test]
+fn describe_answers_the_descriptor_it_was_given_unchanged() {
+    let given = pb::ComponentDescriptor {
+        name: "Ledger".to_string(),
+        kind: pb::ComponentKind::Aggregate as i32,
+        inputs: vec![pb::Target {
+            domain: "elsewhere".to_string(),
+        }],
+        rules_version: String::new(),
+        state: None,
+        starting_types: vec!["test.Ledger".to_string()],
+        output_domain: "inventory".to_string(),
+    };
+    let router = RouterBuilder::new()
+        .aggregate(ledger(""))
+        .descriptor(given.clone())
+        .build()
+        .expect("build");
+    assert_eq!(router.component_descriptor(), Some(&given));
+    let undescribed = RouterBuilder::new()
+        .aggregate(ledger("1"))
+        .build()
+        .expect("build");
+    assert_eq!(undescribed.component_descriptor(), None);
+}
+
 #[test]
 fn a_router_answers_its_components_hello() {
     let kind = |router: Router| router.component_descriptor().expect("hello").kind();
