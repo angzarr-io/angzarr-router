@@ -319,6 +319,58 @@ const INVENTORY_14_37: &[&str] = &[
     "REFUSAL_FACT_WRONG_STREAM",
 ];
 
+/// angzarr-project's reason-key catalog (decisions 14.37, 14.42): the
+/// submodule's, or the one beside `ANGZARR_PROJECT_PROTO`'s proto root.
+fn catalog() -> String {
+    let root = match std::env::var("ANGZARR_PROJECT_PROTO") {
+        Ok(proto) => std::path::PathBuf::from(proto).join(".."),
+        Err(_) => std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../angzarr-project"),
+    };
+    let path = root.join("catalog/reasons.toml");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+/// The catalog's keys whose `owner` is `owner`: each `[keys.NAME]` table's
+/// name, read line by line (scripts/check_reasons.py holds the file to
+/// that shape).
+fn owned_by(catalog: &str, owner: &str) -> std::collections::BTreeSet<String> {
+    let mut owned = std::collections::BTreeSet::new();
+    let mut key = None;
+    for line in catalog.lines().map(str::trim) {
+        if line.starts_with('[') {
+            key = line
+                .strip_prefix("[keys.")
+                .and_then(|rest| rest.strip_suffix(']'))
+                .map(str::to_string);
+        } else if let (Some(name), Some(value)) = (&key, line.strip_prefix("owner")) {
+            let value = value.trim_start().trim_start_matches('=').trim_start();
+            if value.split('#').next().map(str::trim) == Some(format!("\"{owner}\"").as_str()) {
+                owned.insert(name.clone());
+            }
+        }
+    }
+    owned
+}
+
+// Decision 14.42: the catalog lists every framework key once, with the
+// component that answers it. The router answers its own keys, all of them,
+// and no other: none the coordinator answers, none retired.
+#[test]
+fn the_router_answers_exactly_the_catalogs_router_keys() {
+    let catalog = catalog();
+    let router = owned_by(&catalog, "router");
+    assert!(
+        router.contains("UNKNOWN_COMMAND_TYPE") && !owned_by(&catalog, "coordinator").is_empty(),
+        "the catalog parses: {router:?}"
+    );
+    let answered: std::collections::BTreeSet<String> =
+        codes::ALL.iter().map(|code| code.to_string()).collect();
+    assert_eq!(
+        answered, router,
+        "codes::ALL is the catalog's router keys, no more and no fewer"
+    );
+}
+
 #[test]
 fn every_key_of_the_14_37_inventory_is_a_router_code() {
     let missing: Vec<&str> = INVENTORY_14_37
