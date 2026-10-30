@@ -1,16 +1,16 @@
-//! A policy on the current spec: its commands stay in its trigger's edition,
-//! and a refusal of one of them comes back through OnRefused as the one
-//! refusal fact for its own source domain, passed through or translated
-//! (policy.proto, PolicyService, Refusals; types.proto, the refusal_facts and
-//! command_identity regions; decision 14.31).
+//! A policy on the current spec: a refusal of one of its commands comes back
+//! through OnRefused, which answers the translating callback's fact payload
+//! alone, or no translation (policy.proto, PolicyService, Refusals; decisions
+//! 14.31, 14.42). Building the pass-through `CommandRefused`, and
+//! addressing and identifying every refusal fact, are the coordinator's.
 
 use prost::Message;
 use prost_types::Any;
 
 use crate::domain::CommandContext;
-use crate::error::{codes, CodedError, GrpcCode, HandlerError};
+use crate::error::{codes, GrpcCode, HandlerError};
 use crate::pb;
-use crate::policy::{address_refusal_fact, PolicyDispatch};
+use crate::policy::PolicyDispatch;
 use crate::test_support::*;
 
 const INSTANCE: u8 = 7;
@@ -44,13 +44,6 @@ fn trigger_book(edition: Option<&str>) -> pb::EventBook {
             any_of(&BuyInStarted { amount: 150 }),
         )],
         ..Default::default()
-    }
-}
-
-fn trigger_ref(edition: Option<&str>) -> pb::EventRef {
-    pb::EventRef {
-        stream: Some(stream("buyin", edition, INSTANCE)),
-        sequence: 4,
     }
 }
 
@@ -113,39 +106,16 @@ fn a_policy_translates_an_event_into_a_command_for_its_destination() {
     );
 }
 
-// --- pass-through ----------------------------------------------------------------------
+// --- no translation (C-0692) ------------------------------------------------------------
 
 #[test]
-fn pass_through_answers_the_standard_command_refused() {
-    let answer = buyin_wallet()
-        .dispatch_refusal(
-            &refusal(None, Some(insufficient())),
-            &CommandContext::default(),
-        )
-        .expect("answered");
-    let fact: pb::CommandRefused = fact_of(&answer);
-    assert_eq!(
-        fact,
-        pb::CommandRefused {
-            command: Some(sent_command(None)),
-            refusal: Some(insufficient()),
-            trigger: Some(trigger_ref(None)),
-        }
-    );
-    assert!(
-        answer.fact.unwrap().cover.is_none(),
-        "the policy leaves the cover to the runtime"
-    );
-}
-
-#[test]
-fn pass_through_without_a_typed_refusal_leaves_refusal_unset() {
-    let answer = buyin_wallet()
-        .dispatch_refusal(&refusal(None, None), &CommandContext::default())
-        .expect("answered");
-    let fact: pb::CommandRefused = fact_of(&answer);
-    assert_eq!(fact.refusal, None);
-    assert_eq!(fact.trigger, Some(trigger_ref(None)));
+fn with_no_callback_the_answer_carries_no_fact() {
+    for typed in [Some(insufficient()), None] {
+        let answer = buyin_wallet()
+            .dispatch_refusal(&refusal(None, typed), &CommandContext::default())
+            .expect("answered");
+        assert_eq!(answer, pb::OnRefusedResponse { fact: None });
+    }
 }
 
 // --- translate --------------------------------------------------------------------------
@@ -175,6 +145,15 @@ fn translate_answers_the_callbacks_domestic_fact() {
         .expect("answered");
     let fact: FundsUnavailable = fact_of(&answer);
     assert_eq!(fact, FundsUnavailable { available: 100 });
+    // C-0691: the payload alone; its cover, handling and identity are the
+    // coordinator's.
+    assert_eq!(
+        answer.fact,
+        Some(pb::CommandBook {
+            page: Some(fact_page(any_of(&FundsUnavailable { available: 100 }))),
+            ..Default::default()
+        })
+    );
 }
 
 // The translating callback reads the refused command's context, whole, as
@@ -237,7 +216,7 @@ fn a_translating_callback_reads_the_refused_commands_context() {
 
 // The callback's presence is translate mode for THAT command type only.
 #[test]
-fn a_command_type_with_no_callback_is_passed_through() {
+fn a_command_type_with_no_callback_has_no_translation() {
     let policy = buyin_wallet().on_refused(&fq::<ReleaseFunds>(), |_, _| {
         panic!("not the refused command's type")
     });
@@ -247,8 +226,7 @@ fn a_command_type_with_no_callback_is_passed_through() {
             &CommandContext::default(),
         )
         .expect("answered");
-    let fact: pb::CommandRefused = fact_of(&answer);
-    assert_eq!(fact.refusal, Some(insufficient()));
+    assert_eq!(answer.fact, None);
 }
 
 // A failing callback is a policy bug: dead-lettered and alerted by the runtime.
@@ -267,97 +245,20 @@ fn a_failing_callback_is_a_policy_bug() {
     assert_eq!(err.grpc, GrpcCode::Internal);
 }
 
-// --- addressing and identity ----------------------------------------------------------
-
-#[test]
-fn the_refusal_fact_goes_to_the_triggers_exact_stream() {
-    let refusal = refusal(Some("what-if"), Some(insufficient()));
-    let answer = buyin_wallet()
-        .dispatch_refusal(&refusal, &CommandContext::default())
-        .expect("answered");
-    let fact = address_refusal_fact(&refusal, &answer).expect("addressed");
-    assert_eq!(fact.cover, Some(stream("buyin", Some("what-if"), INSTANCE)));
-}
-
-// One id in two streams by design: never applied at the target, recorded as
-// the refusal at the source; both deduplicate on it.
-#[test]
-fn the_refusal_facts_id_is_the_refused_commands_id() {
-    let refusal = refusal(None, Some(insufficient()));
-    let answer = buyin_wallet()
-        .dispatch_refusal(&refusal, &CommandContext::default())
-        .expect("answered");
-    let fact = address_refusal_fact(&refusal, &answer).expect("addressed");
-    let page = fact.page.as_ref().expect("its page");
-    assert_eq!(page.command_id, Some(uuid_of(9)));
-    assert_eq!(page.causation_id, Some(trigger_ref(None)));
-    assert_eq!(page.correlation_id, Some(uuid_of(INSTANCE)));
-    assert_eq!(
-        page.fact_origin.as_ref().map(|o| o.external_id.as_str()),
-        Some("09090909-0909-0909-0909-090909090909")
-    );
-}
-
-// The policy builds Facts only through OnRefused: an answer that is not a Fact,
-// or that sets its own cover, is a policy bug.
-#[test]
-fn an_answer_that_is_not_a_bare_fact_is_refused() {
-    let refusal = refusal(None, Some(insufficient()));
-    let not_a_fact = pb::OnRefusedResponse {
-        fact: Some(pb::CommandBook {
-            page: Some(command_page(any_of(&ReleaseFunds { amount: 1 }))),
-            ..Default::default()
-        }),
-    };
-    let addressed = pb::OnRefusedResponse {
-        fact: Some(pb::CommandBook {
-            cover: Some(stream("wallet", None, 1)),
-            page: Some(fact_page(any_of(&FundsUnavailable { available: 1 }))),
-            ..Default::default()
-        }),
-    };
-    for answer in [not_a_fact, addressed] {
-        let err: CodedError = address_refusal_fact(&refusal, &answer).expect_err("a policy bug");
-        assert_eq!(err.grpc, GrpcCode::Internal);
-    }
-}
-
-// The fact's identity is the runtime's to set: a policy that sets any one
-// piece of it is a policy bug.
-#[test]
-fn an_answer_that_sets_any_of_the_facts_identity_is_refused() {
-    let refusal = refusal(None, Some(insufficient()));
-    let answered = buyin_wallet()
-        .dispatch_refusal(&refusal, &CommandContext::default())
-        .expect("answered");
-    let setters: [fn(&mut pb::CommandPage); 4] = [
-        |p| p.command_id = Some(uuid_of(1)),
-        |p| p.correlation_id = Some(uuid_of(1)),
-        |p| p.causation_id = Some(trigger_ref(None)),
-        |p| p.fact_origin = Some(pb::FactOrigin::default()),
-    ];
-    for set in setters {
-        let mut answer = answered.clone();
-        set(answer.fact.as_mut().unwrap().page.as_mut().unwrap());
-        let err: CodedError = address_refusal_fact(&refusal, &answer).expect_err("a policy bug");
-        // Decision 14.37: the condition is its own key; no text tells it apart.
-        assert_eq!(err.code, "REFUSAL_FACT_IDENTIFIED");
-        assert!(err.extras.is_empty(), "no other metadata: {:?}", err.extras);
-    }
-}
-
 #[test]
 fn a_policy_router_answers_a_refusal_and_no_other_router_does() {
     let refusal = refusal(None, Some(insufficient()));
     let router = crate::router::RouterBuilder::new()
-        .policy(buyin_wallet())
+        .policy(buyin_wallet().on_refused(&fq::<HoldFunds>(), |_, _| {
+            Ok(any_of(&FundsUnavailable { available: 2 }))
+        }))
         .build()
         .expect("build");
     let answer = router
         .dispatch_refusal(&refusal, &CommandContext::default())
         .expect("answered");
-    let fact: pb::CommandRefused = fact_of(&answer);
-    assert_eq!(fact.refusal, Some(insufficient()));
+    let fact: FundsUnavailable = fact_of(&answer);
+    assert_eq!(fact, FundsUnavailable { available: 2 });
 
     let projector = crate::router::RouterBuilder::new()
         .projector(crate::projector::ProjectorDispatch::new("p", || ()))

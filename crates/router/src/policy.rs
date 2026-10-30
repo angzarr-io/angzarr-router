@@ -9,18 +9,17 @@
 //! correlation, stamps the trigger's edition, and stamps its identity,
 //! causation and correlation.
 //!
-//! Refusals (policy.proto, PolicyService, Refusals; decision 14.31): when one of
-//! the policy's commands is refused, [`PolicyDispatch::dispatch_refusal`] (the
-//! policy's OnRefused) answers the one refusal fact for the policy's own source
-//! domain: the standard `CommandRefused` (pass-through), or, when the policy
-//! registers a callback for the refused command's type
-//! ([`PolicyDispatch::on_refused`]), the domestic fact that callback returns
-//! (translate). [`address_refusal_fact`] then addresses and identifies it,
-//! as the runtime must, to the exact stream of the triggering event.
+//! Refusals (policy.proto, PolicyService, Refusals; decisions 14.31, 14.42):
+//! when one of the policy's commands is refused,
+//! [`PolicyDispatch::dispatch_refusal`] (the policy's OnRefused) runs the
+//! callback the policy registers for the refused command's type
+//! ([`PolicyDispatch::on_refused`]) and answers the domestic fact's payload
+//! it returns (translate), or, with no callback, answers that it has no
+//! translation. The coordinator builds the pass-through `CommandRefused`
+//! itself, and addresses and identifies every refusal fact.
 
 use std::collections::HashMap;
 
-use prost::{Message, Name};
 use prost_types::Any;
 
 use crate::context::CommandContext;
@@ -120,17 +119,15 @@ impl PolicyDispatch {
         self
     }
 
-    /// `PolicyService.OnRefused`: the refusal fact for the policy's own source
-    /// domain, as a CommandBook whose page body is a Fact and whose cover
-    /// and identity are left for the runtime ([`address_refusal_fact`]).
-    /// Pass-through (no callback for the refused command's type): the
-    /// standard `CommandRefused { command, refusal, trigger }`, `refusal`
-    /// the typed refusal object still packed, `trigger` the triggering
-    /// event's EventRef. Translate: the callback's fact, the callback handed
-    /// `ctx`, the refused command's context as its target's handler was
-    /// handed it: the runtime passes on
-    /// [`command_context`](crate::context::command_context) of the
-    /// `ContextualCommand` it delivered. Over the wire, policy.proto's
+    /// `PolicyService.OnRefused`: the translation of the refusal
+    /// ([`Self::translate_refusal`]) as a fact page carrying only the
+    /// callback's payload (C-0691), or, with no callback for the refused
+    /// command's type, an empty answer: no translation (C-0692). Its cover,
+    /// handling and identity are the coordinator's to set, as is the
+    /// pass-through fact. The callback is handed `ctx`, the refused
+    /// command's context as its target's handler was handed it: the
+    /// runtime passes on [`command_context`](crate::context::command_context)
+    /// of the `ContextualCommand` it delivered. Over the wire, policy.proto's
     /// OnRefused request is the `Refusal` alone, so a server answering it
     /// knows only what the refused command's book carries (its cover,
     /// identity and Handling): the next sequence, the history flag and the
@@ -141,44 +138,9 @@ impl PolicyDispatch {
         refusal: &pb::Refusal,
         ctx: &CommandContext,
     ) -> Result<pb::OnRefusedResponse, CodedError> {
-        let missing = |code: &str| CodedError::internal(code, []);
-        let command = refusal
-            .command
-            .as_ref()
-            .ok_or_else(|| missing(codes::REFUSAL_WITHOUT_COMMAND))?;
-        let event = refusal
-            .event
-            .as_ref()
-            .ok_or_else(|| missing(codes::REFUSAL_WITHOUT_EVENT))?;
-        let refused_type = command
-            .page
-            .as_ref()
-            .and_then(crate::command_payload)
-            .map(|p| crate::type_name_from_url(&p.type_url).to_string())
-            .unwrap_or_default();
-        let payload = match self.refusals.get(&refused_type) {
-            Some(translate) => call_handler(|| translate(refusal, ctx))?,
-            None => {
-                let trigger = pb::EventRef {
-                    stream: event.cover.clone(),
-                    sequence: event.pages.last().map_or(0, |p| p.sequence),
-                };
-                let fact = pb::CommandRefused {
-                    command: Some(command.clone()),
-                    refusal: refusal.response.as_ref().and_then(|r| match &r.reason {
-                        Some(pb::refusal_response::Reason::Refusal(any)) => Some(any.clone()),
-                        _ => None,
-                    }),
-                    trigger: Some(trigger),
-                };
-                Any {
-                    type_url: crate::type_url(&pb::CommandRefused::full_name()),
-                    value: fact.encode_to_vec(),
-                }
-            }
-        };
-        Ok(pb::OnRefusedResponse {
-            fact: Some(pb::CommandBook {
+        let fact = self
+            .translate_refusal(refusal, ctx)?
+            .map(|payload| pb::CommandBook {
                 page: Some(pb::CommandPage {
                     body: Some(pb::command_page::Body::Fact(pb::Fact {
                         payload: Some(payload),
@@ -186,15 +148,15 @@ impl PolicyDispatch {
                     ..Default::default()
                 }),
                 ..Default::default()
-            }),
-        })
+            });
+        Ok(pb::OnRefusedResponse { fact })
     }
 
     /// The translation of a refusal: the payload of the translating
     /// callback for the refused command's type, handed the `Refusal` and
     /// `ctx` (a failing one is a policy bug, as in [`Self::dispatch_refusal`]);
-    /// `None` when there is none for that type, the runtime then passing
-    /// the refusal through (decision 14.42).
+    /// `None` when there is none for that type, the coordinator then
+    /// passing the refusal through (decision 14.42).
     pub fn translate_refusal(
         &self,
         refusal: &pb::Refusal,
@@ -303,71 +265,6 @@ impl PolicyDispatch {
 
         Ok(resp)
     }
-}
-
-/// Addresses and identifies the refusal fact OnRefused answered, as the
-/// policy's runtime does (types.proto, the command_identity region,
-/// Validation; policy.proto, Refusals, Mechanics): its cover is the exact
-/// stream of the triggering event (domain, root and edition); its
-/// `command_id` is the refused command's (no prefix, no derivation); its
-/// `causation_id` and `correlation_id` are the refused command's; and its
-/// `fact_origin.external_id` is that command_id's canonical text. An
-/// answer whose page is not a Fact, or that sets its own cover, identity or
-/// Handling, is a policy bug, refused.
-pub fn address_refusal_fact(
-    refusal: &pb::Refusal,
-    answer: &pb::OnRefusedResponse,
-) -> Result<pb::CommandBook, CodedError> {
-    let malformed = |code: &str| CodedError::internal(code, []);
-    let fact = answer
-        .fact
-        .as_ref()
-        .ok_or_else(|| malformed(codes::REFUSAL_FACT_MISSING))?;
-    if fact.cover.is_some() || fact.handling.is_some() {
-        return Err(malformed(codes::REFUSAL_FACT_ADDRESSED));
-    }
-    let page = fact
-        .page
-        .as_ref()
-        .ok_or_else(|| malformed(codes::REFUSAL_FACT_NO_PAGE))?;
-    if crate::fact_payload(page).is_none() {
-        return Err(malformed(codes::REFUSAL_FACT_NOT_A_FACT));
-    }
-    if page.command_id.is_some()
-        || page.correlation_id.is_some()
-        || page.causation_id.is_some()
-        || page.fact_origin.is_some()
-    {
-        return Err(malformed(codes::REFUSAL_FACT_IDENTIFIED));
-    }
-    let refused = refusal
-        .command
-        .as_ref()
-        .and_then(|c| c.page.as_ref())
-        .ok_or_else(|| malformed(codes::REFUSAL_WITHOUT_REFUSED_COMMAND))?;
-    let command_id = refused
-        .command_id
-        .clone()
-        .ok_or_else(|| malformed(codes::REFUSED_COMMAND_WITHOUT_ID))?;
-    let trigger = refusal
-        .event
-        .as_ref()
-        .and_then(|e| e.cover.clone())
-        .ok_or_else(|| malformed(codes::REFUSAL_WITHOUT_TRIGGER_STREAM))?;
-    Ok(pb::CommandBook {
-        cover: Some(trigger),
-        page: Some(pb::CommandPage {
-            body: page.body.clone(),
-            fact_origin: Some(pb::FactOrigin {
-                external_id: command_id.to_string(),
-                ..Default::default()
-            }),
-            command_id: Some(command_id),
-            correlation_id: refused.correlation_id.clone(),
-            causation_id: refused.causation_id.clone(),
-        }),
-        handling: None,
-    })
 }
 
 #[cfg(test)]

@@ -13,7 +13,7 @@ use prost::Message;
 use crate::domain::{CommandContext, DomainDispatch, FactRecord};
 use crate::error::{CodedError, HandlerError};
 use crate::pb;
-use crate::policy::{address_refusal_fact, PolicyDispatch};
+use crate::policy::PolicyDispatch;
 use crate::test_support::*;
 
 const INSTANCE: u8 = 7;
@@ -80,6 +80,47 @@ fn buyin_wallet() -> PolicyDispatch {
     )
 }
 
+/// The refusal fact the runtime builds from OnRefused's `answer` (decision
+/// 14.42): the translated fact, or with none the standard pass-through
+/// `CommandRefused`, addressed to the trigger's exact stream under the
+/// refused command's identity.
+fn runtime_refusal_fact(refusal: &pb::Refusal, answer: &pb::OnRefusedResponse) -> pb::CommandBook {
+    let refused = refusal.command.clone().expect("the refused command");
+    let trigger = refusal.event.as_ref().expect("the trigger");
+    let body = match answer.fact.as_ref().and_then(|f| f.page.as_ref()) {
+        Some(page) => page.body.clone(),
+        None => Some(pb::command_page::Body::Fact(pb::Fact {
+            payload: Some(any_of(&pb::CommandRefused {
+                command: Some(refused.clone()),
+                refusal: refusal.response.as_ref().and_then(|r| match &r.reason {
+                    Some(pb::refusal_response::Reason::Refusal(typed)) => Some(typed.clone()),
+                    _ => None,
+                }),
+                trigger: Some(pb::EventRef {
+                    stream: trigger.cover.clone(),
+                    sequence: trigger.pages.last().map_or(0, |p| p.sequence),
+                }),
+            })),
+        })),
+    };
+    let page = refused.page.expect("its page");
+    let command_id = page.command_id.expect("its id");
+    pb::CommandBook {
+        cover: trigger.cover.clone(),
+        page: Some(pb::CommandPage {
+            body,
+            fact_origin: Some(pb::FactOrigin {
+                external_id: command_id.to_string(),
+                ..Default::default()
+            }),
+            command_id: Some(command_id),
+            correlation_id: page.correlation_id,
+            causation_id: page.causation_id,
+        }),
+        handling: None,
+    }
+}
+
 /// Runs the chain from StartBuyIn (in `edition`) to the buy-in's answer to
 /// the refusal, and returns the event it records.
 fn run(policy: PolicyDispatch, edition: Option<&str>) -> pb::EventPage {
@@ -125,7 +166,8 @@ fn run(policy: PolicyDispatch, edition: Option<&str>) -> pb::EventPage {
         })
         .expect_err("refused");
 
-    // 4. Back to the policy: OnRefused builds the fact; the runtime addresses it.
+    // 4. Back to the policy: OnRefused translates, or answers no translation;
+    //    the runtime builds the pass-through fact and addresses it.
     let refusal = pb::Refusal {
         event: Some(trigger),
         command: Some(hold),
@@ -134,7 +176,7 @@ fn run(policy: PolicyDispatch, edition: Option<&str>) -> pb::EventPage {
     let answer = policy
         .dispatch_refusal(&refusal, &CommandContext::default())
         .expect("answered");
-    let fact = address_refusal_fact(&refusal, &answer).expect("addressed");
+    let fact = runtime_refusal_fact(&refusal, &answer);
     assert_eq!(fact.cover, Some(instance));
 
     // 5. The buy-in records its own event for the fact.
