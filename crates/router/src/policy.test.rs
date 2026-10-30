@@ -281,3 +281,84 @@ fn a_context_handler_sees_sequence_zero_for_an_unsequenced_page() {
         .expect("dispatch");
     assert_eq!(*seen.lock().unwrap(), vec![0]);
 }
+
+// --- reactions by triggering page (decision 14.42) ---------------------------
+
+/// A policy answering `test.A` with `per_page` commands to "inventory", and
+/// `test.B` with none; `test.C` is undeclared.
+fn reacting(per_page: usize) -> PolicyDispatch {
+    PolicyDispatch::new("p", "order", "inventory")
+        .on_event("test.A", move |_e, _c| {
+            Ok((0..per_page)
+                .map(|i| pb::CommandBook {
+                    cover: Some(pb::Cover {
+                        domain: "inventory".into(),
+                        root: Some(uuid_of(i as u8 + 1)),
+                        ..Default::default()
+                    }),
+                    page: Some(command_page(Any {
+                        type_url: type_url("test.Command"),
+                        value: vec![i as u8],
+                    })),
+                    ..Default::default()
+                })
+                .collect())
+        })
+        .on_event("test.B", |_e, _c| Ok(Vec::new()))
+}
+
+fn source_of(pages: &[(&str, u64)]) -> pb::EventBook {
+    pb::EventBook {
+        cover: Some(pb::Cover {
+            domain: "order".into(),
+            ..Default::default()
+        }),
+        pages: pages
+            .iter()
+            .map(|(kind, seq)| {
+                crate::test_support::sequenced_event_page(
+                    *seq,
+                    Any {
+                        type_url: type_url(kind),
+                        value: Vec::new(),
+                    },
+                )
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn every_handled_page_answers_one_reaction_in_page_order_an_empty_one_included() {
+    let resp = reacting(2)
+        .dispatch(&source_of(&[
+            ("test.A", 3),
+            ("test.C", 4),
+            ("test.B", 5),
+            ("test.A", 6),
+        ]))
+        .expect("translated");
+    let shape: Vec<(u64, usize)> = resp
+        .reactions
+        .iter()
+        .map(|r| (r.trigger_sequence, r.commands.len()))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![(3, 2), (5, 0), (6, 2)],
+        "one reaction per handled page, empty included; none for the unhandled page"
+    );
+    assert_eq!(
+        resp.reactions[0]
+            .commands
+            .iter()
+            .map(|c| crate::command_payload(c.page.as_ref().unwrap())
+                .unwrap()
+                .value
+                .clone())
+            .collect::<Vec<_>>(),
+        vec![vec![0], vec![1]],
+        "a reaction's commands in the order business code returned them"
+    );
+}

@@ -389,6 +389,66 @@ fn aggregate_handles_with_an_empty_window_still_demands_the_nonce() {
     assert_eq!(*windows.lock().unwrap(), vec![Vec::<u64>::new()]);
 }
 
+// --- the conflict report (decision 14.42) -----------------------------------
+//
+// The router reports a stale command's conflicts and the coordinator judges
+// them (CommandHandlerResponse.conflict, ConflictReport). The router's own
+// judgement stays until its removal step, so only the reports of accepted
+// commands are visible here.
+
+#[test]
+fn aggregate_handles_reports_the_nonce_business_code_settled_with() {
+    let d = handles(|nonce| Some(nonce.to_vec()), Arc::default());
+    let resp = d
+        .dispatch(&delivery(
+            "a",
+            &["x", "y", "z"],
+            1,
+            pb::ConflictResolution::AggregateHandles,
+            b"n-1",
+        ))
+        .expect("resolved");
+    assert_eq!(
+        resp.conflict,
+        Some(pb::ConflictReport {
+            resolved_nonce: b"n-1".to_vec().into(),
+            window_units: Vec::new(),
+            command_units: Vec::new(),
+        }),
+        "the nonce passed to resolve_conflicts, and no units"
+    );
+}
+
+#[test]
+fn commutative_reports_the_window_units_and_the_command_units() {
+    let resp = commutative(Arc::default())
+        .dispatch(&delivery(
+            "a",
+            &["x", "b", "c"],
+            1,
+            pb::ConflictResolution::Commutative,
+            b"n",
+        ))
+        .expect("items[a] vs items[b], items[c]: disjoint");
+    assert_eq!(
+        resp.conflict,
+        Some(pb::ConflictReport {
+            resolved_nonce: Default::default(),
+            window_units: units(&["items[b]", "items[c]"]),
+            command_units: units(&["items[a]"]),
+        }),
+        "window = changed(expected, head), mine = changed(head, head + events)"
+    );
+}
+
+#[test]
+fn strict_reports_no_conflict() {
+    let resp = list_aggregate(Arc::default())
+        .dispatch(&strict("a", &["b"]))
+        .expect("strict");
+    assert_eq!(resp.conflict, None, "STRICT has no window to report");
+}
+
 // --- COMMUTATIVE: the library resolver (CR-1) -------------------------------
 
 fn commutative(seen: Arc<Mutex<Vec<CommandContext>>>) -> DomainDispatch<ListState> {

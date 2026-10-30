@@ -412,6 +412,41 @@ async fn one_reaction_unchanged(w: &mut HandlingWorld) {
     assert_eq!(reactions[0].commands, w.policy_commands, "unchanged");
 }
 
+#[then(regex = r"^the answer holds (\w+) reactions, in page order:$")]
+async fn holds_reactions(w: &mut HandlingWorld, _count: String, step: &cucumber::gherkin::Step) {
+    let table = step.table.as_ref().expect("a table");
+    let expected: Vec<Vec<String>> = table.rows.iter().skip(1).cloned().collect();
+    let actual: Vec<Vec<String>> = policy_answer(w)
+        .reactions
+        .iter()
+        .map(|r| {
+            let types: Vec<&str> = r
+                .commands
+                .iter()
+                .map(|c| {
+                    angzarr_router::command_payload(c.page.as_ref().expect("a page"))
+                        .map(|p| angzarr_router::type_name_from_url(&p.type_url))
+                        .expect("a command")
+                })
+                .collect();
+            let commands = match types.as_slice() {
+                [one] => format!("one {}", one.trim_start_matches("orders.v1.")),
+                other => panic!("expected one command per reaction, got {other:?}"),
+            };
+            vec![r.trigger_sequence.to_string(), commands]
+        })
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+#[then(regex = r"^no reaction names sequence (\d+)$")]
+async fn no_reaction_for(w: &mut HandlingWorld, sequence: u64) {
+    assert!(policy_answer(w)
+        .reactions
+        .iter()
+        .all(|r| r.trigger_sequence != sequence));
+}
+
 // --- OnRefused: a translation or none (C-0691, C-0692; decision 14.42) ---------
 
 #[given(
@@ -711,6 +746,63 @@ async fn over_delivery(w: &mut HandlingWorld, item: String) {
     book.next_sequence = w.delivery_pages.last().map_or(0, |p| p.sequence + 1);
     book.pages = w.delivery_pages.clone();
     w.dispatch(req);
+}
+
+// --- the conflict report (C-0542 to C-0550; decision 14.42) -------------------
+
+fn reported(w: &HandlingWorld) -> pb::ConflictReport {
+    w.accepted()
+        .conflict
+        .clone()
+        .expect("the answer reports the conflict")
+}
+
+#[then(regex = r#"^the answer reports resolved nonce "([^"]*)"$"#)]
+async fn reports_nonce(w: &mut HandlingWorld, nonce: String) {
+    assert_eq!(reported(w).resolved_nonce, nonce.into_bytes());
+}
+
+#[then("the answer reports no resolved nonce")]
+async fn reports_no_nonce(w: &mut HandlingWorld) {
+    assert!(reported(w).resolved_nonce.is_empty(), "an empty nonce");
+}
+
+/// `"items[pear]"`, or several quoted units joined by commas and "and".
+fn quoted_units(text: &str) -> Vec<String> {
+    text.split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .collect()
+}
+
+#[then(regex = r#"^the answer reports window units (".*") and command units (".*")$"#)]
+async fn reports_units(w: &mut HandlingWorld, window: String, command: String) {
+    let report = reported(w);
+    assert_eq!(report.window_units, quoted_units(&window), "window units");
+    assert_eq!(
+        report.command_units,
+        quoted_units(&command),
+        "command units"
+    );
+}
+
+#[then("the answer carries business code's events")]
+async fn carries_events(w: &mut HandlingWorld) {
+    let item = w.observed().item;
+    let events = w.accepted().events.as_ref().expect("its events");
+    let added: Vec<String> = events
+        .pages
+        .iter()
+        .map(|p| {
+            let payload = p.payload.as_ref().expect("a payload");
+            assert!(payload.type_url.ends_with("orders.v1.ItemAdded"));
+            conf::orders::v1::ItemAdded::decode(payload.value.as_slice())
+                .expect("ItemAdded")
+                .item
+        })
+        .collect();
+    assert_eq!(added, vec![item], "business code's one ItemAdded");
 }
 
 // --- errors are a key and an argument map (decision 14.37) --------------------

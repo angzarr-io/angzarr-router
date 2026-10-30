@@ -17,10 +17,6 @@ use cucumber::gherkin;
 /// Tier scenarios held out until a later removal step: (scenario ID, the
 /// removal they wait on).
 pub const LATER_STEPS: &[(&str, &str)] = &[
-    ("C-0542", "the conflict report (14.42)"),
-    ("C-0546", "the conflict report (14.42)"),
-    ("C-0548", "the conflict report (14.42)"),
-    ("C-0689", "reactions by triggering page (14.42)"),
     ("C-0543", "conflict judgement moves out (14.42)"),
     ("C-0544", "conflict judgement moves out (14.42)"),
     ("C-0545", "conflict judgement moves out (14.42)"),
