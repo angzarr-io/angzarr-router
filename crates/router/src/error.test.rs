@@ -57,7 +57,6 @@ fn every_constructor() -> Vec<(&'static str, CodedError)> {
             "undecodable",
             CodedError::undecodable("io.angzarr.v1.ContextualCommand", &decode_error()),
         ),
-        ("stale", CodedError::stale(codes::CONFLICT_UNRESOLVED, [])),
         ("persisted_corrupt", CodedError::persisted_corrupt("/a.Evt")),
         (
             "fold_failed",
@@ -523,7 +522,7 @@ fn only_a_business_rejection_reaches_on_refused() {
         CodedError::bug("BROKEN", []),
         CodedError::unhandled(),
         CodedError::panicked(),
-        CodedError::stale(codes::CONFLICT_OVERLAP, []),
+        CodedError::immediate("PRICE_MOVED", []),
     ] {
         assert_eq!(err.refusal_response(), None, "{}", err.code);
     }
@@ -705,17 +704,6 @@ fn a_handlers_immediate_rejection_is_aborted_under_its_own_code() {
     assert_eq!(err.status_message(), "PRICE_MOVED");
     assert_eq!(err.extras, [arg("item", "apple")].into());
     assert_eq!(err.refusal_response(), None, "never a policy's OnRefused");
-}
-
-// The framework's own conflicts are the immediate-return business class.
-#[test]
-fn a_framework_conflict_is_business_immediate() {
-    for code in [codes::CONFLICT_UNRESOLVED, codes::CONFLICT_OVERLAP] {
-        let err = CodedError::stale(code, []);
-        assert_eq!(err.grpc, GrpcCode::Aborted, "{code}");
-        assert_eq!(err.grpc.class(), ErrorClass::BusinessImmediate, "{code}");
-        assert_eq!(err.refusal_response(), None, "{code}: never OnRefused");
-    }
 }
 
 // A value that would not parse back is quoted (decision 14.37's display

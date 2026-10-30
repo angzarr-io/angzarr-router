@@ -3,8 +3,7 @@
 //! from the submodule) to the Rust core: the order aggregate, the
 //! Fulfillment process manager (a domain, decision 14.31) and the
 //! OrderFulfillment policy, built by hand over the tier's orders.v1 fixture
-//! messages. Scenarios waiting on a later removal are held out by ID
-//! (`common::LATER_STEPS`).
+//! messages.
 
 mod common;
 
@@ -1244,9 +1243,7 @@ async fn read_no_clock(w: &mut HandlingWorld) {
 async fn main() {
     let tier = HandlingWorld::cucumber()
         .fail_on_skipped()
-        .filter_run(common::tier("handling.feature"), |_, _, scenario| {
-            common::runs(scenario)
-        })
+        .run(common::tier("handling.feature"))
         .await;
     common::exit(tier.execution_has_failed());
 }

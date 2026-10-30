@@ -288,9 +288,9 @@ impl<S> DomainDispatch<S> {
     /// Supports COMMUTATIVE conflict resolution with the state's generated
     /// `changed(before, after)` (backlog CR-1): the router folds the state to
     /// the expected sequence and to the head, runs decide on the head, and
-    /// keeps the command's events iff `changed(expected, head)` and
-    /// `changed(head, head + events)` do not overlap ([`crate::conflict`]);
-    /// otherwise the command fails CONFLICT_OVERLAP (ABORTED).
+    /// reports `changed(expected, head)` and `changed(head, head + events)`
+    /// beside the command's events, for the coordinator to judge (decision
+    /// 14.42).
     pub fn with_commutative(
         self,
         changed: impl Fn(&S, &S) -> Vec<String> + Send + Sync + 'static,
@@ -507,12 +507,16 @@ impl<S> DomainDispatch<S> {
     /// (types.proto, Handling and ConflictResolution):
     /// - STRICT (or unspecified): decide on the rebuilt head;
     /// - AGGREGATE_HANDLES: decide on the head with the window and nonce in
-    ///   [`CommandContext::conflict`]; unless the handler resolved with the
-    ///   delivered nonce, its output is discarded: CONFLICT_UNRESOLVED;
+    ///   [`CommandContext::conflict`];
     /// - COMMUTATIVE: the registered resolver ([`Self::with_commutative`])
-    ///   decides on the head and keeps the events iff the window's units and
-    ///   the command's do not overlap (else CONFLICT_OVERLAP); with none
-    ///   registered, CONFLICT_RESOLUTION_UNSUPPORTED, before rebuild.
+    ///   decides on the head and computes the window's units and the
+    ///   command's; with none registered, CONFLICT_RESOLUTION_UNSUPPORTED,
+    ///   before rebuild.
+    ///
+    /// It judges nothing (decision 14.42): the coordinator accepts the
+    /// events only if the reported nonce is the one it delivered
+    /// (CONFLICT_UNRESOLVED), or the two unit sets do not overlap
+    /// (CONFLICT_OVERLAP).
     ///
     /// Answers decide's events, the state after them (the head with the
     /// events folded in, origin Emitted) and the conflict report (decision
@@ -542,9 +546,6 @@ impl<S> DomainDispatch<S> {
             pb::ConflictResolution::AggregateHandles => {
                 let (mut state, _) = self.rebuilder.rebuild(events)?;
                 let out = run(&mut state, base.clone())?;
-                if !base.conflict.as_ref().is_some_and(Conflict::is_resolved) {
-                    return Err(CodedError::stale(codes::CONFLICT_UNRESOLVED, []));
-                }
                 let report = pb::ConflictReport {
                     resolved_nonce: base
                         .conflict
@@ -574,15 +575,6 @@ impl<S> DomainDispatch<S> {
                     &mut |state| run(state, base.clone()),
                     &mut |state, book| fold_emitted(state, book),
                 )?;
-                if crate::conflict::overlap(&resolved.window, &resolved.mine) {
-                    return Err(CodedError::stale(
-                        codes::CONFLICT_OVERLAP,
-                        [
-                            (extras::WINDOW_UNITS.to_string(), resolved.window.join(",")),
-                            (extras::COMMAND_UNITS.to_string(), resolved.mine.join(",")),
-                        ],
-                    ));
-                }
                 // The resolver leaves the state at the head plus the
                 // command's events.
                 let report = pb::ConflictReport {

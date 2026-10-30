@@ -90,10 +90,7 @@ async fn main() {
         .await;
     let tier = ProjectorWorld::cucumber()
         .fail_on_skipped()
-        .filter_run(
-            common::tier("projector_dispatch.feature"),
-            |_, _, scenario| common::runs(scenario),
-        )
+        .run(common::tier("projector_dispatch.feature"))
         .await;
     common::exit(local.execution_has_failed() || tier.execution_has_failed());
 }

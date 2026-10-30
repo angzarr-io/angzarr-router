@@ -1,5 +1,7 @@
 //! The handler-facing handling surface: conflict delivery, the COMMUTATIVE
-//! resolver and the overlap rule (docs/design-handling.md).
+//! resolver and the conflict report (docs/design-handling.md). Judging the
+//! report (the nonce, the overlap rule) is the coordinator's (decision
+//! 14.42).
 //! Also the rules version every response reports.
 //!
 //! Spec governing each group (angzarr-project spec/20261019-draft):
@@ -9,8 +11,8 @@
 //!   decision 12.6; backlog RV-2.
 //! - conflict delivery: types.proto Handling, ConflictResolution,
 //!   ContextualCommand.conflict_nonce; decision 12.7; backlog HD-5, NC-1.
-//! - COMMUTATIVE resolver and overlap: options.proto conflict_units region
-//!   ("Overlap", "The resolver"); backlog CR-1.
+//! - COMMUTATIVE resolver: options.proto conflict_units region ("The
+//!   resolver"); backlog CR-1.
 //!
 //! The behaviour-level scenarios are angzarr-project's handler-contract
 //! tier (features/handler-contract/handling.feature, C-0533..C-0550), bound
@@ -22,7 +24,6 @@ use std::sync::{Arc, Mutex};
 
 use prost_types::Any;
 
-use crate::conflict::overlap;
 use crate::domain::{CommandContext, DomainDispatch};
 use crate::error::{codes, GrpcCode};
 use crate::pb;
@@ -333,60 +334,41 @@ fn aggregate_handles_delivers_the_window_and_keeps_resolved_output() {
     assert_eq!(resp.events.expect("events").pages.len(), 1);
 }
 
+// Business code that never settles, settles with a made-up nonce, or has an
+// empty window is reported as it settled, never refused (C-0543 to C-0545):
+// the coordinator judges the nonce. Its events are answered all the same.
 #[test]
-fn aggregate_handles_without_resolve_conflicts_fails_stale() {
-    let d = handles(|_| None, Arc::default());
-    let err = d
-        .dispatch(&delivery(
-            "a",
-            &["x"],
-            0,
-            pb::ConflictResolution::AggregateHandles,
-            b"n-1",
-        ))
-        .expect_err("the handler ignored the window");
-    assert_eq!(err.code, codes::CONFLICT_UNRESOLVED);
-    assert_eq!(err.grpc, GrpcCode::Aborted);
-}
-
-#[test]
-fn aggregate_handles_with_another_nonce_fails_stale() {
-    let d = handles(|_| Some(b"made-up".to_vec()), Arc::default());
-    let err = d
-        .dispatch(&delivery(
-            "a",
-            &["x"],
-            0,
-            pb::ConflictResolution::AggregateHandles,
-            b"n-1",
-        ))
-        .expect_err("a made-up nonce");
-    assert_eq!(err.code, codes::CONFLICT_UNRESOLVED);
-}
-
-#[test]
-fn aggregate_handles_with_an_empty_window_still_demands_the_nonce() {
-    let windows = Arc::new(Mutex::new(Vec::new()));
-    let d = handles(|_| None, windows.clone());
-    let err = d
-        .dispatch(&delivery(
-            "a",
-            &["x"],
-            1,
-            pb::ConflictResolution::AggregateHandles,
-            b"n-1",
-        ))
-        .expect_err("uniform handler path");
-    assert_eq!(err.code, codes::CONFLICT_UNRESOLVED);
-    assert_eq!(*windows.lock().unwrap(), vec![Vec::<u64>::new()]);
+fn aggregate_handles_reports_whatever_business_code_settled_with() {
+    for (ack, expected, window) in [
+        (None, Vec::new(), 0),
+        (Some(b"made-up".to_vec()), b"made-up".to_vec(), 0),
+        (None, Vec::new(), 1),
+    ] {
+        let windows = Arc::new(Mutex::new(Vec::new()));
+        let d = handles(move |_| ack.clone(), windows.clone());
+        let resp = d
+            .dispatch(&delivery(
+                "a",
+                &["x"],
+                window,
+                pb::ConflictResolution::AggregateHandles,
+                b"n-1",
+            ))
+            .expect("reported, not refused");
+        assert_eq!(
+            resp.conflict.expect("a report").resolved_nonce,
+            expected,
+            "the nonce business code passed, empty when none"
+        );
+        assert_eq!(resp.events.expect("events").pages.len(), 1);
+        assert_eq!(windows.lock().unwrap().len(), 1);
+    }
 }
 
 // --- the conflict report (decision 14.42) -----------------------------------
 //
 // The router reports a stale command's conflicts and the coordinator judges
-// them (CommandHandlerResponse.conflict, ConflictReport). The router's own
-// judgement stays until its removal step, so only the reports of accepted
-// commands are visible here.
+// them (CommandHandlerResponse.conflict, ConflictReport).
 
 #[test]
 fn aggregate_handles_reports_the_nonce_business_code_settled_with() {
@@ -494,9 +476,11 @@ fn commutative_tells_the_handler_whether_the_aggregate_exists() {
     }
 }
 
+// Overlapping units are reported, not refused (C-0547): the coordinator
+// applies the overlap rule.
 #[test]
-fn commutative_fails_stale_on_overlap() {
-    let err = commutative(Arc::default())
+fn commutative_reports_an_overlap_and_keeps_the_events() {
+    let resp = commutative(Arc::default())
         .dispatch(&delivery(
             "b",
             &["a", "b"],
@@ -504,9 +488,11 @@ fn commutative_fails_stale_on_overlap() {
             pb::ConflictResolution::Commutative,
             b"n",
         ))
-        .expect_err("items[b] in both window and mine");
-    assert_eq!(err.code, codes::CONFLICT_OVERLAP);
-    assert_eq!(err.grpc, GrpcCode::Aborted);
+        .expect("items[b] in both window and mine: reported");
+    let report = resp.conflict.expect("a report");
+    assert_eq!(report.window_units, units(&["items[b]"]));
+    assert_eq!(report.command_units, units(&["items[b]"]));
+    assert_eq!(resp.events.expect("events").pages.len(), 1);
 }
 
 // Owner ruling 2026-10-19: a fold of the command's own new events (not yet
@@ -638,50 +624,9 @@ fn commutative_without_a_changed_function_is_unsupported() {
     assert_eq!(err.grpc, GrpcCode::Internal);
 }
 
-// --- the overlap rule (options.proto conflict_units, "Overlap") -------------
-
+/// Unit paths, owned.
 fn units(paths: &[&str]) -> Vec<String> {
     paths.iter().map(|p| p.to_string()).collect()
-}
-
-#[test]
-fn overlap_follows_the_conflict_units_rules() {
-    assert!(
-        !overlap(&units(&[]), &units(&["items[a]"])),
-        "an empty set is disjoint"
-    );
-    assert!(
-        overlap(&units(&["*notes"]), &units(&["title"])),
-        "a wildcard vs non-empty"
-    );
-    assert!(
-        !overlap(&units(&["*notes"]), &units(&[])),
-        "a wildcard vs empty"
-    );
-    assert!(
-        overlap(&units(&["items[42]"]), &units(&["items[42]"])),
-        "equal units"
-    );
-    assert!(
-        overlap(&units(&["items[42]"]), &units(&["items[42].weight"])),
-        "a prefix at a `.` boundary"
-    );
-    assert!(
-        overlap(&units(&["settings"]), &units(&["settings.cooldown_days"])),
-        "a prefix at a `.` boundary"
-    );
-    assert!(
-        overlap(&units(&["columns"]), &units(&["columns[due]"])),
-        "a prefix at `[`"
-    );
-    assert!(
-        !overlap(&units(&["items[4]"]), &units(&["items[42]"])),
-        "no boundary"
-    );
-    assert!(
-        !overlap(&units(&["title"]), &units(&["titles"])),
-        "no boundary"
-    );
 }
 
 // --- the rules version every response reports -------------------------------

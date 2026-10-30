@@ -229,10 +229,7 @@ async fn main() {
         .await;
     let tier = CounterWorld::cucumber()
         .fail_on_skipped()
-        .filter_run(
-            common::tier("counter_dispatch.feature"),
-            |_, _, scenario| common::runs(scenario),
-        )
+        .run(common::tier("counter_dispatch.feature"))
         .await;
     common::exit(local.execution_has_failed() || tier.execution_has_failed());
 }

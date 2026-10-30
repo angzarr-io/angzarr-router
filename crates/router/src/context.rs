@@ -51,9 +51,10 @@ pub struct CommandContext {
 /// A stale command's conflict under AGGREGATE_HANDLES (types.proto,
 /// ContextualCommand.conflict_nonce; backlog NC-1): the window of events the
 /// command did not see, and the nonce the handler must hand back through
-/// [`Conflict::resolve_conflicts`] before returning. A handler that does not
-/// (or hands back another value) fails the command stale: its output is
-/// discarded and the command answered CONFLICT_UNRESOLVED (ABORTED).
+/// [`Conflict::resolve_conflicts`] before returning. The router reports the
+/// nonce it handed back (`ConflictReport.resolved_nonce`); a coordinator
+/// that finds any other value than the delivered one discards the output,
+/// CONFLICT_UNRESOLVED (ABORTED; decision 14.42).
 #[derive(Debug, Clone, Default)]
 pub struct Conflict {
     window: Vec<pb::EventPage>,
@@ -100,15 +101,6 @@ impl Conflict {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
             .unwrap_or_default()
-    }
-
-    /// True when the handler resolved with exactly the delivered nonce.
-    pub fn is_resolved(&self) -> bool {
-        self.resolved
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_deref()
-            == Some(self.nonce.as_slice())
     }
 }
 

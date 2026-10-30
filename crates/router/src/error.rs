@@ -469,12 +469,6 @@ impl CodedError {
         Self::coded(code, extras, GrpcCode::Unimplemented)
     }
 
-    /// A stale command (ABORTED, as STRICT would answer it): its conflict
-    /// window was not resolved, or COMMUTATIVE found an overlap.
-    pub fn stale(code: &str, extras: impl IntoIterator<Item = (String, String)>) -> Self {
-        Self::coded(code, extras, GrpcCode::Aborted)
-    }
-
     /// Classifies a store-sourced decode failure (DATA_LOSS on the wire).
     pub fn persisted_corrupt(type_url: &str) -> Self {
         Self::coded(
