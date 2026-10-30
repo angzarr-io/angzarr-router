@@ -219,12 +219,6 @@ fn a_typed_refusal_is_command_refused_naming_its_type() {
         [arg("refusal_type", "test.wallet.InsufficientFunds")].into()
     );
     assert_eq!(err.refusal.as_deref(), Some(&typed_refusal()));
-    assert_eq!(
-        err.refusal_response(),
-        Some(pb::RefusalResponse {
-            reason: Some(pb::refusal_response::Reason::Refusal(typed_refusal())),
-        })
-    );
 }
 
 #[test]
@@ -474,42 +468,7 @@ fn a_bug_is_unhandled_handler_error_with_the_handlers_code_as_its_cause() {
     assert_eq!(extras::CAUSE, "cause");
 }
 
-// --- the refused policy's view (types.proto RefusalResponse) -------------------
-
-// An untyped rejection reaches the refused policy as its key and args.
-#[test]
-fn an_untyped_rejection_reaches_the_policy_as_its_diagnostic() {
-    let err = CodedError::rejection(
-        BusinessStatus::FailedPrecondition,
-        "CLOSED",
-        [arg("wallet", "w-1")],
-    );
-    assert_eq!(
-        err.refusal_response(),
-        Some(pb::RefusalResponse {
-            reason: Some(pb::refusal_response::Reason::Diagnostic(pb::Diagnostic {
-                code: "CLOSED".to_string(),
-                args: [arg("wallet", "w-1")].into_iter().collect(),
-            })),
-        })
-    );
-}
-
-// Only a business rejection (FAILED_PRECONDITION) reaches OnRefused; anything
-// else is retried or dead-lettered as a bug.
-#[test]
-fn only_a_business_rejection_reaches_on_refused() {
-    for err in [
-        CodedError::bug("BROKEN", []),
-        CodedError::unhandled(),
-        CodedError::panicked(),
-        CodedError::immediate("PRICE_MOVED", []),
-    ] {
-        assert_eq!(err.refusal_response(), None, "{}", err.code);
-    }
-}
-
-// --- the two classes, by status (owner ruling, 2026-10-29) ---------------------
+// --- the statuses a handler picks (owner ruling, 2026-10-29) ---------------------
 
 const BUSINESS: [(BusinessStatus, GrpcCode); 6] = [
     (
@@ -588,42 +547,9 @@ fn only_a_business_status_converts_to_a_business_status() {
 }
 
 #[test]
-fn the_status_decides_the_class() {
-    let wrong: Vec<String> = BUSINESS
-        .iter()
-        .map(|(_, grpc)| (*grpc, ErrorClass::BusinessFatal))
-        // Four classes (owner's rulings, 2026-10-29, latest).
-        .chain(IMMEDIATE.map(|grpc| (grpc, ErrorClass::BusinessImmediate)))
-        .chain(BUGS.map(|grpc| (grpc, ErrorClass::BugFatal)))
-        .chain(RETRYABLE.map(|grpc| (grpc, ErrorClass::BugRetryable)))
-        .filter(|(grpc, class)| {
-            grpc.class() != *class
-                // Only a fatal business refusal reaches OnRefused.
-                || grpc.is_business_refusal() != (*class == ErrorClass::BusinessFatal)
-        })
-        .map(|(grpc, class)| format!("{grpc:?}: {:?}, expected {class:?}", grpc.class()))
-        .collect();
-    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
-}
-
-// Every business refusal reaches the refused policy's OnRefused, whatever
-// its business status.
-#[test]
-fn every_business_refusal_reaches_on_refused() {
-    for (status, _) in BUSINESS {
-        let err = CodedError::rejection(status, "ORDER_CLOSED", []);
-        assert!(
-            err.refusal_response().is_some(),
-            "{status:?} reaches OnRefused"
-        );
-    }
-}
-
-#[test]
 fn a_bug_stays_internal_with_its_cause() {
     let err = CodedError::bug("LEDGER_OFFLINE", [arg("ledger", "main")]);
     assert_eq!(err.grpc, GrpcCode::Internal);
-    assert_eq!(err.grpc.class(), ErrorClass::BugFatal);
     assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR);
     assert_eq!(
         err.extras,
@@ -640,7 +566,6 @@ fn a_retryable_bug_goes_out_under_the_status_the_handler_picks() {
     for (status, grpc) in RETRYABLE_STATUSES {
         let err = CodedError::retryable_bug(status, "LEDGER_OFFLINE", [arg("ledger", "main")]);
         assert_eq!(err.grpc, grpc, "{status:?}: the status the handler picked");
-        assert_eq!(err.grpc.class(), ErrorClass::BugRetryable, "{status:?}");
         assert_eq!(err.code, codes::UNHANDLED_HANDLER_ERROR, "{status:?}");
         assert_eq!(err.status_message(), codes::UNHANDLED_HANDLER_ERROR);
         assert_eq!(
@@ -648,7 +573,6 @@ fn a_retryable_bug_goes_out_under_the_status_the_handler_picks() {
             [arg("cause", "LEDGER_OFFLINE"), arg("cause.ledger", "main")].into(),
             "{status:?}"
         );
-        assert_eq!(err.refusal_response(), None, "{status:?}: never OnRefused");
     }
 }
 
@@ -680,11 +604,9 @@ fn a_handlers_retryable_bug_keeps_its_status_through_the_boundary() {
 fn a_handlers_immediate_rejection_is_aborted_under_its_own_code() {
     let err = CodedError::immediate("PRICE_MOVED", [arg("item", "apple")]);
     assert_eq!(err.grpc, GrpcCode::Aborted);
-    assert_eq!(err.grpc.class(), ErrorClass::BusinessImmediate);
     assert_eq!(err.code, "PRICE_MOVED");
     assert_eq!(err.status_message(), "PRICE_MOVED");
     assert_eq!(err.extras, [arg("item", "apple")].into());
-    assert_eq!(err.refusal_response(), None, "never a policy's OnRefused");
 }
 
 // A value that would not parse back is quoted (decision 14.37's display

@@ -39,7 +39,3 @@ harness = false
 [[test]]
 name = "handling"
 harness = false
-
-[[test]]
-name = "policy_refusal"
-harness = false

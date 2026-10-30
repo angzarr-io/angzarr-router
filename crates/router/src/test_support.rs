@@ -138,21 +138,13 @@ impl prost::Name for LedgerState {
 }
 
 /// Asserts `err` is a bug (owner ruling on decision 14.37, 2026-10-29):
-/// the router's own error on malformed input is INTERNAL, alerted and
-/// dead-lettered, and never reaches a policy's OnRefused.
+/// the router's own error on malformed input is INTERNAL, which the
+/// coordinator classifies a fatal bug (decision 14.42).
 pub fn assert_bug(err: &crate::error::CodedError) {
-    use crate::error::{ErrorClass, GrpcCode};
     assert_eq!(
         err.grpc,
-        GrpcCode::Internal,
+        crate::error::GrpcCode::Internal,
         "{}: the router's own malformed-input error is a bug",
-        err.code
-    );
-    assert_eq!(err.grpc.class(), ErrorClass::BugFatal, "{}", err.code);
-    assert_eq!(
-        err.refusal_response(),
-        None,
-        "{}: never a policy's OnRefused",
         err.code
     );
 }

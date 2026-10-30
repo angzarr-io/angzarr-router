@@ -79,6 +79,18 @@ fn buyin_wallet() -> PolicyDispatch {
     )
 }
 
+/// The refused policy's view of a business refusal, as the runtime builds
+/// it (types.proto, RefusalResponse; decision 14.42): its typed refusal
+/// object, else its key and args.
+fn runtime_refusal_response(refused: &CodedError) -> pb::RefusalResponse {
+    pb::RefusalResponse {
+        reason: Some(match refused.refusal.as_deref() {
+            Some(typed) => pb::refusal_response::Reason::Refusal(typed.clone()),
+            None => pb::refusal_response::Reason::Diagnostic(refused.diagnostic()),
+        }),
+    }
+}
+
 /// The refusal fact the runtime builds from OnRefused's `answer` (decision
 /// 14.42): the translated fact, or with none the standard pass-through
 /// `CommandRefused`, addressed to the trigger's exact stream under the
@@ -170,7 +182,7 @@ fn run(policy: PolicyDispatch, edition: Option<&str>) -> pb::EventPage {
     let refusal = pb::Refusal {
         event: Some(trigger),
         command: Some(hold),
-        response: Some(refused.refusal_response().expect("a business rejection")),
+        response: Some(runtime_refusal_response(&refused)),
     };
     let answer = policy
         .dispatch_refusal(&refusal, &CommandContext::default())

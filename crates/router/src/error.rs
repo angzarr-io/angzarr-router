@@ -56,35 +56,6 @@ pub enum GrpcCode {
     DataLoss = 15,
 }
 
-/// The class an error is, decided by its gRPC status alone (decision
-/// 14.37). Four classes (owner's rulings, 2026-10-29, latest). Acting on
-/// the class (the retry, its backoff and cap, the dead letter, the alert,
-/// re-running a policy step) is the runtime's configuration and work; the
-/// router only classifies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ErrorClass {
-    /// Business, fatal: FAILED_PRECONDITION, INVALID_ARGUMENT, NOT_FOUND,
-    /// ALREADY_EXISTS, OUT_OF_RANGE, PERMISSION_DENIED. Final: to the
-    /// caller, or the issuing policy's OnRefused; never retried.
-    BusinessFatal,
-    /// Business, immediate return: ABORTED, "re-read and re-decide". The
-    /// framework's conflicts (a stale or mismatched sequence, an overlap)
-    /// or a handler's own choice ([`CodedError::immediate`]). Returned at
-    /// once to an outside caller; for a policy step the runtime is the
-    /// caller, reloading and re-running the step under the capped backoff,
-    /// then dead-lettering it. Never OnRefused.
-    BusinessImmediate,
-    /// Bug, fatal: INTERNAL, UNKNOWN, DATA_LOSS. Dead-lettered and alerted
-    /// at once.
-    BugFatal,
-    /// Bug, retryable: UNAVAILABLE, DEADLINE_EXCEEDED, RESOURCE_EXHAUSTED
-    /// (a handler's [`RetryableStatus`]), UNIMPLEMENTED and the remaining
-    /// framework statuses. Capped exponential backoff with jitter, then
-    /// dead-lettered and alerted. The statuses are not interchangeable:
-    /// see [`RetryableStatus`].
-    BugRetryable,
-}
-
 /// The status a handler picks for a bug it
 /// marks retryable ([`CodedError::retryable_bug`]; decision 14.37, owner's
 /// rulings 2026-10-29, latest). The statuses are not interchangeable, and
@@ -108,36 +79,6 @@ impl From<RetryableStatus> for GrpcCode {
             RetryableStatus::DeadlineExceeded => GrpcCode::DeadlineExceeded,
             RetryableStatus::ResourceExhausted => GrpcCode::ResourceExhausted,
         }
-    }
-}
-
-impl GrpcCode {
-    /// The class an error with this status is (decision 14.37, owner's
-    /// rulings 2026-10-29, latest). UNIMPLEMENTED (a request this router
-    /// hosts no component for: a misroute or a stale deployment) is
-    /// [`ErrorClass::BugRetryable`].
-    pub fn class(self) -> ErrorClass {
-        match self {
-            GrpcCode::FailedPrecondition
-            | GrpcCode::InvalidArgument
-            | GrpcCode::NotFound
-            | GrpcCode::AlreadyExists
-            | GrpcCode::OutOfRange
-            | GrpcCode::PermissionDenied => ErrorClass::BusinessFatal,
-            GrpcCode::Aborted => ErrorClass::BusinessImmediate,
-            GrpcCode::Internal | GrpcCode::Unknown | GrpcCode::DataLoss => ErrorClass::BugFatal,
-            GrpcCode::Unavailable
-            | GrpcCode::DeadlineExceeded
-            | GrpcCode::ResourceExhausted
-            | GrpcCode::Unimplemented => ErrorClass::BugRetryable,
-        }
-    }
-
-    /// True when an error with this status is a business refusal that
-    /// reaches the issuing policy's OnRefused: [`ErrorClass::BusinessFatal`]
-    /// only.
-    pub fn is_business_refusal(self) -> bool {
-        self.class() == ErrorClass::BusinessFatal
     }
 }
 
@@ -292,7 +233,7 @@ pub enum FoldAt<'a> {
 /// the status message alike ([`Self::status_message`]); `extras` are the
 /// args, the `ErrorInfo` metadata, a wrapped cause flattened into them as
 /// `cause` and `cause.<arg>`; `grpc` is resolved at construction, and
-/// decides the error's [`ErrorClass`]. No constructor takes text.
+/// is the status it travels with. No constructor takes text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodedError {
     pub code: String,
@@ -463,8 +404,8 @@ impl CodedError {
     /// command is refused, a business "no", never a fault. One of the two
     /// classes a handler fails with (the other is [`Self::bug`]). `code` is
     /// its key and `details` its args; a typed refusal is
-    /// [`Self::refused`] instead. The refusal reaches the issuing policy's
-    /// OnRefused ([`Self::refusal_response`]).
+    /// [`Self::refused`] instead. The coordinator hands it to the issuing
+    /// policy's OnRefused.
     pub fn rejection(
         status: BusinessStatus,
         code: &str,
@@ -534,10 +475,9 @@ impl CodedError {
         Self::coded(code, details, GrpcCode::Aborted)
     }
 
-    /// A bug the router itself finds (INTERNAL), under its own code:
-    /// malformed input, a component's misconfiguration, a policy's
-    /// malformed answer. Never a handler's, and never a business refusal
-    /// (owner ruling, 2026-10-29).
+    /// A bug the router itself finds (INTERNAL), under its own code: a
+    /// type no handler claims, a component's misconfiguration. Never a
+    /// handler's, and never a business refusal (owner ruling, 2026-10-29).
     pub(crate) fn internal(code: &str, extras: impl IntoIterator<Item = (String, String)>) -> Self {
         Self::coded(code, extras, GrpcCode::Internal)
     }
@@ -549,24 +489,6 @@ impl CodedError {
             refusal: Some(Box::new(refusal)),
             ..self
         }
-    }
-
-    /// The refused policy's view of this answer (types.proto,
-    /// RefusalResponse): `Some` for a business refusal only (its status in
-    /// the business set, [`GrpcCode::is_business_refusal`]), carrying the
-    /// typed refusal object, or, for an untyped rejection, its key and args
-    /// as a `Diagnostic`; `None` for every other failure, which never
-    /// reaches a policy's OnRefused (retried, or dead-lettered as a bug).
-    pub fn refusal_response(&self) -> Option<angzarr_proto::v1::RefusalResponse> {
-        use angzarr_proto::v1::refusal_response::Reason;
-        self.grpc
-            .is_business_refusal()
-            .then(|| angzarr_proto::v1::RefusalResponse {
-                reason: Some(match self.refusal.as_deref() {
-                    Some(refusal) => Reason::Refusal(refusal.clone()),
-                    None => Reason::Diagnostic(self.diagnostic()),
-                }),
-            })
     }
 }
 
