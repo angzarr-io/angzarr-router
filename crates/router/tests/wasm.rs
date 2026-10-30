@@ -5,9 +5,9 @@
 //! such components: each holds an `Rc`, so neither it nor its dispatch
 //! future (which holds the `Rc` across an await) is `Send`.
 //!
-//! This file is compiled only for wasm32, by `just wasm`; compiling is the
-//! test (the native build of the same traits asks `Send`, and these impls
-//! would not compile there).
+//! This file is compiled only for wasm32 (the native build of the same
+//! traits asks `Send`, and these impls would not compile there); `just wasm`
+//! runs it under node with wasm-bindgen-test-runner.
 
 #![cfg(target_arch = "wasm32")]
 
@@ -23,6 +23,7 @@ use angzarr_router::router::{
     CommandHandler, DynCommandHandler, DynPolicyComponent, DynProjectorHandler, PolicyComponent,
     ProjectorHandler, RouterBuilder,
 };
+use wasm_bindgen_test::wasm_bindgen_test;
 
 /// An await point holding `held` across it: makes the future not `Send`.
 async fn across_an_await(held: Rc<str>) -> String {
@@ -94,7 +95,7 @@ fn now<F: Future>(future: F) -> F::Output {
     }
 }
 
-#[test]
+#[wasm_bindgen_test]
 fn a_router_hosts_components_that_are_not_send() {
     let router = RouterBuilder::new()
         .aggregate(RcDomain(Rc::from("rc")))
@@ -111,7 +112,7 @@ fn a_router_hosts_components_that_are_not_send() {
     assert_eq!(answer.expect("answered").projector, "rc");
 }
 
-#[test]
+#[wasm_bindgen_test]
 fn components_that_are_not_send_box_through_their_twins() {
     let domain: Box<dyn DynCommandHandler> = Box::new(RcDomain(Rc::from("rc")));
     let policy: Box<dyn DynPolicyComponent> = Box::new(RcPolicy(Rc::from("rc")));

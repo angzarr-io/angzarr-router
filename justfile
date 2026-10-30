@@ -63,7 +63,8 @@ test: (_container "test")
 # Check Rust formatting (no rewrite; fails on drift)
 fmt-check: (_container "fmt-check")
 
-# Build the router for wasm32, and compile its wasm32-only tests: there the
+# Build the router for wasm32, compile its wasm32 tests, and run its
+# wasm32-only tests under node (wasm-bindgen-test-runner): there the
 # kernel-facing dispatch traits ask no Send (crates/router/tests/wasm.rs)
 wasm: (_container "wasm")
 

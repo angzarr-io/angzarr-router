@@ -11,6 +11,12 @@ prost = { workspace = true }
 prost-types = { workspace = true }
 tracing = { workspace = true }
 
+# The wasm32 run of tests/wasm.rs (components that are not Send), under
+# node with wasm-bindgen-test-runner (`just wasm`). The same pin as
+# angzarr-ports'; the runner's version must match the lock's wasm-bindgen.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "=0.3.79"
+
 [build-dependencies]
 heck = "0.5"
 prost-build = { workspace = true }

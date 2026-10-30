@@ -41,3 +41,8 @@ jobs:
 
       - name: Unit tests and the handler-contract tier (Rust)
         run: just test
+
+      # wasm32 build, and tests/wasm.rs run under node by
+      # wasm-bindgen-test-runner; the recipe installs both, pinned.
+      - name: wasm32 build and tests
+        run: just wasm

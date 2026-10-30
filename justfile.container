@@ -25,13 +25,57 @@ build:
 test:
     cargo test --manifest-path {{TOP}}/Cargo.toml --workspace
 
-# Build the router for wasm32 and compile its wasm32 tests (no runner: the
-# test is that components that are not Send compile, tests/wasm.rs). The
-# target is added when the rust image lacks it.
-wasm:
+# The wasm test runner, pinned to the wasm-bindgen in Cargo.lock (the CLI
+# and the library must match exactly; the same pin as angzarr-ports').
+WASM_BINDGEN := "0.2.129"
+# The node the runner runs the tests under: an official release, verified
+# against its published SHA-256, unpacked into .tools/ (the rust image has
+# no node).
+NODE := "22.22.2"
+NODE_SHA256_X64 := "88fd1ce767091fd8d4a99fdb2356e98c819f93f3b1f8663853a2dee9b438068a"
+NODE_SHA256_ARM64 := "e9e1930fd321a470e29bb68f30318bf58e3ecb4acb4f1533fb19c58328a091fe"
+
+# Install what the wasm tests need beyond the image: the wasm32 target,
+# wasm-bindgen-test-runner (into CARGO_HOME) and node (into .tools/).
+wasm-tools:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # cargo install puts the runner in CARGO_HOME's bin, which the image's
+    # PATH lacks when CARGO_HOME is the overlay's (.cargo-container).
+    export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
     rustup target list --installed | grep -qx wasm32-unknown-unknown || rustup target add wasm32-unknown-unknown
+    have="$(wasm-bindgen-test-runner --version 2>/dev/null | awk '{print $2}' || true)"
+    if [ "$have" != "{{WASM_BINDGEN}}" ]; then
+        cargo install --locked wasm-bindgen-cli --version {{WASM_BINDGEN}}
+    fi
+    locked="$(grep -A1 '^name = "wasm-bindgen"$' {{TOP}}/Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')"
+    [ "$locked" = "{{WASM_BINDGEN}}" ] || { echo "Cargo.lock has wasm-bindgen $locked; WASM_BINDGEN is {{WASM_BINDGEN}}: bump them together" >&2; exit 1; }
+    case "$(uname -m)" in
+        x86_64) arch=x64; sum={{NODE_SHA256_X64}} ;;
+        aarch64) arch=arm64; sum={{NODE_SHA256_ARM64}} ;;
+        *) echo "no pinned node for $(uname -m)" >&2; exit 1 ;;
+    esac
+    dir="{{TOP}}/.tools/node-v{{NODE}}-linux-$arch"
+    if [ ! -x "$dir/bin/node" ]; then
+        mkdir -p "{{TOP}}/.tools"
+        tarball="$dir.tar.xz"
+        curl -fsSL -o "$tarball" "https://nodejs.org/dist/v{{NODE}}/node-v{{NODE}}-linux-$arch.tar.xz"
+        echo "$sum  $tarball" | sha256sum -c --quiet -
+        tar -xJf "$tarball" -C "{{TOP}}/.tools"
+        rm -f "$tarball"
+    fi
+
+# Build the router for wasm32, compile all its wasm32 tests, and run
+# tests/wasm.rs (components that are not Send, an Rc held across an await)
+# under node with wasm-bindgen-test-runner.
+wasm: wasm-tools
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "$(uname -m)" in x86_64) arch=x64 ;; aarch64) arch=arm64 ;; esac
+    export PATH="{{TOP}}/.tools/node-v{{NODE}}-linux-$arch/bin:${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
     cargo build --manifest-path {{TOP}}/Cargo.toml -p angzarr-router --target wasm32-unknown-unknown
     cargo test --manifest-path {{TOP}}/Cargo.toml -p angzarr-router --target wasm32-unknown-unknown --no-run
+    CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner cargo test --manifest-path {{TOP}}/Cargo.toml -p angzarr-router --target wasm32-unknown-unknown --test wasm
 
 # Check formatting (no rewrite; fails on drift)
 fmt-check:
