@@ -4,14 +4,7 @@ members = ["crates/router", "crates/conformance", "tools/archlint"]
 # The angzarr-project submodule's crates are standalone workspaces of their
 # own (angzarr-proto declares `[workspace]`), consumed here as path
 # dependencies only.
-#
-# crates/router-ffi (the C ABI the Go/Java/C#/C++/TypeScript bindings link)
-# is out of the workspace on the POC line (poc/dispatch): it is the router's
-# distributed side, which the angzarr/annals POC leaves broken (plan "SCOPE
-# NOW"). It still registers trigger-fed process managers, which spec 636b313
-# deleted (decision 14.31), so it does not build against this pin. Restore it
-# to `members` when the distributed side is brought to the spec.
-exclude = ["angzarr-project", "crates/router-ffi"]
+exclude = ["angzarr-project"]
 
 [workspace.package]
 version = "0.1.0"

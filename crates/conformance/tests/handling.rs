@@ -814,8 +814,7 @@ async fn carries_events(w: &mut HandlingWorld) {
 
 // --- errors are a key and an argument map (decision 14.37) --------------------
 //
-// The extras render as the status's google.rpc.ErrorInfo metadata (see
-// crates/router-ffi/src/abi.rs, coded_to_status_bytes).
+// The extras render as the status's google.rpc.ErrorInfo metadata.
 
 fn grpc_name(code: GrpcCode) -> &'static str {
     match code {

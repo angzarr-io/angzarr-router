@@ -96,7 +96,7 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// The fixture: CounterAggregate on the router core (see FIXTURE.md).
+// The fixture: CounterAggregate on the router (the tier's fixture/FIXTURE.md).
 // ---------------------------------------------------------------------------
 
 /// Build the CounterAggregate dispatch table (appliers and handlers).

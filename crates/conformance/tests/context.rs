@@ -1,6 +1,6 @@
-//! Cucumber harness for `context.feature`: facts, cover access and
-//! projector page context, driven natively against hand-built components on
-//! the Rust core.
+//! Cucumber harness for the handler-contract tier's `context.feature`:
+//! facts, cover access and projector page context, driven against
+//! hand-built components on the Rust router.
 
 mod common;
 
@@ -146,12 +146,9 @@ async fn projector_saw(w: &mut ContextWorld, label: String, first: u64, second: 
 
 #[tokio::main]
 async fn main() {
-    let local = ContextWorld::cucumber()
-        .run(common::path("conformance/features/context.feature"))
-        .await;
     let tier = ContextWorld::cucumber()
         .fail_on_skipped()
         .run(common::tier("context.feature"))
         .await;
-    common::exit(local.execution_has_failed() || tier.execution_has_failed());
+    common::exit(tier.execution_has_failed());
 }

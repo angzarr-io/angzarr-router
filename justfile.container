@@ -29,12 +29,12 @@ test:
 fmt-check:
     cargo fmt --manifest-path {{TOP}}/Cargo.toml --all --check
 
-# The files held to mutation testing: the core modules, the FFI registry's
-# routing/claim rules and the architecture linter. Their threshold is 100%:
+# The files held to mutation testing: the core modules and the architecture
+# linter. Their threshold is 100%:
 # any missed (or timed-out) mutant fails `mutation-test` and `mutation-diff`
 # (cargo-mutants exits non-zero); only a genuinely equivalent mutant may be
 # excluded, in .cargo/mutants.toml, with the argument for its equivalence.
-MUTATED := "-f crates/router/src/rebuild.rs -f crates/router/src/domain.rs -f crates/router/src/context.rs -f crates/router/src/projector.rs -f crates/router/src/policy.rs -f crates/router/src/error.rs -f crates/router/src/lib.rs -f crates/router/src/router.rs -f crates/router-ffi/src/registry.rs -f tools/archlint/src/rules.rs -f tools/archlint/src/scan.rs -f tools/archlint/src/workspace.rs -f tools/archlint/src/model.rs"
+MUTATED := "-f crates/router/src/rebuild.rs -f crates/router/src/domain.rs -f crates/router/src/context.rs -f crates/router/src/projector.rs -f crates/router/src/policy.rs -f crates/router/src/error.rs -f crates/router/src/lib.rs -f crates/router/src/router.rs -f tools/archlint/src/rules.rs -f tools/archlint/src/scan.rs -f tools/archlint/src/workspace.rs -f tools/archlint/src/model.rs"
 
 # Mutation-test every file in MUTATED: the full pass.
 # cargo-mutants copies the source tree, so the proto root must be an absolute
@@ -66,12 +66,3 @@ lint:
 # --edges` prints the model the rules are checked against.
 archlint:
     cargo run --manifest-path {{TOP}}/Cargo.toml --quiet -p archlint -- --rules {{TOP}}/archlint.toml --manifest-path {{TOP}}/Cargo.toml
-
-# Lint the router's own protos (io.angzarr.router.ffi.v1) with buf, in the
-# root workspace so their angzarr-project imports resolve.
-buf-lint:
-    cd {{TOP}} && buf lint --path proto/io
-
-# Check proto formatting (no rewrite; fails on drift).
-buf-format:
-    cd {{TOP}}/proto && buf format --diff --exit-code

@@ -1,7 +1,7 @@
-//! Cucumber harness for the projector behavior suite: drives the shared
-//! `projector.feature` against the Rust core's ProjectorDispatch natively.
-//! The same feature runs against the bindings and the generated clients in
-//! later units — only this step-definition layer differs.
+//! Cucumber harness for the handler-contract tier's
+//! `projector_dispatch.feature`: drives it against the Rust router's
+//! ProjectorDispatch. Every router binds the same feature; only this
+//! step-definition layer differs.
 
 mod common;
 
@@ -68,12 +68,9 @@ async fn records_nothing(w: &mut ProjectorWorld) {
 
 #[tokio::main]
 async fn main() {
-    let local = ProjectorWorld::cucumber()
-        .run(common::path("conformance/features/projector.feature"))
-        .await;
     let tier = ProjectorWorld::cucumber()
         .fail_on_skipped()
         .run(common::tier("projector_dispatch.feature"))
         .await;
-    common::exit(local.execution_has_failed() || tier.execution_has_failed());
+    common::exit(tier.execution_has_failed());
 }

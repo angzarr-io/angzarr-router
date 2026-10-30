@@ -7,7 +7,6 @@
 #   angzarr-proto               the io.angzarr.v1 wire types (angzarr-project's
 #                               rust/angzarr-proto, a path dependency)
 #   angzarr_router              the engine: dispatch, component model, rebuild
-#   angzarr_router_ffi          the C ABI over the engine (marshaling, registry)
 #   angzarr_router_conformance  the harness: drives the engine's public API
 #   archlint                    tooling; no product crate depends on it
 #
@@ -19,25 +18,14 @@
 
 [[rule]]
 name = "engine-is-the-bottom"
-why = "the engine never depends on the C ABI layer, the conformance harness, tooling, or C FFI types; its wire types come from angzarr-project's angzarr-proto crate"
+why = "the engine never depends on the conformance harness, tooling, or C FFI types; its wire types come from angzarr-project's angzarr-proto crate"
 from = ["angzarr_router::**"]
 allow = ["angzarr_router::**", "path:angzarr-project/rust/angzarr-proto"]
 deny = ["std::ffi::**", "core::ffi::**", "std::os::raw::**", "libc::**"]
 
-# The C ABI layer's rules (ffi-sits-on-the-engine, and the "C ABI internals"
-# section below) are parked on the POC line: crates/router-ffi is out of the
-# workspace there (see Cargo.toml), so their patterns match no module. Restore
-# them with the crate:
-#
-# [[rule]]
-# name = "ffi-sits-on-the-engine"
-# why = "the C ABI layer marshals over the engine; it never reaches the harness or tooling"
-# from = ["angzarr_router_ffi::**"]
-# allow = ["angzarr_router_ffi::**", "angzarr_router::**"]
-
 [[rule]]
 name = "conformance-drives-the-public-engine"
-why = "the harness library exercises the engine's public API and the conformance fixtures, never the C ABI"
+why = "the harness library exercises the engine's public API and the tier's fixtures"
 from = ["angzarr_router_conformance::**"]
 scope = "lib"
 allow = [
@@ -49,13 +37,12 @@ allow = [
 
 [[rule]]
 name = "conformance-tests-use-public-surfaces"
-why = "conformance tests drive the engine's public API, never the C ABI"
+why = "conformance tests drive the engine's public API"
 from = ["angzarr_router_conformance::**"]
 scope = "test"
 allow = [
     "angzarr_router_conformance::**",
     "angzarr_router::**",
-    "path:conformance/**",
 ]
 
 # ---- engine internals (library code) ----------------------------------------
@@ -105,27 +92,3 @@ allow = [
     "angzarr_router::rebuild::**",
     "angzarr_router::context::**",
 ]
-
-# ---- C ABI internals (library code) -----------------------------------------
-# (parked with the crate on the POC line; see above)
-
-# [[rule]]
-# name = "ffi-proto-is-a-leaf"
-# why = "the ABI's generated proto types reference nothing else"
-# from = ["angzarr_router_ffi::proto::**"]
-# scope = "lib"
-# allow = ["angzarr_router_ffi::proto::**"]
-
-# [[rule]]
-# name = "ffi-abi-below-registry"
-# why = "buffer/status marshaling sits below the registry and the exported entry points"
-# from = ["angzarr_router_ffi::abi::**"]
-# scope = "lib"
-# allow = ["self::**", "angzarr_router_ffi::proto::**", "angzarr_router::**"]
-
-# [[rule]]
-# name = "ffi-registry-below-entry-points"
-# why = "the registry adapts host callbacks to engine components; the extern \"C\" entry points sit above it"
-# from = ["angzarr_router_ffi::registry::**"]
-# scope = "lib"
-# allow = ["self::**", "angzarr_router_ffi::abi::**", "angzarr_router_ffi::proto::**", "angzarr_router::**"]

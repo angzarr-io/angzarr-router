@@ -4,10 +4,10 @@
 #   1. `justfile` (this file) runs on the host and delegates into the org's
 #      pinned toolchain image.
 #   2. `justfile.container` is mounted over this file inside the container and
-#      holds the real recipes (cargo, and buf with the pinned plugins).
+#      holds the real recipes (cargo, and cargo-mutants).
 #   3. DEVCONTAINER=true short-circuits to run recipes directly — no nesting.
 #
-# So `just buf-lint` / `just build` produce identical results on the host,
+# So `just lint` / `just build` produce identical results on the host,
 # from inside the coordinator container, and inside a devcontainer.
 set shell := ["bash", "-c"]
 
@@ -63,7 +63,7 @@ test: (_container "test")
 # Check Rust formatting (no rewrite; fails on drift)
 fmt-check: (_container "fmt-check")
 
-# Mutation-test the core modules and the FFI registry: the full pass
+# Mutation-test the core modules and the architecture linter: the full pass
 mutation-test: (_container "mutation-test")
 
 # Mutation-test what a push adds: lefthook's pre-push step (the full pass,
@@ -184,9 +184,3 @@ lint: (_container "lint")
 
 # Architecture lint: module-level layer rules (archlint.toml)
 archlint: (_container "archlint")
-
-# Lint the router's protos (buf, pinned plugins)
-buf-lint: (_container "buf-lint")
-
-# Check proto formatting
-buf-format: (_container "buf-format")

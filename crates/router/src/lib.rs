@@ -1,11 +1,16 @@
-//! angzarr-router — the shared client router core.
+//! angzarr-router — the Rust client library's router, and the reference
+//! router (decision 14.42).
 //!
-//! Dispatch/rebuild mechanics implemented once, exposed through the C-ABI
-//! FFI crate (crates/router-ffi) to the language bindings that
-//! angzarr-cli's generated code targets. The engine semantics table in
-//! docs/architecture.md is this crate's contract. Framework rules live
-//! here — do not duplicate them into generated output, bindings, or
-//! component adapters.
+//! It keeps dispatch only: it routes an input by its type to business code,
+//! folds the starting state and the pages it is given, runs decide or
+//! ingest, reports a stale command's conflicts, runs a policy's handlers
+//! per page and its translating callback, runs a projector, and turns
+//! whatever escapes business code into a key and its args. Everything
+//! generic beside it (upcasting, snapshots, admission, descriptor
+//! validation, the reason catalog and classification, policy output
+//! checks, refusal building, envelope guards, conflict judgement) is the
+//! coordinator's. angzarr-project's handler-contract tier is its complete
+//! contract, and every router in every language is held to it.
 
 #![forbid(unsafe_code)]
 

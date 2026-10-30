@@ -1,7 +1,7 @@
-//! Cucumber harness for the policy behavior suite: drives the shared
-//! `policy.feature` against the Rust core's PolicyDispatch natively. The same
-//! feature runs against the bindings and the generated clients in later
-//! units — only this step-definition layer differs.
+//! Cucumber harness for the handler-contract tier's
+//! `policy_dispatch.feature`: drives it against the Rust router's
+//! PolicyDispatch. Every router binds the same feature; only this
+//! step-definition layer differs.
 
 mod common;
 
@@ -57,13 +57,6 @@ async fn reserve_event(w: &mut PolicyWorld) {
     w.dispatch(conf::policy_event_source("test.counter.Reserve", 0));
 }
 
-#[then(regex = r#"^the policy emits one command to "([^"]*)"$"#)]
-async fn emits_one_command(w: &mut PolicyWorld, target: String) {
-    let commands = w.commands();
-    assert_eq!(commands.len(), 1, "exactly one command emitted");
-    assert_eq!(commands[0].cover.as_ref().expect("cover").domain, target);
-}
-
 #[then(regex = r#"^the policy emits one command to "([^"]*)", in the reaction to sequence (\d+)$"#)]
 async fn emits_one_command_in_reaction(w: &mut PolicyWorld, target: String, sequence: u64) {
     let reactions = &w.response().reactions;
@@ -114,12 +107,9 @@ async fn emits_no_commands(w: &mut PolicyWorld) {
 
 #[tokio::main]
 async fn main() {
-    let local = PolicyWorld::cucumber()
-        .run(common::path("conformance/features/policy.feature"))
-        .await;
     let tier = PolicyWorld::cucumber()
         .fail_on_skipped()
         .run(common::tier("policy_dispatch.feature"))
         .await;
-    common::exit(local.execution_has_failed() || tier.execution_has_failed());
+    common::exit(tier.execution_has_failed());
 }

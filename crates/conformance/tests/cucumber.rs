@@ -1,9 +1,8 @@
-//! Cucumber harness: drives the shared `.feature` behavior suite against the
-//! Rust core natively. Step defs parse the orthogonal `.txtpb` skeletons,
-//! set the scenario's data by field, dispatch, and assert outcomes.
-//!
-//! The same `.feature` files run against the bindings and the generated
-//! clients in later units — only the step-definition layer differs.
+//! Cucumber harness for the handler-contract tier's
+//! `counter_dispatch.feature`: step defs parse the tier's orthogonal
+//! `.txtpb` skeletons, set the scenario's data by field, dispatch to the
+//! Rust router, and assert outcomes. Every router binds the same feature;
+//! only the step-definition layer differs.
 
 mod common;
 
@@ -209,12 +208,9 @@ fn assert_failed_with(w: &CounterWorld, code: &str) {
 
 #[tokio::main]
 async fn main() {
-    let local = CounterWorld::cucumber()
-        .run(common::path("conformance/features/counter.feature"))
-        .await;
     let tier = CounterWorld::cucumber()
         .fail_on_skipped()
         .run(common::tier("counter_dispatch.feature"))
         .await;
-    common::exit(local.execution_has_failed() || tier.execution_has_failed());
+    common::exit(tier.execution_has_failed());
 }

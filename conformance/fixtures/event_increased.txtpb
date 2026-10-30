@@ -1,6 +1,0 @@
-# A single prior Increased event page (orthogonal scaffold). The step
-# definition replays it N times with consecutive sequences to build the
-# "already recorded N increases" history.
-payload {
-  [type.googleapis.com/test.counter.Increased] {}
-}
