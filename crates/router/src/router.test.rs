@@ -10,7 +10,7 @@ use crate::pb;
 use crate::policy::PolicyDispatch;
 use crate::projector::ProjectorDispatch;
 use crate::rebuild::Rebuilder;
-use crate::router::{CommandHandler, ProjectorHandler, Router, RouterBuilder};
+use crate::router::{CommandHandler, PolicyComponent, ProjectorHandler, Router, RouterBuilder};
 use crate::test_support::{
     command_page, event_page, fact_page, fresh_rebuilder, LedgerState, TestState,
 };
@@ -622,4 +622,113 @@ fn a_router_refuses_its_components_hello_without_a_rules_version() {
         .expect_err("refused");
     assert_eq!(err.code, codes::MISSING_RULES_VERSION);
     crate::test_support::assert_bug(&err);
+}
+
+/// A hand-written policy (a policy in another process, say): from `order`
+/// to `inventory`, answering one command per source and, for a refusal, a
+/// fact named for the refused command's type.
+struct Relay;
+
+impl PolicyComponent for Relay {
+    fn name(&self) -> &str {
+        "relay"
+    }
+    fn input_domain(&self) -> &str {
+        "order"
+    }
+    fn dispatch(&self, _: &pb::EventBook) -> Result<pb::PolicyResponse, CodedError> {
+        Ok(pb::PolicyResponse {
+            commands: vec![pb::CommandBook::default()],
+        })
+    }
+    fn dispatch_refusal(
+        &self,
+        refusal: &pb::Refusal,
+        _: &crate::context::CommandContext,
+    ) -> Result<pb::OnRefusedResponse, CodedError> {
+        let refused = refusal
+            .command
+            .as_ref()
+            .and_then(|c| c.page.as_ref())
+            .and_then(crate::command_payload)
+            .map_or(String::new(), |a| a.type_url.clone());
+        Ok(pb::OnRefusedResponse {
+            fact: Some(pb::CommandBook {
+                page: Some(fact_page(any_of_type(&format!("relayed{refused}")))),
+                ..Default::default()
+            }),
+        })
+    }
+    fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError> {
+        Ok(pb::ComponentDescriptor {
+            name: "relay".to_string(),
+            kind: pb::ComponentKind::Policy as i32,
+            ..Default::default()
+        })
+    }
+}
+
+// A hand-written policy is hosted as a PolicyDispatch is: the router checks
+// its source's domain and hands the rest to it, its refusals included, and
+// names it as a POLICY when refusing a second component.
+#[test]
+fn a_hand_written_policy_builds_a_router() {
+    let router = RouterBuilder::new().policy(Relay).build().expect("build");
+    assert_eq!(
+        router
+            .dispatch_policy(&source("order"))
+            .expect("policy")
+            .commands
+            .len(),
+        1
+    );
+    assert_eq!(
+        router.dispatch_policy(&source("billing")).unwrap_err().code,
+        "POLICY_SOURCE_OUTSIDE_INPUT_DOMAIN",
+        "the router checks a hand-written policy's source too"
+    );
+    let refusal = pb::Refusal {
+        command: Some(pb::CommandBook {
+            page: Some(command_page(any_of_type("test.Reserve"))),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let answer = router
+        .dispatch_refusal(&refusal, &crate::context::CommandContext::default())
+        .expect("answered");
+    let fact = answer.fact.and_then(|f| f.page).and_then(|p| match p.body {
+        Some(pb::command_page::Body::Fact(f)) => f.payload,
+        _ => None,
+    });
+    assert_eq!(
+        fact.map(|a| a.type_url),
+        Some(type_url("relayed/test.Reserve"))
+    );
+    assert_eq!(router.component_descriptor().expect("hello").name, "relay");
+    assert_eq!(
+        router
+            .refuse_another_component()
+            .extras
+            .get(crate::error::extras::COMPONENT_KIND)
+            .map(String::as_str),
+        Some("POLICY")
+    );
+}
+
+// A boxed policy, and a PolicyDispatch through the trait, build routers.
+#[test]
+fn boxed_policies_build_routers() {
+    let boxed: Box<dyn PolicyComponent> = Box::new(Relay);
+    assert_eq!(boxed.name(), "relay");
+    assert_eq!(boxed.input_domain(), "order");
+    let router = RouterBuilder::new().policy(boxed).build().expect("build");
+    assert_eq!(
+        router.dispatch_policy(&source("order")).expect("policy").commands.len(),
+        1
+    );
+
+    let dispatch: &dyn PolicyComponent = &PolicyDispatch::new("s", "order", "inventory");
+    assert_eq!(dispatch.name(), "s");
+    assert_eq!(dispatch.input_domain(), "order");
 }
