@@ -115,7 +115,7 @@ fn run(policy: PolicyDispatch, edition: Option<&str>) -> pb::EventPage {
         ..Default::default()
     };
     trigger.pages[0].sequence = 0;
-    let sent = policy.dispatch(&trigger).expect("translated").commands;
+    let sent = commands_of(&policy.dispatch(&trigger).expect("translated"));
     assert_eq!(sent.len(), 1);
     assert_eq!(
         sent[0].cover.as_ref().and_then(|c| c.edition.as_deref()),

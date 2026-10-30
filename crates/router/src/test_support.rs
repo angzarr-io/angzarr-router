@@ -288,3 +288,12 @@ pub fn recorded_page(sequence: u64, event: Any, command_id: u8) -> pb::EventPage
         }),
     }
 }
+
+/// Every command a policy answered, in page order: its reactions' commands,
+/// flattened.
+pub fn commands_of(resp: &pb::PolicyResponse) -> Vec<pb::CommandBook> {
+    resp.reactions
+        .iter()
+        .flat_map(|r| r.commands.iter().cloned())
+        .collect()
+}

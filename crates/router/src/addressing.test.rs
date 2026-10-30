@@ -140,9 +140,9 @@ fn a_command_keeps_the_root_it_names_for_any_target() {
         (order_to_fulfillment(), NAMED),
     ] {
         let resp = policy.dispatch(&one_placed()).expect("dispatched");
-        assert_eq!(resp.commands.len(), 1);
-        assert_eq!(cover_of(&resp.commands[0]).root, Some(uuid_of(root)));
-        keeps_the_triggers_correlation(&resp.commands[0], CORRELATION);
+        assert_eq!(commands_of(&resp).len(), 1);
+        assert_eq!(cover_of(&commands_of(&resp)[0]).root, Some(uuid_of(root)));
+        keeps_the_triggers_correlation(&commands_of(&resp)[0], CORRELATION);
     }
 }
 
@@ -221,7 +221,7 @@ fn a_command_carrying_its_triggers_correlation_passes() {
     );
     let resp = policy.dispatch(&one_placed()).expect("its trigger's own");
     assert_eq!(
-        correlation_of(&resp.commands[0]),
+        correlation_of(&commands_of(&resp)[0]),
         Some(&uuid_of(CORRELATION))
     );
 }
@@ -261,18 +261,18 @@ fn one_event_fans_out_to_an_aggregate_and_a_process_manager() {
         .dispatch(&source)
         .expect("to the aggregate");
     let fulfillment = order_to_fulfillment().dispatch(&source).expect("to the PM");
-    assert_eq!(inventory.commands.len(), 1);
-    assert_eq!(fulfillment.commands.len(), 1);
+    assert_eq!(commands_of(&inventory).len(), 1);
+    assert_eq!(commands_of(&fulfillment).len(), 1);
     assert_eq!(
-        cover_of(&inventory.commands[0]).root,
+        cover_of(&commands_of(&inventory)[0]).root,
         Some(uuid_of(INVENTORY))
     );
     assert_eq!(
-        cover_of(&fulfillment.commands[0]).root,
+        cover_of(&commands_of(&fulfillment)[0]).root,
         Some(uuid_of(NAMED))
     );
-    keeps_the_triggers_correlation(&inventory.commands[0], CORRELATION);
-    keeps_the_triggers_correlation(&fulfillment.commands[0], CORRELATION);
+    keeps_the_triggers_correlation(&commands_of(&inventory)[0], CORRELATION);
+    keeps_the_triggers_correlation(&commands_of(&fulfillment)[0], CORRELATION);
 }
 
 // --- the edition: unchanged (POLICY_COMMAND_OUTSIDE_EDITION) ------------------
@@ -288,7 +288,7 @@ fn a_process_manager_command_stays_in_its_triggers_edition() {
         ))
         .expect("dispatched");
     assert_eq!(
-        cover_of(&resp.commands[0]).edition.as_deref(),
+        cover_of(&commands_of(&resp)[0]).edition.as_deref(),
         Some("what-if")
     );
     let stray = PolicyDispatch::new("Stray", "order", "fulfillment").on_event(
@@ -335,7 +335,7 @@ fn a_policy_reads_its_triggers_correlation_and_recorded_at() {
         .dispatch(&order_source(None, vec![trigger]))
         .expect("dispatched");
     assert_eq!(
-        cover_of(&resp.commands[0]).root,
+        cover_of(&commands_of(&resp)[0]).root,
         Some(uuid_of(CORRELATION)),
         "the root the policy named: its trigger's correlation"
     );

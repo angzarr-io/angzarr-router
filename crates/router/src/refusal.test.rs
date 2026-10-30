@@ -106,9 +106,9 @@ fn a_policy_translates_an_event_into_a_command_for_its_destination() {
     let resp = buyin_wallet()
         .dispatch(&trigger_book(None))
         .expect("translated");
-    assert_eq!(resp.commands.len(), 1);
+    assert_eq!(commands_of(&resp).len(), 1);
     assert_eq!(
-        crate::command_payload(resp.commands[0].page.as_ref().unwrap()),
+        crate::command_payload(commands_of(&resp)[0].page.as_ref().unwrap()),
         Some(&any_of(&HoldFunds { amount: 150 }))
     );
 }
@@ -121,7 +121,12 @@ fn a_policies_commands_stay_in_their_triggers_edition() {
         .dispatch(&trigger_book(Some("what-if")))
         .expect("translated");
     assert_eq!(
-        resp.commands[0].cover.as_ref().unwrap().edition.as_deref(),
+        commands_of(&resp)[0]
+            .cover
+            .as_ref()
+            .unwrap()
+            .edition
+            .as_deref(),
         Some("what-if")
     );
 }

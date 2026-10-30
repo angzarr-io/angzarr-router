@@ -264,7 +264,10 @@ impl PolicyDispatch {
     }
 
     /// Walks EVERY page of the source book: declared event types emit;
-    /// undeclared types are skipped. Emitted commands pass through
+    /// undeclared types are skipped. The answer holds one
+    /// `PolicyReaction` per handled page, in page order, naming its
+    /// trigger's sequence, an empty one included, and none for an
+    /// unhandled page (decision 14.42). Emitted commands pass through
     /// unstamped, in emission order. A source with no pages is
     /// EMPTY_POLICY_SOURCE.
     pub fn dispatch(&self, source: &pb::EventBook) -> Result<pb::PolicyResponse, CodedError> {
@@ -317,7 +320,12 @@ impl PolicyDispatch {
                 check_root(command)?;
                 check_correlation(command, trigger_correlation)?;
             }
-            resp.commands.extend(commands);
+            // One reaction per handled page, an empty one included
+            // (decision 14.42).
+            resp.reactions.push(pb::PolicyReaction {
+                trigger_sequence: page.sequence,
+                commands,
+            });
         }
 
         Ok(resp)

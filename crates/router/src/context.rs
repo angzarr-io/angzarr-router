@@ -90,6 +90,18 @@ impl Conflict {
         *self.resolved.lock().unwrap_or_else(|e| e.into_inner()) = Some(nonce.to_vec());
     }
 
+    /// The nonce the handler last passed to
+    /// [`resolve_conflicts`](Self::resolve_conflicts), empty if it never
+    /// called it: what the router reports (`ConflictReport.resolved_nonce`,
+    /// decision 14.42).
+    pub fn resolved_nonce(&self) -> Vec<u8> {
+        self.resolved
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_default()
+    }
+
     /// True when the handler resolved with exactly the delivered nonce.
     pub fn is_resolved(&self) -> bool {
         self.resolved

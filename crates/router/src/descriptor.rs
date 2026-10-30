@@ -38,6 +38,9 @@ pub(crate) fn component_descriptor(
         rules_version: rules_version.to_string(),
         state,
         starting_types,
+        // angzarr-cli generates the descriptor, the output domain included
+        // (decision 14.42); the router's descriptor is retired with it.
+        output_domain: String::new(),
     })
 }
 

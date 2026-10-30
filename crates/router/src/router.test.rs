@@ -246,11 +246,10 @@ fn a_router_runs_its_policy() {
         .build()
         .expect("build");
     assert_eq!(
-        router
-            .dispatch_policy(&source("order"))
-            .expect("policy")
-            .commands
-            .len(),
+        crate::test_support::commands_of(
+            &router.dispatch_policy(&source("order")).expect("policy")
+        )
+        .len(),
         1
     );
     assert_eq!(

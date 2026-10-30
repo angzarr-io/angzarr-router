@@ -3,9 +3,12 @@
 //! The same feature runs against the bindings and the generated clients in
 //! later units — only this step-definition layer differs.
 
+mod common;
+
 use angzarr_router::error::CodedError;
 use angzarr_router::pb;
 use angzarr_router_conformance as conf;
+use cucumber::writer::Stats as _;
 use cucumber::{given, then, when, World};
 
 #[derive(Debug, Default, World)]
@@ -82,9 +85,15 @@ async fn fails_with(w: &mut ProjectorWorld, code: String) {
 
 #[tokio::main]
 async fn main() {
-    let feature = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../conformance/features/projector.feature"
-    );
-    ProjectorWorld::cucumber().run_and_exit(feature).await;
+    let local = ProjectorWorld::cucumber()
+        .run(common::path("conformance/features/projector.feature"))
+        .await;
+    let tier = ProjectorWorld::cucumber()
+        .fail_on_skipped()
+        .filter_run(
+            common::tier("projector_dispatch.feature"),
+            |_, _, scenario| common::runs(scenario),
+        )
+        .await;
+    common::exit(local.execution_has_failed() || tier.execution_has_failed());
 }

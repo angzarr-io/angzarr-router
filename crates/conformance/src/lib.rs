@@ -35,11 +35,18 @@ const FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/con
 
 // The orthogonal envelope skeletons — structural scaffold only; the
 // test-meaningful field is omitted and supplied by the step definitions.
-const SKEL_INCREASE: &str = include_str!("../../../conformance/fixtures/command_increase.txtpb");
-const SKEL_FAILHARD: &str = include_str!("../../../conformance/fixtures/command_failhard.txtpb");
-const SKEL_UNHANDLED: &str = include_str!("../../../conformance/fixtures/command_unhandled.txtpb");
-const SKEL_INCREASED_EVENT: &str =
-    include_str!("../../../conformance/fixtures/event_increased.txtpb");
+const SKEL_INCREASE: &str = include_str!(
+    "../../../angzarr-project/features/handler-contract/fixture/txtpb/command_increase.txtpb"
+);
+const SKEL_FAILHARD: &str = include_str!(
+    "../../../angzarr-project/features/handler-contract/fixture/txtpb/command_failhard.txtpb"
+);
+const SKEL_UNHANDLED: &str = include_str!(
+    "../../../angzarr-project/features/handler-contract/fixture/txtpb/command_unhandled.txtpb"
+);
+const SKEL_INCREASED_EVENT: &str = include_str!(
+    "../../../angzarr-project/features/handler-contract/fixture/txtpb/event_increased.txtpb"
+);
 
 /// The CounterAggregate's business rejection code (`IncreaseBy { n: 0 }`).
 /// A fixture code, not a router code.
@@ -403,6 +410,28 @@ pub fn snapshot_history() -> Option<pb::EventBook> {
         }),
         pages: vec![increased_at(10), increased_at(11)],
         next_sequence: 12,
+        ..Default::default()
+    })
+}
+
+/// A counter delivered a starting state of `count` at `sequence` and one
+/// `Increased` event at `event_at`: the pages after the snapshot only, as
+/// the coordinator delivers them (decision 14.40).
+pub fn starting_state_history(count: u32, sequence: u64, event_at: u64) -> Option<pb::EventBook> {
+    Some(pb::EventBook {
+        snapshot: Some(pb::Snapshot {
+            state: Some(prost_types::Any {
+                type_url: angzarr_router::type_url("test.counter.CounterState"),
+                value: CounterState { count }.encode_to_vec(),
+            }),
+            sequence,
+            ..Default::default()
+        }),
+        pages: vec![pb::EventPage {
+            sequence: event_at,
+            ..parse_txtpb(EVENT_PAGE, SKEL_INCREASED_EVENT)
+        }],
+        next_sequence: event_at + 1,
         ..Default::default()
     })
 }

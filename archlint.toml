@@ -41,7 +41,12 @@ name = "conformance-drives-the-public-engine"
 why = "the harness library exercises the engine's public API and the conformance fixtures, never the C ABI"
 from = ["angzarr_router_conformance::**"]
 scope = "lib"
-allow = ["angzarr_router_conformance::**", "angzarr_router::**", "path:conformance/fixtures/**"]
+allow = [
+    "angzarr_router_conformance::**",
+    "angzarr_router::**",
+    # the handler-contract tier's fixtures (decision 14.42)
+    "path:angzarr-project/features/handler-contract/fixture/**",
+]
 
 [[rule]]
 name = "conformance-tests-use-public-surfaces"
