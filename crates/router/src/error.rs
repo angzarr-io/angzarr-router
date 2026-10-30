@@ -4,6 +4,32 @@
 //! `google.rpc.ErrorInfo` (domain [`ERROR_INFO_DOMAIN`]) carries the same
 //! key as its reason and the args as its metadata, and text is rendered only
 //! where it is shown, from a catalog keyed by the code.
+//!
+//! The router answers a status and a key, and never classifies (decision
+//! 14.42): which of decision 14.37's four classes a status is, and what
+//! reaches a policy's OnRefused, are the coordinator's. No class,
+//!
+//! ```compile_fail
+//! use angzarr_router::error::ErrorClass;
+//! ```
+//!
+//! no status's class,
+//!
+//! ```compile_fail
+//! let _ = angzarr_router::error::GrpcCode::Internal.class();
+//! ```
+//!
+//! no business-refusal test,
+//!
+//! ```compile_fail
+//! let _ = angzarr_router::error::GrpcCode::Internal.is_business_refusal();
+//! ```
+//!
+//! and no refused policy's view of an answer:
+//!
+//! ```compile_fail
+//! let _ = angzarr_router::error::CodedError::unhandled().refusal_response();
+//! ```
 
 use std::collections::BTreeMap;
 
