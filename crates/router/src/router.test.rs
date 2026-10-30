@@ -701,7 +701,16 @@ fn a_hand_written_policy_answers_through_policy_component() {
 #[test]
 fn a_policy_dispatch_answers_through_policy_component() {
     let dispatch = PolicyDispatch::new("s", "order", "inventory")
-        .on_event("test.Created", |_, _| Ok(vec![pb::CommandBook::default()]))
+        .on_event("test.Created", |_, _| {
+            Ok(vec![pb::CommandBook {
+                cover: Some(pb::Cover {
+                    domain: "inventory".to_string(),
+                    root: Some(crate::test_support::uuid_of(1)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }])
+        })
         .on_refused("test.Reserve", |_, _| Ok(any_of_type("test.ReserveFailed")));
     let policy: &dyn PolicyComponent = &dispatch;
     assert_eq!(policy.name(), "s");

@@ -192,6 +192,29 @@ impl PolicyDispatch {
         })
     }
 
+    /// The translation of a refusal: the payload of the translating
+    /// callback for the refused command's type, handed the `Refusal` and
+    /// `ctx` (a failing one is a policy bug, as in [`Self::dispatch_refusal`]);
+    /// `None` when there is none for that type, the runtime then passing
+    /// the refusal through (decision 14.42).
+    pub fn translate_refusal(
+        &self,
+        refusal: &pb::Refusal,
+        ctx: &CommandContext,
+    ) -> Result<Option<Any>, CodedError> {
+        let refused_type = refusal
+            .command
+            .as_ref()
+            .and_then(|c| c.page.as_ref())
+            .and_then(crate::command_payload)
+            .map(|p| crate::type_name_from_url(&p.type_url).to_string())
+            .unwrap_or_default();
+        match self.refusals.get(&refused_type) {
+            Some(translate) => call_handler(|| translate(refusal, ctx)).map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// The rules version the policy registers with: the business binary's
     /// full version, baked in at build. Empty until declared.
     pub fn with_rules_version(mut self, rules_version: impl Into<String>) -> Self {
