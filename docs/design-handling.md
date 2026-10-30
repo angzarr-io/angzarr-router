@@ -1,5 +1,18 @@
 # Design: rules version, conflict resolution, command upcasting and router-owned state
 
+> **Superseded in most of its detail by decisions 14.39, 14.40 and 14.42
+> (the router keeps dispatch; everything else is the coordinator's):** the
+> router no longer upcasts (no `UpcasterDispatch`, no command chains, no
+> claims), skips no page a snapshot covers (one state codec), admits
+> nothing, builds no descriptor (`component_descriptor()` and the
+> registration hello below are gone; `Router::component_descriptor`
+> answers the one it was given), checks no policy command, builds no
+> refusal fact, guards no envelope, and judges no conflict: it reports
+> the nonce or the unit sets, and the coordinator refuses
+> `CONFLICT_UNRESOLVED` and `CONFLICT_OVERLAP`. router-ffi, its C ABI and
+> its router-owned state are deleted. The current contract is
+> docs/architecture.md; this note is the record of how it got there.
+
 > **Superseded in part by decision 14.37 (errors are a key and an argument
 > map):** every error code, status and message below is historical. A
 > failing fold is `FOLD_FAILED` / `FOLD_FAILED_EMITTED` with the fold's own

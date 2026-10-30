@@ -1,142 +1,99 @@
 # angzarr-router architecture
 
-angzarr-router is one dispatch engine — routing commands and events to
-business handlers, rebuilding state, fanning out, mapping errors —
-written in Rust and exposed over a generic C ABI (`crates/router-ffi`,
-defined as data in `proto/io/angzarr/router/ffi/v1/abi.proto`) whose
-bindings `tools/abigen` generates from that proto: Python's cffi layer
-first, vendored by client-python. The hand-written Go, Java, C#, C++ and
-TypeScript bindings are retired (owner's ruling, 2026-10-29). The router
-has no transport: each host process still serves the
-coordinator's gRPC services itself and hands the framework messages to the
-router.
+angzarr-router is the Rust client library's router, and the reference
+router: the one part of a client library that calls business code
+(decision 14.42). It routes an input to the business code registered for
+its type, folds the state it is given, runs decide or ingest, and answers
+what business code did, as the framework's messages. Python has a native
+router of its own; angzarr-project's handler-contract tier
+(`features/handler-contract/`, with its fixtures in `fixture/`) is the
+complete contract of both, run in CI against every router.
 
-## Where it sits today
+The router has no transport and no store. The host process serves the
+coordinator's gRPC services (`CommandHandlerService`, `PolicyService`,
+`ProjectorService`, `ComponentService`) and hands their messages to the
+router; the coordinator (core's, or the angzarr-embedded kernel) owns
+every read and write around each call.
 
-- **Consumers.** client-python, through the generated Python cffi layer
-  (`crates/router-ffi/generated/python/`) and its own hand-written
-  registration API; the conformance suite here also runs through the C
-  ABI, by way of router-ffi's Rust host (`crates/conformance`, the `*_ffi`
-  targets).
-- **client-rust** dispatches through `crates/router`'s Rust-native API (no
-  FFI) and has no engine of its own. That API (`Rebuilder`,
-  `DomainDispatch` with commands and facts (an aggregate's or a process
-  manager's: a PM is a domain, decision 14.31), `PolicyDispatch`,
-  `ProjectorDispatch`, `RouterBuilder`/`Router`
-  (one component per router),
-  `CodedError`, and the wire types re-exported as `pb`) is
-  therefore a public contract, documented on each item; components may be
-  registered boxed (`Box<dyn CommandHandler>` and so on).
-- **Not consumers (yet).** The other `angzarr-client-*` libraries still
-  carry their own engines (client-go `engine*.go`, client-python
-  `angzarr_client/router/`). Until they retire, the engine semantics exist
-  in this repo AND in each of them; the shared contract is the semantics
-  table below and the angzarr-project feature suite, not shared code.
+## What the router does, and what it leaves to the coordinator
 
-## Layers
+| The router (this crate) | The coordinator |
+|---|---|
+| routes by type URL; refuses a type nothing handles | upcasts every payload and event first, through the component's upcaster sidecar (14.39), and relays the type as sent beside an unknown type (`upcast_type_url`) |
+| folds the starting state it is delivered and every page, in order | loads the snapshot, drops the pages it covers, decides when to write one (14.40) |
+| answers the state after every input, with the build's rules version | stamps the snapshot's sequence and rules version, and the events' |
+| — | admits an input: deduplication, the refusal fact's stream check, a process manager's start rule by `starting_types` |
+| answers `Describe` with the descriptor it was given, unchanged | validates the descriptor angzarr-cli generated |
+| answers a status and a reason key with its args | owns the catalog's coordinator keys, and classifies every status (14.37's four classes) |
+| answers a policy's commands as business code returned them, grouped by triggering page | checks each command's destination, edition, root and correlation, stamps the edition and identity |
+| runs a translating callback for a refusal, or answers none | builds the pass-through `CommandRefused`, addresses and identifies every refusal fact |
+| — | builds every delivery well formed (no envelope guards in the router) |
+| reports a stale command's conflicts | judges the report: `CONFLICT_UNRESOLVED`, `CONFLICT_OVERLAP` |
 
-```
-conformance/proto (component declarations)
-        │  angzarr codegen <lang>
-        ▼
-generated wiring  ── typed seam + Register<Component>(router, handler)
-        │
-generated binding  ── (tools/abigen) role invokers, one trampoline;
-        │             stateless (the router owns every state)
-        │  C ABI (crates/router-ffi: 14 extern "C" fns)
-        ▼
-crates/router-ffi  ── descriptor → the one component's core table,
-        │             router-held state and projections
-        ▼
-crates/router      ── Rebuilder, DomainDispatch (aggregate or PM),
-                      PolicyDispatch, Router (one component),
-                      ProjectorDispatch, CodedError
-```
+## The API
 
-### crates/router (core)
+`crates/router` is a public contract, documented on each item. Business
+payloads are opaque `Any`s; the router calls thunks keyed by
+fully-qualified type name.
 
-Every dispatch rule lives here and is mutation-tested
-(`just mutation-test`). Business payloads are opaque `Any`s; the core
-calls thunks keyed by fully-qualified type name.
+- `Rebuilder<S>`: a state factory, per-type appliers (`apply`,
+  `apply_with_context`) or one batched fold (`with_fold`), the state type
+  (`with_state_type`), and the state's one codec (`with_state_codec`:
+  decode the starting state, encode the state answered).
+  `Rebuilder::of_message` takes all of them from a prost message.
+- `DomainDispatch<S>`: an aggregate (`new`) or a process manager
+  (`process_manager`; a PM is a domain, decision 14.31): command handlers
+  (`on_command`), fact handlers (`on_fact`, `on_fact_with_context`),
+  pass-through refusal handlers (`on_refused`), COMMUTATIVE support
+  (`with_commutative`, `with_commutative_via`) and the rules version
+  (`with_rules_version`).
+- `PolicyDispatch`: one input domain and one output domain, event handlers
+  (`on_event`, `on_event_with_context`) and translating callbacks for
+  refused commands (`on_refused`).
+- `ProjectorDispatch<P>`: the domains it consumes (`for_domains`, `*` for
+  every one), event folds (`on_event`) or one batched fold (`with_fold`),
+  and a finish step (`finish`).
+- `RouterBuilder`/`Router`: one component per router (owner ruling: one
+  coordinator, one component, one business process), and the descriptor
+  it answers `Describe` with (`RouterBuilder::descriptor`,
+  `Router::component_descriptor`). The traits `CommandHandler`,
+  `PolicyComponent` and `ProjectorHandler` let a runtime hold a component
+  of its own (one in another process, say); components may be registered
+  boxed.
+- `CodedError`, `HandlerError` and the reason keys (`error::codes`), and
+  the wire types re-exported as `pb`.
 
-### crates/router-ffi (C ABI)
-
-The exported surface (see `crates/router-ffi/src/lib.rs`):
-`angzarr_abi_version`, `angzarr_buf_alloc`, `angzarr_buf_release`,
-`angzarr_router_new`, `angzarr_router_free`, per component kind a
-`register_*` and a `dispatch*` entry point (aggregate, projector, policy,
-process manager), and `angzarr_router_component_descriptor`, which
-answers the component's registration hello (the spec's
-`ComponentDescriptor`, the one `ComponentService.Describe` answers, built by
-the router; the host only sends it) (ABI version 4). The aggregate's `dispatch` takes a
-`ContextualCommand` whose page carries a command or a fact and answers a
-`CommandHandlerResponse`; the policy's takes the source `EventBook`. A component is registered from a serialized descriptor
-(`proto/io/angzarr/router/ffi/v1/abi.proto`) listing `(fq_type,
-callback_id)` entries; every callback goes through one host function
-`angzarr_cb(callback_id, type_url, payload, aux, out)`.
-
-A router hosts exactly one component (owner ruling: one coordinator, one
-component, one business process), held as the core's `Router`: registering a
-second component of any kind is refused (`DUPLICATE_COMPONENT`, naming the
-one already hosted in metadata `component` and `component_kind`; a second
-upcaster chain is `DUPLICATE_UPCASTER_CHAIN`; the C ABI's
-`register_*` returns only the status code), and
-dispatching a kind the router does not host is `NO_COMPONENT_OF_KIND`
-(UNIMPLEMENTED). An
-aggregate whose upcaster chain accepts one of its own command types is
-refused at registration (`DUPLICATE_COMMAND_HANDLER`).
-
-### Bindings
-
-Generated from abi.proto by `tools/abigen`, never hand-written: the Python
-cffi layer (the `cdef`, the loader and its `angzarr_abi_version` check, the
-role invokers and the trampoline) is committed at
-`crates/router-ffi/generated/python/` and checked against a regeneration by
-abigen's tests. The hand-written Go, Java, C#, C++ and TypeScript bindings
-are retired (git history keeps them). Every callback is stateless: the
-router owns aggregate and process-manager state and projector projections,
-so a binding keeps no state of any kind.
-
-## Engine semantics
+## Semantics
 
 | Semantic | Contract |
 |---|---|
-| State rebuild | Snapshot applies first; pages at or below a LOADED snapshot's sequence never re-apply (a snapshot with no loader or no state covers nothing); pageless or unknown-type entries are skipped, never terminal; a page that fails to fold is a handler bug (INTERNAL, `FOLD_FAILED`, or `FOLD_FAILED_EMITTED` for a fold of the command's own events), whose ErrorInfo metadata names the page's `sequence` and `type_url` (or, when the fold could not say, the batch's `first_sequence` and `last_sequence`), the `state_type_url` the rebuilder declares (`Rebuilder::of_message`, `with_state_type`) and the fold's own failure, when it is a key and args (an applier's `CodedError`, `FoldFailure.cause`, a projector handler's coded error, `HANDLER_PANICKED`), as `cause` and `cause.<arg>`, never its text; a snapshot the loader cannot load fails with `PERSISTED_EVENT_CORRUPT`; a batched fold (`Rebuilder::with_fold`) gets every uncovered page in one call. Across the C ABI, aggregate and process-manager state is router-owned: a serialized `Any` of the registered state type, the delivered snapshot's state as the initial value, folded by one stateless host fold call per rebuild and handed to every decide / fact / PM callback; a failing host fold answers a `FoldFailure` (the failing page's index in the batch) and is never called again |
-| Aggregate dispatch | `CommandHandlerService.Handle` is the only input: envelope, body arm and type validate BEFORE rebuild (unknown command → `UNKNOWN_COMMAND_TYPE`, INTERNAL); handlers receive `CommandContext` (next sequence, had-prior-events, the handled cover, and `recorded_at`, when the input was accepted, from `ContextualCommand.recorded_at`); the emitted book passes through as the handler returned it (the coordinator stamps sequences and meta) |
-| Policy commands | Policy commands pass through as the handler emitted them, addressed in the trigger's edition (one naming another edition is refused `POLICY_COMMAND_OUTSIDE_EDITION`, INTERNAL): the coordinator stamps their identity, causation and correlation. A policy handler sees the triggering page's cover and sequence. A refusal of one comes back through `dispatch_refusal` (OnRefused) as the one refusal fact for the policy's source, passed through as `CommandRefused` or translated by its `on_refused` callback, which reads the refused command's `CommandContext` as the runtime passes it on (`context::command_context` of the `ContextualCommand` it delivered); `address_refusal_fact` sends it to the trigger's exact stream under the refused command's id |
-| Policy dispatch | EVERY page of the source book dispatches; undeclared types are skipped (C-0051). A policy translates between exactly two domains (decision 14.24): an answer holding a command whose cover names any domain but its one destination (`output_domain`; the C ABI's `PolicyDescriptor.output_domain`) is refused INTERNAL (`POLICY_COMMAND_OUTSIDE_DESTINATION`, metadata `expected_domain`, `actual_domain`) with no commands |
-| Facts | A fact arrives in the Fact arm of the command page and runs the fact handler registered for its type; a type with none (a command type included: the arm must match the handler's kind) is `NO_FACT_HANDLER` (INTERNAL) before any rebuild, so nothing is recorded. Otherwise the handler sees the rebuilt state and returns the fact to record (it may annotate it, never refuse it) followed by events that flag it; they come back as the response's events, payloads only. Facts route by (cover domain, fact type), else to the domain's first aggregate, which refuses them. There is no Replay |
-| Event upcasting | `Router::upcast` runs an `UpcastRequest` for the chain's domain through the component's own upcaster chain (part of the component, never a component of its own; C-0136); other requests, or a component with no chain, pass through unchanged |
-| Command upcasting | Command and fact payloads run through the aggregate's upcaster chains before dispatch; a refusal names the sent type URL, its extras the chain's last (`upcast_type_url`); routing tries the sent type, then the aggregate of the domain whose chain serves it (docs/design-handling.md) |
-| Conflicts | Handlers see the resolved `Handling` (`expected_sequence`, `conflict_resolution`). AGGREGATE_HANDLES hands the window and nonce in `CommandContext.conflict`; output without `resolve_conflicts(window, nonce)` on exactly that nonce is discarded: `CONFLICT_UNRESOLVED` (ABORTED). COMMUTATIVE runs in the router over the generated `changed()`: decide on the head, keep the events iff `changed(expected, head)` and `changed(head, head + events)` do not overlap, else `CONFLICT_OVERLAP` (ABORTED); none registered: `CONFLICT_RESOLUTION_UNSUPPORTED` |
-| Rules version | Every `CommandHandlerResponse` (an aggregate's or a PM's) carries the binary's declared rules version, overwriting a handler's. Snapshot selection is the coordinator's (decision 14.1) |
-| Process manager | A domain (decision 14.31): served by `DomainDispatch::process_manager`, its inputs commands and facts, its output its own events. `admit` applies its start rule: with no instance, a type it `starts` is dispatched, any other command is refused `PM_NO_INSTANCE` (FAILED_PRECONDITION) and any other fact is skipped. No triggers, no commands out |
-| Editions | The router never sees a meta-event and has no edition-lifecycle outcome (owner ruling, 2026-10-28): creating and forking a stream in an edition, refusing an arrival in an unforked or deleted edition, and deleting are the runtime's (annals' kernel and store; core's coordinator), decided before it calls the router. The one edition rule the router keeps: a policy's commands stay in their trigger's edition (`POLICY_COMMAND_OUTSIDE_EDITION`) |
-| Projector | Folds every page into one projection instance, each fold seeing the book cover and the page's sequence; undeclared domains fold nothing (C-0032), and a projector declaring `"*"` consumes every domain; unmatched types are skipped with a WARN; without a finish step the `Projection` carries the cover, the projector's name and its next sequence (the last page's sequence + 1, or the book's `next_sequence` with no pages); a failing fold is a handler bug (INTERNAL), named as a failing state fold is, with the projection type (`with_projection_type`) as `state_type_url`. Across the C ABI the projection is router-held (a serialized `Any` of the registered projection type, empty at first), folded by one stateless batched host fold call per delivery, and the router builds the `Projection` (cover, projector name, next sequence after the last page) |
-| Registration hello | Every component builds the spec's `ComponentDescriptor` from its own table (`component_descriptor()`): name, kind, inputs (a policy's input domain, a PM's sources, a projector's domains or `*`, none for an aggregate), the rules version, and for aggregates and PMs the state type the rebuilder declares with its resolutions (STRICT, AGGREGATE_HANDLES, plus COMMUTATIVE first with `changed()`). `Router::component_descriptor()` and the C ABI's `angzarr_router_component_descriptor` answer the one component's (`ComponentService.Describe`); an empty rules version is `MISSING_RULES_VERSION`, an undeclared state type `MISSING_STATE_TYPE` (both INTERNAL, naming the `component`) |
-| Snapshot | Every domain answer (an aggregate's or a PM's) carries `events.snapshot.state`, the state after its events (the emitted events, or a fact's record, folded at the sequences they will get). Sequence and rules version stay unset for the coordinator; a rejection has no body |
+| Folding | A delivered starting state (`EventBook.snapshot.state`) is decoded by the state's codec (`with_state_codec`; `of_message` decodes the state message); without one it is ignored. Then every page the book holds folds onto it, in order, whatever its sequence (14.40); pageless or unknown-type entries are skipped, never terminal. A starting state the codec cannot decode is `PERSISTED_EVENT_CORRUPT` (DATA_LOSS); a codec that panics is `FOLD_FAILED` naming the snapshot's `sequence` and `type_url`. A page that fails to fold is a handler bug (INTERNAL, `FOLD_FAILED`, or `FOLD_FAILED_EMITTED` for a fold of the command's own events), whose metadata names the page's `sequence` and `type_url` (or the batch's `first_sequence` and `last_sequence`), the `state_type_url`, and the fold's own failure, when it is a key and args, as `cause` and `cause.<arg>` |
+| Domain dispatch | `CommandHandlerService.Handle` is the only input: the page's body arm picks the table (a Command its command handler, a Fact its fact handler), the payload's type the handler, before any fold. A type nothing handles is `UNKNOWN_COMMAND_TYPE` or `NO_FACT_HANDLER` (INTERNAL), naming `type_url`, the type it was given; a delivery with no book, page, arm or payload is a command of no type. Handlers receive a `CommandContext` (next sequence, had-prior-events, the cover, the resolved Handling, the input's identity and `recorded_at`); the emitted book passes through as the handler returned it |
+| Facts | A fact handler sees the folded state and returns the fact to record and the events that flag it; they come back as the answer's events, payloads only. A `CommandRefused` runs the domain's `on_refused` handler for the refused command's type (none: `NO_REFUSAL_HANDLER`; one that does not decode: `ANY_DECODE_FAILED`) |
+| State on every answer | Every domain answer carries `events.snapshot.state`, the state after its events (folded at the sequences they will get), encoded by the codec; sequence and rules version stay unset for the coordinator. A rejection has no body |
+| Rules version | Every `CommandHandlerResponse` carries the domain's declared rules version (`with_rules_version`) |
+| Conflicts | Handlers see the resolved `Handling`. AGGREGATE_HANDLES hands the window and nonce in `CommandContext.conflict`, and the answer reports the nonce business code passed to `resolve_conflicts` (empty if none) in `CommandHandlerResponse.conflict`. COMMUTATIVE runs the registered resolver over the generated `changed()`: decide on the head, and report `changed(expected, head)` and `changed(head, head + events)`. Either way the events are answered; the coordinator judges. A COMMUTATIVE delivery with no resolver is `CONFLICT_RESOLUTION_UNSUPPORTED` |
+| Policy | EVERY page of the source book dispatches; undeclared types are skipped (C-0051). The answer holds one `PolicyReaction` per handled page, in page order, an empty one included, each carrying the commands as business code returned them (C-0690). A handler sees the triggering page's cover, sequence and metadata. OnRefused (`dispatch_refusal`) answers the translating callback's fact payload alone, as a fact page with no cover, handling or identity (C-0691), or no fact: no translation (C-0692) |
+| Projector | Folds every page into one projection instance, each fold seeing the cover and the page's sequence; undeclared domains fold nothing (C-0032), `*` consumes every domain; unmatched types are skipped with a WARN; without a finish step the `Projection` carries the cover, the projector's name and its next sequence. A failing fold is named as a state fold's is, with the projection type as `state_type_url` |
+| Describe | `Router::component_descriptor` answers the `ComponentDescriptor` the router was given (angzarr-cli generates it at build time), unchanged, and none when given none |
+| One component | A router hosts one component: none is `NO_HANDLERS_REGISTERED`, a second of any kind `DUPLICATE_COMPONENT` (both INTERNAL; the latter naming the hosted `component` and `component_kind`); dispatching a kind it does not host is `NO_COMPONENT_OF_KIND` (UNIMPLEMENTED) |
 | Type URLs | Emitted type URLs use the bare `/` prefix; incoming ones match by the fully-qualified name after the last `/`, whatever the prefix |
-| Errors | Decision 14.37: every error is a key and an argument map, never English. The status message IS the key; the `google.rpc.ErrorInfo` (domain `angzarr.io`) carries the same key and the args as metadata; a wrapped cause flattens to `cause` / `cause.<arg>`; `Display` is the key then ` name=value` args. One key per condition (`codes::ALL`). The status decides the class (`GrpcCode::class`): a business refusal (FAILED_PRECONDITION, INVALID_ARGUMENT, NOT_FOUND, ALREADY_EXISTS, OUT_OF_RANGE, PERMISSION_DENIED) reaches the policy's OnRefused (`refusal_response`); a bug (INTERNAL, UNKNOWN, DATA_LOSS) is alerted and dead-lettered; ABORTED, UNAVAILABLE and UNIMPLEMENTED are retried. A handler refuses with `rejection(BusinessStatus, key, args)` or a typed `refused(object)` (`COMMAND_REFUSED`, `refusal_type`), or fails as a `bug(key, args)` (`UNHANDLED_HANDLER_ERROR`, its key the `cause`); an unclassified error is `UNHANDLED_HANDLER_ERROR` with no cause and a panic is caught (`cause` `HANDLER_PANICKED`), their text left to the log. The router's own malformed-input and misconfiguration errors are INTERNAL; no component for the request → UNIMPLEMENTED (`NO_COMPONENT_OF_KIND`, `POLICY_SOURCE_OUTSIDE_INPUT_DOMAIN`); `PERSISTED_EVENT_CORRUPT` → DATA_LOSS; `CONFLICT_UNRESOLVED` and `CONFLICT_OVERLAP` → ABORTED |
+| Errors | Decision 14.37: every error is a key and an argument map, never English. The status message IS the key; the `google.rpc.ErrorInfo` (domain `angzarr.io`) carries the same key and the args as metadata; a wrapped cause flattens to `cause` / `cause.<arg>`; `Display` is the key then ` name=value` args. `codes::ALL` is exactly the catalog's router keys (`catalog/reasons.toml`, `owner = "router"`). A handler refuses with `rejection(BusinessStatus, key, args)` or a typed `refused(object)` (`COMMAND_REFUSED`, `refusal_type`), returns at once with `immediate(key, args)` (ABORTED), or fails as a `bug(key, args)` or a `retryable_bug(status, key, args)` (`UNHANDLED_HANDLER_ERROR`, its key the `cause`); an unclassified error is `UNHANDLED_HANDLER_ERROR` with no cause, and a panic is caught (`cause` `HANDLER_PANICKED`), their text left to the log. The router never classifies: what a status means is the coordinator's |
 
-Not provided here: gRPC serving, health/readiness and transport
-configuration, and CloudEvents. Those remain with the host application or the client-*
-libraries.
+Not provided here: gRPC serving, health and readiness, transport
+configuration, CloudEvents, and every duty the table above gives the
+coordinator.
 
 ## Testing
 
-- `just test`: the core unit bank, the FFI's raw-pointer ABI consumer test
-  (`crates/router-ffi/src/lib.test.rs`), and the conformance features
-  driven natively by cucumber-rs (`crates/conformance`), including angzarr-project's handler-contract tier (`features/handler-contract/handling.feature`, bound by scenario id from the submodule).
-- The `*_ffi` conformance targets (in `just test`): the same
-  `conformance/features` run through the C ABI by router-ffi's Rust host,
-  the fixtures restated as role callbacks.
-- `just mutation-test`: cargo-mutants over the core modules, the FFI
-  registry and the architecture linter, every missed mutant a failure.
-  The pre-push hook runs `just mutation-push`, the same over only what
-  the push adds.
-- `just archlint`: the layering above as checked rules — `archlint.toml`
-  (engine below the C ABI, components independent of each other and of the
-  router, conformance on the public surfaces or through the C ABI as a
-  binding, the generator reading only abi.proto), enforced
-  by `tools/archlint` over every module's `use`/path references and every
+- `just test`: the unit bank (`crates/router/src/*.test.rs`) and the
+  handler-contract tier, run whole from the submodule by cucumber-rs
+  (`crates/conformance`, one harness per tier feature).
+- `just mutation-test`: cargo-mutants over the router's modules and the
+  architecture linter, every missed mutant a failure. The pre-push hook
+  runs `just mutation-push`, the same over only what the push adds.
+- `just archlint`: the layering as checked rules (`archlint.toml`: the
+  router below the harness, its components independent of each other and
+  of the `Router` that composes them, the harness on the public surface),
+  enforced by `tools/archlint` over every module's references and every
   manifest dependency. Runs in pre-commit and CI.

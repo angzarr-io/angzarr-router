@@ -1,102 +1,79 @@
 # angzarr-router
 
-The shared angzarr client router: the engine that dispatches
-commands/events to business handlers, rebuilds state, fans out, and maps
-errors — implemented **once, in Rust**, and exposed through a generic C
-ABI (`crates/router-ffi`, defined as data in
-`proto/io/angzarr/router/ffi/v1/abi.proto`) whose bindings are generated
-from that proto by `tools/abigen` (Python first; client-python vendors it).
-The hand-written Go, Java, C#, TypeScript and C++ bindings are retired
-(owner's ruling, 2026-10-29); git history keeps them.
+The angzarr router for Rust: the part of a client library that calls
+business code. It is the reference router; Python has a native router of
+its own (decision 14.42), and every router, in every language, is held to
+the same contract, angzarr-project's handler-contract tier
+(`features/handler-contract/`).
 
-The `angzarr-client-*` libraries (including client-rust) still carry
-their own engines today; none of them links this router yet. client-rust
-is planned to adopt `crates/router`'s Rust-native API directly (no FFI). See
-[docs/architecture.md](docs/architecture.md) for where the router sits,
-its layers, and the engine semantics it guarantees. The decision is
-recorded as `docs/adr/0001-shared-rust-router-via-ffi.md` in
-[angzarr-project](https://github.com/angzarr-io/angzarr-project).
+The router keeps dispatch, and only dispatch. For one component (an
+aggregate, a process manager, a policy or a projector) it:
 
-## Why this exists: code size & complexity
+- routes an input by its type URL to the business code registered for it,
+  refusing a type nothing handles (`UNKNOWN_COMMAND_TYPE`,
+  `NO_FACT_HANDLER`, `NO_REFUSAL_HANDLER`);
+- folds the starting state and every page it is given;
+- runs decide (a command) or ingest (a fact), and answers the events, the
+  state after them and the build's rules version;
+- reports a stale command's conflicts: the nonce business code settled
+  with (AGGREGATE_HANDLES), or the window's and the command's conflict
+  units (COMMUTATIVE);
+- runs a policy's handlers once per page and answers their commands
+  grouped by the page that triggered them, and runs its translating
+  callback for a refusal, or answers that it has none;
+- runs a projector;
+- turns whatever escapes business code into a reason key and its args.
 
-The dispatch engine — command/event routing, state rebuild, error→gRPC
-mapping, sequence stamping, compensation/rejection fan-out — is
-hand-written and maintained **once per language** in the client-*
-libraries, each a line-for-line transliteration of the same subtle
-semantics. This crate implements that engine **once** and shares it over
-the C ABI; each language keeps only a thin marshaling binding (and its
-own transport, which the router never touches). The savings below are
-realised for a language once its client library adopts the binding and
-retires its own engine.
+Everything else is the coordinator's (core's coordinator, and the
+angzarr-embedded kernel): upcasting, through the component's upcaster
+sidecar (14.39); loading snapshots and dropping the pages they cover, and
+deciding when to write one (14.40); admission (deduplication, the refusal
+fact's stream check, a process manager's start rule); validating the
+descriptor angzarr-cli generates; the reason catalog and classifying a
+status; checking and stamping a policy's commands; building and addressing
+refusal facts; envelope guards; and judging a conflict report (14.42).
 
-Measured prod LOC, dispatch layer only (transport / coordinator excluded —
-they stay per-language either way):
+The router has no transport: the host serves the coordinator's gRPC
+services and hands the framework messages to it. There is no C ABI; the
+router-ffi crate and the hand-written Go, Java, C#, C++ and TypeScript
+bindings are retired (git history keeps them).
 
-| | Old (per language) | New |
-|---|---|---|
-| Semantic core | ~4,000, owned alone | **2,115**, shared (÷ N languages) |
-| Marshaling / binding | (folded into the above) | ~950, mechanical, partly generated |
-
-Per language the dispatch layer would drop **~4,000 → ~1,300** LOC, and the
-*semantic* share drops ~4,000 → ~350 (amortized over six languages).
-Across six languages, **~24,000 → ~7,800** total — and the bug-prone
-invariants (undeclared-is-silent-not-error,
-exact type-URL match, the body arm matching the handler's kind) are
-implemented, mutation-tested to ~1.0 kill, and proven by
-**one** behavioral conformance suite run against every language — not
-re-derived and re-tested six times. A fix lands once, in every binding.
-
-(Figures are prod-LOC proxies with a hand-drawn dispatch/transport
-boundary, measured during the bootstrap, before the latest spec moved
-sequence stamping and compensation out of the client libraries. The shared test bank — core +
-FFI + conformance — is likewise written once.)
-
-## The POC line (`poc/dispatch`)
-
-This line brings the pure dispatch to spec 55eab0f for the angzarr/annals
-POC: a process manager is a domain (decision 14.31; the trigger-fed
-`ProcessManagerDispatch` is deleted), refusals are typed and come back
-through a policy's OnRefused, and `DomainDispatch::admit` applies the
-rules an input meets before its handler runs (deduplication,
-the PM start rule). `crates/router-ffi` is back in the workspace as the generic C ABI (one
-register of a ComponentSpec, one dispatch, role-typed callbacks), and the
-conformance suite runs through it (`crates/conformance`, the `*_ffi`
-targets).
+See [docs/architecture.md](docs/architecture.md) for the API and the
+semantics it guarantees.
 
 ## Layout
 
 ```
 crates/
-├── router/        # core crate: Rebuilder, domain (aggregate or PM)/Policy/Projector dispatch
-├── router-ffi/    # the generic C ABI over the core (cdylib) + its Rust host
-└── conformance/   # cucumber-rs harness: conformance/features against the core, and through the C ABI
-tools/abigen/      # generates the C ABI's bindings (Rust role shims, the Python cffi layer) from abi.proto
-conformance/       # shared behaviour suite (features, fixture proto, .txtpb skeletons)
-proto/             # the router's own ABI protos (io.angzarr.router.ffi.v1)
+├── router/        # the router: Rebuilder, DomainDispatch (aggregate or PM),
+│                  # PolicyDispatch, ProjectorDispatch, Router, CodedError
+└── conformance/   # cucumber-rs harness: the handler-contract tier against the router
+tools/archlint/    # the architecture linter (archlint.toml)
 ```
 
 ## Protos
 
 The framework protos come from the repo-local `angzarr-project/`
-submodule (the org convention); `ANGZARR_PROJECT_PROTO` overrides it
-when set. The io.angzarr.v1 wire types are angzarr-project's
-`rust/angzarr-proto` crate at the submodule's commit (re-exported as
-`angzarr_router::pb`); `crates/router/build.rs` generates only the
-service-proto messages that crate does not compile
-(`CommandHandlerResponse`, `PolicyResponse`, `Refusal`,
-`OnRefusedResponse`), against its types. The `mutation-test` target passes the submodule's absolute
-path through that env var so cargo-mutants' copied trees build.
+submodule (the org convention); `ANGZARR_PROJECT_PROTO` overrides it when
+set. The io.angzarr.v1 wire types are angzarr-project's `rust/angzarr-proto`
+crate at the submodule's commit (re-exported as `angzarr_router::pb`);
+`crates/router/build.rs` generates only the service-proto messages that
+crate does not compile (`CommandHandlerResponse`, `PolicyResponse`,
+`Refusal`, `OnRefusedResponse`), against its types. The reason keys are the
+submodule's `catalog/reasons.toml` router keys, checked by a test. The
+`mutation-test` target passes the submodule's absolute path through
+`ANGZARR_PROJECT_PROTO` so cargo-mutants' copied trees build.
 
 ## Development
 
 ```bash
-just build              # cargo build --workspace (also builds the router-ffi cdylib)
-just test               # core + FFI ABI tests + abigen + conformance (native and through the C ABI)
-just mutation-test      # cargo-mutants over the core, the FFI registry and archlint
+just build              # cargo build --workspace
+just test               # the unit bank and the handler-contract tier
+just mutation-test      # cargo-mutants over the router and archlint, 100%
 just mutation-push      # pre-push: the same, over what a push adds (stdin: git's pushed refs)
 just lint               # clippy -D warnings
 just archlint           # module-level layer rules (archlint.toml)
-cargo run -p angzarr-abigen -- python   # regenerate the committed Python cffi layer
+just fmt-check          # rustfmt, no rewrite
 ```
 
 Every recipe runs in the org's pinned Rust toolchain image (see
