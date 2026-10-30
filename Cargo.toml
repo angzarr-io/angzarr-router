@@ -1,17 +1,16 @@
 [workspace]
 resolver = "2"
-members = ["crates/router", "crates/conformance", "tools/archlint"]
+members = ["crates/router", "crates/router-ffi", "crates/conformance", "tools/abigen", "tools/archlint"]
 # The angzarr-project submodule's crates are standalone workspaces of their
 # own (angzarr-proto declares `[workspace]`), consumed here as path
 # dependencies only.
 #
-# crates/router-ffi (the C ABI the Go/Java/C#/C++/TypeScript bindings link)
-# is out of the workspace on the POC line (poc/dispatch): it is the router's
-# distributed side, which the angzarr/annals POC leaves broken (plan "SCOPE
-# NOW"). It still registers trigger-fed process managers, which spec 636b313
-# deleted (decision 14.31), so it does not build against this pin. Restore it
-# to `members` when the distributed side is brought to the spec.
-exclude = ["angzarr-project", "crates/router-ffi"]
+# crates/router-ffi is the router's C ABI (owner's ruling, 2026-10-29): a
+# generic, generated ABI (proto/io/angzarr/router/ffi/v1/abi.proto) whose
+# bindings tools/abigen generates. It is in the workspace so its drift from
+# the engine fails the build, and the conformance suite runs through it
+# (crates/conformance, the `*_ffi` test targets).
+exclude = ["angzarr-project"]
 
 [workspace.package]
 version = "0.1.0"

@@ -1,19 +1,26 @@
-//! angzarr-router-ffi — the C ABI over the core. Dispatch semantics live in
-//! the core; this layer owns the marshaling. A router hosts exactly ONE
-//! component (owner ruling: one coordinator, one component, one business
-//! process): one aggregate, saga, process manager or projector, held as the
-//! core's `Router`. Registering a second component of any kind is refused
-//! DUPLICATE_REGISTRATION; dispatching a kind the router does not host is
-//! NO_HANDLER_REGISTERED.
+//! angzarr-router-ffi — the router's generic C ABI (owner's ruling,
+//! 2026-10-29). The ABI is data: proto/io/angzarr/router/ffi/v1/abi.proto
+//! defines the one component a router hosts (ComponentSpec: a kind and its
+//! roles), the one call that drives it (DispatchRequest/DispatchResponse)
+//! and each role's Call and Return; tools/abigen generates the bindings
+//! from it. Dispatch semantics live in the core; this layer owns the
+//! marshaling.
+//!
+//! # Entry points
+//! Seven, and no per-kind symbol: `angzarr_abi_version`, `angzarr_buf_alloc`,
+//! `angzarr_buf_release`, `angzarr_router_new`, `angzarr_router_free`,
+//! `angzarr_router_register` and `angzarr_router_dispatch`
+//! (angzarr_abigen::SYMBOLS declares them for the bindings).
 //!
 //! # Status codes
 //! Every entry point and host callback returns `i32`:
 //! - `0`  — success; `out` carries the payload (possibly empty bytes)
-//! - `1`  — success with NO payload (a handler that emits nothing)
+//! - `1`  — success with NO payload (the Return message's default)
 //! - `<0` — coded failure; the value is the negated gRPC status code and
-//!   `out` carries serialized `google.rpc.Status` bytes with a
-//!   `google.rpc.ErrorInfo` detail (reason = SCREAMING_SNAKE code,
-//!   domain `angzarr.io`, metadata = extras)
+//!   `out` carries serialized `google.rpc.Status` bytes: message = the key,
+//!   a `google.rpc.ErrorInfo` (reason = the key, domain `angzarr.io`,
+//!   metadata = the args) and, for a typed refusal, the refusal object
+//!   (decision 14.37: no English crosses)
 //!
 //! # Memory ownership (symmetric, copy-at-the-boundary)
 //! - Router → host: `type_url`/`payload`/`aux` buffers are router-owned
@@ -21,42 +28,38 @@
 //! - Host → router: a callback fills `out.data` with memory obtained from
 //!   `angzarr_buf_alloc`; the router consumes and frees it. Bindings
 //!   never free router memory with their own allocator.
-//! - Router → host responses: `angzarr_router_dispatch` fills `out` with
-//!   router-allocated bytes; the host copies what it needs and releases
-//!   them with `angzarr_buf_release`.
+//! - Router → host responses: `angzarr_router_register` and
+//!   `angzarr_router_dispatch` fill `out` with router-allocated bytes; the
+//!   host copies what it needs and releases them with `angzarr_buf_release`.
 //!
 //! # Threading and panics
 //! Callbacks are invoked synchronously on the dispatching thread, one
 //! callback at a time per dispatch; dispatches on different threads may run
-//! concurrently against one router.
-//!
-//! # State
-//! All component state is router-owned: the router holds it as a serialized
-//! `google.protobuf.Any` of the registered state (or projection) type and
-//! hands it to every callback (fold, decide, fact, PM event), which are
-//! stateless; a delivered snapshot is the initial state. A binding keeps no
-//! state of any kind between or within dispatches, and nothing per-dispatch
-//! crosses the boundary but the callback's own buffers.
-//! Registration takes the router exclusively: it must not run concurrently
-//! with any other call on the same router.
-//! Every entry point wraps `catch_unwind`; a Rust panic surfaces as a
-//! coded UNHANDLED_HANDLER_ERROR failure — never an abort, never an
-//! unwind across the boundary.
+//! concurrently against one router. Registration takes the router
+//! exclusively: it must not run concurrently with any other call on the
+//! same router. Every entry point wraps `catch_unwind`; a Rust panic
+//! surfaces as UNHANDLED_HANDLER_ERROR with cause HANDLER_PANICKED — never
+//! an abort, never an unwind across the boundary.
 
 mod abi;
+#[cfg(any(test, feature = "host"))]
+pub mod host;
 mod proto;
 mod registry;
 
 use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-pub use abi::{AngzarrBuf, AngzarrCb};
+pub use abi::{AngzarrBuf, AngzarrCb, ABI_VERSION, STATUS_OK, STATUS_OK_EMPTY};
+/// The ABI's generated messages (abi.proto) and the vendored google.rpc
+/// error shapes, for Rust hosts.
+pub use proto::{google, io::angzarr::router::ffi::v1 as abi_pb};
 
-use abi::{coded_to_status_bytes, fill_out, ABI_VERSION};
-use angzarr_router::error::CodedError;
+use abi::{coded_to_status_bytes, fill_out};
+use angzarr_router::error::{codes, CodedError, GrpcCode};
 use registry::FfiRouter;
 
-/// The ABI version bindings must check at load.
+/// The ABI version bindings must check at load: abi.proto's hash.
 #[no_mangle]
 pub extern "C" fn angzarr_abi_version() -> u32 {
     ABI_VERSION
@@ -69,8 +72,8 @@ pub extern "C" fn angzarr_buf_alloc(len: usize) -> *mut u8 {
     abi::alloc_bytes(len)
 }
 
-/// Releases a router-allocated response buffer (the `out` filled by
-/// `angzarr_router_dispatch`). Never used on callback input buffers.
+/// Releases a router-allocated response buffer (an `out` the router
+/// filled). Never used on callback input buffers.
 ///
 /// # Safety
 /// `ptr`/`len` must be exactly what the router handed out, released once.
@@ -96,274 +99,44 @@ pub unsafe extern "C" fn angzarr_router_free(r: *mut c_void) {
     }
 }
 
-/// Registers one aggregate component from a serialized
-/// `io.angzarr.router.ffi.v1.AggregateDescriptor` and the host's callback
-/// gateway. Returns 0 on success, a negated gRPC code on failure.
-///
-/// # Safety
-/// `r` must be a live router; `descriptor` must point to `descriptor_len`
-/// readable bytes; `cb` must remain valid for the router's lifetime.
-#[no_mangle]
-pub unsafe extern "C" fn angzarr_router_register_aggregate(
-    r: *mut c_void,
-    descriptor: *const u8,
-    descriptor_len: usize,
-    cb: AngzarrCb,
-) -> i32 {
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        if r.is_null() {
-            return Err(invalid_pointer("router"));
-        }
-        let router = &mut *(r as *mut FfiRouter);
-        let bytes = slice_from(descriptor, descriptor_len);
-        router.register_aggregate(bytes, cb)
-    }));
-    match flatten_panic(result) {
-        Ok(()) => 0,
-        Err(err) => -(err.grpc as i32),
-    }
-}
-
-/// Registers one projector component from a serialized
-/// `io.angzarr.router.ffi.v1.ProjectorDescriptor` and the host's callback
-/// gateway. Returns 0 on success, a negated gRPC code on failure.
-///
-/// # Safety
-/// `r` must be a live router; `descriptor` must point to `descriptor_len`
-/// readable bytes; `cb` must remain valid for the router's lifetime.
-#[no_mangle]
-pub unsafe extern "C" fn angzarr_router_register_projector(
-    r: *mut c_void,
-    descriptor: *const u8,
-    descriptor_len: usize,
-    cb: AngzarrCb,
-) -> i32 {
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        if r.is_null() {
-            return Err(invalid_pointer("router"));
-        }
-        let router = &mut *(r as *mut FfiRouter);
-        let bytes = slice_from(descriptor, descriptor_len);
-        router.register_projector(bytes, cb)
-    }));
-    match flatten_panic(result) {
-        Ok(()) => 0,
-        Err(err) => -(err.grpc as i32),
-    }
-}
-
-/// Dispatches `EventBook` bytes through the registered projector. On success
-/// returns 0 and fills `out` with `Projection` bytes; on failure returns the
-/// negated gRPC code and fills `out` with `google.rpc.Status` bytes. Either
-/// way the host releases `out` with `angzarr_buf_release`.
-///
-/// # Safety
-/// `r` must be a live router; `request` must point to `request_len` readable
-/// bytes; `out` must point to a writable `AngzarrBuf`.
-#[no_mangle]
-pub unsafe extern "C" fn angzarr_router_dispatch_projector(
-    r: *mut c_void,
-    request: *const u8,
-    request_len: usize,
-    out: *mut AngzarrBuf,
-) -> i32 {
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        if r.is_null() {
-            return Err(invalid_pointer("router"));
-        }
-        let router = &*(r as *const FfiRouter);
-        let bytes = slice_from(request, request_len);
-        router.dispatch_projector(bytes)
-    }));
-    match flatten_panic(result) {
-        Ok(response) => {
-            fill_out(out, &response);
-            0
-        }
-        Err(err) => {
-            let code = err.grpc as i32;
-            fill_out(out, &coded_to_status_bytes(err));
-            -code
-        }
-    }
-}
-
-/// Fills `out` with the registered component's registration hello: a
-/// serialized `io.angzarr.v1.ComponentDescriptor` (the spec's
-/// `ComponentService.Describe` answer) the router built from its own table.
-/// The host only sends it to its coordinator. A component that cannot build
-/// one (`MISSING_RULES_VERSION` or `MISSING_STATE_TYPE`, INVALID_ARGUMENT,
-/// naming it) or a router with no component yet (`NO_HANDLERS_REGISTERED`)
-/// refuses the call: returns the negated gRPC code and fills `out` with
-/// `google.rpc.Status` bytes. Either way the host releases `out` with
+/// Registers the router's one component from a serialized
+/// `io.angzarr.router.ffi.v1.ComponentSpec` and the host's callback gateway.
+/// Returns 0 on success (`out` empty); on failure the negated gRPC code,
+/// `out` its `google.rpc.Status`. The host releases a filled `out` with
 /// `angzarr_buf_release`.
 ///
 /// # Safety
-/// `r` must be a live router; `out` must point to a writable `AngzarrBuf`.
+/// `r` must be a live router or null; `spec` must point to `spec_len`
+/// readable bytes; `cb` must remain valid for the router's lifetime; `out`
+/// must point to a writable `AngzarrBuf`.
 #[no_mangle]
-pub unsafe extern "C" fn angzarr_router_component_descriptor(
+pub unsafe extern "C" fn angzarr_router_register(
     r: *mut c_void,
+    spec: *const u8,
+    spec_len: usize,
+    cb: AngzarrCb,
     out: *mut AngzarrBuf,
 ) -> i32 {
-    let result = catch_unwind(AssertUnwindSafe(|| {
+    entry(out, || {
         if r.is_null() {
-            return Err(invalid_pointer("router"));
-        }
-        let router = &*(r as *const FfiRouter);
-        router.component_descriptor()
-    }));
-    match flatten_panic(result) {
-        Ok(response) => {
-            fill_out(out, &response);
-            0
-        }
-        Err(err) => {
-            let code = err.grpc as i32;
-            fill_out(out, &coded_to_status_bytes(err));
-            -code
-        }
-    }
-}
-
-/// Registers one saga component from a serialized
-/// `io.angzarr.router.ffi.v1.SagaDescriptor` and the host's callback
-/// gateway. Returns 0 on success, a negated gRPC code on failure.
-///
-/// # Safety
-/// `r` must be a live router; `descriptor` must point to `descriptor_len`
-/// readable bytes; `cb` must remain valid for the router's lifetime.
-#[no_mangle]
-pub unsafe extern "C" fn angzarr_router_register_saga(
-    r: *mut c_void,
-    descriptor: *const u8,
-    descriptor_len: usize,
-    cb: AngzarrCb,
-) -> i32 {
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        if r.is_null() {
-            return Err(invalid_pointer("router"));
+            return Err(null_pointer());
         }
         let router = &mut *(r as *mut FfiRouter);
-        let bytes = slice_from(descriptor, descriptor_len);
-        router.register_saga(bytes, cb)
-    }));
-    match flatten_panic(result) {
-        Ok(()) => 0,
-        Err(err) => -(err.grpc as i32),
-    }
+        router.register(slice_from(spec, spec_len), cb)?;
+        Ok(Vec::new())
+    })
 }
 
-/// Dispatches the source `EventBook` bytes through the sagas consuming its
-/// domain. On success returns 0 and fills `out` with `SagaResponse` bytes; on failure
-/// returns the negated gRPC code and fills `out` with `google.rpc.Status`
-/// bytes. Either way the host releases `out` with `angzarr_buf_release`.
+/// Runs one serialized `io.angzarr.router.ffi.v1.DispatchRequest` through
+/// the hosted component. On success returns 0 and fills `out` with the
+/// `DispatchResponse`; on failure returns the negated gRPC code and fills
+/// `out` with `google.rpc.Status` bytes. Either way the host releases `out`
+/// with `angzarr_buf_release`.
 ///
 /// # Safety
-/// `r` must be a live router; `request` must point to `request_len` readable
-/// bytes; `out` must point to a writable `AngzarrBuf`.
-#[no_mangle]
-pub unsafe extern "C" fn angzarr_router_dispatch_saga(
-    r: *mut c_void,
-    request: *const u8,
-    request_len: usize,
-    out: *mut AngzarrBuf,
-) -> i32 {
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        if r.is_null() {
-            return Err(invalid_pointer("router"));
-        }
-        let router = &*(r as *const FfiRouter);
-        let bytes = slice_from(request, request_len);
-        router.dispatch_saga(bytes)
-    }));
-    match flatten_panic(result) {
-        Ok(response) => {
-            fill_out(out, &response);
-            0
-        }
-        Err(err) => {
-            let code = err.grpc as i32;
-            fill_out(out, &coded_to_status_bytes(err));
-            -code
-        }
-    }
-}
-
-/// Registers one process-manager component from a serialized
-/// `io.angzarr.router.ffi.v1.ProcessManagerDescriptor` and the host's
-/// callback gateway. Returns 0 on success, a negated gRPC code on failure.
-///
-/// # Safety
-/// `r` must be a live router; `descriptor` must point to `descriptor_len`
-/// readable bytes; `cb` must remain valid for the router's lifetime.
-#[no_mangle]
-pub unsafe extern "C" fn angzarr_router_register_process_manager(
-    r: *mut c_void,
-    descriptor: *const u8,
-    descriptor_len: usize,
-    cb: AngzarrCb,
-) -> i32 {
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        if r.is_null() {
-            return Err(invalid_pointer("router"));
-        }
-        let router = &mut *(r as *mut FfiRouter);
-        let bytes = slice_from(descriptor, descriptor_len);
-        router.register_process_manager(bytes, cb)
-    }));
-    match flatten_panic(result) {
-        Ok(()) => 0,
-        Err(err) => -(err.grpc as i32),
-    }
-}
-
-/// Dispatches `ProcessManagerHandleRequest` bytes through the registered
-/// process manager. On success returns 0 and fills `out` with
-/// `ProcessManagerHandleResponse` bytes; on failure returns the negated gRPC
-/// code and fills `out` with `google.rpc.Status` bytes. Either way the host
-/// releases `out` with `angzarr_buf_release`.
-///
-/// # Safety
-/// `r` must be a live router; `request` must point to `request_len` readable
-/// bytes; `out` must point to a writable `AngzarrBuf`.
-#[no_mangle]
-pub unsafe extern "C" fn angzarr_router_dispatch_process_manager(
-    r: *mut c_void,
-    request: *const u8,
-    request_len: usize,
-    out: *mut AngzarrBuf,
-) -> i32 {
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        if r.is_null() {
-            return Err(invalid_pointer("router"));
-        }
-        let router = &*(r as *const FfiRouter);
-        let bytes = slice_from(request, request_len);
-        router.dispatch_process_manager(bytes)
-    }));
-    match flatten_panic(result) {
-        Ok(response) => {
-            fill_out(out, &response);
-            0
-        }
-        Err(err) => {
-            let code = err.grpc as i32;
-            fill_out(out, &coded_to_status_bytes(err));
-            -code
-        }
-    }
-}
-
-/// Dispatches `ContextualCommand` bytes (a command, or a fact in the page's
-/// Fact arm) through the registered tables. On success returns 0 and fills
-/// `out` with `CommandHandlerResponse` bytes; on
-/// failure returns the negated gRPC code and fills `out` with
-/// `google.rpc.Status` bytes. Either way the host releases `out` with
-/// `angzarr_buf_release`.
-///
-/// # Safety
-/// `r` must be a live router; `request` must point to `request_len`
-/// readable bytes; `out` must point to a writable `AngzarrBuf`.
+/// `r` must be a live router or null; `request` must point to
+/// `request_len` readable bytes; `out` must point to a writable
+/// `AngzarrBuf`.
 #[no_mangle]
 pub unsafe extern "C" fn angzarr_router_dispatch(
     r: *mut c_void,
@@ -371,25 +144,33 @@ pub unsafe extern "C" fn angzarr_router_dispatch(
     request_len: usize,
     out: *mut AngzarrBuf,
 ) -> i32 {
-    let result = catch_unwind(AssertUnwindSafe(|| {
+    entry(out, || {
         if r.is_null() {
-            return Err(invalid_pointer("router"));
+            return Err(null_pointer());
         }
         let router = &*(r as *const FfiRouter);
-        let bytes = slice_from(request, request_len);
-        router.dispatch(bytes)
-    }));
-    match flatten_panic(result) {
-        Ok(response) => {
-            fill_out(out, &response);
-            0
+        router.dispatch(slice_from(request, request_len))
+    })
+}
+
+/// Runs an entry point's body, answering 0 and its bytes, or the negated
+/// gRPC code and the error's Status; a panic anywhere, the body's or the
+/// encoding's, is answered rather than unwound.
+fn entry(out: *mut AngzarrBuf, body: impl FnOnce() -> Result<Vec<u8>, CodedError>) -> i32 {
+    let err = match catch_unwind(AssertUnwindSafe(body)) {
+        Ok(Ok(bytes)) => {
+            fill_out(out, &bytes);
+            return 0;
         }
-        Err(err) => {
-            let code = err.grpc as i32;
-            fill_out(out, &coded_to_status_bytes(err));
-            -code
-        }
+        Ok(Err(err)) => err,
+        Err(_) => CodedError::panicked(),
+    };
+    let code = err.grpc as i32;
+    match catch_unwind(AssertUnwindSafe(|| coded_to_status_bytes(&err))) {
+        Ok(bytes) => fill_out(out, &bytes),
+        Err(_) => fill_out(out, &[]),
     }
+    -code
 }
 
 unsafe fn slice_from<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
@@ -400,27 +181,14 @@ unsafe fn slice_from<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
     }
 }
 
-fn invalid_pointer(what: &str) -> CodedError {
-    CodedError::unhandled(&format!("null {what} pointer crossed the ABI"))
-}
-
-/// A panic anywhere inside an entry point becomes a coded
-/// UNHANDLED_HANDLER_ERROR — never an unwind across the boundary.
-fn flatten_panic<T>(result: std::thread::Result<Result<T, CodedError>>) -> Result<T, CodedError> {
-    match result {
-        Ok(inner) => inner,
-        // &*panic: pass the payload itself, not the Box (which is also Any).
-        Err(panic) => Err(CodedError::unhandled(&panic_message(&*panic))),
-    }
-}
-
-fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
-    if let Some(s) = panic.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else if let Some(s) = panic.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "panic crossed the FFI entry point".to_string()
+/// A null router pointer crossing the ABI: NULL_ABI_POINTER, a binding bug
+/// (INTERNAL).
+fn null_pointer() -> CodedError {
+    CodedError {
+        code: codes::NULL_ABI_POINTER.to_string(),
+        extras: Default::default(),
+        grpc: GrpcCode::Internal,
+        refusal: None,
     }
 }
 

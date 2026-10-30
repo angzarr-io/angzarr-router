@@ -204,6 +204,13 @@ pub mod codes {
     pub const HOST_STATUS_UNDECODABLE: &str = "HOST_STATUS_UNDECODABLE";
     /// A null pointer crossing the C ABI.
     pub const NULL_ABI_POINTER: &str = "NULL_ABI_POINTER";
+    /// A C ABI ComponentSpec role its component's kind does not take (args
+    /// `role`, `component_kind`).
+    pub const ROLE_NOT_FOR_KIND: &str = "ROLE_NOT_FOR_KIND";
+    /// A C ABI ComponentSpec naming no component kind.
+    pub const MISSING_COMPONENT_KIND: &str = "MISSING_COMPONENT_KIND";
+    /// A C ABI DispatchRequest naming no request.
+    pub const EMPTY_DISPATCH_REQUEST: &str = "EMPTY_DISPATCH_REQUEST";
 
     // --- the store ------------------------------------------------------------
     pub const PERSISTED_EVENT_CORRUPT: &str = "PERSISTED_EVENT_CORRUPT";
@@ -288,6 +295,9 @@ pub mod codes {
         CONFLICT_RESOLUTION_UNSUPPORTED,
         HOST_STATUS_UNDECODABLE,
         NULL_ABI_POINTER,
+        ROLE_NOT_FOR_KIND,
+        MISSING_COMPONENT_KIND,
+        EMPTY_DISPATCH_REQUEST,
         PERSISTED_EVENT_CORRUPT,
         CONFLICT_UNRESOLVED,
         CONFLICT_OVERLAP,
@@ -344,6 +354,8 @@ pub mod extras {
     /// A third-party library's own error text, verbatim (decision 14.37,
     /// owner's rulings 2026-10-29, late): the one text an arg may hold.
     pub const EXT_ERR_TXT: &str = "ext_err_txt";
+    /// A C ABI role, as its abi.proto enum value name (ROLE_NOT_FOR_KIND).
+    pub const ROLE: &str = "role";
 }
 
 /// Where a failing fold failed: the page, when known, else the batch's

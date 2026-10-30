@@ -1,9 +1,13 @@
 //! Cucumber harness: drives the shared `.feature` behavior suite against the
-//! Rust core natively. Step defs parse the orthogonal `.txtpb` skeletons,
-//! set the scenario's data by field, dispatch, and assert outcomes.
+//! Rust core. Step defs parse the orthogonal `.txtpb` skeletons, set the
+//! scenario's data by field, dispatch, and assert outcomes.
 //!
-//! The same `.feature` files run against the bindings and the generated
-//! clients in later units — only the step-definition layer differs.
+//! Two targets run this suite: `cucumber` (this file), against the engine
+//! natively, and `cucumber_ffi` (tests/cucumber_ffi.rs, which loads this
+//! file), through the router's C ABI (tests/ffi), so the ABI's drift from
+//! the engine fails the build.
+
+mod ffi;
 
 use angzarr_router::error::CodedError;
 use angzarr_router::pb;
@@ -23,7 +27,11 @@ struct CounterWorld {
 impl CounterWorld {
     fn dispatch(&mut self, mut cc: pb::ContextualCommand) {
         cc.events = self.prior.clone();
-        self.result = Some(conf::counter_aggregate(self.observed.clone()).dispatch(&cc));
+        self.result = Some(if ffi::through_ffi() {
+            ffi::dispatch_counter(self.observed.clone(), &cc)
+        } else {
+            conf::counter_aggregate(self.observed.clone()).dispatch(&cc)
+        });
     }
 
     fn last_observed(&self) -> conf::Observed {
@@ -218,7 +226,7 @@ fn assert_failed_with(w: &CounterWorld, code: &str) {
 }
 
 #[tokio::main]
-async fn main() {
+pub(crate) async fn main() {
     let feature = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../conformance/features/counter.feature"

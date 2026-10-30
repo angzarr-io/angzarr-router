@@ -16,12 +16,18 @@ uuid = { version = "1", features = ["v5"] }
 prost-build = { workspace = true }
 
 [dev-dependencies]
+angzarr-router-ffi = { path = "../router-ffi", features = ["host"] }
 cucumber = "0.21"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 futures = "0.3"
 
 [[test]]
 name = "cucumber"
+harness = false
+
+# The counter suite again, through the C ABI (tests/ffi).
+[[test]]
+name = "cucumber_ffi"
 harness = false
 
 [[test]]

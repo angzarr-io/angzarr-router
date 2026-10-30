@@ -1,17 +1,30 @@
 //! The raw ABI vocabulary: buffer type, allocator, status-code
-//! conventions, and the error serialization both directions share.
+//! conventions, the ABI version, and the error serialization both
+//! directions share.
 
-use prost::Message;
+use angzarr_router::error::{CodedError, GrpcCode};
 
-use angzarr_router::error::{CodedError, GrpcCode, ERROR_INFO_DOMAIN};
+/// The ABI version: abi.proto's FNV-1a 32-bit hash (abi.proto's header;
+/// angzarr-abigen computes the same for the bindings it generates). Any
+/// edit of abi.proto is a new ABI.
+pub const ABI_VERSION: u32 = fnv1a32(include_bytes!(
+    "../../../proto/io/angzarr/router/ffi/v1/abi.proto"
+));
 
-use crate::proto::google::rpc::{ErrorInfo, Status};
-
-pub const ABI_VERSION: u32 = 4;
+const fn fnv1a32(bytes: &[u8]) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    let mut i = 0;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+        i += 1;
+    }
+    hash
+}
 
 /// Callback success with a payload in `out`.
 pub const STATUS_OK: i32 = 0;
-/// Callback success with NO payload (handler emitted nothing).
+/// Callback success with NO payload (the role's Return message's default).
 pub const STATUS_OK_EMPTY: i32 = 1;
 
 /// The byte-buffer shape crossing the boundary.
@@ -23,7 +36,8 @@ pub struct AngzarrBuf {
 }
 
 /// The single host callback signature; `callback_id` selects the host
-/// thunk (the binding's registration API assigns ids).
+/// thunk (a role's RoleEntry.callback_id), `type_url` names the role's Call
+/// message and `payload` carries it (abi.proto, the callback convention).
 pub type AngzarrCb = unsafe extern "C" fn(
     callback_id: u64,
     type_url: *const u8,
@@ -84,6 +98,8 @@ pub fn fill_out(out: *mut AngzarrBuf, bytes: &[u8]) {
 
 /// Takes ownership of a host-filled `out` buffer (memory from
 /// `angzarr_buf_alloc`), returning its bytes and freeing the allocation.
+// The registry's, stubbed until the green commit.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn consume_out(out: &mut AngzarrBuf) -> Option<Vec<u8>> {
     if out.data.is_null() || out.len == 0 {
         return None;
@@ -96,78 +112,37 @@ pub fn consume_out(out: &mut AngzarrBuf) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-const ERROR_INFO_TYPE_URL: &str = "type.googleapis.com/google.rpc.ErrorInfo";
-
-/// Serializes a CodedError as google.rpc.Status bytes carrying an
-/// ErrorInfo detail — the exact shape gRPC puts on the wire.
-pub fn coded_to_status_bytes(err: CodedError) -> Vec<u8> {
-    let info = ErrorInfo {
-        reason: err.code,
-        domain: ERROR_INFO_DOMAIN.to_string(),
-        metadata: err.extras.into_iter().collect(),
-    };
-    Status {
-        code: err.grpc as i32,
-        message: err.message,
-        details: vec![prost_types::Any {
-            type_url: ERROR_INFO_TYPE_URL.to_string(),
-            value: info.encode_to_vec(),
-        }],
-    }
-    .encode_to_vec()
+/// Serializes a CodedError as google.rpc.Status bytes, the exact shape gRPC
+/// puts on the wire (decision 14.37): code = its gRPC status, message = its
+/// key, an ErrorInfo detail (reason = the key, domain angzarr.io, metadata
+/// = its args) and, for a typed business refusal, the refusal object as a
+/// second detail.
+pub fn coded_to_status_bytes(err: &CodedError) -> Vec<u8> {
+    let _ = err;
+    todo!("coded_to_status_bytes")
 }
 
-/// Decodes host-returned google.rpc.Status bytes into a CodedError.
-/// `ret` (the negative callback return) is the fallback gRPC code when
-/// the Status bytes are absent or carry no usable code.
+/// Decodes a host callback's failure: `ret` its (negative) return and
+/// `bytes` its `out`. A google.rpc.Status crosses exactly: its code, the
+/// ErrorInfo's reason and metadata, and a typed refusal object. Bytes that
+/// do not decode are HOST_STATUS_UNDECODABLE (INTERNAL), prost's text as
+/// `ext_err_txt`; no bytes at all, UNHANDLED_HANDLER_ERROR under the status
+/// `-ret` names.
+// The registry's, stubbed until the green commit.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn status_to_coded(bytes: Option<&[u8]>, ret: i32) -> CodedError {
-    let fallback = grpc_from_wire(-ret);
-    let Some(bytes) = bytes else {
-        return CodedError {
-            code: String::new(),
-            message: "host callback failed without a status payload".to_string(),
-            extras: Default::default(),
-            grpc: fallback,
-        };
-    };
-    let Ok(status) = Status::decode(bytes) else {
-        return CodedError::unhandled("host callback returned undecodable status bytes");
-    };
-    let mut code = String::new();
-    let mut extras = std::collections::BTreeMap::new();
-    for detail in &status.details {
-        if detail.type_url == ERROR_INFO_TYPE_URL {
-            if let Ok(info) = ErrorInfo::decode(detail.value.as_slice()) {
-                code = info.reason;
-                extras = info.metadata.into_iter().collect();
-            }
-            break;
-        }
-    }
-    CodedError {
-        code,
-        message: status.message,
-        extras,
-        grpc: if status.code != 0 {
-            grpc_from_wire(status.code)
-        } else {
-            fallback
-        },
-    }
+    let _ = (bytes, ret);
+    todo!("status_to_coded")
 }
 
-/// Wire code → GrpcCode; unknown codes degrade to INTERNAL (a binding
-/// emitting an unmapped code is a binding bug).
+/// Wire code → GrpcCode: every code the router knows crosses as itself;
+/// any other (OK, CANCELLED, UNAUTHENTICATED, an unassigned number)
+/// degrades to INTERNAL (a binding emitting one is a binding bug).
+// The registry's, stubbed until the green commit.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn grpc_from_wire(code: i32) -> GrpcCode {
-    match code {
-        3 => GrpcCode::InvalidArgument,
-        5 => GrpcCode::NotFound,
-        9 => GrpcCode::FailedPrecondition,
-        10 => GrpcCode::Aborted,
-        12 => GrpcCode::Unimplemented,
-        15 => GrpcCode::DataLoss,
-        _ => GrpcCode::Internal,
-    }
+    let _ = code;
+    todo!("grpc_from_wire")
 }
 
 #[cfg(test)]

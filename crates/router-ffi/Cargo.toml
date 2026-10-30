@@ -3,10 +3,15 @@ name = "angzarr-router-ffi"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "C-ABI surface over angzarr-router — no semantics in this layer"
+description = "The router's generic C ABI (abi.proto): one register, one dispatch, role-typed callbacks; no semantics in this layer"
 
 [lib]
 crate-type = ["cdylib", "staticlib", "rlib"]
+
+[features]
+# `host`: a Rust host of the C ABI (src/host.rs), what a binding is, for the
+# conformance suite run through the binding (crates/conformance, `*_ffi`).
+host = []
 
 [dependencies]
 angzarr-router = { path = "../router" }
@@ -15,3 +20,6 @@ prost-types = { workspace = true }
 
 [build-dependencies]
 prost-build = { workspace = true }
+
+[dev-dependencies]
+angzarr-abigen = { path = "../../tools/abigen" }

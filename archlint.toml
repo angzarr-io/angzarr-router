@@ -10,6 +10,8 @@
 #   angzarr_router_ffi          the C ABI over the engine (marshaling, registry)
 #   bindings/<lang>             out-of-tree leaves that link the cdylib
 #   angzarr_router_conformance  the harness: drives the engine's public API
+#   angzarr_abigen              tooling: generates the ABI's bindings from
+#                               abi.proto; only tests depend on it
 #   archlint                    tooling; no product crate depends on it
 #
 # `allow` lists the ONLY workspace targets a module may reference (external
@@ -25,16 +27,19 @@ from = ["angzarr_router::**"]
 allow = ["angzarr_router::**", "path:angzarr-project/rust/angzarr-proto"]
 deny = ["std::ffi::**", "core::ffi::**", "std::os::raw::**", "libc::**"]
 
-# The C ABI layer's rules (ffi-sits-on-the-engine, and the "C ABI internals"
-# section below) are parked on the POC line: crates/router-ffi is out of the
-# workspace there (see Cargo.toml), so their patterns match no module. Restore
-# them with the crate:
-#
-# [[rule]]
-# name = "ffi-sits-on-the-engine"
-# why = "the C ABI layer marshals over the engine; it never reaches the harness or tooling"
-# from = ["angzarr_router_ffi::**"]
-# allow = ["angzarr_router_ffi::**", "angzarr_router::**"]
+[[rule]]
+name = "ffi-sits-on-the-engine"
+why = "the C ABI layer marshals over the engine; it never reaches the harness or tooling"
+from = ["angzarr_router_ffi::**"]
+scope = "lib"
+allow = ["angzarr_router_ffi::**", "angzarr_router::**", "path:proto/io/angzarr/router/ffi/v1/abi.proto"]
+
+[[rule]]
+name = "abigen-reads-only-the-abi-definition"
+why = "the generator's input is abi.proto alone (its descriptor and bytes); it links no product crate, so a binding generated from it cannot depend on the engine's Rust"
+from = ["angzarr_abigen::**"]
+scope = "lib"
+allow = ["angzarr_abigen::**", "path:proto/io/angzarr/router/ffi/v1/abi.proto"]
 
 [[rule]]
 name = "conformance-drives-the-public-engine"
@@ -45,19 +50,22 @@ allow = ["angzarr_router_conformance::**", "angzarr_router::**", "path:conforman
 
 [[rule]]
 name = "conformance-tests-use-public-surfaces"
-why = "conformance tests drive the engine's public API, never the C ABI"
+why = "conformance tests drive the engine's public API, or the C ABI as a binding does (the `*_ffi` targets, through angzarr-router-ffi's host), never the ABI's internals"
 from = ["angzarr_router_conformance::**"]
 scope = "test"
 allow = [
     "angzarr_router_conformance::**",
     "angzarr_router::**",
+    "angzarr_router_ffi",
+    "angzarr_router_ffi::abi_pb::**",
+    "angzarr_router_ffi::host::**",
     "path:conformance/**",
 ]
 
 [[rule]]
 name = "bindings-are-leaves"
 why = "language bindings link the C ABI from outside the workspace; no Rust crate reads or depends on them"
-from = ["angzarr_router::**", "angzarr_router_conformance::**"] # + "angzarr_router_ffi::**" when restored
+from = ["angzarr_router::**", "angzarr_router_conformance::**", "angzarr_router_ffi::**"]
 deny = ["path:bindings/**"]
 
 # ---- engine internals (library code) ----------------------------------------
@@ -114,25 +122,38 @@ allow = [
 ]
 
 # ---- C ABI internals (library code) -----------------------------------------
-# (parked with the crate on the POC line; see above)
 
-# [[rule]]
-# name = "ffi-proto-is-a-leaf"
-# why = "the ABI's generated proto types reference nothing else"
-# from = ["angzarr_router_ffi::proto::**"]
-# scope = "lib"
-# allow = ["angzarr_router_ffi::proto::**"]
+[[rule]]
+name = "ffi-proto-is-a-leaf"
+why = "the ABI's generated proto types reference nothing else"
+from = ["angzarr_router_ffi::proto::**"]
+scope = "lib"
+allow = ["angzarr_router_ffi::proto::**"]
 
-# [[rule]]
-# name = "ffi-abi-below-registry"
-# why = "buffer/status marshaling sits below the registry and the exported entry points"
-# from = ["angzarr_router_ffi::abi::**"]
-# scope = "lib"
-# allow = ["self::**", "angzarr_router_ffi::proto::**", "angzarr_router::**"]
+[[rule]]
+name = "ffi-abi-below-registry"
+why = "buffer/status marshaling sits below the registry and the exported entry points"
+from = ["angzarr_router_ffi::abi::**"]
+scope = "lib"
+# abi.proto's bytes: the ABI version is their hash.
+allow = ["self::**", "angzarr_router_ffi::proto::**", "angzarr_router::**", "path:proto/io/angzarr/router/ffi/v1/abi.proto"]
 
-# [[rule]]
-# name = "ffi-registry-below-entry-points"
-# why = "the registry adapts host callbacks to engine components; the extern \"C\" entry points sit above it"
-# from = ["angzarr_router_ffi::registry::**"]
-# scope = "lib"
-# allow = ["self::**", "angzarr_router_ffi::abi::**", "angzarr_router_ffi::proto::**", "angzarr_router::**"]
+[[rule]]
+name = "ffi-registry-below-entry-points"
+why = "the registry adapts host callbacks to engine components; the extern \"C\" entry points sit above it"
+from = ["angzarr_router_ffi::registry::**"]
+scope = "lib"
+allow = ["self::**", "angzarr_router_ffi::abi::**", "angzarr_router_ffi::proto::**", "angzarr_router::**"]
+
+[[rule]]
+name = "ffi-host-is-a-binding"
+why = "the Rust host drives the router through the exported entry points only, as a foreign binding does; it never reaches the registry"
+from = ["angzarr_router_ffi::host::**"]
+scope = "lib"
+allow = [
+    "self::**",
+    "angzarr_router_ffi",
+    "angzarr_router_ffi::abi::**",
+    "angzarr_router_ffi::proto::**",
+    "angzarr_router::**",
+]

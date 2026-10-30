@@ -12,6 +12,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "angzarr-abigen"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "prost-build",
+ "prost-types",
+]
+
+[[package]]
 name = "angzarr-proto"
 version = "0.1.0"
 source = "git+https://github.com/angzarr-io/angzarr-project?rev=a0be9386a8e535141dea3a5c27499e838ec6abc8#a0be9386a8e535141dea3a5c27499e838ec6abc8"
@@ -40,6 +49,7 @@ name = "angzarr-router-conformance"
 version = "0.1.0"
 dependencies = [
  "angzarr-router",
+ "angzarr-router-ffi",
  "cucumber",
  "futures",
  "prost",
@@ -48,6 +58,17 @@ dependencies = [
  "prost-types",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "angzarr-router-ffi"
+version = "0.1.0"
+dependencies = [
+ "angzarr-abigen",
+ "angzarr-router",
+ "prost",
+ "prost-build",
+ "prost-types",
 ]
 
 [[package]]
