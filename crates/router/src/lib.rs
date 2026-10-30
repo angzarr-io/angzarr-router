@@ -19,7 +19,6 @@ pub mod projector;
 pub mod proto;
 pub mod rebuild;
 pub mod router;
-pub mod upcaster;
 
 pub use proto::io::angzarr::v1 as pb;
 
@@ -116,18 +115,6 @@ pub fn decode_message<M: prost::Message + prost::Name + Default>(
     bytes: &[u8],
 ) -> Result<M, error::CodedError> {
     M::decode(bytes).map_err(|e| error::CodedError::undecodable(&M::full_name(), &e))
-}
-
-/// An upcaster chain a command handler runs on incoming command and fact
-/// payloads before dispatch (upcaster.proto; decision 12.11):
-/// [`upcaster::UpcasterDispatch`] is one.
-pub trait PayloadUpcaster: Send + Sync {
-    /// The payload brought up to its current type (unchanged when no rule
-    /// matches).
-    fn upcast_payload(&self, payload: &Any) -> Result<Any, error::CodedError>;
-    /// The fully-qualified source types the chain accepts: claimed for its
-    /// aggregate at registration, like command types.
-    fn source_types(&self) -> Vec<String>;
 }
 
 /// Where a folded event sits: its book's cover (domain, root) and the page's

@@ -51,7 +51,7 @@ fn every_constructor() -> Vec<(&'static str, CodedError)> {
         ),
         (
             "unknown_type",
-            CodedError::unknown_type("UNKNOWN_COMMAND_TYPE", "/a.Sent", "/a.Upcast", []),
+            CodedError::unknown_type("UNKNOWN_COMMAND_TYPE", "/a.Sent"),
         ),
         (
             "undecodable",
@@ -285,7 +285,6 @@ const INVENTORY_14_37: &[&str] = &[
     "NO_FACT_HANDLER",
     "NO_REFUSAL_HANDLER",
     "DUPLICATE_COMPONENT",
-    "DUPLICATE_UPCASTER_CHAIN",
     "REFUSAL_WITHOUT_COMMAND",
     "REFUSAL_WITHOUT_EVENT",
     "REFUSAL_FACT_MISSING",
@@ -303,7 +302,6 @@ const INVENTORY_14_37: &[&str] = &[
     "MISSING_RULES_VERSION",
     "MISSING_STATE_TYPE",
     "STARTING_TYPES_ON_NON_PM",
-    "DUPLICATE_COMMAND_HANDLER",
     "NO_HANDLERS_REGISTERED",
     "MISSING_COMMAND_BOOK",
     "MISSING_COMMAND_PAGE",
@@ -341,13 +339,16 @@ fn the_retired_keys_are_gone() {
         "MALFORMED_REFUSAL_FACT",
         "DUPLICATE_REGISTRATION",
         "NO_HANDLER_REGISTERED",
+        // Retired by decision 14.39 with the router's upcaster chain.
+        "DUPLICATE_UPCASTER_CHAIN",
+        "DUPLICATE_COMMAND_HANDLER",
     ]
     .into_iter()
     .filter(|key| codes::ALL.contains(key))
     .collect();
     assert!(
         kept.is_empty(),
-        "decision 14.37 retired these, still in codes::ALL: {kept:?}"
+        "decisions 14.37 and 14.39 retired these, still in codes::ALL: {kept:?}"
     );
 }
 
@@ -445,12 +446,7 @@ fn the_routers_own_malformed_input_is_a_bug() {
     ] {
         crate::test_support::assert_bug(&CodedError::internal(code, []));
     }
-    crate::test_support::assert_bug(&CodedError::unknown_type(
-        "UNKNOWN_COMMAND_TYPE",
-        "/a.B",
-        "/a.B",
-        [],
-    ));
+    crate::test_support::assert_bug(&CodedError::unknown_type("UNKNOWN_COMMAND_TYPE", "/a.B"));
     crate::test_support::assert_bug(&CodedError::undecodable(
         "io.angzarr.v1.EventBook",
         &decode_error(),

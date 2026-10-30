@@ -1,14 +1,12 @@
 //! Router: the one component of one business process (owner ruling: one
 //! coordinator, one component, one business process). A component is one
-//! aggregate, policy, process manager or projector; its upcaster chain is part
-//! of it, not another component.
+//! aggregate, policy, process manager or projector. It upcasts nothing: the
+//! coordinator upcasts every payload and event through the component's
+//! upcaster sidecar before the router sees it (decision 14.39).
 //!
-//! [`RouterBuilder`] takes the component (and, optionally, its upcaster
-//! chain) and validates the configuration at build time: no component is
-//! NO_HANDLERS_REGISTERED (C-0060); a second component, of any kind, is
-//! DUPLICATE_COMPONENT, a second upcaster chain DUPLICATE_UPCASTER_CHAIN; an
-//! aggregate whose
-//! chain accepts one of its own current types is DUPLICATE_COMMAND_HANDLER.
+//! [`RouterBuilder`] takes the component and validates the configuration at
+//! build time: no component is NO_HANDLERS_REGISTERED (C-0060); a second
+//! component, of any kind, is DUPLICATE_COMPONENT.
 //! The built [`Router`] dispatches to that component:
 //!
 //! - a command or a fact (a page's Fact arm) to the domain: an aggregate, or
@@ -17,10 +15,7 @@
 //!   meets before its handler runs;
 //! - a policy source to the policy, when it comes from the policy's input domain,
 //!   and a refusal of one of its commands to the policy's OnRefused;
-//! - an EventBook to the projector, one Projection;
-//! - an UpcastRequest for the chain's domain through the component's chain,
-//!   each rule's output feeding the next (C-0136); other requests pass
-//!   through unchanged.
+//! - an EventBook to the projector, one Projection.
 //!
 //! The component may be registered boxed (`Box<dyn CommandHandler>` and so
 //! on). Transport (gRPC servers), health and readiness stay with the host.
@@ -30,7 +25,6 @@ use crate::error::{codes, extras, CodedError};
 use crate::pb;
 use crate::policy::PolicyDispatch;
 use crate::projector::ProjectorDispatch;
-use crate::upcaster::UpcasterDispatch;
 
 /// A domain (an aggregate or a process manager; decision 14.31) as the
 /// router sees it, whatever its state type.
@@ -51,17 +45,6 @@ pub trait CommandHandler: Send + Sync {
     }
     /// The fully-qualified command types it handles.
     fn command_types(&self) -> Vec<String>;
-    /// The fully-qualified types its upcaster chains accept (none by
-    /// default).
-    fn upcast_types(&self) -> Vec<String> {
-        Vec::new()
-    }
-    /// Checks the aggregate's own claims at build time (none to check by
-    /// default): an old type its chain accepts that is also a current type
-    /// is DUPLICATE_COMMAND_HANDLER.
-    fn check_claims(&self) -> Result<(), CodedError> {
-        Ok(())
-    }
     /// `CommandHandlerService.Handle`: a command or a fact.
     fn dispatch(
         &self,
@@ -83,12 +66,6 @@ impl<T: CommandHandler + ?Sized> CommandHandler for Box<T> {
     }
     fn command_types(&self) -> Vec<String> {
         (**self).command_types()
-    }
-    fn upcast_types(&self) -> Vec<String> {
-        (**self).upcast_types()
-    }
-    fn check_claims(&self) -> Result<(), CodedError> {
-        (**self).check_claims()
     }
     fn dispatch(
         &self,
@@ -113,12 +90,6 @@ impl<S> CommandHandler for DomainDispatch<S> {
     }
     fn command_types(&self) -> Vec<String> {
         DomainDispatch::command_types(self)
-    }
-    fn upcast_types(&self) -> Vec<String> {
-        DomainDispatch::upcast_types(self)
-    }
-    fn check_claims(&self) -> Result<(), CodedError> {
-        DomainDispatch::check_claims(self)
     }
     fn dispatch(
         &self,
@@ -253,10 +224,9 @@ impl Component {
         }
     }
 
-    /// The refusal of a second component (DUPLICATE_COMPONENT) or a second
-    /// upcaster chain (DUPLICATE_UPCASTER_CHAIN) beside this one, naming
-    /// this component and its kind (C-0580, C-0670): a misconfiguration,
-    /// INTERNAL.
+    /// The refusal of a second component (DUPLICATE_COMPONENT) beside this
+    /// one, naming this component and its kind (C-0580, C-0670): a
+    /// misconfiguration, INTERNAL.
     fn refuse_another(&self, code: &str) -> CodedError {
         CodedError::internal(
             code,
@@ -274,12 +244,11 @@ impl Component {
     }
 }
 
-/// Collects the one component of a [`Router`] and its upcaster chain;
+/// Collects the one component of a [`Router`];
 /// [`RouterBuilder::build`] validates the configuration.
 #[derive(Default)]
 pub struct RouterBuilder {
     components: Vec<Component>,
-    upcasters: Vec<UpcasterDispatch>,
 }
 
 impl RouterBuilder {
@@ -314,13 +283,6 @@ impl RouterBuilder {
         self
     }
 
-    /// Gives the component its upcaster chain (upcaster.proto), which serves
-    /// [`Router::upcast`].
-    pub fn upcaster(mut self, upcaster: UpcasterDispatch) -> Self {
-        self.upcasters.push(upcaster);
-        self
-    }
-
     /// Validates the configuration and builds the router.
     pub fn build(mut self) -> Result<Router, CodedError> {
         if self.components.is_empty() {
@@ -330,16 +292,7 @@ impl RouterBuilder {
         if !self.components.is_empty() {
             return Err(component.refuse_another(codes::DUPLICATE_COMPONENT));
         }
-        if self.upcasters.len() > 1 {
-            return Err(component.refuse_another(codes::DUPLICATE_UPCASTER_CHAIN));
-        }
-        if let Component::Aggregate(aggregate) = &component {
-            aggregate.check_claims()?;
-        }
-        Ok(Router {
-            component,
-            upcaster: self.upcasters.pop(),
-        })
+        Ok(Router { component })
     }
 }
 
@@ -347,7 +300,6 @@ impl RouterBuilder {
 /// a kind the router does not host is NO_COMPONENT_OF_KIND (UNIMPLEMENTED).
 pub struct Router {
     component: Component,
-    upcaster: Option<UpcasterDispatch>,
 }
 
 fn wrong_kind() -> CodedError {
@@ -445,22 +397,6 @@ impl Router {
             Component::Projector(projector) => projector.dispatch(events),
             _ => Err(wrong_kind()),
         }
-    }
-
-    /// Runs every page through the component's upcaster chain when the
-    /// request is for the chain's domain, each rule's output feeding the next
-    /// (C-0136); otherwise, or with no chain, the pages pass through
-    /// unchanged.
-    pub fn upcast(&self, req: &pb::UpcastRequest) -> Result<pb::UpcastResponse, CodedError> {
-        let events = match self.upcaster.as_ref() {
-            Some(upcaster) if upcaster.domain() == req.domain => req
-                .events
-                .iter()
-                .map(|page| upcaster.upcast_page(page))
-                .collect::<Result<_, _>>()?,
-            _ => req.events.clone(),
-        };
-        Ok(pb::UpcastResponse { events })
     }
 }
 

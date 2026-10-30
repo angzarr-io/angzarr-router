@@ -17,13 +17,11 @@
 //! dispatch), core's coordinator over the wire; neither reimplements them.
 
 use prost::Message;
-use prost_types::Any;
 
 use crate::domain::{Admission, Arrival, DomainDispatch, FactRecord, StreamStatus};
 use crate::error::{codes, CodedError, GrpcCode, HandlerError};
 use crate::pb;
 use crate::test_support::*;
-use crate::upcaster::UpcasterDispatch;
 
 // --- fixtures ----------------------------------------------------------------
 
@@ -264,28 +262,6 @@ fn any_input_reaches_an_existing_instance() {
             Admission::Dispatch
         );
     }
-}
-
-// The match is on the type URL after upcasting (decision 14.25).
-#[test]
-fn the_start_rule_matches_the_type_after_upcasting() {
-    let pm = buyin().with_command_upcaster(
-        UpcasterDispatch::new("buyin-v0", "buyin").on_event("test.buyin.StartBuyInV0", |_| {
-            Ok(any_of(&StartBuyIn { amount: 1 }))
-        }),
-    );
-    let old = command_book(
-        stream("buyin", None, INSTANCE),
-        Any {
-            type_url: crate::type_url("test.buyin.StartBuyInV0"),
-            value: Vec::new(),
-        },
-        1,
-    );
-    assert_eq!(
-        pm.admit(&arrival(&old, absent())).expect("admitted"),
-        Admission::Dispatch
-    );
 }
 
 // An aggregate has no start rule: any command reaches a new stream.

@@ -1,5 +1,5 @@
 //! The handler-facing handling surface: conflict delivery, the COMMUTATIVE
-//! resolver, the overlap rule and command upcasting (docs/design-handling.md).
+//! resolver and the overlap rule (docs/design-handling.md).
 //! Also the rules version every response reports.
 //!
 //! Spec governing each group (angzarr-project spec/20261019-draft):
@@ -11,8 +11,6 @@
 //!   ContextualCommand.conflict_nonce; decision 12.7; backlog HD-5, NC-1.
 //! - COMMUTATIVE resolver and overlap: options.proto conflict_units region
 //!   ("Overlap", "The resolver"); backlog CR-1.
-//! - command upcasting: upcaster.proto, command_handler.proto Handle step 2;
-//!   decision 12.11; backlog VC-1.
 //!
 //! The behaviour-level scenarios are angzarr-project's handler-contract
 //! tier (features/handler-contract/handling.feature, C-0533..C-0550), bound
@@ -31,7 +29,6 @@ use crate::pb;
 use crate::rebuild::Rebuilder;
 use crate::test_support::*;
 use crate::type_url;
-use crate::upcaster::UpcasterDispatch;
 
 /// A COMMUTATIVE-capable state: one counter per item key. `changed` below is
 /// what the generator (backlog CR-1) would emit for
@@ -689,113 +686,6 @@ fn overlap_follows_the_conflict_units_rules() {
     assert!(
         !overlap(&units(&["title"]), &units(&["titles"])),
         "no boundary"
-    );
-}
-
-// --- command upcasting (VC-1) -----------------------------------------------
-
-/// A list aggregate whose chain upcasts BumpV1 → Bump and BumpOld →
-/// BumpLost (a type nothing handles), handling Bump as a command and
-/// FactV2 as a fact, and recording the type URL each handler received.
-fn upcasting_aggregate(handled: Arc<Mutex<Vec<String>>>) -> DomainDispatch<ListState> {
-    let rename = |to: &'static str| {
-        move |any: &Any| -> Result<Any, crate::error::HandlerError> {
-            Ok(Any {
-                type_url: type_url(to),
-                value: any.value.clone(),
-            })
-        }
-    };
-    let upcaster = UpcasterDispatch::new("cmd-upcaster", "list")
-        .on_event("test.BumpV1", rename("test.Bump"))
-        .on_event("test.BumpOld", rename("test.BumpLost"))
-        .on_event("test.FactV1", rename("test.FactV2"));
-    let facts = handled.clone();
-    DomainDispatch::new("list", "list", list_rebuilder())
-        .with_command_upcaster(upcaster)
-        .on_command("test.Bump", move |cmd, _s, _c| {
-            handled.lock().unwrap().push(cmd.type_url.clone());
-            Ok(None)
-        })
-        .on_fact("test.FactV2", move |fact, _s| {
-            facts.lock().unwrap().push(fact.type_url.clone());
-            Ok(crate::domain::FactRecord::from(fact.clone()))
-        })
-}
-
-fn typed(name: &str) -> Any {
-    Any {
-        type_url: type_url(name),
-        value: Vec::new(),
-    }
-}
-
-#[test]
-fn an_old_command_type_is_upcast_then_handled_as_the_new_type() {
-    let handled = Arc::new(Mutex::new(Vec::new()));
-    upcasting_aggregate(handled.clone())
-        .dispatch(&command_for(typed("test.BumpV1")))
-        .expect("upcast to test.Bump");
-    assert_eq!(*handled.lock().unwrap(), vec![type_url("test.Bump")]);
-}
-
-// Owner ruling: upcasting runs on both arms.
-#[test]
-fn an_old_fact_type_is_upcast_then_recorded_as_the_new_type() {
-    let handled = Arc::new(Mutex::new(Vec::new()));
-    let resp = upcasting_aggregate(handled.clone())
-        .dispatch(&contextual(fact_page(typed("test.FactV1"))))
-        .expect("upcast to test.FactV2");
-    assert_eq!(*handled.lock().unwrap(), vec![type_url("test.FactV2")]);
-    assert_eq!(
-        resp.events.unwrap().pages[0]
-            .payload
-            .as_ref()
-            .unwrap()
-            .type_url,
-        type_url("test.FactV2"),
-        "the upcast fact is what is recorded"
-    );
-}
-
-// Owner ruling: the refusal names both types: its args carry the type URL
-// the client sent and the last one the chain produced. Decision 14.37: an
-// unknown command type has its own key, which is also its status message.
-#[test]
-fn an_upcast_type_with_no_handler_is_refused_naming_both_types() {
-    let err = upcasting_aggregate(Arc::default())
-        .dispatch(&command_for(typed("test.BumpOld")))
-        .expect_err("BumpLost reaches no handler");
-    assert_eq!(err.code, "UNKNOWN_COMMAND_TYPE");
-    crate::test_support::assert_bug(&err);
-    assert_eq!(err.grpc, GrpcCode::Internal);
-    assert_eq!(err.status_message(), "UNKNOWN_COMMAND_TYPE");
-    assert_eq!(
-        err.extras.get("type_url").map(String::as_str),
-        Some(type_url("test.BumpOld").as_str())
-    );
-    assert_eq!(
-        err.extras.get("upcast_type_url").map(String::as_str),
-        Some(type_url("test.BumpLost").as_str())
-    );
-}
-
-#[test]
-fn a_type_with_no_handler_and_no_upcaster_path_is_refused_naming_the_sent_type() {
-    let err = upcasting_aggregate(Arc::default())
-        .dispatch(&command_for(typed("test.BumpV0")))
-        .expect_err("no path to a handler");
-    assert_eq!(err.grpc, GrpcCode::Internal);
-    assert_eq!(err.code, "UNKNOWN_COMMAND_TYPE");
-    crate::test_support::assert_bug(&err);
-    assert_eq!(
-        err.extras.get("type_url").map(String::as_str),
-        Some(type_url("test.BumpV0").as_str())
-    );
-    assert_eq!(
-        err.extras.get("upcast_type_url").map(String::as_str),
-        Some(type_url("test.BumpV0").as_str()),
-        "the chain left it unchanged"
     );
 }
 

@@ -657,7 +657,7 @@ pub enum Settle {
 /// What business code saw when it ran.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OrderObserved {
-    /// The fully-qualified type business code received (after upcasting).
+    /// The fully-qualified type business code received.
     pub handled: String,
     pub item: String,
     pub expected_sequence: u64,
@@ -789,17 +789,6 @@ fn orders_any<M: prost::Message + prost::Name>(msg: &M) -> prost_types::Any {
     }
 }
 
-fn rename(
-    to: &'static str,
-) -> impl Fn(&prost_types::Any) -> Result<prost_types::Any, HandlerError> {
-    move |any| {
-        Ok(prost_types::Any {
-            type_url: angzarr_router::type_url(to),
-            value: any.value.clone(),
-        })
-    }
-}
-
 fn sorted_items(state: &orders::v1::OrderState) -> Vec<String> {
     let mut items: Vec<String> = state.items.keys().cloned().collect();
     items.sort();
@@ -810,8 +799,6 @@ fn sorted_items(state: &orders::v1::OrderState) -> Vec<String> {
 /// an item, OrderNoteAdded sets the notes, a snapshot loads OrderState;
 /// AddItem records what business code saw in `seen`, settles per `settle`
 /// and records ItemAdded; the fact ItemDelivered is recorded as received;
-/// the upcaster chain renames AddItemV1 to AddItem, ItemDeliveredV1 to
-/// ItemDelivered and AddLine to AddLineItem (which nothing handles);
 /// COMMUTATIVE runs through [`order_changed`].
 pub fn order_aggregate(
     rules_version: &str,
@@ -864,18 +851,10 @@ pub fn order_aggregate_with(
             *state = orders::v1::OrderState::decode(any.value.as_slice())?;
             Ok(())
         });
-    let upcaster = angzarr_router::upcaster::UpcasterDispatch::new("order-payloads", "order")
-        .on_event("orders.v1.AddItemV1", rename("orders.v1.AddItem"))
-        .on_event(
-            "orders.v1.ItemDeliveredV1",
-            rename("orders.v1.ItemDelivered"),
-        )
-        .on_event("orders.v1.AddLine", rename("orders.v1.AddLineItem"));
     let facts = seen.clone();
     DomainDispatch::new("order", "order", rebuilder)
         .with_rules_version(rules_version)
         .with_commutative(order_changed)
-        .with_command_upcaster(upcaster)
         .on_command("orders.v1.AddItem", move |cmd, state, cctx| {
             let item = orders::v1::AddItem::decode(cmd.value.as_slice())
                 .map_err(|e| HandlerError::Other(format!("decode AddItem: {e}")))?

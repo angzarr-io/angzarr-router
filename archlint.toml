@@ -104,7 +104,6 @@ from = [
     "angzarr_router::domain::**",
     "angzarr_router::policy::**",
     "angzarr_router::projector::**",
-    "angzarr_router::upcaster::**",
 ]
 scope = "lib"
 allow = [

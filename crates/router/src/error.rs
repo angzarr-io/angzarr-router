@@ -186,9 +186,9 @@ pub mod codes {
     pub const MISSING_COMMAND_PAYLOAD: &str = "MISSING_COMMAND_PAYLOAD";
     pub const MISSING_EVENT_BOOK_COVER: &str = "MISSING_EVENT_BOOK_COVER";
     pub const EMPTY_POLICY_SOURCE: &str = "EMPTY_POLICY_SOURCE";
-    /// A command type no handler claims, after upcasting.
+    /// A command type no handler claims.
     pub const UNKNOWN_COMMAND_TYPE: &str = "UNKNOWN_COMMAND_TYPE";
-    /// A fact type no handler claims, after upcasting.
+    /// A fact type no handler claims.
     pub const NO_FACT_HANDLER: &str = "NO_FACT_HANDLER";
     /// A pass-through CommandRefused the domain has no handler for.
     pub const NO_REFUSAL_HANDLER: &str = "NO_REFUSAL_HANDLER";
@@ -223,9 +223,6 @@ pub mod codes {
     /// A second component beside the one a router (a business process)
     /// hosts.
     pub const DUPLICATE_COMPONENT: &str = "DUPLICATE_COMPONENT";
-    /// A second upcaster chain for a component.
-    pub const DUPLICATE_UPCASTER_CHAIN: &str = "DUPLICATE_UPCASTER_CHAIN";
-    pub const DUPLICATE_COMMAND_HANDLER: &str = "DUPLICATE_COMMAND_HANDLER";
     pub const MISSING_RULES_VERSION: &str = "MISSING_RULES_VERSION";
     pub const MISSING_STATE_TYPE: &str = "MISSING_STATE_TYPE";
     /// A component other than a process manager declaring starting types
@@ -295,8 +292,6 @@ pub mod codes {
         POLICY_SOURCE_OUTSIDE_INPUT_DOMAIN,
         NO_HANDLERS_REGISTERED,
         DUPLICATE_COMPONENT,
-        DUPLICATE_UPCASTER_CHAIN,
-        DUPLICATE_COMMAND_HANDLER,
         MISSING_RULES_VERSION,
         MISSING_STATE_TYPE,
         STARTING_TYPES_ON_NON_PM,
@@ -321,6 +316,9 @@ pub mod extras {
     pub const DOMAIN: &str = "domain";
     pub const TYPE_URL: &str = "type_url";
     pub const COMMAND_TYPE: &str = "command_type";
+    /// The type an upcaster sidecar returned: never the router's, which
+    /// upcasts nothing; the coordinator relays it beside `type_url` on an
+    /// unknown type (decision 14.39).
     pub const UPCAST_TYPE_URL: &str = "upcast_type_url";
     pub const WINDOW_UNITS: &str = "window_units";
     pub const COMMAND_UNITS: &str = "command_units";
@@ -434,27 +432,13 @@ impl CodedError {
 
     /// A command or fact whose type URL reaches no registered handler
     /// (`code` UNKNOWN_COMMAND_TYPE or NO_FACT_HANDLER): a bug (INTERNAL;
-    /// owner ruling, 2026-10-29), its args carrying the type URL as sent as
-    /// `type_url` and the type the upcaster chain ended at as
-    /// `upcast_type_url` (upcaster.proto, VC-1: the sent one when no
-    /// upcaster applies).
-    pub fn unknown_type(
-        code: &str,
-        type_url: &str,
-        upcast_type_url: &str,
-        extras: impl IntoIterator<Item = (String, String)>,
-    ) -> Self {
+    /// owner ruling, 2026-10-29), its one arg `type_url` the type it was
+    /// given (C-0682). The coordinator upcast it, and relays the type as sent
+    /// beside it (decision 14.39).
+    pub fn unknown_type(code: &str, type_url: &str) -> Self {
         Self::coded(
             code,
-            [
-                (extras::TYPE_URL.to_string(), type_url.to_string()),
-                (
-                    extras::UPCAST_TYPE_URL.to_string(),
-                    upcast_type_url.to_string(),
-                ),
-            ]
-            .into_iter()
-            .chain(extras),
+            [(extras::TYPE_URL.to_string(), type_url.to_string())],
             GrpcCode::Internal,
         )
     }

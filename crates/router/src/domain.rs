@@ -176,9 +176,8 @@ pub type RefusedFn<S> = Box<
 /// One fact handler, bound to its input: records it against the state.
 type RecordFn<'a, S> = Box<dyn Fn(&S, CommandContext) -> Result<FactRecord, CodedError> + 'a>;
 
-/// A process manager's start rule: whether an input payload (as sent) is of
-/// a type that may start an instance, judged after upcasting. `None` for an
-/// aggregate, which has none.
+/// A process manager's start rule: whether an input payload is of a type
+/// that may start an instance. `None` for an aggregate, which has none.
 pub type StartRule<'a> = Option<&'a dyn Fn(&Any) -> Result<bool, CodedError>>;
 
 /// The dispatch table for one domain: an aggregate or a process manager.
@@ -192,7 +191,6 @@ pub struct DomainDispatch<S> {
     refused: HashMap<String, RefusedFn<S>>,
     starting: BTreeSet<String>,
     commutative: Option<Box<dyn Resolver<S>>>,
-    upcasters: Vec<Box<dyn crate::PayloadUpcaster>>,
     rules_version: String,
 }
 
@@ -213,7 +211,6 @@ impl<S> DomainDispatch<S> {
             refused: HashMap::new(),
             starting: BTreeSet::new(),
             commutative: None,
-            upcasters: Vec::new(),
             rules_version: String::new(),
         }
     }
@@ -281,19 +278,18 @@ impl<S> DomainDispatch<S> {
     ///    (decision 14.36);
     /// 2. deduplication: events already recorded under the input's id are
     ///    [`Admission::Duplicate`];
-    /// 3. a process manager's start rule, by the input's type after
-    ///    upcasting: with no instance, a starting type is dispatched; any
-    ///    other command is refused FAILED_PRECONDITION, PM_NO_INSTANCE, and
+    /// 3. a process manager's start rule, by the input's type (the
+    ///    coordinator has upcast it; decision 14.39): with no instance, a
+    ///    starting type is dispatched; any other command is refused FAILED_PRECONDITION, PM_NO_INSTANCE, and
     ///    any other fact is [`Admission::Skip`].
     pub fn admit(&self, arrival: &Arrival<'_>) -> Result<Admission, CodedError> {
         if self.kind != pb::ComponentKind::ProcessManager {
             return admit_rules(arrival, None);
         }
         let starts = |sent: &Any| -> Result<bool, CodedError> {
-            let any = self.upcast(sent)?;
             Ok(self
                 .starting
-                .contains(crate::type_name_from_url(&any.type_url)))
+                .contains(crate::type_name_from_url(&sent.type_url)))
         };
         admit_rules(arrival, Some(&starts))
     }
@@ -376,17 +372,6 @@ impl<S> DomainDispatch<S> {
         self
     }
 
-    /// Adds an upcaster chain run on every incoming command and fact payload
-    /// before dispatch, by type URL (upcaster.proto; decision 12.11). Chains
-    /// run in registration order, each one's output feeding the next.
-    pub fn with_command_upcaster(
-        mut self,
-        upcaster: impl crate::PayloadUpcaster + 'static,
-    ) -> Self {
-        self.upcasters.push(Box::new(upcaster));
-        self
-    }
-
     /// Registers the thunk for a fully-qualified command type name.
     pub fn on_command(
         mut self,
@@ -441,39 +426,18 @@ impl<S> DomainDispatch<S> {
         self.handlers.keys().cloned().collect()
     }
 
-    /// Checks the aggregate's own claims: an old type its upcaster chains
-    /// accept that is also one of its current command types is
-    /// DUPLICATE_COMMAND_HANDLER (the old type would never reach its chain).
-    pub fn check_claims(&self) -> Result<(), CodedError> {
-        match self
-            .upcast_types()
-            .into_iter()
-            .find(|old| self.handlers.contains_key(old))
-        {
-            Some(old) => Err(CodedError::internal(
-                codes::DUPLICATE_COMMAND_HANDLER,
-                [
-                    (extras::DOMAIN.to_string(), self.domain.clone()),
-                    (extras::COMMAND_TYPE.to_string(), old),
-                ],
-            )),
-            None => Ok(()),
-        }
-    }
-
     /// The registered fully-qualified fact type names.
     pub fn fact_types(&self) -> Vec<String> {
         self.facts.keys().cloned().collect()
     }
 
     /// `CommandHandlerService.Handle`: envelope guards with their exact
-    /// codes; the payload upcast through the upcaster chains; the page's
-    /// body arm picks the handler table — a Command runs its command handler
+    /// codes; the page's body arm picks the handler table — a Command runs its command handler
     /// (none: UNKNOWN_COMMAND_TYPE), a Fact its fact handler (none:
     /// NO_FACT_HANDLER, so a fact never reaches a command handler or the
     /// reverse) — before rebuild (a corrupt persisted event fails the
-    /// command). A refusal names the type URL the client sent; its extras
-    /// carry the type the chains ended at as `upcast_type_url`.
+    /// command). A refusal names the type URL it was given: the coordinator
+    /// has upcast it (decision 14.39), and relays the type as sent beside it.
     /// A command is then decided under its resolved conflict resolution
     /// ([`Self::decide`]). The emitted book passes through as the handler
     /// returned it: the coordinator stamps the cover, sequences and meta. A
@@ -492,17 +456,18 @@ impl<S> DomainDispatch<S> {
         let cover = req.events.as_ref().and_then(|b| b.cover.as_ref());
         let (mut events, state, conflict) = match &page.body {
             Some(pb::command_page::Body::Command(command)) => {
-                let sent = non_empty_payload(command.payload.as_ref())?;
-                let any = self.upcast(sent)?;
+                let any = non_empty_payload(command.payload.as_ref())?;
                 let Some(thunk) = self.handlers.get(crate::type_name_from_url(&any.type_url))
                 else {
-                    return Err(self.unknown(codes::UNKNOWN_COMMAND_TYPE, sent, &any));
+                    return Err(CodedError::unknown_type(
+                        codes::UNKNOWN_COMMAND_TYPE,
+                        &any.type_url,
+                    ));
                 };
-                self.decide(req, &any, thunk)?
+                self.decide(req, any, thunk)?
             }
             Some(pb::command_page::Body::Fact(fact)) => {
-                let sent = non_empty_payload(fact.payload.as_ref())?;
-                let any = self.upcast(sent)?;
+                let any = non_empty_payload(fact.payload.as_ref())?;
                 let fact_type = crate::type_name_from_url(&any.type_url);
                 let record_with: RecordFn<'_, S> = match self.facts.get(fact_type) {
                     Some(thunk) => {
@@ -534,7 +499,12 @@ impl<S> DomainDispatch<S> {
                         };
                         Box::new(move |state, cctx| call_handler(|| thunk(&refused, state, cctx)))
                     }
-                    None => return Err(self.unknown(codes::NO_FACT_HANDLER, sent, &any)),
+                    None => {
+                        return Err(CodedError::unknown_type(
+                            codes::NO_FACT_HANDLER,
+                            &any.type_url,
+                        ))
+                    }
                 };
                 let (mut state, _) = self.rebuilder.rebuild(req.events.as_ref())?;
                 let record = record_with(&state, command_context(req))?;
@@ -573,34 +543,6 @@ impl<S> DomainDispatch<S> {
             rules_version: self.rules_version.clone(),
             conflict,
         })
-    }
-
-    /// The fully-qualified types its upcaster chains accept, claimed for it
-    /// at registration like its command types.
-    pub fn upcast_types(&self) -> Vec<String> {
-        let mut types: Vec<String> = self
-            .upcasters
-            .iter()
-            .flat_map(|u| u.source_types())
-            .collect();
-        types.sort();
-        types.dedup();
-        types
-    }
-
-    fn upcast(&self, sent: &Any) -> Result<Any, CodedError> {
-        let mut current = sent.clone();
-        for upcaster in &self.upcasters {
-            current = upcaster.upcast_payload(&current)?;
-        }
-        Ok(current)
-    }
-
-    /// The refusal of a type no handler of the arm's kind claims: the
-    /// message names the type URL the client sent, the extras the type the
-    /// upcaster chains ended at (`upcast_type_url`).
-    fn unknown(&self, code: &str, sent: &Any, upcast: &Any) -> CodedError {
-        CodedError::unknown_type(code, &sent.type_url, &upcast.type_url, [])
     }
 
     /// Runs a command's handler under its resolved conflict resolution

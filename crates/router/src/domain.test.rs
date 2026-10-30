@@ -101,12 +101,9 @@ fn an_unknown_type_is_invalid_argument_naming_its_type_url() {
     crate::test_support::assert_bug(&err);
     assert_eq!(err.status_message(), "UNKNOWN_COMMAND_TYPE");
     assert_eq!(err.extras.get("type_url"), Some(&url));
-    // upcaster.proto (VC-1): the ErrorInfo metadata key upcast_type_url
-    // holds the type the chain ended at, the sent one when none applies.
-    assert_eq!(
-        err.extras.get("upcast_type_url").map(String::as_str),
-        Some(url.as_str())
-    );
+    // C-0682: the router upcasts nothing, so names no upcast type; the
+    // coordinator relays the type as sent beside it (decision 14.39).
+    assert_eq!(err.extras.get("upcast_type_url"), None);
 
     let err = d
         .dispatch(&contextual(fact_page(unknown)))

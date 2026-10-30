@@ -1,6 +1,6 @@
 //! RouterBuilder / Router: one router hosts ONE component (owner ruling: one
-//! coordinator, one component, one business process), whose upcaster chain is
-//! part of it. Build-time validation (C-0060) and dispatch to that component.
+//! coordinator, one component, one business process). Build-time validation
+//! (C-0060) and dispatch to that component.
 
 use prost_types::Any;
 
@@ -15,7 +15,6 @@ use crate::test_support::{
     command_page, event_page, fact_page, fresh_rebuilder, LedgerState, TestState,
 };
 use crate::type_url;
-use crate::upcaster::UpcasterDispatch;
 
 fn any_of_type(fq: &str) -> Any {
     Any {
@@ -126,64 +125,6 @@ fn a_router_hosts_one_component_and_refuses_a_second_of_any_kind() {
             assert_eq!(extra(crate::error::extras::COMPONENT_KIND), Some(kind));
         }
     }
-}
-
-#[test]
-fn an_upcaster_chain_is_part_of_its_component() {
-    let chain = UpcasterDispatch::new("v1-v3", "order")
-        .on_event("test.V1", |_| Ok(any_of_type("test.V2")))
-        .on_event("test.V2", |_| Ok(any_of_type("test.V3")));
-    let router = with_one(RouterBuilder::new(), "projector")
-        .upcaster(chain)
-        .build()
-        .expect("build");
-    let upcast = |domain: &str| {
-        let resp = router
-            .upcast(&pb::UpcastRequest {
-                domain: domain.to_string(),
-                events: vec![event_page(any_of_type("test.V1"))],
-            })
-            .expect("upcast");
-        let any = resp.events[0].payload.clone().expect("an event");
-        crate::type_name_from_url(&any.type_url).to_string()
-    };
-    assert_eq!(upcast("order"), "test.V3", "C-0136");
-    assert_eq!(
-        upcast("billing"),
-        "test.V1",
-        "another domain passes through"
-    );
-}
-
-#[test]
-fn a_component_without_an_upcaster_chain_passes_events_through() {
-    let router = with_one(RouterBuilder::new(), "policy")
-        .build()
-        .expect("build");
-    let events = vec![event_page(any_of_type("test.V1"))];
-    let resp = router
-        .upcast(&pb::UpcastRequest {
-            domain: "order".to_string(),
-            events: events.clone(),
-        })
-        .expect("upcast");
-    assert_eq!(resp.events, events);
-}
-
-#[test]
-fn a_component_has_one_upcaster_chain_and_a_chain_alone_is_no_component() {
-    assert_eq!(
-        build_err(
-            with_one(RouterBuilder::new(), "aggregate")
-                .upcaster(UpcasterDispatch::new("one", "order"))
-                .upcaster(UpcasterDispatch::new("two", "order"))
-        ),
-        "DUPLICATE_UPCASTER_CHAIN"
-    );
-    assert_eq!(
-        build_err(RouterBuilder::new().upcaster(UpcasterDispatch::new("one", "order"))),
-        codes::NO_HANDLERS_REGISTERED
-    );
 }
 
 #[test]
@@ -392,10 +333,6 @@ impl CommandHandler for Plain {
 
 #[test]
 fn a_hand_written_aggregate_builds_a_router() {
-    assert!(
-        Plain.upcast_types().is_empty(),
-        "no upcaster chain by default"
-    );
     let router = RouterBuilder::new()
         .aggregate(Plain)
         .build()
@@ -470,94 +407,6 @@ fn a_hand_written_aggregate_meets_the_framework_rules() {
         })
         .expect("admitted");
     assert_eq!(admission, crate::domain::Admission::Duplicate(recorded));
-}
-
-// --- the aggregate's own upcaster chain ---------------------------------------
-
-/// A chain renaming `from` to `to`, for the domain "order".
-fn renaming(from: &str, to: &'static str) -> UpcasterDispatch {
-    UpcasterDispatch::new("rename", "order").on_event(from, move |any| {
-        Ok(Any {
-            type_url: type_url(to),
-            value: any.value.clone(),
-        })
-    })
-}
-
-// An old type its chain accepts must not also be one of the aggregate's
-// current types (owner ruling): the build fails.
-// A domain, boxed or not, reports the old types its chains accept.
-#[test]
-fn a_domain_reports_the_types_its_chain_accepts() {
-    let domain = aggregate("ship", "order", &["test.Ship"])
-        .with_command_upcaster(renaming("test.ShipV1", "test.Ship"));
-    assert_eq!(
-        CommandHandler::upcast_types(&domain),
-        vec!["test.ShipV1".to_string()]
-    );
-    let boxed: Box<dyn CommandHandler> = Box::new(domain);
-    assert_eq!(boxed.upcast_types(), vec!["test.ShipV1".to_string()]);
-}
-
-#[test]
-fn an_old_type_colliding_with_a_current_one_fails_the_build() {
-    let err = build_err(
-        RouterBuilder::new().aggregate(
-            aggregate("a", "order", &["test.Ship", "test.ShipV1"])
-                .with_command_upcaster(renaming("test.ShipV1", "test.Ship")),
-        ),
-    );
-    assert_eq!(err, codes::DUPLICATE_COMMAND_HANDLER);
-    let err = RouterBuilder::new()
-        .aggregate(
-            aggregate("a", "order", &["test.Ship", "test.ShipV1"])
-                .with_command_upcaster(renaming("test.ShipV1", "test.Ship")),
-        )
-        .build()
-        .err()
-        .expect("refused");
-    crate::test_support::assert_bug(&err);
-}
-
-#[test]
-fn an_old_type_that_upcasts_to_nothing_is_refused_naming_where_it_ended() {
-    let router = RouterBuilder::new()
-        .aggregate(
-            aggregate("ship", "order", &["test.Ship"])
-                .with_command_upcaster(renaming("test.ShipOld", "test.ShipLost")),
-        )
-        .build()
-        .expect("build");
-    let err = router
-        .dispatch_command(&command("order", "test.ShipOld"))
-        .expect_err("ShipLost reaches no handler");
-    assert_eq!(err.code, "UNKNOWN_COMMAND_TYPE");
-    crate::test_support::assert_bug(&err);
-    assert_eq!(
-        err.extras.get("upcast_type_url").map(String::as_str),
-        Some(type_url("test.ShipLost").as_str()),
-        "the chain ran"
-    );
-}
-
-// One aggregate's chains may name a source type more than once (rules on
-// one type compose in order, C-0136): its own claims never collide.
-#[test]
-fn an_aggregate_naming_a_source_type_twice_builds() {
-    let chain = renaming("test.ShipV1", "test.ShipV1").on_event("test.ShipV1", |any| {
-        Ok(Any {
-            type_url: type_url("test.Ship"),
-            value: any.value.clone(),
-        })
-    });
-    let router = RouterBuilder::new()
-        .aggregate(aggregate("ship", "order", &["test.Ship"]).with_command_upcaster(chain))
-        .build()
-        .expect("one claimant");
-    let resp = router
-        .dispatch_command(&command("order", "test.ShipV1"))
-        .expect("both rules ran");
-    assert_eq!(emitted_label(&resp), "ship");
 }
 
 // --- the registration hello (types.proto ComponentDescriptor) ----------------
