@@ -2,9 +2,12 @@
 //! projector page context, driven natively against hand-built components on
 //! the Rust core.
 
+mod common;
+
 use angzarr_router::error::CodedError;
 use angzarr_router::pb;
 use angzarr_router_conformance as conf;
+use cucumber::writer::Stats as _;
 use cucumber::{given, then, when, World};
 use prost::Message;
 
@@ -143,9 +146,14 @@ async fn projector_saw(w: &mut ContextWorld, label: String, first: u64, second: 
 
 #[tokio::main]
 async fn main() {
-    let feature = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../conformance/features/context.feature"
-    );
-    ContextWorld::cucumber().run_and_exit(feature).await;
+    let local = ContextWorld::cucumber()
+        .run(common::path("conformance/features/context.feature"))
+        .await;
+    let tier = ContextWorld::cucumber()
+        .fail_on_skipped()
+        .filter_run(common::tier("context.feature"), |_, _, scenario| {
+            common::runs(scenario)
+        })
+        .await;
+    common::exit(local.execution_has_failed() || tier.execution_has_failed());
 }

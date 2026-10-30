@@ -3,9 +3,12 @@
 //! feature runs against the bindings and the generated clients in later
 //! units — only this step-definition layer differs.
 
+mod common;
+
 use angzarr_router::error::CodedError;
 use angzarr_router::pb;
 use angzarr_router_conformance as conf;
+use cucumber::writer::Stats as _;
 use cucumber::{given, then, when, World};
 
 #[derive(Debug, Default, World)]
@@ -27,6 +30,15 @@ impl PolicyWorld {
             .expect("a source was dispatched")
             .as_ref()
             .expect("expected a successful policy response")
+    }
+
+    /// Every command answered, in page order.
+    fn commands(&self) -> Vec<pb::CommandBook> {
+        self.response()
+            .reactions
+            .iter()
+            .flat_map(|r| r.commands.iter().cloned())
+            .collect()
     }
 }
 
@@ -52,10 +64,27 @@ async fn empty_source(w: &mut PolicyWorld) {
 
 #[then(regex = r#"^the policy emits one command to "([^"]*)"$"#)]
 async fn emits_one_command(w: &mut PolicyWorld, target: String) {
-    let resp = w.response();
-    assert_eq!(resp.commands.len(), 1, "exactly one command emitted");
+    let commands = w.commands();
+    assert_eq!(commands.len(), 1, "exactly one command emitted");
+    assert_eq!(commands[0].cover.as_ref().expect("cover").domain, target);
+}
+
+#[then(regex = r#"^the policy emits one command to "([^"]*)", in the reaction to sequence (\d+)$"#)]
+async fn emits_one_command_in_reaction(w: &mut PolicyWorld, target: String, sequence: u64) {
+    let reactions = &w.response().reactions;
+    assert_eq!(reactions.len(), 1, "one reaction, to the one handled page");
+    assert_eq!(reactions[0].trigger_sequence, sequence, "its trigger");
     assert_eq!(
-        resp.commands[0].cover.as_ref().expect("cover").domain,
+        reactions[0].commands.len(),
+        1,
+        "exactly one command emitted"
+    );
+    assert_eq!(
+        reactions[0].commands[0]
+            .cover
+            .as_ref()
+            .expect("cover")
+            .domain,
         target
     );
 }
@@ -67,10 +96,8 @@ async fn handler_saw_sequence(w: &mut PolicyWorld, seq: u64) {
 
 #[then("the command carries no router-stamped provenance")]
 async fn no_stamped_provenance(w: &mut PolicyWorld) {
-    let page = w.response().commands[0]
-        .page
-        .as_ref()
-        .expect("a command page");
+    let commands = w.commands();
+    let page = commands[0].page.as_ref().expect("a command page");
     assert_eq!(
         page.command_id, None,
         "the coordinator stamps the command id"
@@ -87,7 +114,7 @@ async fn no_stamped_provenance(w: &mut PolicyWorld) {
 
 #[then("the policy emits no commands")]
 async fn emits_no_commands(w: &mut PolicyWorld) {
-    assert!(w.response().commands.is_empty(), "no commands emitted");
+    assert!(w.commands().is_empty(), "no commands emitted");
 }
 
 #[then(regex = r"^the dispatch fails with ([A-Z_]+)$")]
@@ -104,9 +131,14 @@ async fn fails_with(w: &mut PolicyWorld, code: String) {
 
 #[tokio::main]
 async fn main() {
-    let feature = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../conformance/features/policy.feature"
-    );
-    PolicyWorld::cucumber().run_and_exit(feature).await;
+    let local = PolicyWorld::cucumber()
+        .run(common::path("conformance/features/policy.feature"))
+        .await;
+    let tier = PolicyWorld::cucumber()
+        .fail_on_skipped()
+        .filter_run(common::tier("policy_dispatch.feature"), |_, _, scenario| {
+            common::runs(scenario)
+        })
+        .await;
+    common::exit(local.execution_has_failed() || tier.execution_has_failed());
 }

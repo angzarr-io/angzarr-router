@@ -13,9 +13,11 @@ fn main() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let top = manifest.join("../..");
     let framework_proto = top.join("angzarr-project/proto");
-    let conformance_proto = top.join("conformance/proto");
-    let counter = conformance_proto.join("test/counter/counter.proto");
-    let order = conformance_proto.join("orders/v1/order.proto");
+    // The handler-contract tier's fixtures (decision 14.42): the router's
+    // complete contract, shared by every router.
+    let fixture = top.join("angzarr-project/features/handler-contract/fixture");
+    let counter = fixture.join("counter.proto");
+    let order = fixture.join("order.proto");
     // The fixture pool parses framework envelopes (ContextualCommand, EventPage)
     // from the .txtpb fixtures. The message-annotation counter.proto no longer
     // imports these, so the harness names them explicitly — its descriptor
@@ -26,7 +28,7 @@ fn main() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let fds_path = out_dir.join("conformance_fds.bin");
 
-    println!("cargo:rerun-if-changed={}", conformance_proto.display());
+    println!("cargo:rerun-if-changed={}", fixture.display());
     println!("cargo:rerun-if-changed={}", framework_proto.display());
 
     let mut config = prost_build::Config::new();
@@ -37,7 +39,7 @@ fn main() {
         .file_descriptor_set_path(&fds_path)
         .compile_protos(
             &[counter, order, types, command_handler],
-            &[framework_proto, conformance_proto],
+            &[framework_proto, fixture],
         )
         .expect("prost: compile conformance protos");
 }

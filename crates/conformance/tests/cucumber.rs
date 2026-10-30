@@ -5,9 +5,12 @@
 //! The same `.feature` files run against the bindings and the generated
 //! clients in later units — only the step-definition layer differs.
 
+mod common;
+
 use angzarr_router::error::CodedError;
 use angzarr_router::pb;
 use angzarr_router_conformance as conf;
+use cucumber::writer::Stats as _;
 use cucumber::{given, then, when, World};
 
 #[derive(Debug, Default, World)]
@@ -65,6 +68,13 @@ async fn corrupt_history(w: &mut CounterWorld) {
 #[given("a counter restored from a snapshot of 10 with one newer event")]
 async fn snapshot_history(w: &mut CounterWorld) {
     w.prior = conf::snapshot_history();
+}
+
+#[given(
+    regex = r"^a counter delivered a starting state of (\d+) at sequence (\d+) and one Increased event at sequence (\d+)$"
+)]
+async fn starting_state(w: &mut CounterWorld, count: u32, sequence: u64, event_at: u64) {
+    w.prior = conf::starting_state_history(count, sequence, event_at);
 }
 
 #[when(regex = r"^the operator increases the counter by (\d+)$")]
@@ -219,9 +229,15 @@ fn assert_failed_with(w: &CounterWorld, code: &str) {
 
 #[tokio::main]
 async fn main() {
-    let feature = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../conformance/features/counter.feature"
-    );
-    CounterWorld::cucumber().run_and_exit(feature).await;
+    let local = CounterWorld::cucumber()
+        .run(common::path("conformance/features/counter.feature"))
+        .await;
+    let tier = CounterWorld::cucumber()
+        .fail_on_skipped()
+        .filter_run(
+            common::tier("counter_dispatch.feature"),
+            |_, _, scenario| common::runs(scenario),
+        )
+        .await;
+    common::exit(local.execution_has_failed() || tier.execution_has_failed());
 }

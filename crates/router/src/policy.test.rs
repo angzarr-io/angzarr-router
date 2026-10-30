@@ -10,7 +10,7 @@ use prost_types::Any;
 use crate::error::{codes, extras, GrpcCode, HandlerError};
 use crate::pb;
 use crate::policy::PolicyDispatch;
-use crate::test_support::{command_page, event_page, uuid_of};
+use crate::test_support::{command_page, commands_of, event_page, uuid_of};
 use crate::type_url;
 
 const FQ_ORDER_CREATED: &str = "test.OrderCreated";
@@ -56,9 +56,9 @@ fn command_to(domain: &str) -> pb::CommandBook {
     }
 }
 
-fn cmd_to<'a>(resp: &'a pb::PolicyResponse, domain: &str) -> &'a pb::CommandBook {
-    resp.commands
-        .iter()
+fn cmd_to(resp: &pb::PolicyResponse, domain: &str) -> pb::CommandBook {
+    commands_of(resp)
+        .into_iter()
         .find(|c| c.cover.as_ref().map(|cv| cv.domain.as_str()) == Some(domain))
         .unwrap_or_else(|| panic!("no command targets {domain}"))
 }
@@ -78,7 +78,7 @@ fn declared_event_emits_its_command() {
     let resp = policy
         .dispatch(&source_book("order", vec![event_page_of(FQ_ORDER_CREATED)]))
         .expect("dispatch");
-    assert_eq!(resp.commands.len(), 1, "one command emitted (C-0050)");
+    assert_eq!(commands_of(&resp).len(), 1, "one command emitted (C-0050)");
     assert_eq!(
         cmd_to(&resp, "inventory").cover.as_ref().unwrap().domain,
         "inventory"
@@ -98,7 +98,7 @@ fn undeclared_event_type_is_skipped() {
         ))
         .expect("dispatch");
     assert!(
-        resp.commands.is_empty(),
+        commands_of(&resp).is_empty(),
         "undeclared event emits no commands"
     );
 }
@@ -113,7 +113,11 @@ fn every_page_is_a_fresh_trigger() {
     let resp = policy
         .dispatch(&source_book("order", pages))
         .expect("dispatch");
-    assert_eq!(resp.commands.len(), 3, "every page triggers the handler");
+    assert_eq!(
+        commands_of(&resp).len(),
+        3,
+        "every page triggers the handler"
+    );
 }
 
 // --- pass-through: the coordinator stamps emitted commands ---------------
@@ -149,7 +153,7 @@ fn emitted_commands_pass_through_unstamped_in_emission_order() {
     let mut expected_first = command_to("inventory");
     expected_first.page.as_mut().unwrap().correlation_id = Some(uuid_of(1));
     assert_eq!(
-        resp.commands,
+        commands_of(&resp),
         vec![
             expected_first.clone(),
             command_to("inventory"),
@@ -256,7 +260,7 @@ fn a_context_handler_sees_each_triggering_page() {
             ],
         ))
         .expect("dispatch");
-    assert_eq!(resp.commands.len(), 2, "one command per declared page");
+    assert_eq!(commands_of(&resp).len(), 2, "one command per declared page");
     assert_eq!(
         *seen.lock().unwrap(),
         vec![("order".to_string(), 4), ("order".to_string(), 6)]

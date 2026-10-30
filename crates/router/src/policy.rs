@@ -294,7 +294,12 @@ impl PolicyDispatch {
                 check_root(command)?;
                 check_correlation(command, trigger_correlation)?;
             }
-            resp.commands.extend(commands);
+            if !commands.is_empty() {
+                resp.reactions.push(pb::PolicyReaction {
+                    trigger_sequence: page.sequence,
+                    commands,
+                });
+            }
         }
 
         Ok(resp)
