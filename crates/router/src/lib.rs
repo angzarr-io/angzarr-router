@@ -10,7 +10,6 @@
 #![forbid(unsafe_code)]
 
 pub mod context;
-pub mod descriptor;
 pub mod domain;
 pub mod error;
 pub mod policy;

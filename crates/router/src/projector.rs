@@ -126,25 +126,6 @@ impl<P> ProjectorDispatch<P> {
         self
     }
 
-    /// The registration hello (types.proto, ComponentDescriptor): kind
-    /// PROJECTOR, its declared domains as inputs (`*` when it declares
-    /// none), and no state. Refused MISSING_RULES_VERSION without a rules
-    /// version.
-    pub fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError> {
-        let inputs: Vec<String> = match self.domains.as_ref() {
-            Some(domains) => domains.iter().cloned().collect(),
-            None => vec![crate::WILDCARD_DOMAIN.to_string()],
-        };
-        crate::descriptor::component_descriptor(
-            &self.name,
-            pb::ComponentKind::Projector,
-            inputs,
-            &self.rules_version,
-            None,
-            Vec::new(),
-        )
-    }
-
     /// The component name.
     pub fn name(&self) -> &str {
         &self.name

@@ -558,9 +558,17 @@ async fn no_fact(w: &mut HandlingWorld) {
 #[given(r#"the "order" business binary has its "order" aggregate registered"#)]
 async fn order_registered(w: &mut HandlingWorld) {
     let order = conf::order_aggregate(&w.rules_version, w.settle.clone(), w.seen.clone());
+    // The descriptor angzarr-cli generates for it (decision 14.42).
+    let descriptor = pb::ComponentDescriptor {
+        name: "order".to_string(),
+        kind: pb::ComponentKind::Aggregate as i32,
+        rules_version: w.rules_version.clone(),
+        ..Default::default()
+    };
     w.registered = Some(Registered(
         angzarr_router::router::RouterBuilder::new()
             .aggregate(order)
+            .descriptor(descriptor)
             .build()
             .expect("the order aggregate"),
     ));

@@ -1009,7 +1009,6 @@ pub fn fulfillment_pm_writing(
                 ..Default::default()
             }))
         })
-        .starts("orders.v1.StartFulfillment")
 }
 
 /// A StartFulfillment command for the Fulfillment instance of correlation

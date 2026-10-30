@@ -182,20 +182,6 @@ impl PolicyDispatch {
         self
     }
 
-    /// The registration hello (types.proto, ComponentDescriptor): kind POLICY,
-    /// its input domain as its input, and no state. Refused
-    /// MISSING_RULES_VERSION without a rules version.
-    pub fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError> {
-        crate::descriptor::component_descriptor(
-            &self.name,
-            pb::ComponentKind::Policy,
-            [self.input_domain.clone()],
-            &self.rules_version,
-            None,
-            Vec::new(),
-        )
-    }
-
     /// The component name.
     pub fn name(&self) -> &str {
         &self.name

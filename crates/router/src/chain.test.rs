@@ -61,7 +61,6 @@ fn buyin() -> DomainDispatch<TestState> {
                 requested: unavailable.available,
             })))
         })
-        .starts(&fq::<StartBuyIn>())
 }
 
 fn buyin_wallet() -> PolicyDispatch {

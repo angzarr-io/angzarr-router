@@ -213,8 +213,7 @@ fn a_router_runs_its_process_manager_as_a_domain() {
                         pages: vec![event_page(any_of_type("test.Started"))],
                         ..Default::default()
                     }))
-                })
-                .starts("test.Start"),
+                }),
         )
         .build()
         .expect("build");
@@ -223,10 +222,6 @@ fn a_router_runs_its_process_manager_as_a_domain() {
         .expect("pm");
     assert_eq!(emitted_label(&resp), "test.Started");
     assert_eq!(resp.rules_version, "9");
-    assert_eq!(
-        router.component_descriptor().expect("hello").kind(),
-        pb::ComponentKind::ProcessManager
-    );
 }
 
 #[test]
@@ -323,12 +318,6 @@ impl CommandHandler for Plain {
     ) -> Result<pb::CommandHandlerResponse, CodedError> {
         Ok(pb::CommandHandlerResponse::default())
     }
-    fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError> {
-        Ok(pb::ComponentDescriptor {
-            name: "plain".to_string(),
-            ..Default::default()
-        })
-    }
 }
 
 #[test]
@@ -343,7 +332,6 @@ fn a_hand_written_aggregate_builds_a_router() {
             .expect("dispatch"),
         pb::CommandHandlerResponse::default()
     );
-    assert_eq!(router.component_descriptor().expect("hello").name, "plain");
 }
 
 // A hand-written domain is an aggregate unless it says otherwise: the
@@ -401,61 +389,6 @@ fn describe_answers_the_descriptor_it_was_given_unchanged() {
         .build()
         .expect("build");
     assert_eq!(undescribed.component_descriptor(), None);
-}
-
-#[test]
-fn a_router_answers_its_components_hello() {
-    let kind = |router: Router| router.component_descriptor().expect("hello").kind();
-    assert_eq!(
-        kind(RouterBuilder::new().aggregate(ledger("1")).build().unwrap()),
-        pb::ComponentKind::Aggregate
-    );
-    assert_eq!(
-        kind(
-            RouterBuilder::new()
-                .policy(PolicyDispatch::new("s", "order", "x").with_rules_version("1"))
-                .build()
-                .unwrap()
-        ),
-        pb::ComponentKind::Policy
-    );
-    assert_eq!(
-        kind(
-            RouterBuilder::new()
-                .process_manager(
-                    DomainDispatch::process_manager(
-                        "p",
-                        "pm",
-                        Rebuilder::<LedgerState>::of_message()
-                    )
-                    .with_rules_version("1")
-                )
-                .build()
-                .unwrap()
-        ),
-        pb::ComponentKind::ProcessManager
-    );
-    assert_eq!(
-        kind(
-            RouterBuilder::new()
-                .projector(ProjectorDispatch::new("v", || ()).with_rules_version("1"))
-                .build()
-                .unwrap()
-        ),
-        pb::ComponentKind::Projector
-    );
-}
-
-#[test]
-fn a_router_refuses_its_components_hello_without_a_rules_version() {
-    let err = RouterBuilder::new()
-        .aggregate(ledger(""))
-        .build()
-        .unwrap()
-        .component_descriptor()
-        .expect_err("refused");
-    assert_eq!(err.code, codes::MISSING_RULES_VERSION);
-    crate::test_support::assert_bug(&err);
 }
 
 /// A hand-written policy (a policy in another process, say): from `order`,

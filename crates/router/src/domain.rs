@@ -49,7 +49,7 @@
 //! }
 //! ```
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use prost::Message;
 use prost_types::Any;
@@ -171,7 +171,6 @@ pub struct DomainDispatch<S> {
     handlers: HashMap<String, CommandFn<S>>,
     facts: HashMap<String, FactFn<S>>,
     refused: HashMap<String, RefusedFn<S>>,
-    starting: BTreeSet<String>,
     commutative: Option<Box<dyn Resolver<S>>>,
     rules_version: String,
 }
@@ -191,7 +190,6 @@ impl<S> DomainDispatch<S> {
             handlers: HashMap::new(),
             facts: HashMap::new(),
             refused: HashMap::new(),
-            starting: BTreeSet::new(),
             commutative: None,
             rules_version: String::new(),
         }
@@ -199,9 +197,10 @@ impl<S> DomainDispatch<S> {
 
     /// An empty process-manager table over a Rebuilder: a domain (decision
     /// 14.31) whose inputs are commands and facts, whose only output is its
-    /// own events, whose stream root is the one its input's cover names
-    /// (decision 14.36), and which declares its starting inputs ([`Self::starts`]). Registered with kind
-    /// PROCESS_MANAGER and no inputs (it subscribes to nothing).
+    /// own events, and whose stream root is the one its input's cover names
+    /// (decision 14.36). Its kind is PROCESS_MANAGER; its starting types are
+    /// its generated descriptor's, which the coordinator's start rule reads
+    /// (decision 14.42).
     pub fn process_manager(
         name: impl Into<String>,
         domain: impl Into<String>,
@@ -211,16 +210,6 @@ impl<S> DomainDispatch<S> {
             kind: pb::ComponentKind::ProcessManager,
             ..Self::new(name, domain, rebuilder)
         }
-    }
-
-    /// Declares a registered command or fact type (fully qualified) as one
-    /// that may start a process-manager instance (options.proto,
-    /// CommandOptions.starts; advertised as
-    /// ComponentDescriptor.starting_types). An aggregate declaring one is
-    /// refused at registration (STARTING_TYPES_ON_NON_PM).
-    pub fn starts(mut self, full_name: &str) -> Self {
-        self.starting.insert(full_name.to_string());
-        self
     }
 
     /// Registers the handler of a refusal fact passed through by one of the
@@ -258,31 +247,6 @@ impl<S> DomainDispatch<S> {
     pub fn with_rules_version(mut self, rules_version: impl Into<String>) -> Self {
         self.rules_version = rules_version.into();
         self
-    }
-
-    /// The registration hello (types.proto, ComponentDescriptor): kind
-    /// AGGREGATE, no inputs (an aggregate consumes commands, not events), and
-    /// the state type its rebuilder declares. Refused MISSING_RULES_VERSION
-    /// without a rules version, MISSING_STATE_TYPE without a state type.
-    pub fn component_descriptor(&self) -> Result<pb::ComponentDescriptor, CodedError> {
-        if self.kind != pb::ComponentKind::ProcessManager && !self.starting.is_empty() {
-            return Err(CodedError::internal(
-                codes::STARTING_TYPES_ON_NON_PM,
-                [(extras::COMPONENT.to_string(), self.name.clone())],
-            ));
-        }
-        crate::descriptor::component_descriptor(
-            &self.name,
-            self.kind,
-            [],
-            &self.rules_version,
-            Some(crate::descriptor::state_descriptor(
-                &self.name,
-                self.rebuilder.state_type_url(),
-                self.commutative.is_some(),
-            )?),
-            self.starting.iter().cloned().collect(),
-        )
     }
 
     /// Supports COMMUTATIVE conflict resolution with the state's generated

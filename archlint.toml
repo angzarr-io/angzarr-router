@@ -83,8 +83,8 @@ allow = ["angzarr_router::error::**"]
 
 [[rule]]
 name = "engine-kernel-below-components"
-why = "the shared kernel (crate-root helpers, rebuild, context, descriptor) sits below the component dispatchers and the router"
-from = ["angzarr_router", "angzarr_router::rebuild::**", "angzarr_router::context::**", "angzarr_router::descriptor::**"]
+why = "the shared kernel (crate-root helpers, rebuild, context) sits below the component dispatchers and the router"
+from = ["angzarr_router", "angzarr_router::rebuild::**", "angzarr_router::context::**"]
 scope = "lib"
 allow = [
     "angzarr_router",
@@ -93,7 +93,6 @@ allow = [
     "angzarr_router::error::**",
     "angzarr_router::rebuild::**",
     "angzarr_router::context::**",
-    "angzarr_router::descriptor::**",
 ]
 
 [[rule]]
@@ -112,7 +111,6 @@ allow = [
     "angzarr_router::error::**",
     "angzarr_router::rebuild::**",
     "angzarr_router::context::**",
-    "angzarr_router::descriptor::**",
 ]
 
 # ---- C ABI internals (library code) -----------------------------------------
