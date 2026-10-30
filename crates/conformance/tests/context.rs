@@ -6,6 +6,7 @@ mod common;
 
 use angzarr_router::error::CodedError;
 use angzarr_router::pb;
+use angzarr_router::router::{CommandHandler, ProjectorHandler};
 use angzarr_router_conformance as conf;
 use cucumber::writer::Stats as _;
 use cucumber::{given, then, when, World};
@@ -29,7 +30,7 @@ async fn tracking(_w: &mut ContextWorld) {}
 async fn fact_handled(w: &mut ContextWorld, fact: String, prior: String) {
     let prior = prior.parse().unwrap_or(0);
     let ledger = conf::ledger_aggregate(w.covers.clone(), w.applied.clone());
-    w.fact = Some(ledger.dispatch(&conf::ledger_fact(&fact, prior)));
+    w.fact = Some(CommandHandler::dispatch(&ledger, &conf::ledger_fact(&fact, prior)).await);
 }
 
 // The router folds the command's own event too, at the sequence it will be
@@ -44,8 +45,8 @@ async fn applied_at(w: &mut ContextWorld, first: u64, second: u64, emitted: u64)
 #[when(regex = r#"^an IncreaseBy command for ledger root "([^"]*)" is dispatched$"#)]
 async fn ledger_command(w: &mut ContextWorld, label: String) {
     let ledger = conf::ledger_aggregate(w.covers.clone(), w.applied.clone());
-    ledger
-        .dispatch(&conf::ledger_command(&label))
+    CommandHandler::dispatch(&ledger, &conf::ledger_command(&label))
+        .await
         .expect("dispatch");
 }
 
@@ -54,8 +55,8 @@ async fn ledger_command(w: &mut ContextWorld, label: String) {
 )]
 async fn ledger_command_over(w: &mut ContextWorld, label: String, first: u64, second: u64) {
     let ledger = conf::ledger_aggregate(w.covers.clone(), w.applied.clone());
-    ledger
-        .dispatch(&conf::ledger_command_over(&label, &[first, second]))
+    CommandHandler::dispatch(&ledger, &conf::ledger_command_over(&label, &[first, second]))
+        .await
         .expect("dispatch");
 }
 
@@ -64,8 +65,8 @@ async fn ledger_command_over(w: &mut ContextWorld, label: String, first: u64, se
 )]
 async fn projected(w: &mut ContextWorld, label: String, first: u64, second: u64) {
     let projector = conf::tracking_projector(w.pages.clone());
-    projector
-        .dispatch(&conf::tracked_book(&label, &[first, second]))
+    ProjectorHandler::dispatch(&projector, &conf::tracked_book(&label, &[first, second]))
+        .await
         .expect("dispatch");
 }
 

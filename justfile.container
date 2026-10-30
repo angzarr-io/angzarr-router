@@ -25,6 +25,14 @@ build:
 test:
     cargo test --manifest-path {{TOP}}/Cargo.toml --workspace
 
+# Build the router for wasm32 and compile its wasm32 tests (no runner: the
+# test is that components that are not Send compile, tests/wasm.rs). The
+# target is added when the rust image lacks it.
+wasm:
+    rustup target list --installed | grep -qx wasm32-unknown-unknown || rustup target add wasm32-unknown-unknown
+    cargo build --manifest-path {{TOP}}/Cargo.toml -p angzarr-router --target wasm32-unknown-unknown
+    cargo test --manifest-path {{TOP}}/Cargo.toml -p angzarr-router --target wasm32-unknown-unknown --no-run
+
 # Check formatting (no rewrite; fails on drift)
 fmt-check:
     cargo fmt --manifest-path {{TOP}}/Cargo.toml --all --check

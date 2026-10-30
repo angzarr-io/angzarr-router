@@ -8,6 +8,7 @@ mod common;
 
 use angzarr_router::error::CodedError;
 use angzarr_router::pb;
+use angzarr_router::router::CommandHandler;
 use angzarr_router_conformance as conf;
 use cucumber::writer::Stats as _;
 use cucumber::{given, then, when, World};
@@ -23,9 +24,12 @@ struct CounterWorld {
 }
 
 impl CounterWorld {
-    fn dispatch(&mut self, mut cc: pb::ContextualCommand) {
+    /// Dispatches through the kernel-facing [`CommandHandler`], awaiting
+    /// its answer.
+    async fn dispatch(&mut self, mut cc: pb::ContextualCommand) {
         cc.events = self.prior.clone();
-        self.result = Some(conf::counter_aggregate(self.observed.clone()).dispatch(&cc));
+        let counter = conf::counter_aggregate(self.observed.clone());
+        self.result = Some(CommandHandler::dispatch(&counter, &cc).await);
     }
 
     fn last_observed(&self) -> conf::Observed {
@@ -73,7 +77,7 @@ async fn starting_state(w: &mut CounterWorld, count: u32, sequence: u64, event_a
 
 #[when(regex = r"^the operator increases the counter by (\d+)$")]
 async fn increase_by(w: &mut CounterWorld, n: u32) {
-    w.dispatch(conf::increase_command(n));
+    w.dispatch(conf::increase_command(n)).await;
 }
 
 #[when(
@@ -83,17 +87,17 @@ async fn increase_by_prefixed(w: &mut CounterWorld, n: u32, prefix: String) {
     w.dispatch(conf::with_type_url_prefix(
         conf::increase_command(n),
         &prefix,
-    ));
+    )).await;
 }
 
 #[when("the operator triggers a hard failure")]
 async fn hard_failure(w: &mut CounterWorld) {
-    w.dispatch(conf::failhard_command());
+    w.dispatch(conf::failhard_command()).await;
 }
 
 #[when("an unhandled command is dispatched")]
 async fn unhandled_command(w: &mut CounterWorld) {
-    w.dispatch(conf::unhandled_command());
+    w.dispatch(conf::unhandled_command()).await;
 }
 
 #[then(regex = r"^(\d+) increases are recorded$")]

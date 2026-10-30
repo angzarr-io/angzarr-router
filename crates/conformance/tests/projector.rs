@@ -7,6 +7,7 @@ mod common;
 
 use angzarr_router::error::CodedError;
 use angzarr_router::pb;
+use angzarr_router::router::ProjectorHandler;
 use angzarr_router_conformance as conf;
 use cucumber::writer::Stats as _;
 use cucumber::{given, then, when, World};
@@ -20,8 +21,11 @@ struct ProjectorWorld {
 }
 
 impl ProjectorWorld {
-    fn dispatch(&mut self, book: pb::EventBook) {
-        self.result = Some(conf::counter_projector(&self.domains).dispatch(&book));
+    /// Dispatches through the kernel-facing [`ProjectorHandler`], awaiting
+    /// its answer.
+    async fn dispatch(&mut self, book: pb::EventBook) {
+        let projector = conf::counter_projector(&self.domains);
+        self.result = Some(ProjectorHandler::dispatch(&projector, &book).await);
     }
 
     fn projection(&self) -> &pb::Projection {
@@ -45,7 +49,7 @@ async fn a_counter_projection_over_every_domain(w: &mut ProjectorWorld) {
 
 #[when(regex = r#"^(\d+) events are delivered in domain "([^"]*)"$"#)]
 async fn events_delivered(w: &mut ProjectorWorld, count: u32, domain: String) {
-    w.dispatch(conf::delivery(&domain, count));
+    w.dispatch(conf::delivery(&domain, count)).await;
 }
 
 #[then(regex = r"^the projection records (\d+) events?$")]

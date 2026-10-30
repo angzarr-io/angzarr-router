@@ -10,8 +10,12 @@ use crate::pb;
 use crate::policy::PolicyDispatch;
 use crate::projector::ProjectorDispatch;
 use crate::rebuild::Rebuilder;
-use crate::router::{CommandHandler, PolicyComponent, ProjectorHandler, Router, RouterBuilder};
+use crate::router::{
+    CommandHandler, DynCommandHandler, DynPolicyComponent, DynProjectorHandler, PolicyComponent,
+    Router, RouterBuilder,
+};
 use crate::test_support::{
+    now,
     command_page, event_page, fact_page, fresh_rebuilder, LedgerState, TestState,
 };
 use crate::type_url;
@@ -137,22 +141,22 @@ fn a_router_dispatches_commands_and_facts_to_its_aggregate() {
         )
         .build()
         .expect("build");
-    let resp = router
-        .dispatch_command(&command("order", "test.Create"))
+    let resp = now(router
+        .dispatch_command(&command("order", "test.Create")))
         .expect("command");
     assert_eq!(emitted_label(&resp), "created");
-    let resp = router
-        .dispatch_command(&fact("order", "test.Paid"))
+    let resp = now(router
+        .dispatch_command(&fact("order", "test.Paid")))
         .expect("fact");
     assert_eq!(emitted_label(&resp), "paid");
-    let err = router
-        .dispatch_command(&command("order", "test.Unknown"))
+    let err = now(router
+        .dispatch_command(&command("order", "test.Unknown")))
         .unwrap_err();
     assert_eq!(err.code, "ROUTER_REASON_UNKNOWN_COMMAND_TYPE");
     crate::test_support::assert_bug(&err);
     assert_eq!(err.grpc, crate::error::GrpcCode::Internal);
-    let err = router
-        .dispatch_command(&fact("order", "test.Unrecorded"))
+    let err = now(router
+        .dispatch_command(&fact("order", "test.Unrecorded")))
         .unwrap_err();
     assert_eq!(err.code, RouterReason::NoFactHandler.as_str_name());
     crate::test_support::assert_bug(&err);
@@ -188,7 +192,7 @@ fn a_router_runs_its_policy() {
         .expect("build");
     assert_eq!(
         crate::test_support::commands_of(
-            &router.dispatch_policy(&source("order")).expect("policy")
+            &now(router.dispatch_policy(&source("order"))).expect("policy")
         )
         .len(),
         1
@@ -198,7 +202,7 @@ fn a_router_runs_its_policy() {
     // domain is handled all the same.
     assert_eq!(
         crate::test_support::commands_of(
-            &router.dispatch_policy(&source("billing")).expect("policy")
+            &now(router.dispatch_policy(&source("billing"))).expect("policy")
         )
         .len(),
         1
@@ -222,8 +226,8 @@ fn a_router_runs_its_process_manager_as_a_domain() {
         )
         .build()
         .expect("build");
-    let resp = router
-        .dispatch_command(&command("pm", "test.Start"))
+    let resp = now(router
+        .dispatch_command(&command("pm", "test.Start")))
         .expect("pm");
     assert_eq!(emitted_label(&resp), "test.Started");
     assert_eq!(resp.rules_version, "9");
@@ -235,8 +239,8 @@ fn a_router_answers_its_projectors_projection() {
         .projector(ProjectorDispatch::new("p1", || ()))
         .build()
         .expect("build");
-    let projection = router
-        .dispatch_projector(&source("order"))
+    let projection = now(router
+        .dispatch_projector(&source("order")))
         .expect("projection");
     assert_eq!(projection.projector, "p1");
 }
@@ -247,15 +251,15 @@ fn a_router_refuses_dispatch_of_another_kind() {
         .build()
         .expect("build");
     assert_eq!(
-        router
-            .dispatch_command(&command("order", "test.Create"))
+        now(router
+            .dispatch_command(&command("order", "test.Create")))
             .unwrap_err()
             .code,
         "ROUTER_REASON_NO_COMPONENT_OF_KIND"
     );
     assert_eq!(
-        router
-            .dispatch_projector(&source("order"))
+        now(router
+            .dispatch_projector(&source("order")))
             .unwrap_err()
             .code,
         "ROUTER_REASON_NO_COMPONENT_OF_KIND"
@@ -264,8 +268,8 @@ fn a_router_refuses_dispatch_of_another_kind() {
         .build()
         .expect("build");
     assert_eq!(
-        aggregate_router
-            .dispatch_policy(&source("order"))
+        now(aggregate_router
+            .dispatch_policy(&source("order")))
             .unwrap_err()
             .code,
         "ROUTER_REASON_NO_COMPONENT_OF_KIND"
@@ -276,18 +280,18 @@ fn a_router_refuses_dispatch_of_another_kind() {
 
 #[test]
 fn boxed_components_build_routers() {
-    let boxed: Box<dyn CommandHandler> = Box::new(aggregate("boxed", "order", &["test.Create"]));
-    assert_eq!(boxed.command_types(), vec!["test.Create".to_string()]);
+    let boxed: Box<dyn DynCommandHandler> = Box::new(aggregate("boxed", "order", &["test.Create"]));
+    assert_eq!(CommandHandler::command_types(&boxed), vec!["test.Create".to_string()]);
     let router = RouterBuilder::new()
         .aggregate(boxed)
         .build()
         .expect("build");
-    let resp = router
-        .dispatch_command(&command("order", "test.Create"))
+    let resp = now(router
+        .dispatch_command(&command("order", "test.Create")))
         .expect("dispatch");
     assert_eq!(emitted_label(&resp), "boxed");
 
-    let projector: Box<dyn ProjectorHandler> =
+    let projector: Box<dyn DynProjectorHandler> =
         Box::new(ProjectorDispatch::new("p", || ()).finish(|_, _| {
             Ok(pb::Projection {
                 projector: "boxed".to_string(),
@@ -298,11 +302,11 @@ fn boxed_components_build_routers() {
         .projector(projector)
         .build()
         .expect("build");
-    let projection = router
+    let projection = now(router
         .dispatch_projector(&pb::EventBook {
             cover: Some(pb::Cover::default()),
             ..Default::default()
-        })
+        }))
         .expect("dispatch");
     assert_eq!(projection.projector, "boxed");
 }
@@ -317,7 +321,7 @@ impl CommandHandler for Plain {
     fn command_types(&self) -> Vec<String> {
         vec!["test.Plain".to_string()]
     }
-    fn dispatch(
+    async fn dispatch(
         &self,
         _: &pb::ContextualCommand,
     ) -> Result<pb::CommandHandlerResponse, CodedError> {
@@ -332,8 +336,8 @@ fn a_hand_written_aggregate_builds_a_router() {
         .build()
         .expect("build");
     assert_eq!(
-        router
-            .dispatch_command(&command("plain", "test.Plain"))
+        now(router
+            .dispatch_command(&command("plain", "test.Plain")))
             .expect("dispatch"),
         pb::CommandHandlerResponse::default()
     );
@@ -408,7 +412,7 @@ impl PolicyComponent for Relay {
     fn input_domain(&self) -> &str {
         "order"
     }
-    fn dispatch(&self, _: &pb::EventBook) -> Result<pb::PolicyResponse, CodedError> {
+    async fn dispatch(&self, _: &pb::EventBook) -> Result<pb::PolicyResponse, CodedError> {
         Ok(pb::PolicyResponse {
             reactions: vec![pb::PolicyReaction {
                 trigger_sequence: 0,
@@ -416,7 +420,7 @@ impl PolicyComponent for Relay {
             }],
         })
     }
-    fn dispatch_refusal(
+    async fn dispatch_refusal(
         &self,
         refusal: &pb::Refusal,
         _: &crate::context::CommandContext,
@@ -447,19 +451,19 @@ fn reserve_refused() -> pb::Refusal {
 // hand-written one, boxed, answers through the trait.
 #[test]
 fn a_hand_written_policy_answers_through_policy_component() {
-    let boxed: Box<dyn PolicyComponent> = Box::new(Relay);
-    assert_eq!(boxed.name(), "relay");
-    assert_eq!(boxed.input_domain(), "order");
+    let boxed: Box<dyn DynPolicyComponent> = Box::new(Relay);
+    assert_eq!(PolicyComponent::name(&boxed), "relay");
+    assert_eq!(PolicyComponent::input_domain(&boxed), "order");
     assert_eq!(
-        crate::test_support::commands_of(&boxed.dispatch(&source("order")).expect("policy")).len(),
+        crate::test_support::commands_of(&now(PolicyComponent::dispatch(&boxed, &source("order"))).expect("policy")).len(),
         1
     );
     assert_eq!(
-        boxed
-            .dispatch_refusal(
-                &reserve_refused(),
-                &crate::context::CommandContext::default()
-            )
+        now(PolicyComponent::dispatch_refusal(
+            &boxed,
+            &reserve_refused(),
+            &crate::context::CommandContext::default()
+        ))
             .expect("answered"),
         Some(any_of_type("relayed/test.Reserve"))
     );
@@ -483,17 +487,16 @@ fn a_policy_dispatch_answers_through_policy_component() {
             }])
         })
         .on_refused("test.Reserve", |_, _| Ok(any_of_type("test.ReserveFailed")));
-    let policy: &dyn PolicyComponent = &dispatch;
-    assert_eq!(policy.name(), "s");
-    assert_eq!(policy.input_domain(), "order");
+    let policy: &dyn DynPolicyComponent = &dispatch;
+    assert_eq!(PolicyComponent::name(policy), "s");
+    assert_eq!(PolicyComponent::input_domain(policy), "order");
     assert_eq!(
-        crate::test_support::commands_of(&policy.dispatch(&source("order")).expect("policy")).len(),
+        crate::test_support::commands_of(&now(PolicyComponent::dispatch(policy, &source("order"))).expect("policy")).len(),
         1
     );
     let ctx = crate::context::CommandContext::default();
     assert_eq!(
-        policy
-            .dispatch_refusal(&reserve_refused(), &ctx)
+        now(PolicyComponent::dispatch_refusal(policy, &reserve_refused(), &ctx))
             .expect("translated"),
         Some(any_of_type("test.ReserveFailed"))
     );
@@ -503,7 +506,7 @@ fn a_policy_dispatch_answers_through_policy_component() {
         ..Default::default()
     });
     assert_eq!(
-        policy.dispatch_refusal(&other, &ctx).expect("answered"),
+        now(PolicyComponent::dispatch_refusal(policy, &other, &ctx)).expect("answered"),
         None,
         "no callback: no translation"
     );

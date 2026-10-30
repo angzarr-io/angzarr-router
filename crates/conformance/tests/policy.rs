@@ -7,6 +7,7 @@ mod common;
 
 use angzarr_router::error::CodedError;
 use angzarr_router::pb;
+use angzarr_router::router::PolicyComponent;
 use angzarr_router_conformance as conf;
 use cucumber::writer::Stats as _;
 use cucumber::{given, then, when, World};
@@ -20,8 +21,11 @@ struct PolicyWorld {
 }
 
 impl PolicyWorld {
-    fn dispatch(&mut self, req: pb::EventBook) {
-        self.result = Some(conf::order_policy(self.seen.clone()).dispatch(&req));
+    /// Dispatches through the kernel-facing [`PolicyComponent`], awaiting
+    /// its answer.
+    async fn dispatch(&mut self, req: pb::EventBook) {
+        let policy = conf::order_policy(self.seen.clone());
+        self.result = Some(PolicyComponent::dispatch(&policy, &req).await);
     }
 
     fn response(&self) -> &pb::PolicyResponse {
@@ -49,12 +53,12 @@ async fn an_order_policy(_w: &mut PolicyWorld, _target: String) {
 
 #[when(regex = r"^an Increased event at sequence (\d+) is dispatched$")]
 async fn increased_at(w: &mut PolicyWorld, seq: u64) {
-    w.dispatch(conf::policy_event_source("test.counter.Increased", seq));
+    w.dispatch(conf::policy_event_source("test.counter.Increased", seq)).await;
 }
 
 #[when("a Reserve event is dispatched")]
 async fn reserve_event(w: &mut PolicyWorld) {
-    w.dispatch(conf::policy_event_source("test.counter.Reserve", 0));
+    w.dispatch(conf::policy_event_source("test.counter.Reserve", 0)).await;
 }
 
 #[then(regex = r#"^the policy emits one command to "([^"]*)", in the reaction to sequence (\d+)$"#)]

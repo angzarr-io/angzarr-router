@@ -9,6 +9,8 @@ mod common;
 
 use angzarr_router::error::{CodedError, GrpcCode, RetryableStatus};
 use angzarr_router::pb;
+use angzarr_router::router::CommandHandler;
+use futures::FutureExt as _;
 use angzarr_router_conformance as conf;
 use cucumber::writer::Stats as _;
 use cucumber::{given, then, when, World};
@@ -62,7 +64,9 @@ struct HandlingWorld {
 }
 
 impl HandlingWorld {
-    fn dispatch(&mut self, mut req: pb::ContextualCommand) {
+    /// Dispatches through the kernel-facing [`CommandHandler`], awaiting
+    /// its answer.
+    async fn dispatch(&mut self, mut req: pb::ContextualCommand) {
         if self.recorded_at.is_some() {
             req.recorded_at = self.recorded_at;
         }
@@ -74,7 +78,10 @@ impl HandlingWorld {
         );
         // A handler's panic is the router's to answer (decision 14.37);
         // one that escapes is recorded, for the Then steps to fail on.
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| order.dispatch(&req))) {
+        let answer = std::panic::AssertUnwindSafe(CommandHandler::dispatch(&order, &req))
+            .catch_unwind()
+            .await;
+        match answer {
             Ok(answer) => self.result = Some(answer),
             Err(panic) => {
                 self.escaped = Some(
@@ -172,7 +179,7 @@ async fn fulfillment(w: &mut HandlingWorld, version: String) {
 #[when("the process manager handles a StartFulfillment command")]
 async fn pm_handles(w: &mut HandlingWorld) {
     let pm = conf::fulfillment_pm(&w.pm_rules_version);
-    w.pm_result = Some(pm.dispatch(&conf::start_fulfillment()));
+    w.pm_result = Some(CommandHandler::dispatch(&pm, &conf::start_fulfillment()).await);
 }
 
 #[then(regex = r#"^the answer reports rules version "([^"]*)"$"#)]
@@ -195,7 +202,7 @@ async fn delivered_snapshot(w: &mut HandlingWorld, version: String) {
 #[when(regex = r#"^AddItem "([^"]*)" is handled over that snapshot$"#)]
 async fn over_snapshot(w: &mut HandlingWorld, item: String) {
     let snapshot = w.snapshot.clone();
-    w.dispatch(conf::order_command("AddItem", &item, &[], None, snapshot));
+    w.dispatch(conf::order_command("AddItem", &item, &[], None, snapshot)).await;
 }
 
 #[then("business code decides on the snapshot's state")]
@@ -207,12 +214,12 @@ async fn decided_on_snapshot(w: &mut HandlingWorld) {
 
 #[when(regex = r#"^(\w+) "([^"]*)" is handled over no prior events$"#)]
 async fn handled(w: &mut HandlingWorld, command: String, item: String) {
-    w.dispatch(conf::order_command(&command, &item, &[], None, None));
+    w.dispatch(conf::order_command(&command, &item, &[], None, None)).await;
 }
 
 #[when(regex = r#"^a fact (\w+) "([^"]*)" is handled over no prior events$"#)]
 async fn fact_handled(w: &mut HandlingWorld, fact: String, item: String) {
-    w.dispatch(conf::order_fact(&fact, &item));
+    w.dispatch(conf::order_fact(&fact, &item)).await;
 }
 
 // --- the state on every answer (C-0570, C-0571; decisions 14.12, 14.14) -------
@@ -234,7 +241,7 @@ async fn delivery_over(w: &mut HandlingWorld, delivery: String, prior: String) {
         let command = delivery.split(' ').next().unwrap().to_string();
         conf::order_command(&command, &quoted(&delivery), &history, None, None)
     };
-    w.dispatch(req);
+    w.dispatch(req).await;
 }
 
 #[then(regex = r#"^the answer carries the order state with (.+) as its snapshot state$"#)]
@@ -272,7 +279,7 @@ async fn pm_handles_writing(w: &mut HandlingWorld, writing: String) {
     let writes = writing.starts_with("and writes");
     w.pm_placed = u32::from(writes);
     let pm = conf::fulfillment_pm_writing(&w.pm_rules_version, writes);
-    w.pm_result = Some(pm.dispatch(&conf::start_fulfillment()));
+    w.pm_result = Some(CommandHandler::dispatch(&pm, &conf::start_fulfillment()).await);
 }
 
 fn pm_answer(w: &HandlingWorld) -> &pb::CommandHandlerResponse {
@@ -340,7 +347,7 @@ async fn answers_unchecked(w: &mut HandlingWorld, domain: String) {
 
 /// The policy from `policy_translating`, answering each OrderPlaced with
 /// `policy_commands`, handling `source`.
-fn handle_policy(w: &mut HandlingWorld, source: pb::EventBook) {
+async fn handle_policy(w: &mut HandlingWorld, source: pb::EventBook) {
     let (name, input, output) = w.policy.clone().expect("a policy");
     let commands = w.policy_commands.clone();
     let policy = angzarr_router::policy::PolicyDispatch::new(name, input, output)
@@ -349,7 +356,7 @@ fn handle_policy(w: &mut HandlingWorld, source: pb::EventBook) {
         .policy(policy)
         .build()
         .expect("one policy");
-    w.policy_result = Some(router.dispatch_policy(&source));
+    w.policy_result = Some(router.dispatch_policy(&source).await);
 }
 
 /// An "order" book of `events` ((type, sequence)), from the order stream
@@ -374,7 +381,7 @@ fn order_book(events: &[(&str, u64)]) -> pb::EventBook {
 
 #[when("the OrderPlaced event is handled")]
 async fn policy_handles(w: &mut HandlingWorld) {
-    handle_policy(w, order_book(&[("OrderPlaced", 1)]));
+    handle_policy(w, order_book(&[("OrderPlaced", 1)])).await;
 }
 
 #[when(
@@ -388,7 +395,7 @@ async fn policy_handles_book(w: &mut HandlingWorld, first: u64, note: u64, secon
             ("OrderNoteAdded", note),
             ("OrderPlaced", second),
         ]),
-    );
+    ).await;
 }
 
 fn policy_answer(w: &HandlingWorld) -> &pb::PolicyResponse {
@@ -493,10 +500,18 @@ async fn policy_given_refusal(w: &mut HandlingWorld, command: String) {
             Ok(fact.clone())
         });
     }
-    w.refusal_answer = Some(policy.dispatch_refusal(
-        &refusal,
-        &angzarr_router::context::CommandContext::default(),
-    ));
+    let router = angzarr_router::router::RouterBuilder::new()
+        .policy(policy)
+        .build()
+        .expect("one policy");
+    w.refusal_answer = Some(
+        router
+            .dispatch_refusal(
+                &refusal,
+                &angzarr_router::context::CommandContext::default(),
+            )
+            .await,
+    );
     w.refusal = Some(refusal);
 }
 
@@ -676,7 +691,7 @@ async fn handled_resolving(
         &history(&events),
         Some((expected, resolution(&name), nonce.into_bytes())),
         None,
-    ));
+    )).await;
 }
 
 #[then(regex = r"^business code saw expected sequence (\d+) under (\w+)$")]
@@ -752,7 +767,7 @@ async fn over_delivery(w: &mut HandlingWorld, item: String) {
     let book = req.events.as_mut().expect("a book");
     book.next_sequence = w.delivery_pages.last().map_or(0, |p| p.sequence + 1);
     book.pages = w.delivery_pages.clone();
-    w.dispatch(req);
+    w.dispatch(req).await;
 }
 
 // --- the conflict report (C-0542 to C-0550; decision 14.42) -------------------
@@ -1090,7 +1105,7 @@ async fn fold_fails_persisted(w: &mut HandlingWorld, sequence: u64) {
     history.push(("ItemAdded".to_string(), conf::ROTTEN_ITEM.to_string()));
     w.dispatch(conf::order_command(
         "AddItem", "apple", &history, None, None,
-    ));
+    )).await;
     let outcome = w.result.take().expect("handled").map(|_| ());
     condition(w, outcome);
 }
@@ -1104,7 +1119,7 @@ async fn fold_fails_emitted(w: &mut HandlingWorld, sequence: u64) {
         &history,
         None,
         None,
-    ));
+    )).await;
     let outcome = w.result.take().expect("handled").map(|_| ());
     condition(w, outcome);
 }
@@ -1114,7 +1129,7 @@ async fn command_of_type(w: &mut HandlingWorld, type_url: String) {
     w.dispatch(with_payload_type(
         conf::order_command("AddItem", "apple", &[], None, None),
         &type_url,
-    ));
+    )).await;
     let outcome = w.result.take().expect("handled").map(|_| ());
     condition(w, outcome);
 }
@@ -1124,7 +1139,7 @@ async fn fact_of_type(w: &mut HandlingWorld, type_url: String) {
     w.dispatch(with_payload_type(
         conf::order_fact("ItemDelivered", "apple"),
         &type_url,
-    ));
+    )).await;
     let outcome = w.result.take().expect("handled").map(|_| ());
     condition(w, outcome);
 }
@@ -1147,7 +1162,7 @@ async fn command_refused_unhandled(w: &mut HandlingWorld, command: String, _none
             value: refused.encode_to_vec(),
         }),
     }));
-    w.dispatch(req);
+    w.dispatch(req).await;
     let outcome = w.result.take().expect("handled").map(|_| ());
     condition(w, outcome);
 }
@@ -1166,7 +1181,7 @@ async fn command_refused_undecodable(w: &mut HandlingWorld) {
             value: vec![0xff, 0xff, 0xff],
         }),
     }));
-    w.dispatch(req);
+    w.dispatch(req).await;
     let outcome = w.result.take().expect("handled").map(|_| ());
     condition(w, outcome);
 }
@@ -1186,7 +1201,7 @@ async fn commutative_without_resolver(w: &mut HandlingWorld) {
         Some((0, pb::ConflictResolution::Commutative, Vec::new())),
         None,
     );
-    condition(w, order.dispatch(&req).map(|_| ()));
+    condition(w, CommandHandler::dispatch(&order, &req).await.map(|_| ()));
 }
 
 #[when(r#"a policy is dispatched to the business process hosting the "order" aggregate"#)]
@@ -1200,6 +1215,7 @@ async fn policy_to_aggregate(w: &mut HandlingWorld) {
         w,
         router
             .dispatch_policy(&conf::order_placed_source())
+            .await
             .map(|_| ()),
     );
 }

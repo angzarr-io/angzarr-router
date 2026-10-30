@@ -254,8 +254,8 @@ fn a_policy_router_answers_a_refusal_and_no_other_router_does() {
         }))
         .build()
         .expect("build");
-    let answer = router
-        .dispatch_refusal(&refusal, &CommandContext::default())
+    let answer = now(router
+        .dispatch_refusal(&refusal, &CommandContext::default()))
         .expect("answered");
     let fact: FundsUnavailable = fact_of(&answer);
     assert_eq!(fact, FundsUnavailable { available: 2 });
@@ -264,8 +264,8 @@ fn a_policy_router_answers_a_refusal_and_no_other_router_does() {
         .projector(crate::projector::ProjectorDispatch::new("p", || ()))
         .build()
         .expect("build");
-    let err = projector
-        .dispatch_refusal(&refusal, &CommandContext::default())
+    let err = now(projector
+        .dispatch_refusal(&refusal, &CommandContext::default()))
         .expect_err("no policy");
     assert_eq!(err.code, "ROUTER_REASON_NO_COMPONENT_OF_KIND");
 }

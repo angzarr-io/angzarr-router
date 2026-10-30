@@ -2,6 +2,10 @@
 //! client-go's engine_test.go helpers so the two suites pin identical
 //! shapes.
 
+use std::future::Future;
+use std::pin::pin;
+use std::task::{Context, Poll, Waker};
+
 use prost::{Message, Name};
 use prost_types::Any;
 
@@ -259,4 +263,14 @@ pub fn commands_of(resp: &pb::PolicyResponse) -> Vec<pb::CommandBook> {
         .iter()
         .flat_map(|r| r.commands.iter().cloned())
         .collect()
+}
+
+/// The answer of a dispatch future, which must be ready on its first poll:
+/// the router's own components wrap synchronous business code, so there is
+/// nothing to wait on.
+pub fn now<F: Future>(future: F) -> F::Output {
+    match pin!(future).poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(answer) => answer,
+        Poll::Pending => panic!("a router-built component's dispatch waited"),
+    }
 }
