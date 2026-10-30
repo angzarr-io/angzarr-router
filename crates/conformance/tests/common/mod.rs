@@ -22,10 +22,6 @@ pub const LATER_STEPS: &[(&str, &str)] = &[
     ("C-0545", "conflict judgement moves out (14.42)"),
     ("C-0547", "conflict judgement moves out (14.42)"),
     ("C-0550", "conflict judgement moves out (14.42)"),
-    (
-        "C-0692",
-        "refusal building moves to the coordinator (14.42)",
-    ),
 ];
 
 /// A path under the workspace root.
