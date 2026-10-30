@@ -10,10 +10,10 @@ mod common;
 use angzarr_router::error::{CodedError, GrpcCode, RetryableStatus};
 use angzarr_router::pb;
 use angzarr_router::router::CommandHandler;
-use futures::FutureExt as _;
 use angzarr_router_conformance as conf;
 use cucumber::writer::Stats as _;
 use cucumber::{given, then, when, World};
+use futures::FutureExt as _;
 use prost::Message;
 use std::sync::{Arc, Mutex};
 
@@ -202,7 +202,8 @@ async fn delivered_snapshot(w: &mut HandlingWorld, version: String) {
 #[when(regex = r#"^AddItem "([^"]*)" is handled over that snapshot$"#)]
 async fn over_snapshot(w: &mut HandlingWorld, item: String) {
     let snapshot = w.snapshot.clone();
-    w.dispatch(conf::order_command("AddItem", &item, &[], None, snapshot)).await;
+    w.dispatch(conf::order_command("AddItem", &item, &[], None, snapshot))
+        .await;
 }
 
 #[then("business code decides on the snapshot's state")]
@@ -214,7 +215,8 @@ async fn decided_on_snapshot(w: &mut HandlingWorld) {
 
 #[when(regex = r#"^(\w+) "([^"]*)" is handled over no prior events$"#)]
 async fn handled(w: &mut HandlingWorld, command: String, item: String) {
-    w.dispatch(conf::order_command(&command, &item, &[], None, None)).await;
+    w.dispatch(conf::order_command(&command, &item, &[], None, None))
+        .await;
 }
 
 #[when(regex = r#"^a fact (\w+) "([^"]*)" is handled over no prior events$"#)]
@@ -395,7 +397,8 @@ async fn policy_handles_book(w: &mut HandlingWorld, first: u64, note: u64, secon
             ("OrderNoteAdded", note),
             ("OrderPlaced", second),
         ]),
-    ).await;
+    )
+    .await;
 }
 
 fn policy_answer(w: &HandlingWorld) -> &pb::PolicyResponse {
@@ -691,7 +694,8 @@ async fn handled_resolving(
         &history(&events),
         Some((expected, resolution(&name), nonce.into_bytes())),
         None,
-    )).await;
+    ))
+    .await;
 }
 
 #[then(regex = r"^business code saw expected sequence (\d+) under (\w+)$")]
@@ -1105,7 +1109,8 @@ async fn fold_fails_persisted(w: &mut HandlingWorld, sequence: u64) {
     history.push(("ItemAdded".to_string(), conf::ROTTEN_ITEM.to_string()));
     w.dispatch(conf::order_command(
         "AddItem", "apple", &history, None, None,
-    )).await;
+    ))
+    .await;
     let outcome = w.result.take().expect("handled").map(|_| ());
     condition(w, outcome);
 }
@@ -1119,7 +1124,8 @@ async fn fold_fails_emitted(w: &mut HandlingWorld, sequence: u64) {
         &history,
         None,
         None,
-    )).await;
+    ))
+    .await;
     let outcome = w.result.take().expect("handled").map(|_| ());
     condition(w, outcome);
 }
@@ -1129,7 +1135,8 @@ async fn command_of_type(w: &mut HandlingWorld, type_url: String) {
     w.dispatch(with_payload_type(
         conf::order_command("AddItem", "apple", &[], None, None),
         &type_url,
-    )).await;
+    ))
+    .await;
     let outcome = w.result.take().expect("handled").map(|_| ());
     condition(w, outcome);
 }
@@ -1139,7 +1146,8 @@ async fn fact_of_type(w: &mut HandlingWorld, type_url: String) {
     w.dispatch(with_payload_type(
         conf::order_fact("ItemDelivered", "apple"),
         &type_url,
-    )).await;
+    ))
+    .await;
     let outcome = w.result.take().expect("handled").map(|_| ());
     condition(w, outcome);
 }

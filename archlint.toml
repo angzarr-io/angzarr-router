@@ -55,6 +55,13 @@ scope = "lib"
 allow = ["angzarr_router::proto::**"]
 
 [[rule]]
+name = "engine-send-is-a-leaf"
+why = "the target-dependent Send bounds and the boxed future reference nothing else in the engine"
+from = ["angzarr_router::send::**"]
+scope = "lib"
+allow = ["angzarr_router::send::**"]
+
+[[rule]]
 name = "engine-error-is-a-leaf"
 why = "the coded-error vocabulary references nothing else in the engine"
 from = ["angzarr_router::error::**"]

@@ -22,6 +22,7 @@ pub mod projector;
 pub mod proto;
 pub mod rebuild;
 pub mod router;
+pub mod send;
 
 pub use proto::io::angzarr::v1 as pb;
 

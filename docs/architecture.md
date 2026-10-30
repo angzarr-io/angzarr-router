@@ -58,8 +58,15 @@ fully-qualified type name.
   it answers `Describe` with (`RouterBuilder::descriptor`,
   `Router::component_descriptor`). The traits `CommandHandler`,
   `PolicyComponent` and `ProjectorHandler` let a runtime hold a component
-  of its own (one in another process, say); components may be registered
-  boxed.
+  of its own (one in another process, say). They are kernel-facing and
+  async (owner ruling 2026-10-30): their dispatch returns a future, `Send`
+  on every target but wasm32 (`send::MaybeSend`), and so do the `Router`'s
+  `dispatch_*`. The router's own components answer at once, a ready future
+  around the business code's synchronous functions; business code is never
+  async. Each trait has an object-safe twin (`DynCommandHandler`,
+  `DynPolicyComponent`, `DynProjectorHandler`, boxed futures) that every
+  implementor is, and whose `dyn` is the trait again: components are held
+  and registered boxed as `Box<dyn Dyn…>`.
 - `CodedError`, `HandlerError` and the reason keys (`error::RouterReason`,
   re-exported from angzarr-proto), and the wire types re-exported as `pb`.
 

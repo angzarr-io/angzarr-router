@@ -53,12 +53,14 @@ async fn an_order_policy(_w: &mut PolicyWorld, _target: String) {
 
 #[when(regex = r"^an Increased event at sequence (\d+) is dispatched$")]
 async fn increased_at(w: &mut PolicyWorld, seq: u64) {
-    w.dispatch(conf::policy_event_source("test.counter.Increased", seq)).await;
+    w.dispatch(conf::policy_event_source("test.counter.Increased", seq))
+        .await;
 }
 
 #[when("a Reserve event is dispatched")]
 async fn reserve_event(w: &mut PolicyWorld) {
-    w.dispatch(conf::policy_event_source("test.counter.Reserve", 0)).await;
+    w.dispatch(conf::policy_event_source("test.counter.Reserve", 0))
+        .await;
 }
 
 #[then(regex = r#"^the policy emits one command to "([^"]*)", in the reaction to sequence (\d+)$"#)]

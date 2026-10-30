@@ -268,10 +268,7 @@ async fn the_routers_own_components_answer_on_the_first_poll() {
         translating.translate_refusal(&refusal, &ctx)
     );
     assert!(
-        matches!(
-            translating.translate_refusal(&refusal, &ctx),
-            Ok(Some(_))
-        ),
+        matches!(translating.translate_refusal(&refusal, &ctx), Ok(Some(_))),
         "the translation is answered"
     );
 
@@ -343,9 +340,10 @@ async fn dispatch_spawns_on_a_multi_threaded_runtime() {
             .expect("one domain"),
     );
     let shared = Arc::clone(&router);
-    let task = tokio::spawn(async move {
-        sent(shared.dispatch_command(&conf::increase_command(1))).await
-    });
+    let task =
+        tokio::spawn(
+            async move { sent(shared.dispatch_command(&conf::increase_command(1))).await },
+        );
     answer.send(answered_with("spawned")).unwrap();
     assert_eq!(task.await.unwrap(), Ok(answered_with("spawned")));
 

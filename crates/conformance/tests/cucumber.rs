@@ -87,7 +87,8 @@ async fn increase_by_prefixed(w: &mut CounterWorld, n: u32, prefix: String) {
     w.dispatch(conf::with_type_url_prefix(
         conf::increase_command(n),
         &prefix,
-    )).await;
+    ))
+    .await;
 }
 
 #[when("the operator triggers a hard failure")]

@@ -55,9 +55,12 @@ async fn ledger_command(w: &mut ContextWorld, label: String) {
 )]
 async fn ledger_command_over(w: &mut ContextWorld, label: String, first: u64, second: u64) {
     let ledger = conf::ledger_aggregate(w.covers.clone(), w.applied.clone());
-    CommandHandler::dispatch(&ledger, &conf::ledger_command_over(&label, &[first, second]))
-        .await
-        .expect("dispatch");
+    CommandHandler::dispatch(
+        &ledger,
+        &conf::ledger_command_over(&label, &[first, second]),
+    )
+    .await
+    .expect("dispatch");
 }
 
 #[when(
