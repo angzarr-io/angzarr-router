@@ -22,6 +22,32 @@
 //! envelope, the arm and the type validate BEFORE state is rebuilt (an
 //! unknown command must report UNKNOWN_COMMAND_TYPE, not whatever the
 //! rebuild would surface). There is no compensation input.
+//!
+//! The router admits nothing (decision 14.42): deduplication, the refusal
+//! fact's stream check and a process manager's start rule are the
+//! coordinator's, done before it calls the router. No admit rules,
+//!
+//! ```compile_fail
+//! use angzarr_router::domain::admit_rules;
+//! ```
+//!
+//! no domain that admits,
+//!
+//! ```compile_fail
+//! use angzarr_router::domain::{Admission, Arrival};
+//! fn admits(domain: &dyn angzarr_router::router::CommandHandler, arrival: &Arrival<'_>) -> Admission {
+//!     domain.admit(arrival).unwrap()
+//! }
+//! ```
+//!
+//! and no router that admits:
+//!
+//! ```compile_fail
+//! use angzarr_router::domain::{Admission, Arrival};
+//! fn admits(router: &angzarr_router::router::Router, arrival: &Arrival<'_>) -> Admission {
+//!     router.admit(arrival).unwrap()
+//! }
+//! ```
 
 use std::collections::{BTreeSet, HashMap};
 
