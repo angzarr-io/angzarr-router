@@ -6,7 +6,7 @@ license.workspace = true
 description = "The router's generic C ABI (abi.proto): one register, one dispatch, role-typed callbacks; no semantics in this layer"
 
 [lib]
-crate-type = ["cdylib", "staticlib", "rlib"]
+crate-type = ["cdylib", "rlib"]
 
 [features]
 # `host`: a Rust host of the C ABI (src/host.rs), what a binding is, for the

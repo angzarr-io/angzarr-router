@@ -8,7 +8,6 @@
 #                               rust/angzarr-proto, a path dependency)
 #   angzarr_router              the engine: dispatch, component model, rebuild
 #   angzarr_router_ffi          the C ABI over the engine (marshaling, registry)
-#   bindings/<lang>             out-of-tree leaves that link the cdylib
 #   angzarr_router_conformance  the harness: drives the engine's public API
 #   angzarr_abigen              tooling: generates the ABI's bindings from
 #                               abi.proto; only tests depend on it
@@ -61,12 +60,6 @@ allow = [
     "angzarr_router_ffi::host::**",
     "path:conformance/**",
 ]
-
-[[rule]]
-name = "bindings-are-leaves"
-why = "language bindings link the C ABI from outside the workspace; no Rust crate reads or depends on them"
-from = ["angzarr_router::**", "angzarr_router_conformance::**", "angzarr_router_ffi::**"]
-deny = ["path:bindings/**"]
 
 # ---- engine internals (library code) ----------------------------------------
 
