@@ -21,7 +21,7 @@ license = "Apache-2.0 OR BSD-3-Clause"
 # angzarr-proto is built from; keep this repository's angzarr-project
 # submodule (the .proto files and the shared features) at that same commit
 # (`just check-core-lockstep`). prost and prost-types match its.
-angzarr-proto = { git = "https://github.com/angzarr-io/angzarr", rev = "bfbe8d3e51bbc754ee80f955e9fbb64d83beabb7" }
+angzarr-proto = { git = "https://github.com/angzarr-io/angzarr", rev = "dd0e55368d8f88ea24d3278fa135b2658c7cb26c" }
 prost = "0.14"
 prost-types = "0.14"
 prost-build = "0.14"
