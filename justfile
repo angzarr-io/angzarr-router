@@ -184,6 +184,98 @@ mutation-push remote *lefthook:
     done
     [ "$pushed" = 1 ] || echo "ok   mutation-push (no commit pushed: nothing to mutate)"
 
+# lefthook's pre-push step, given the remote's name and git's pushed refs on
+# stdin: every test (`just test`), in each pushed commit's tree checked out
+# alone at target/push-tree, so an unpushed edit cannot pass or fail it. No
+# mutation: no git hook runs it. The range reported runs from the merge base
+# of the commit pushed and the remote's current tip of that ref (a
+# fast-forward's base is that tip); for a new ref, or a tip not fetched here,
+# the merge base with the remote's default branch (<remote>/HEAD, else main).
+# A deleted ref passes at once. The push tree's angzarr-project is the pushed
+# commit's submodule commit, exported from this checkout's submodule (fetched
+# if it is missing there). The run's log is target/logs/push-tests.log.
+#
+# Red tests are allowed on a branch and kept out of the default branch: pushed
+# to another branch, failing tests pass with a warning that the branch cannot
+# merge until they pass; pushed to the default branch they are refused.
+# `lefthook` is what lefthook.yml passes to stop lefthook skipping it, and is
+# ignored. To check a push to main by hand without pushing:
+#
+#     echo "refs/heads/B $(git rev-parse HEAD) refs/heads/main 0" | just push-check origin
+[positional-arguments]
+push-check remote *lefthook:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # git exports repository-locating variables (GIT_DIR, ...) into a hook;
+    # with them, a git -C the push tree or a submodule would act on this
+    # checkout instead.
+    unset $(git rev-parse --local-env-vars)
+    top='{{TOP}}'
+    remote=$1
+    default=$(git -C "$top" symbolic-ref --quiet --short "refs/remotes/$remote/HEAD" 2>/dev/null) && default=${default#"$remote"/} || default=main
+    tree="$top/target/push-tree"
+    mkdir -p "$top/target/logs"
+    log="$top/target/logs/push-tests.log"
+    exec 9> "$top/target/.push-tree.lock"
+    flock 9
+    pushed=0
+    while read -r local_ref local_sha remote_ref remote_sha; do
+        [ -n "${local_sha:-}" ] || continue
+        [ "${local_sha//0/}" = "" ] && continue  # a deletion
+        pushed=1
+        target=${remote_ref#refs/heads/}
+        base=
+        if [ -n "${remote_sha//0/}" ] && git -C "$top" cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
+            base=$(git -C "$top" merge-base "$remote_sha" "$local_sha") || base=
+        fi
+        if [ -z "$base" ]; then
+            for ref in "refs/remotes/$remote/$default" "refs/heads/$default"; do
+                if git -C "$top" rev-parse --verify --quiet "$ref^{commit}" > /dev/null; then
+                    base=$(git -C "$top" merge-base "$ref" "$local_sha") && break
+                fi
+            done
+        fi
+        if [ -z "$base" ]; then
+            echo "FAIL push-check: $local_ref shares no history with $remote's tip or with $default" >&2
+            exit 1
+        fi
+        range="$(git -C "$top" rev-parse --short "$base")..$(git -C "$top" rev-parse --short "$local_sha") to $remote/$target"
+        # The pushed commit's tree, alone; no hook of this repository runs for
+        # it (core.hooksPath), and its target/ and .cargo-container/ (ignored,
+        # so kept by clean) carry builds across pushes.
+        nohooks=(-c core.hooksPath=/dev/null)
+        if ! git -C "$tree" rev-parse --git-dir > /dev/null 2>&1; then
+            rm -rf "$tree"
+            git -C "$top" worktree prune
+            git "${nohooks[@]}" -C "$top" worktree add --quiet --detach "$tree" "$local_sha"
+        fi
+        git "${nohooks[@]}" -C "$tree" checkout --quiet --detach --force "$local_sha"
+        git -C "$tree" clean -fdq
+        sub=$(git -C "$top" ls-tree "$local_sha" angzarr-project | awk '{print $3}')
+        if ! git -C "$top/angzarr-project" cat-file -e "$sub^{commit}" 2>/dev/null; then
+            git -C "$top/angzarr-project" fetch --quiet origin "$sub" || {
+                echo "FAIL push-check: angzarr-project $sub, the pushed commit's submodule, is not here (git submodule update --init)" >&2
+                exit 1
+            }
+        fi
+        rm -rf "$tree/angzarr-project"
+        mkdir -p "$tree/angzarr-project"
+        git -C "$top/angzarr-project" archive "$sub" | tar -x -C "$tree/angzarr-project"
+        rc=0
+        (cd "$tree" && just --justfile "$tree/justfile" test) > "$log" 2>&1 9>&- || rc=$?
+        if [ "$rc" -ne 0 ]; then
+            if [ "$remote_ref" != "refs/heads/$default" ]; then
+                echo "RED  push-check: $range: the tests fail (target/logs/push-tests.log); allowed off $default, which $target cannot merge into until they pass"
+                continue
+            fi
+            echo "FAIL push-check: $range: the tests fail, and $default takes no red tests (full log: target/logs/push-tests.log)" >&2
+            grep -E '^(test .* FAILED|failures:|error(\[|:))' "$log" | head -20 >&2 || true
+            exit 1
+        fi
+        echo "ok   push-check ($range): tests pass"
+    done
+    [ "$pushed" = 1 ] || echo "ok   push-check (no commit pushed: nothing to test)"
+
 # Format
 fmt: (_container "fmt")
 
