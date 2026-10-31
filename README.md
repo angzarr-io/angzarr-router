@@ -82,3 +82,7 @@ just fmt-check          # rustfmt, no rewrite
 
 Every recipe runs in the org's pinned Rust toolchain image (see
 `justfile`).
+
+## Licence
+
+AGPL-3.0-only; see [LICENSE](LICENSE).

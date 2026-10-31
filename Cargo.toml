@@ -9,7 +9,7 @@ exclude = ["angzarr-project"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "BSD-3-Clause"
+license = "AGPL-3.0-only"
 
 [workspace.dependencies]
 # The io.angzarr.v1 wire types, from angzarr-core's angzarr-proto crate
