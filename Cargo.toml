@@ -21,7 +21,7 @@ license = "BSD-3-Clause"
 # angzarr-proto is built from; keep this repository's angzarr-project
 # submodule (the .proto files and the shared features) at that same commit
 # (`just check-core-lockstep`). prost and prost-types match its.
-angzarr-proto = { git = "https://github.com/angzarr-io/angzarr", rev = "6741a98ba2ed07124546ae3ed1a4531fbcd9a26c" }
+angzarr-proto = { git = "https://github.com/angzarr-io/angzarr", rev = "bfbe8d3e51bbc754ee80f955e9fbb64d83beabb7" }
 prost = "0.14"
 prost-types = "0.14"
 prost-build = "0.14"
