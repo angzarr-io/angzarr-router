@@ -162,7 +162,8 @@ pub fn assert_fold_failed(
     located: &[(&str, &str)],
     state_type_url: &str,
 ) {
-    use crate::error::{extras, GrpcCode};
+    use crate::error::GrpcCode;
+    use angzarr_proto::v1::reason_args;
     assert_eq!(
         err.grpc,
         GrpcCode::Internal,
@@ -177,7 +178,9 @@ pub fn assert_fold_failed(
         );
     }
     assert_eq!(
-        err.extras.get(extras::STATE_TYPE_URL).map(String::as_str),
+        err.extras
+            .get(reason_args::STATE_TYPE_URL)
+            .map(String::as_str),
         Some(state_type_url)
     );
 }

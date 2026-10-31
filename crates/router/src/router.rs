@@ -22,11 +22,12 @@
 use std::future::Future;
 
 use crate::domain::DomainDispatch;
-use crate::error::{extras, CodedError, RouterReason};
+use crate::error::{CodedError, RouterReason};
 use crate::pb;
 use crate::policy::PolicyDispatch;
 use crate::projector::ProjectorDispatch;
 use crate::send::{BoxFuture, MaybeSend, MaybeSync};
+use angzarr_proto::v1::reason_args;
 
 /// A domain (an aggregate or a process manager; decision 14.31) as the
 /// router sees it, whatever its state type.
@@ -390,9 +391,9 @@ impl Component {
         CodedError::internal(
             reason,
             [
-                (extras::COMPONENT.to_string(), self.name().to_string()),
+                (reason_args::COMPONENT.to_string(), self.name().to_string()),
                 (
-                    extras::COMPONENT_KIND.to_string(),
+                    reason_args::COMPONENT_KIND.to_string(),
                     self.kind()
                         .as_str_name()
                         .trim_start_matches("COMPONENT_KIND_")

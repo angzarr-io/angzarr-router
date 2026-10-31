@@ -249,8 +249,8 @@ fn a_failing_fold_is_a_handler_bug_naming_its_page() {
             &err,
             "ROUTER_REASON_FOLD_FAILED",
             &[
-                (crate::error::extras::SEQUENCE, "1"),
-                (crate::error::extras::TYPE_URL, type_url.as_str()),
+                (angzarr_proto::v1::reason_args::SEQUENCE, "1"),
+                (angzarr_proto::v1::reason_args::TYPE_URL, type_url.as_str()),
             ],
             "/test.Board",
         );
@@ -414,7 +414,7 @@ fn a_batched_fold_failure_names_its_page_or_the_batchs_range() {
     assert_fold_failed(
         &err,
         "ROUTER_REASON_FOLD_FAILED",
-        &[(crate::error::extras::SEQUENCE, "6")],
+        &[(angzarr_proto::v1::reason_args::SEQUENCE, "6")],
         "/test.Board",
     );
     let err = failing(Some(9))
@@ -424,8 +424,8 @@ fn a_batched_fold_failure_names_its_page_or_the_batchs_range() {
         &err,
         "ROUTER_REASON_FOLD_FAILED",
         &[
-            (crate::error::extras::FIRST_SEQUENCE, "4"),
-            (crate::error::extras::LAST_SEQUENCE, "6"),
+            (angzarr_proto::v1::reason_args::FIRST_SEQUENCE, "4"),
+            (angzarr_proto::v1::reason_args::LAST_SEQUENCE, "6"),
         ],
         "/test.Board",
     );

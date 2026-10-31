@@ -124,8 +124,11 @@ fn a_router_hosts_one_component_and_refuses_a_second_of_any_kind() {
                 _ => ("p", "PROJECTOR"),
             };
             let extra = |key: &str| err.extras.get(key).map(String::as_str);
-            assert_eq!(extra(crate::error::extras::COMPONENT), Some(name));
-            assert_eq!(extra(crate::error::extras::COMPONENT_KIND), Some(kind));
+            assert_eq!(extra(angzarr_proto::v1::reason_args::COMPONENT), Some(name));
+            assert_eq!(
+                extra(angzarr_proto::v1::reason_args::COMPONENT_KIND),
+                Some(kind)
+            );
         }
     }
 }
@@ -336,7 +339,7 @@ fn a_hand_written_domain_is_an_aggregate_by_default() {
     let err = router.refuse_another_component();
     assert_eq!(
         err.extras
-            .get(crate::error::extras::COMPONENT_KIND)
+            .get(angzarr_proto::v1::reason_args::COMPONENT_KIND)
             .map(String::as_str),
         Some("AGGREGATE")
     );

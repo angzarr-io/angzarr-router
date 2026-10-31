@@ -42,7 +42,7 @@ fn every_constructor() -> Vec<(&'static str, CodedError)> {
             "internal with args",
             CodedError::internal(
                 RouterReason::DuplicateComponent,
-                [arg(extras::COMPONENT, "order")],
+                [arg(reason_args::COMPONENT, "order")],
             ),
         ),
         (
@@ -123,6 +123,33 @@ fn every_constructors_status_message_is_its_code() {
     );
 }
 
+/// Every arg the router answers a spec key with is one the key declares
+/// on its `(io.angzarr.v1.reason)` option (decision 14.60), a flattened
+/// `cause.<arg>` counting as `cause`; a handler's own code (not a spec key)
+/// is its own.
+#[test]
+fn every_spec_keys_args_are_the_ones_it_declares() {
+    let mut checked = 0;
+    for (name, err) in every_constructor() {
+        let Some(declared) = angzarr_proto::reason_key_args(&err.code) else {
+            continue;
+        };
+        checked += 1;
+        for arg in err.extras.keys() {
+            let base = arg.split_once('.').map_or(arg.as_str(), |(base, _)| base);
+            assert!(
+                declared.contains(&base),
+                "{name}: {} answers {arg}, which it does not declare ({declared:?})",
+                err.code
+            );
+        }
+    }
+    assert!(
+        checked >= 10,
+        "only {checked} constructors answer a spec key"
+    );
+}
+
 /// `value` as a display shows it: bare, or, where it would not parse back
 /// (empty, or holding whitespace, `=`, `"` or `\`), double-quoted with
 /// its `"` and `\` escaped.
@@ -181,7 +208,7 @@ fn an_unclassified_handler_errors_text_never_leaves_the_handler() {
     assert_eq!(err.grpc, GrpcCode::Internal);
     assert_eq!(err.code, RouterReason::UnhandledHandlerError.as_str_name());
     assert!(
-        !err.extras.contains_key(extras::CAUSE),
+        !err.extras.contains_key(reason_args::CAUSE),
         "no cause: {:?}",
         err.extras
     );
@@ -280,7 +307,7 @@ fn answer(reason: RouterReason) -> String {
         RouterReason::Unspecified => unreachable!("proto3's zero is never answered"),
         RouterReason::UnhandledHandlerError => CodedError::unhandled(),
         RouterReason::HandlerPanicked => {
-            return CodedError::panicked().extras[extras::CAUSE].clone();
+            return CodedError::panicked().extras[reason_args::CAUSE].clone();
         }
         RouterReason::CommandRefused => CodedError::refused(typed_refusal()),
         RouterReason::FoldFailed | RouterReason::FoldFailedEmitted => CodedError::fold_failed(
@@ -330,8 +357,8 @@ fn the_router_answers_exactly_the_non_unspecified_router_reasons() {
     let unanswered: Vec<String> = every_constructor()
         .into_iter()
         .flat_map(|(name, err)| {
-            let keys =
-                std::iter::once(err.code.clone()).chain(err.extras.get(extras::CAUSE).cloned());
+            let keys = std::iter::once(err.code.clone())
+                .chain(err.extras.get(reason_args::CAUSE).cloned());
             keys.map(move |key| (name, key)).collect::<Vec<_>>()
         })
         .filter(|(_, key)| key.starts_with("ROUTER_REASON_"))
@@ -407,7 +434,7 @@ fn persisted_corrupt_is_data_loss() {
     assert_eq!(err.grpc, GrpcCode::DataLoss);
     assert_eq!(err.code, RouterReason::PersistedEventCorrupt.as_str_name());
     assert_eq!(
-        err.extras.get(extras::TYPE_URL).map(String::as_str),
+        err.extras.get(reason_args::TYPE_URL).map(String::as_str),
         Some("type.googleapis.com/test.Evt")
     );
 }
@@ -429,11 +456,11 @@ fn fold_failed_is_internal_naming_the_event_and_state() {
     assert_eq!(err.grpc, GrpcCode::Internal);
     assert_eq!(err.code, "ROUTER_REASON_FOLD_FAILED");
     let extra = |key: &str| err.extras.get(key).map(String::as_str);
-    assert_eq!(extra(extras::SEQUENCE), Some("7"));
-    assert_eq!(extra(extras::TYPE_URL), Some("/test.Evt"));
-    assert_eq!(extra(extras::STATE_TYPE_URL), Some("/test.State"));
-    assert_eq!(extra(extras::FIRST_SEQUENCE), None);
-    assert_eq!(extra(extras::CAUSE), None, "no cause, no key");
+    assert_eq!(extra(reason_args::SEQUENCE), Some("7"));
+    assert_eq!(extra(reason_args::TYPE_URL), Some("/test.Evt"));
+    assert_eq!(extra(reason_args::STATE_TYPE_URL), Some("/test.State"));
+    assert_eq!(extra(reason_args::FIRST_SEQUENCE), None);
+    assert_eq!(extra(reason_args::CAUSE), None, "no cause, no key");
 }
 
 #[test]
@@ -447,10 +474,10 @@ fn an_unlocated_fold_failure_names_the_batchs_range() {
     assert_eq!(err.grpc, GrpcCode::Internal);
     assert_eq!(err.code, "ROUTER_REASON_FOLD_FAILED_EMITTED");
     let extra = |key: &str| err.extras.get(key).map(String::as_str);
-    assert_eq!(extra(extras::FIRST_SEQUENCE), Some("3"));
-    assert_eq!(extra(extras::LAST_SEQUENCE), Some("5"));
-    assert_eq!(extra(extras::SEQUENCE), None);
-    assert_eq!(extra(extras::STATE_TYPE_URL), Some(""));
+    assert_eq!(extra(reason_args::FIRST_SEQUENCE), Some("3"));
+    assert_eq!(extra(reason_args::LAST_SEQUENCE), Some("5"));
+    assert_eq!(extra(reason_args::SEQUENCE), None);
+    assert_eq!(extra(reason_args::STATE_TYPE_URL), Some(""));
 }
 
 // A request the router hosts no component for: a misroute or a stale
@@ -519,7 +546,7 @@ fn a_bug_is_unhandled_handler_error_with_the_handlers_code_as_its_cause() {
         ]
         .into()
     );
-    assert_eq!(extras::CAUSE, "cause");
+    assert_eq!(reason_args::CAUSE, "cause");
 }
 
 // --- the statuses a handler picks (owner ruling, 2026-10-29) ---------------------

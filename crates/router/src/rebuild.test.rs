@@ -10,10 +10,11 @@ use std::sync::Arc;
 use prost::Message;
 use prost_types::Any;
 
-use crate::error::{extras, RouterReason};
+use crate::error::RouterReason;
 use crate::pb;
 use crate::rebuild::{FoldFailure, PageOrigin, Rebuilder};
 use crate::test_support::*;
+use angzarr_proto::v1::reason_args;
 
 /// `r` with a state codec whose decode answers a state that has applied
 /// only `label`, and whose encode answers an empty `Any`.
@@ -76,8 +77,8 @@ fn an_applier_failing_on_a_persisted_event_is_a_handler_bug_naming_it() {
         &err,
         "ROUTER_REASON_FOLD_FAILED",
         &[
-            (extras::SEQUENCE, "5"),
-            (extras::TYPE_URL, type_url.as_str()),
+            (reason_args::SEQUENCE, "5"),
+            (reason_args::TYPE_URL, type_url.as_str()),
         ],
         "/test.Ledger",
     );
@@ -89,7 +90,7 @@ fn an_applier_failing_on_a_persisted_event_is_a_handler_bug_naming_it() {
         err.extras
     );
     assert!(
-        !err.extras.contains_key(extras::CAUSE),
+        !err.extras.contains_key(reason_args::CAUSE),
         "an unclassified failure has no cause: {:?}",
         err.extras
     );
@@ -133,7 +134,7 @@ fn a_rebuilder_declares_no_state_type_unless_told() {
             ..Default::default()
         }))
         .expect_err("failed");
-    assert_eq!(err.extras[extras::STATE_TYPE_URL], "");
+    assert_eq!(err.extras[reason_args::STATE_TYPE_URL], "");
 }
 
 #[test]
@@ -536,8 +537,8 @@ fn a_batched_fold_failure_names_the_page_it_indexes() {
         &err,
         "ROUTER_REASON_FOLD_FAILED",
         &[
-            (extras::SEQUENCE, "5"),
-            (extras::TYPE_URL, type_url.as_str()),
+            (reason_args::SEQUENCE, "5"),
+            (reason_args::TYPE_URL, type_url.as_str()),
         ],
         "/test.State",
     );
@@ -547,7 +548,7 @@ fn a_batched_fold_failure_names_the_page_it_indexes() {
         err.extras
     );
     assert_eq!(
-        err.extras.get(extras::CAUSE).map(String::as_str),
+        err.extras.get(reason_args::CAUSE).map(String::as_str),
         Some("NO"),
         "the fold's own failure is its cause"
     );
@@ -571,10 +572,13 @@ fn an_unlocated_or_out_of_range_fold_failure_names_the_batchs_range() {
         assert_fold_failed(
             &err,
             "ROUTER_REASON_FOLD_FAILED",
-            &[(extras::FIRST_SEQUENCE, "4"), (extras::LAST_SEQUENCE, "6")],
+            &[
+                (reason_args::FIRST_SEQUENCE, "4"),
+                (reason_args::LAST_SEQUENCE, "6"),
+            ],
             "/test.State",
         );
-        assert!(!err.extras.contains_key(extras::SEQUENCE));
+        assert!(!err.extras.contains_key(reason_args::SEQUENCE));
         assert_eq!(calls.load(Ordering::SeqCst), 1, "the fold is never re-run");
     }
 }
@@ -596,7 +600,7 @@ fn folding_emitted_pages_says_the_command_emitted_them() {
     assert_fold_failed(
         &err,
         "ROUTER_REASON_FOLD_FAILED_EMITTED",
-        &[(extras::SEQUENCE, "4")],
+        &[(reason_args::SEQUENCE, "4")],
         "/test.State",
     );
     let err = r
@@ -674,7 +678,7 @@ fn panicking_fold() -> Rebuilder<TestState> {
 /// The fold failed with cause ROUTER_REASON_HANDLER_PANICKED and no other cause args.
 fn assert_panicked_cause(err: &crate::error::CodedError) {
     assert_eq!(
-        err.extras.get(extras::CAUSE).map(String::as_str),
+        err.extras.get(reason_args::CAUSE).map(String::as_str),
         Some(RouterReason::HandlerPanicked.as_str_name()),
         "a panicking fold's cause: {:?}",
         err.extras
@@ -701,8 +705,8 @@ fn a_panicking_applier_fails_the_rebuild_naming_the_page() {
         &err,
         "ROUTER_REASON_FOLD_FAILED",
         &[
-            (extras::SEQUENCE, "4"),
-            (extras::TYPE_URL, type_url.as_str()),
+            (reason_args::SEQUENCE, "4"),
+            (reason_args::TYPE_URL, type_url.as_str()),
         ],
         "/test.State",
     );
@@ -716,10 +720,13 @@ fn a_panicking_batched_fold_fails_the_rebuild_naming_the_batchs_range() {
     assert_fold_failed(
         &err,
         "ROUTER_REASON_FOLD_FAILED",
-        &[(extras::FIRST_SEQUENCE, "4"), (extras::LAST_SEQUENCE, "6")],
+        &[
+            (reason_args::FIRST_SEQUENCE, "4"),
+            (reason_args::LAST_SEQUENCE, "6"),
+        ],
         "/test.State",
     );
-    assert!(!err.extras.contains_key(extras::SEQUENCE));
+    assert!(!err.extras.contains_key(reason_args::SEQUENCE));
     assert_panicked_cause(&err);
 }
 
@@ -733,7 +740,10 @@ fn a_panicking_batched_fold_of_emitted_pages_is_fold_failed_emitted() {
     assert_fold_failed(
         &err,
         "ROUTER_REASON_FOLD_FAILED_EMITTED",
-        &[(extras::FIRST_SEQUENCE, "4"), (extras::LAST_SEQUENCE, "6")],
+        &[
+            (reason_args::FIRST_SEQUENCE, "4"),
+            (reason_args::LAST_SEQUENCE, "6"),
+        ],
         "/test.State",
     );
     assert_panicked_cause(&err);
@@ -748,7 +758,7 @@ fn a_panicking_applier_of_emitted_pages_is_fold_failed_emitted() {
     assert_fold_failed(
         &err,
         "ROUTER_REASON_FOLD_FAILED_EMITTED",
-        &[(extras::SEQUENCE, "7")],
+        &[(reason_args::SEQUENCE, "7")],
         "/test.State",
     );
     assert_panicked_cause(&err);
@@ -763,7 +773,10 @@ fn a_panicking_batched_fold_of_one_page_names_it() {
     assert_fold_failed(
         &err,
         "ROUTER_REASON_FOLD_FAILED",
-        &[(extras::FIRST_SEQUENCE, "9"), (extras::LAST_SEQUENCE, "9")],
+        &[
+            (reason_args::FIRST_SEQUENCE, "9"),
+            (reason_args::LAST_SEQUENCE, "9"),
+        ],
         "/test.State",
     );
     assert_panicked_cause(&err);
@@ -791,8 +804,8 @@ fn a_panicking_codec_fails_the_rebuild_naming_the_snapshot() {
         &err,
         "ROUTER_REASON_FOLD_FAILED",
         &[
-            (extras::SEQUENCE, "3"),
-            (extras::TYPE_URL, snap_state.type_url.as_str()),
+            (reason_args::SEQUENCE, "3"),
+            (reason_args::TYPE_URL, snap_state.type_url.as_str()),
         ],
         "/test.State",
     );

@@ -54,9 +54,10 @@ use std::collections::HashMap;
 use prost::Message;
 use prost_types::Any;
 
-use crate::error::{call_handler, extras, CodedError, HandlerError, RouterReason};
+use crate::error::{call_handler, CodedError, HandlerError, RouterReason};
 use crate::pb;
 use crate::rebuild::{PageOrigin, Rebuilder};
+use angzarr_proto::v1::reason_args;
 
 pub use crate::context::{command_context, CommandContext, Conflict};
 
@@ -408,7 +409,7 @@ impl<S> DomainDispatch<S> {
                         else {
                             return Err(CodedError::internal(
                                 RouterReason::NoRefusalHandler,
-                                [(extras::COMMAND_TYPE.to_string(), refused_type)],
+                                [(reason_args::COMMAND_TYPE.to_string(), refused_type)],
                             ));
                         };
                         Box::new(move |state, cctx| call_handler(|| thunk(&refused, state, cctx)))

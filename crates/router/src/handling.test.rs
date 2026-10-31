@@ -521,8 +521,8 @@ fn commutative_folding_an_emitted_event_that_fails_says_the_command_emitted_it()
         &err,
         "ROUTER_REASON_FOLD_FAILED_EMITTED",
         &[
-            (crate::error::extras::SEQUENCE, "1"),
-            (crate::error::extras::TYPE_URL, type_url.as_str()),
+            (angzarr_proto::v1::reason_args::SEQUENCE, "1"),
+            (angzarr_proto::v1::reason_args::TYPE_URL, type_url.as_str()),
         ],
         "",
     );
@@ -543,7 +543,7 @@ fn commutative_folding_a_window_event_that_fails_says_it_was_accepted() {
         .expect_err("the window does not fold");
     // Decision 14.37: a failing fold has its own key.
     assert_eq!(err.code, "ROUTER_REASON_FOLD_FAILED");
-    assert_eq!(err.extras[crate::error::extras::SEQUENCE], "1");
+    assert_eq!(err.extras[angzarr_proto::v1::reason_args::SEQUENCE], "1");
 }
 
 #[test]

@@ -139,33 +139,14 @@ impl TryFrom<GrpcCode> for BusinessStatus {
 /// are reserved there and never answered again.
 pub use angzarr_proto::v1::RouterReason;
 
-/// Cross-language arg names: the `ErrorInfo` metadata keys of the router's
-/// reasons (the args each `RouterReason` value's comment in reasons.proto
-/// names).
-pub mod extras {
-    pub const TYPE_URL: &str = "type_url";
-    pub const COMMAND_TYPE: &str = "command_type";
-    /// The type an upcaster sidecar returned: never the router's, which
-    /// upcasts nothing; the coordinator relays it beside `type_url` on an
-    /// unknown type (decision 14.39).
-    pub const UPCAST_TYPE_URL: &str = "upcast_type_url";
-    pub const SEQUENCE: &str = "sequence";
-    pub const STATE_TYPE_URL: &str = "state_type_url";
-    pub const COMPONENT: &str = "component";
-    pub const COMPONENT_KIND: &str = "component_kind";
-    pub const FIRST_SEQUENCE: &str = "first_sequence";
-    pub const LAST_SEQUENCE: &str = "last_sequence";
-    /// A typed refusal's object's fully-qualified type (ROUTER_REASON_COMMAND_REFUSED).
-    pub const REFUSAL_TYPE: &str = "refusal_type";
-    /// The message bytes failed to decode as (ROUTER_REASON_ANY_DECODE_FAILED).
-    pub const MESSAGE_TYPE: &str = "message_type";
-    /// A wrapped cause's code; its args follow as `cause.<arg>` (decision
-    /// 14.37).
-    pub const CAUSE: &str = "cause";
-    /// A third-party library's own error text, verbatim (decision 14.37,
-    /// owner's rulings 2026-10-29, late): the one text an arg may hold.
-    pub const EXT_ERR_TXT: &str = "ext_err_txt";
-}
+// The args' names: the `ErrorInfo` metadata keys of the reasons, each
+// declared on its `RouterReason` value's `(io.angzarr.v1.reason)` option
+// in reasons.proto and generated into angzarr-proto (decision 14.60), never
+// typed here. A wrapped cause flattens under `cause` as `cause.<arg>`; a
+// third-party library's own text travels verbatim as `ext_err_txt`
+// (decision 14.37, owner's rulings 2026-10-29, late), the one text an arg
+// may hold.
+use angzarr_proto::v1::reason_args;
 
 /// Where a failing fold failed: the page, when known, else the batch's
 /// sequence range.
@@ -261,7 +242,7 @@ impl CodedError {
     pub fn unknown_type(reason: RouterReason, type_url: &str) -> Self {
         Self::coded(
             reason.as_str_name(),
-            [(extras::TYPE_URL.to_string(), type_url.to_string())],
+            [(reason_args::TYPE_URL.to_string(), type_url.to_string())],
             GrpcCode::Internal,
         )
     }
@@ -276,8 +257,11 @@ impl CodedError {
         Self::internal(
             RouterReason::AnyDecodeFailed,
             [
-                (extras::MESSAGE_TYPE.to_string(), message_type.to_string()),
-                (extras::EXT_ERR_TXT.to_string(), error.to_string()),
+                (
+                    reason_args::MESSAGE_TYPE.to_string(),
+                    message_type.to_string(),
+                ),
+                (reason_args::EXT_ERR_TXT.to_string(), error.to_string()),
             ],
         )
     }
@@ -295,7 +279,7 @@ impl CodedError {
     pub fn persisted_corrupt(type_url: &str) -> Self {
         Self::coded(
             RouterReason::PersistedEventCorrupt.as_str_name(),
-            [(extras::TYPE_URL.to_string(), type_url.to_string())],
+            [(reason_args::TYPE_URL.to_string(), type_url.to_string())],
             GrpcCode::DataLoss,
         )
     }
@@ -315,20 +299,20 @@ impl CodedError {
     ) -> Self {
         let mut details = match at {
             FoldAt::Page { sequence, type_url } => vec![
-                (extras::SEQUENCE.to_string(), sequence.to_string()),
-                (extras::TYPE_URL.to_string(), type_url.to_string()),
+                (reason_args::SEQUENCE.to_string(), sequence.to_string()),
+                (reason_args::TYPE_URL.to_string(), type_url.to_string()),
             ],
             FoldAt::Range { first, last } => vec![
-                (extras::FIRST_SEQUENCE.to_string(), first.to_string()),
-                (extras::LAST_SEQUENCE.to_string(), last.to_string()),
+                (reason_args::FIRST_SEQUENCE.to_string(), first.to_string()),
+                (reason_args::LAST_SEQUENCE.to_string(), last.to_string()),
             ],
         };
         details.push((
-            extras::STATE_TYPE_URL.to_string(),
+            reason_args::STATE_TYPE_URL.to_string(),
             state_type_url.to_string(),
         ));
         if let Some(cause) = cause {
-            details.extend(flatten(extras::CAUSE, &cause.code, cause.args.clone()));
+            details.extend(flatten(reason_args::CAUSE, &cause.code, cause.args.clone()));
         }
         Self::coded(reason.as_str_name(), details, GrpcCode::Internal)
     }
@@ -380,7 +364,7 @@ impl CodedError {
         Self::rejection(
             BusinessStatus::FailedPrecondition,
             RouterReason::CommandRefused.as_str_name(),
-            [(extras::REFUSAL_TYPE.to_string(), full_name)],
+            [(reason_args::REFUSAL_TYPE.to_string(), full_name)],
         )
         .with_refusal(refusal)
     }
@@ -394,7 +378,7 @@ impl CodedError {
     pub fn bug(code: &str, details: impl IntoIterator<Item = (String, String)>) -> Self {
         Self::coded(
             RouterReason::UnhandledHandlerError.as_str_name(),
-            flatten(extras::CAUSE, code, details),
+            flatten(reason_args::CAUSE, code, details),
             GrpcCode::Internal,
         )
     }
@@ -412,7 +396,7 @@ impl CodedError {
     ) -> Self {
         Self::coded(
             RouterReason::UnhandledHandlerError.as_str_name(),
-            flatten(extras::CAUSE, code, details),
+            flatten(reason_args::CAUSE, code, details),
             status.into(),
         )
     }

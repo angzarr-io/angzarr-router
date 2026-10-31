@@ -60,7 +60,7 @@ fn undecodable_bytes_carry_the_decoders_own_text() {
         .to_string();
     let err = decode_message::<pb::ContextualCommand>(&garbage).expect_err("undecodable");
     assert_eq!(
-        err.extras.get(error::extras::EXT_ERR_TXT),
+        err.extras.get(angzarr_proto::v1::reason_args::EXT_ERR_TXT),
         Some(&prost_text),
         "ext_err_txt (all: {:?})",
         err.extras
