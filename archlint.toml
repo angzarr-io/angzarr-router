@@ -7,6 +7,9 @@
 #   angzarr-proto               the io.angzarr.v1 wire types (angzarr-core's
 #                               crates/angzarr-proto, a git dependency: an
 #                               external crate, constrained by `deny` alone)
+#   angzarr-ports               `MaybeSend`/`MaybeSync`/`BoxFuture` only
+#                               (core's crates/angzarr-ports, the same git
+#                               rev; external, like angzarr-proto)
 #   angzarr_router              the engine: dispatch, component model, rebuild
 #   angzarr_router_conformance  the harness: drives the engine's public API
 #   archlint                    tooling; no product crate depends on it

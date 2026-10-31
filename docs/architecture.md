@@ -60,8 +60,9 @@ fully-qualified type name.
   `PolicyComponent` and `ProjectorHandler` let a runtime hold a component
   of its own (one in another process, say). They are kernel-facing and
   async (owner ruling 2026-10-30): their dispatch returns a future, `Send`
-  on every target but wasm32 (`send::MaybeSend`), and so do the `Router`'s
-  `dispatch_*`. The router's own components answer at once, a ready future
+  on every target but wasm32 (`send::MaybeSend`, angzarr-ports' own,
+  re-exported), and so do the `Router`'s `dispatch_*`. The router's own
+  components answer at once, a ready future
   around the business code's synchronous functions; business code is never
   async. Each trait has an object-safe twin (`DynCommandHandler`,
   `DynPolicyComponent`, `DynProjectorHandler`, boxed futures) that every
