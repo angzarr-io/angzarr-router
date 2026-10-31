@@ -63,6 +63,40 @@ test: (_container "test")
 # Check Rust formatting (no rewrite; fails on drift)
 fmt-check: (_container "fmt-check")
 
+# Lockstep (on the host, not in the container): angzarr-proto is
+# angzarr-core's crate, pinned in Cargo.toml by commit, and built from core's
+# own angzarr-project submodule at that commit; this repository's
+# angzarr-project submodule (the .proto files build.rs generates the service
+# messages from, and the handler-contract tier) must be the same spec commit,
+# or the router compiles one spec's messages against another's types. Reads
+# the pin from Cargo.toml (and checks Cargo.lock agrees), fetches that one
+# core commit into target/core-lockstep.git, and compares core's submodule
+# pointer with HEAD's.
+check-core-lockstep:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd '{{TOP}}'
+    unset $(git rev-parse --local-env-vars)
+    line=$(grep -E '^angzarr-proto[[:space:]]*=' Cargo.toml) || { echo "FAIL check-core-lockstep: Cargo.toml declares no angzarr-proto" >&2; exit 1; }
+    url=$(sed -nE 's/.*git[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' <<< "$line")
+    rev=$(sed -nE 's/.*rev[[:space:]]*=[[:space:]]*"([0-9a-f]{40})".*/\1/p' <<< "$line")
+    [ -n "$url" ] && [ -n "$rev" ] || { echo "FAIL check-core-lockstep: angzarr-proto is not a git dependency pinned by full commit: $line" >&2; exit 1; }
+    locked=$(grep -c -F "source = \"git+$url?rev=$rev#$rev\"" Cargo.lock || true)
+    [ "$locked" -ge 1 ] || { echo "FAIL check-core-lockstep: Cargo.lock does not resolve angzarr-proto to $url@$rev (cargo update -p angzarr-proto)" >&2; exit 1; }
+    sources=$(awk '/^name = "angzarr-proto"$/ {getline; getline; print}' Cargo.lock | sort -u | wc -l)
+    [ "$sources" -eq 1 ] || { echo "FAIL check-core-lockstep: Cargo.lock holds $sources angzarr-proto sources, expected one" >&2; exit 1; }
+    cache=target/core-lockstep.git
+    [ -d "$cache" ] || git init -q --bare "$cache"
+    git -C "$cache" cat-file -e "$rev^{commit}" 2>/dev/null \
+        || git -C "$cache" fetch -q --depth=1 "$url" "$rev" \
+        || { echo "FAIL check-core-lockstep: cannot fetch $url@$rev" >&2; exit 1; }
+    core=$(git -C "$cache" ls-tree "$rev" angzarr-project | awk '$2 == "commit" {print $3}')
+    [ -n "$core" ] || { echo "FAIL check-core-lockstep: $url@${rev:0:12} has no angzarr-project submodule" >&2; exit 1; }
+    ours=$(git ls-tree HEAD angzarr-project | awk '$2 == "commit" {print $3}')
+    [ -n "$ours" ] || { echo "FAIL check-core-lockstep: angzarr-project is not a submodule of HEAD" >&2; exit 1; }
+    [ "$core" = "$ours" ] || { echo "FAIL check-core-lockstep: core@${rev:0:12} builds angzarr-proto from angzarr-project@${core:0:12}, this repository pins angzarr-project@${ours:0:12}" >&2; exit 1; }
+    echo "ok   check-core-lockstep (core@${rev:0:12} and this repository both at angzarr-project@${ours:0:12})"
+
 # Build the router for wasm32, and compile its wasm32-only tests: there the
 # kernel-facing dispatch traits ask no Send (crates/router/tests/wasm.rs)
 wasm: (_container "wasm")

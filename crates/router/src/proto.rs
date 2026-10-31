@@ -1,4 +1,4 @@
-//! The framework wire types: angzarr-project's angzarr-proto crate
+//! The framework wire types: angzarr-core's angzarr-proto crate
 //! (io.angzarr.v1 books, covers, pages, options and sererr), plus the
 //! request/response messages of the service protos angzarr-proto does not
 //! compile (CommandHandlerResponse, CommandResponse, PolicyResponse, Refusal,

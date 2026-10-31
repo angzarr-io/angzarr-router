@@ -12,15 +12,16 @@ edition = "2021"
 license = "BSD-3-Clause"
 
 [workspace.dependencies]
-# The io.angzarr.v1 wire types, from angzarr-project's angzarr-proto crate,
-# pinned by full commit as a git dependency (as angzarr-cli and annals pin
-# it), so a dependent that links the router and names the same rev gets ONE
-# angzarr-proto crate and one set of types (backlog TG-1). A path dependency
-# into the submodule would give every dependent a second, incompatible copy.
-# Keep this rev equal to the angzarr-project submodule's commit (the
-# submodule supplies the .proto files and the shared features).
-# prost and prost-types match its.
-angzarr-proto = { git = "https://github.com/angzarr-io/angzarr-project", rev = "ed88df424aef2bb714b165a26f5902c79cd3aa73" }
+# The io.angzarr.v1 wire types, from angzarr-core's angzarr-proto crate
+# (moved there from angzarr-project's rust/), pinned by full commit as a git
+# dependency, so a dependent that links the router and names the same rev
+# gets ONE angzarr-proto crate and one set of types (backlog TG-1). A path
+# dependency would give every dependent a second, incompatible copy.
+# Lockstep: core's own angzarr-project submodule at this rev is the spec
+# angzarr-proto is built from; keep this repository's angzarr-project
+# submodule (the .proto files and the shared features) at that same commit
+# (`just check-core-lockstep`). prost and prost-types match its.
+angzarr-proto = { git = "https://github.com/angzarr-io/angzarr", rev = "1cf00b71b094c185b0fd6964f646e48b4c39b8ab" }
 prost = "0.14"
 prost-types = "0.14"
 prost-build = "0.14"
