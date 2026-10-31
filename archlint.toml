@@ -4,8 +4,9 @@
 # module graph these rules are checked against.
 #
 # Crate layers, bottom to top:
-#   angzarr-proto               the io.angzarr.v1 wire types (angzarr-project's
-#                               rust/angzarr-proto, a path dependency)
+#   angzarr-proto               the io.angzarr.v1 wire types (angzarr-core's
+#                               crates/angzarr-proto, a git dependency: an
+#                               external crate, constrained by `deny` alone)
 #   angzarr_router              the engine: dispatch, component model, rebuild
 #   angzarr_router_conformance  the harness: drives the engine's public API
 #   archlint                    tooling; no product crate depends on it
@@ -18,9 +19,9 @@
 
 [[rule]]
 name = "engine-is-the-bottom"
-why = "the engine never depends on the conformance harness, tooling, or C FFI types; its wire types come from angzarr-project's angzarr-proto crate"
+why = "the engine never depends on the conformance harness, tooling, or C FFI types; its wire types come from angzarr-core's angzarr-proto crate"
 from = ["angzarr_router::**"]
-allow = ["angzarr_router::**", "path:angzarr-project/rust/angzarr-proto"]
+allow = ["angzarr_router::**"]
 deny = ["std::ffi::**", "core::ffi::**", "std::os::raw::**", "libc::**"]
 
 [[rule]]
@@ -75,7 +76,6 @@ from = ["angzarr_router", "angzarr_router::rebuild::**", "angzarr_router::contex
 scope = "lib"
 allow = [
     "angzarr_router",
-    "path:angzarr-project/rust/angzarr-proto",
     "angzarr_router::proto::**",
     "angzarr_router::error::**",
     "angzarr_router::rebuild::**",

@@ -301,6 +301,13 @@ fn answer(reason: RouterReason) -> String {
         | RouterReason::ConflictResolutionUnsupported
         | RouterReason::NoHandlersRegistered
         | RouterReason::DuplicateComponent => CodedError::internal(reason, []),
+        // A limit a router may enforce where a client library offers
+        // follow-on steps (decision 14.49). This router's dispatch offers
+        // none, so never reaches it; the key is still an INTERNAL key of its
+        // enum, answered under its full name, with arg limit.
+        RouterReason::TooManySteps => {
+            CodedError::internal(reason, [("limit".to_string(), "16".to_string())])
+        }
     };
     err.code
 }

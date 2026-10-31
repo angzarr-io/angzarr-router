@@ -55,8 +55,10 @@ tools/archlint/    # the architecture linter (archlint.toml)
 
 The framework protos come from the repo-local `angzarr-project/`
 submodule (the org convention); `ANGZARR_PROJECT_PROTO` overrides it when
-set. The io.angzarr.v1 wire types are angzarr-project's `rust/angzarr-proto`
-crate at the submodule's commit (re-exported as `angzarr_router::pb`);
+set. The io.angzarr.v1 wire types are angzarr-core's `crates/angzarr-proto`
+crate, pinned by commit (re-exported as `angzarr_router::pb`), built from
+core's own angzarr-project submodule, which `just check-core-lockstep` holds
+at this repository's submodule commit;
 `crates/router/build.rs` generates only the service-proto messages that
 crate does not compile (`CommandHandlerResponse`, `PolicyResponse`,
 `Refusal`, `OnRefusedResponse`), against its types. The reason keys are

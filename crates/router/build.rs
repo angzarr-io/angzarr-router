@@ -1,4 +1,4 @@
-//! The io.angzarr.v1 wire types come from angzarr-project's angzarr-proto
+//! The io.angzarr.v1 wire types come from angzarr-core's angzarr-proto
 //! crate (types.proto, upcaster.proto, options.proto and sererr). That crate
 //! does not compile the service protos, so the few request/response messages
 //! they define (CommandHandlerResponse, CommandResponse, PolicyResponse,
