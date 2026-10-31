@@ -22,3 +22,6 @@ wasm-bindgen-test = "=0.3.79"
 heck = "0.5"
 prost-build = { workspace = true }
 prost-types = { workspace = true }
+
+[lints]
+workspace = true

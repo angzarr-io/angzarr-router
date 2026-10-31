@@ -33,6 +33,13 @@ pre-commit:
       glob: "*.{rs,toml}"
       run: just archlint
 
+    # Clippy, warnings denied: the complexity gate (cognitive_complexity,
+    # too_many_lines, excessive_nesting; Cargo.toml and clippy.toml) and
+    # every other lint.
+    lint:
+      glob: "*.{rs,toml}"
+      run: just lint
+
 # No mutation testing in any hook: it runs while tests are written and judged
 # (`just mutation-push`, by hand), at the end of an unattended run, and in the
 # scheduled CI full pass (`just mutation-test`, .github/workflows/mutation.yml).
