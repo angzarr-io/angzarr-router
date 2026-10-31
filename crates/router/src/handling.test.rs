@@ -385,7 +385,7 @@ fn aggregate_handles_reports_the_nonce_business_code_settled_with() {
     assert_eq!(
         resp.conflict,
         Some(pb::ConflictReport {
-            resolved_nonce: b"n-1".to_vec(),
+            resolved_nonce: b"n-1".to_vec().into(),
             window_units: Vec::new(),
             command_units: Vec::new(),
         }),

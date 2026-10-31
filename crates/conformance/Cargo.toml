@@ -13,6 +13,9 @@ prost-reflect = { version = "0.16", features = ["text-format"] }
 uuid = { version = "1", features = ["v5"] }
 
 [build-dependencies]
+# The framework protos the fixture pool imports: angzarr-proto's embedded
+# copies, the very files the router's types were generated from.
+angzarr-proto = { workspace = true }
 prost-build = { workspace = true }
 
 [dev-dependencies]

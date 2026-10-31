@@ -52,13 +52,6 @@ allow = [
 # ---- engine internals (library code) ----------------------------------------
 
 [[rule]]
-name = "engine-proto-is-a-leaf"
-why = "generated proto types reference nothing else in the engine"
-from = ["angzarr_router::proto::**"]
-scope = "lib"
-allow = ["angzarr_router::proto::**"]
-
-[[rule]]
 name = "engine-send-is-a-leaf"
 why = "the target-dependent Send bounds and the boxed future reference nothing else in the engine"
 from = ["angzarr_router::send::**"]
@@ -79,7 +72,6 @@ from = ["angzarr_router", "angzarr_router::rebuild::**", "angzarr_router::contex
 scope = "lib"
 allow = [
     "angzarr_router",
-    "angzarr_router::proto::**",
     "angzarr_router::error::**",
     "angzarr_router::rebuild::**",
     "angzarr_router::context::**",
@@ -97,7 +89,6 @@ scope = "lib"
 allow = [
     "self::**",
     "angzarr_router",
-    "angzarr_router::proto::**",
     "angzarr_router::error::**",
     "angzarr_router::rebuild::**",
     "angzarr_router::context::**",

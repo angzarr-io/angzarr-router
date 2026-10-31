@@ -53,19 +53,18 @@ tools/archlint/    # the architecture linter (archlint.toml)
 
 ## Protos
 
-The framework protos come from the repo-local `angzarr-project/`
-submodule (the org convention); `ANGZARR_PROJECT_PROTO` overrides it when
-set. The io.angzarr.v1 wire types are angzarr-core's `crates/angzarr-proto`
-crate, pinned by commit (re-exported as `angzarr_router::pb`), built from
-core's own angzarr-project submodule, which `just check-core-lockstep` holds
-at this repository's submodule commit;
-`crates/router/build.rs` generates only the service-proto messages that
-crate does not compile (`CommandHandlerResponse`, `PolicyResponse`,
-`Refusal`, `OnRefusedResponse`), against its types. The reason keys are
-reasons.proto's `RouterReason` (decision 14.44), each answered as its full
-value name (`as_str_name()`, e.g. `ROUTER_REASON_DUPLICATE_COMPONENT`). The
-`mutation-test` target passes the submodule's absolute path through
-`ANGZARR_PROJECT_PROTO` so cargo-mutants' copied trees build.
+The io.angzarr.v1 wire types are angzarr-core's `crates/angzarr-proto`
+crate, pinned by commit (re-exported as `angzarr_router::pb`, the same
+types as `angzarr_proto::v1`). It compiles every io.angzarr.v1 message,
+the service protos' (`CommandHandlerResponse`, `PolicyResponse`,
+`Refusal`, `OnRefusedResponse`, ...) included, so the router generates
+none and has no build script; the conformance harness's fixture pool
+imports the protos angzarr-proto embeds. The repo-local `angzarr-project/`
+submodule (the org convention) supplies only the handler-contract tier's
+features and fixtures, which `just check-core-lockstep` holds at the spec
+commit core built angzarr-proto from. The reason keys are reasons.proto's
+`RouterReason` (decision 14.44), each answered as its full value name
+(`as_str_name()`, e.g. `ROUTER_REASON_DUPLICATE_COMPONENT`).
 
 ## Development
 

@@ -520,7 +520,8 @@ impl<S> DomainDispatch<S> {
                         .conflict
                         .as_ref()
                         .map(Conflict::resolved_nonce)
-                        .unwrap_or_default(),
+                        .unwrap_or_default()
+                        .into(),
                     ..Default::default()
                 };
                 fold_emitted(&mut state, &out)?;

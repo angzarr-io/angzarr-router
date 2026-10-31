@@ -19,14 +19,18 @@ pub mod domain;
 pub mod error;
 pub mod policy;
 pub mod projector;
-pub mod proto;
 pub mod rebuild;
 pub mod router;
 pub mod send;
 
-pub use proto::io::angzarr::v1 as pb;
+/// The io.angzarr.v1 wire types: angzarr-core's angzarr-proto, which
+/// compiles every message of the spec (the service protos' too:
+/// `CommandHandlerResponse`, `CommandResponse`, `PolicyResponse`, `Refusal`,
+/// `OnRefusedResponse`). The router generates none; `pb::X` is
+/// `angzarr_proto::v1::X`, the one type under two names.
+pub use angzarr_proto::v1 as pb;
 
-/// angzarr-project's wire-type crate, re-exported so a dependent names the
+/// angzarr-core's wire-type crate, re-exported so a dependent names the
 /// very `angzarr_proto` this router was built with (its types are `pb`'s).
 pub use angzarr_proto;
 

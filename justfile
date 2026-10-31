@@ -50,7 +50,6 @@ _container +ARGS:
             -v "{{TOP}}/justfile.container:/workspace/justfile:ro" \
             -w /workspace \
             -e CARGO_HOME=/workspace/.cargo-container \
-            -e ANGZARR_PROJECT_PROTO=/workspace/angzarr-project/proto \
             "{{ROUTER_IMAGE}}" just {{ARGS}}
     fi
 
@@ -65,10 +64,12 @@ fmt-check: (_container "fmt-check")
 
 # Lockstep (on the host, not in the container): angzarr-proto is
 # angzarr-core's crate, pinned in Cargo.toml by commit, and built from core's
-# own angzarr-project submodule at that commit; this repository's
-# angzarr-project submodule (the .proto files build.rs generates the service
-# messages from, and the handler-contract tier) must be the same spec commit,
-# or the router compiles one spec's messages against another's types. Reads
+# own angzarr-project submodule at that commit. It compiles every
+# io.angzarr.v1 message and embeds its protos, so this repository reads no
+# .proto from its own angzarr-project submodule; that submodule holds only
+# the handler-contract tier (its features and fixtures), which must be the
+# same spec commit, or the router is held to one spec's contract while built
+# on another's types. Reads
 # the pin from Cargo.toml (and checks Cargo.lock agrees), fetches that one
 # core commit into target/core-lockstep.git, and compares core's submodule
 # pointer with HEAD's.

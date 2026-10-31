@@ -18,10 +18,5 @@ tracing = { workspace = true }
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "=0.3.79"
 
-[build-dependencies]
-heck = "0.5"
-prost-build = { workspace = true }
-prost-types = { workspace = true }
-
 [lints]
 workspace = true
