@@ -438,6 +438,86 @@ fn increased_page(seq: u64) -> pb::EventPage {
     }
 }
 
+/// What a policy handler or a projector fold read of one event: its book's
+/// root, its sequence and its whole metadata (context.feature, C-0757 and
+/// C-0758).
+pub type MetaSink = Arc<Mutex<Vec<(Vec<u8>, u64, Option<pb::EventMeta>)>>>;
+
+/// An event's metadata, every field set: produced by the command `command`
+/// (its id the label's UUID v5) in correlation `correlation`, from the fact
+/// whose external id is `fact`, decided under `rules_version`, recorded at
+/// `second`.
+pub fn full_meta(
+    command: &str,
+    correlation: &str,
+    fact: &str,
+    rules_version: &str,
+    second: i64,
+) -> pb::EventMeta {
+    let uuid = |label: &str| pb::Uuid {
+        value: root_of(label).into(),
+    };
+    pb::EventMeta {
+        causation: Some(pb::event_meta::Causation::CommandId(uuid(command))),
+        fact: Some(pb::FactOrigin {
+            external_id: fact.to_string(),
+            ..Default::default()
+        }),
+        correlation_id: Some(uuid(correlation)),
+        recorded_at: Some(prost_types::Timestamp {
+            seconds: second,
+            nanos: 0,
+        }),
+        rules_version: rules_version.to_string(),
+    }
+}
+
+/// One Increased event of "counter" root `label` at `sequence`, delivered
+/// with `meta`.
+pub fn metadata_book(label: &str, sequence: u64, meta: pb::EventMeta) -> pb::EventBook {
+    pb::EventBook {
+        cover: Some(cover_of("counter", label)),
+        pages: vec![pb::EventPage {
+            meta: Some(meta),
+            ..increased_page(sequence)
+        }],
+        ..Default::default()
+    }
+}
+
+/// What a handler's page context holds, as a [`MetaSink`] keeps it.
+fn read_back(ctx: &angzarr_router::PageContext<'_>) -> (Vec<u8>, u64, Option<pb::EventMeta>) {
+    let root = ctx
+        .cover
+        .and_then(|c| c.root.as_ref())
+        .map(|r| r.value.to_vec())
+        .unwrap_or_default();
+    (root, ctx.sequence, ctx.meta.cloned())
+}
+
+/// The order policy reading back each Increased event's whole context.
+pub fn metadata_policy(seen: MetaSink) -> PolicyDispatch {
+    PolicyDispatch::new("order-policy", "order", "inventory").on_event_with_context(
+        "test.counter.Increased",
+        move |_any, ctx| {
+            seen.lock().unwrap().push(read_back(ctx));
+            Ok(vec![reserve_command_to("inventory")])
+        },
+    )
+}
+
+/// The tracking projector reading back each Increased event's whole
+/// context.
+pub fn metadata_projector(seen: MetaSink) -> ProjectorDispatch<()> {
+    ProjectorDispatch::new("Tracker", || ()).on_event(
+        "test.counter.Increased",
+        move |_p, _e, ctx| {
+            seen.lock().unwrap().push(read_back(ctx));
+            Ok(())
+        },
+    )
+}
+
 /// The ledger aggregate (domain "ledger") over CounterState: Increased folds
 /// count += 1 and records the page sequence it applied; a starting state
 /// decodes as CounterState; IncreaseBy records the handled cover and emits one

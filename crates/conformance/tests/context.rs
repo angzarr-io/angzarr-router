@@ -6,7 +6,7 @@ mod common;
 
 use angzarr_router::error::CodedError;
 use angzarr_router::pb;
-use angzarr_router::router::{CommandHandler, ProjectorHandler};
+use angzarr_router::router::{CommandHandler, PolicyComponent, ProjectorHandler};
 use angzarr_router_conformance as conf;
 use cucumber::writer::Stats as _;
 use cucumber::{given, then, when, World};
@@ -18,10 +18,15 @@ struct ContextWorld {
     applied: conf::SequenceSink,
     pages: conf::PageSink,
     fact: Option<Result<pb::CommandHandlerResponse, CodedError>>,
+    /// What a policy handler or a projector fold read of its event.
+    read: conf::MetaSink,
 }
 
 #[given("a ledger aggregate")]
 async fn ledger(_w: &mut ContextWorld) {}
+
+#[given(regex = r#"^an order policy delivering to "([^"]*)"$"#)]
+async fn order_policy(_w: &mut ContextWorld, _target: String) {}
 
 #[given("a tracking projector")]
 async fn tracking(_w: &mut ContextWorld) {}
@@ -71,6 +76,53 @@ async fn projected(w: &mut ContextWorld, label: String, first: u64, second: u64)
     ProjectorHandler::dispatch(&projector, &conf::tracked_book(&label, &[first, second]))
         .await
         .expect("dispatch");
+}
+
+/// The metadata a step names, `recorded by command "c" in correlation "r"
+/// from fact "f" under rules version "v" at second N`, as an EventMeta.
+fn metadata(text: &str) -> pb::EventMeta {
+    let quoted: Vec<&str> = text.split('"').skip(1).step_by(2).collect();
+    let [command, correlation, fact, rules] = quoted[..] else {
+        panic!("four quoted metadata fields: {text}");
+    };
+    let second = text
+        .rsplit(' ')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .expect("the recording second");
+    conf::full_meta(command, correlation, fact, rules, second)
+}
+
+#[when(
+    regex = r#"^an Increased event of counter root "([^"]*)" at sequence (\d+) is dispatched, (recorded by .*)$"#
+)]
+async fn policy_metadata(w: &mut ContextWorld, label: String, sequence: u64, meta: String) {
+    let policy = conf::metadata_policy(w.read.clone());
+    let book = conf::metadata_book(&label, sequence, metadata(&meta));
+    PolicyComponent::dispatch(&policy, &book)
+        .await
+        .expect("dispatch");
+}
+
+#[when(
+    regex = r#"^an Increased event of counter root "([^"]*)" at sequence (\d+) is projected, (recorded by .*)$"#
+)]
+async fn projector_metadata(w: &mut ContextWorld, label: String, sequence: u64, meta: String) {
+    let projector = conf::metadata_projector(w.read.clone());
+    let book = conf::metadata_book(&label, sequence, metadata(&meta));
+    ProjectorHandler::dispatch(&projector, &book)
+        .await
+        .expect("dispatch");
+}
+
+#[then(
+    regex = r#"^the (?:policy handler|projector) saw root "([^"]*)" at sequence (\d+), (recorded by .*)$"#
+)]
+async fn saw_metadata(w: &mut ContextWorld, label: String, sequence: u64, meta: String) {
+    assert_eq!(
+        *w.read.lock().unwrap(),
+        vec![(conf::root_of(&label), sequence, Some(metadata(&meta)))]
+    );
 }
 
 fn recorded(w: &ContextWorld) -> &pb::EventBook {
