@@ -24,9 +24,11 @@ pub mod router;
 pub mod send;
 
 /// The io.angzarr.v1 wire types: angzarr-core's angzarr-proto, which
-/// compiles every message of the spec (the service protos' too:
-/// `CommandHandlerResponse`, `CommandResponse`, `PolicyResponse`, `Refusal`,
-/// `OnRefusedResponse`). The router generates none; `pb::X` is
+/// compiles every message of core's package, the ones the router answers
+/// in process too (`CommandHandlerResponse`, `PolicyResponse`, `Refusal`,
+/// `OnRefusedResponse`, `Projection`). The handler services that carry them
+/// are the component contract's (angzarr-proto-component; decision 14.64);
+/// the router needs none. The router generates none; `pb::X` is
 /// `angzarr_proto::v1::X`, the one type under two names.
 pub use angzarr_proto::v1 as pb;
 

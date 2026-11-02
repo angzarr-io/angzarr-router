@@ -14,12 +14,12 @@ dependencies = [
 [[package]]
 name = "angzarr-diagnostic"
 version = "0.1.0"
-source = "git+https://github.com/angzarr-io/angzarr?rev=2be5a43d83fa35a9be1696b57aed3474971bf9cf#2be5a43d83fa35a9be1696b57aed3474971bf9cf"
+source = "git+https://github.com/angzarr-io/angzarr?rev=ab3e9b50ab777f1c4d7269f2744b0a42bc3a6845#ab3e9b50ab777f1c4d7269f2744b0a42bc3a6845"
 
 [[package]]
 name = "angzarr-ports"
 version = "0.1.0"
-source = "git+https://github.com/angzarr-io/angzarr?rev=2be5a43d83fa35a9be1696b57aed3474971bf9cf#2be5a43d83fa35a9be1696b57aed3474971bf9cf"
+source = "git+https://github.com/angzarr-io/angzarr?rev=ab3e9b50ab777f1c4d7269f2744b0a42bc3a6845#ab3e9b50ab777f1c4d7269f2744b0a42bc3a6845"
 dependencies = [
  "angzarr-diagnostic",
  "angzarr-proto",
@@ -30,7 +30,7 @@ dependencies = [
 [[package]]
 name = "angzarr-proto"
 version = "0.1.0"
-source = "git+https://github.com/angzarr-io/angzarr?rev=2be5a43d83fa35a9be1696b57aed3474971bf9cf#2be5a43d83fa35a9be1696b57aed3474971bf9cf"
+source = "git+https://github.com/angzarr-io/angzarr?rev=ab3e9b50ab777f1c4d7269f2744b0a42bc3a6845#ab3e9b50ab777f1c4d7269f2744b0a42bc3a6845"
 dependencies = [
  "bytes",
  "prost",
