@@ -104,9 +104,25 @@ pub fn decode_message<M: prost::Message + prost::Name + Default>(
 pub struct PageContext<'a> {
     pub cover: Option<&'a pb::Cover>,
     pub sequence: u64,
-    /// The page's metadata (types.proto, EventMeta), as delivered: its
-    /// correlation_id, recorded_at and causation; `None` when the page
-    /// carries none (an event this command just emitted carries none yet).
+    /// The page's metadata (types.proto, EventMeta): its correlation_id,
+    /// recorded_at and causation. The router stamps nothing; this is the
+    /// page's `meta`, passed through, and `None` exactly when the page
+    /// carries none. Who fills it depends on where the page comes from:
+    ///
+    /// - A persisted page (a rebuild's history, a projector's or a policy's
+    ///   delivered events, a conflict window) carries the meta its
+    ///   coordinator stamped when it recorded the event: the coordinator
+    ///   guarantees it.
+    /// - A page folded at decide time ([`rebuild::Rebuilder::apply_emitted`],
+    ///   [`rebuild::PageOrigin::Emitted`]: the decision's own events, a
+    ///   recorded fact's) carries what its pages carry when folded. The
+    ///   router's own [`domain`] handler folds them as the handler built
+    ///   them, and a handler's pages carry no meta unless it set one, so its
+    ///   appliers see `None` there and the stamped meta on replay. A host that stamps the decision's own
+    ///   events before folding them (angzarr-embedded's `event_meta`) hands
+    ///   its appliers, at decide time, the meta replay will: the host
+    ///   guarantees that, not the router.
+    ///
     /// A policy reads its trigger's correlation here (decision 14.36: it
     /// may name that correlation as the root).
     pub meta: Option<&'a pb::EventMeta>,
