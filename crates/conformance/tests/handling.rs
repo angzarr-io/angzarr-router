@@ -347,6 +347,30 @@ async fn answers_unchecked(w: &mut HandlingWorld, domain: String) {
     w.policy_commands = vec![command];
 }
 
+/// A StockHoldRequested fact for "inventory", as the policy's business code
+/// answers an OrderPlaced with when its destination declares that type a
+/// fact (decision 14.69): the Fact arm, its payload alone.
+fn stock_hold_requested() -> pb::CommandBook {
+    let mut fact = conf::order_command_for("inventory", "StockHoldRequested");
+    let page = fact.page.as_mut().expect("a page");
+    page.body = match page.body.take() {
+        Some(pb::command_page::Body::Command(command)) => {
+            Some(pb::command_page::Body::Fact(pb::Fact {
+                payload: command.payload,
+            }))
+        }
+        other => other,
+    };
+    fact
+}
+
+#[given(
+    "its business code answers an OrderPlaced event with a ReserveStock command and then a StockHoldRequested fact"
+)]
+async fn answers_command_then_fact(w: &mut HandlingWorld) {
+    w.policy_commands = vec![reserve_stock(), stock_hold_requested()];
+}
+
 /// The policy from `policy_translating`, answering each OrderPlaced with
 /// `policy_commands`, handling `source`.
 async fn handle_policy(w: &mut HandlingWorld, source: pb::EventBook) {
@@ -419,6 +443,19 @@ async fn one_reaction_unchanged(w: &mut HandlingWorld) {
     let reactions = &policy_answer(w).reactions;
     assert_eq!(reactions.len(), 1, "one reaction");
     assert_eq!(reactions[0].commands, w.policy_commands, "unchanged");
+}
+
+#[then(
+    "the answer's one reaction carries the ReserveStock command and then the StockHoldRequested fact, unchanged"
+)]
+async fn one_reaction_command_then_fact(w: &mut HandlingWorld) {
+    let reactions = &policy_answer(w).reactions;
+    assert_eq!(reactions.len(), 1, "one reaction");
+    assert_eq!(
+        reactions[0].commands,
+        [reserve_stock(), stock_hold_requested()],
+        "the command then the fact, unchanged"
+    );
 }
 
 #[then(regex = r"^the answer holds (\w+) reactions, in page order:$")]
