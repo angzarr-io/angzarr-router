@@ -23,11 +23,11 @@ license = "Apache-2.0 OR BSD-3-Clause"
 # angzarr-project submodule (now read only for the handler-contract tier's
 # features and fixtures) at that same commit (`just check-core-lockstep`).
 # prost and prost-types match its.
-angzarr-proto = { git = "https://github.com/angzarr-io/angzarr", rev = "6d29855fa7b23f3e295d77d9ac9064fffa6f81df" }
+angzarr-proto = { git = "https://github.com/angzarr-io/angzarr", rev = "63571a5c1a2d0478eca46d17aefaef02e5a41172" }
 # `MaybeSend`, `MaybeSync` and `BoxFuture`: one home for the target-split
 # Send bound, the store ports' and the dispatch traits' alike (architecture
 # review B1). The same core rev as angzarr-proto, so both name one crate.
-angzarr-ports = { git = "https://github.com/angzarr-io/angzarr", rev = "6d29855fa7b23f3e295d77d9ac9064fffa6f81df" }
+angzarr-ports = { git = "https://github.com/angzarr-io/angzarr", rev = "63571a5c1a2d0478eca46d17aefaef02e5a41172" }
 prost = "0.14"
 prost-types = "0.14"
 prost-build = "0.14"
