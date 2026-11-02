@@ -36,18 +36,18 @@ fn every_constructor() -> Vec<(&'static str, CodedError)> {
     vec![
         (
             "internal",
-            CodedError::internal(RouterReason::NoHandlersRegistered, []),
+            CodedError::keyed(RouterReason::NoHandlersRegistered, []),
         ),
         (
             "internal with args",
-            CodedError::internal(
+            CodedError::keyed(
                 RouterReason::DuplicateComponent,
                 [arg(reason_args::COMPONENT, "order")],
             ),
         ),
         (
             "unimplemented",
-            CodedError::unimplemented(RouterReason::NoComponentOfKind, []),
+            CodedError::keyed(RouterReason::NoComponentOfKind, []),
         ),
         (
             "unknown_type",
@@ -303,12 +303,20 @@ fn router_reasons() -> Vec<RouterReason> {
 /// `cause`. Exhaustive, so a value added to the enum fails to compile here
 /// until the router answers it.
 fn answer(reason: RouterReason) -> String {
-    let err = match reason {
+    match reason {
+        RouterReason::HandlerPanicked => CodedError::panicked().extras[reason_args::CAUSE].clone(),
+        _ => answered(reason).code,
+    }
+}
+
+/// The router's answer with `reason` as its key, from the constructor that
+/// answers it (ROUTER_REASON_HANDLER_PANICKED's is the bug it is the cause
+/// of).
+fn answered(reason: RouterReason) -> CodedError {
+    match reason {
         RouterReason::Unspecified => unreachable!("proto3's zero is never answered"),
         RouterReason::UnhandledHandlerError => CodedError::unhandled(),
-        RouterReason::HandlerPanicked => {
-            return CodedError::panicked().extras[reason_args::CAUSE].clone();
-        }
+        RouterReason::HandlerPanicked => CodedError::panicked(),
         RouterReason::CommandRefused => CodedError::refused(typed_refusal()),
         RouterReason::FoldFailed | RouterReason::FoldFailedEmitted => CodedError::fold_failed(
             reason,
@@ -323,20 +331,66 @@ fn answer(reason: RouterReason) -> String {
         RouterReason::UnknownCommandType | RouterReason::NoFactHandler => {
             CodedError::unknown_type(reason, "/a.Sent")
         }
-        RouterReason::NoComponentOfKind => CodedError::unimplemented(reason, []),
+        RouterReason::NoComponentOfKind => CodedError::keyed(reason, []),
         RouterReason::NoRefusalHandler
         | RouterReason::ConflictResolutionUnsupported
         | RouterReason::NoHandlersRegistered
-        | RouterReason::DuplicateComponent => CodedError::internal(reason, []),
+        | RouterReason::DuplicateComponent => CodedError::keyed(reason, []),
         // A limit a router may enforce where a client library offers
         // follow-on steps (decision 14.49). This router's dispatch offers
         // none, so never reaches it; the key is still an INTERNAL key of its
         // enum, answered under its full name, with arg limit.
         RouterReason::TooManySteps => {
-            CodedError::internal(reason, [("limit".to_string(), "16".to_string())])
+            CodedError::keyed(reason, [("limit".to_string(), "16".to_string())])
         }
-    };
-    err.code
+    }
+}
+
+// Decision 14.65: each key travels under the status its (reason) option
+// declares, generated into angzarr-proto, never one typed here.
+#[test]
+fn every_router_key_travels_under_its_declared_status() {
+    for reason in (1..=64).filter_map(|n| RouterReason::try_from(n).ok()) {
+        let declared = GrpcCode::of_status(reason.status());
+        assert!(declared.is_some(), "{reason:?} travels as a status");
+        let carrier = match reason {
+            // A cause only: it travels as the bug it is the cause of.
+            RouterReason::HandlerPanicked => RouterReason::UnhandledHandlerError,
+            _ => reason,
+        };
+        assert_eq!(
+            Some(answered(reason).grpc),
+            GrpcCode::of_status(carrier.status()),
+            "{reason:?}"
+        );
+    }
+}
+
+#[test]
+fn a_status_is_its_wire_number_and_readiness_is_none() {
+    use angzarr_proto::v1::ReasonStatus;
+    for (status, code) in [
+        (ReasonStatus::InvalidArgument, GrpcCode::InvalidArgument),
+        (
+            ReasonStatus::FailedPrecondition,
+            GrpcCode::FailedPrecondition,
+        ),
+        (ReasonStatus::Aborted, GrpcCode::Aborted),
+        (ReasonStatus::Unimplemented, GrpcCode::Unimplemented),
+        (ReasonStatus::Internal, GrpcCode::Internal),
+        (ReasonStatus::Unavailable, GrpcCode::Unavailable),
+        (ReasonStatus::DataLoss, GrpcCode::DataLoss),
+    ] {
+        assert_eq!(GrpcCode::of_status(status), Some(code));
+    }
+    assert_eq!(GrpcCode::of_status(ReasonStatus::Readiness), None);
+    assert_eq!(GrpcCode::of_status(ReasonStatus::Unspecified), None);
+    for n in 2..=15 {
+        assert_eq!(GrpcCode::from_wire(n).map(|c| c as i32), Some(n));
+    }
+    for n in [0, 1, 16, 100, -1] {
+        assert_eq!(GrpcCode::from_wire(n), None, "{n}");
+    }
 }
 
 // Decisions 14.42 and 14.44: reasons.proto's RouterReason holds every key
@@ -484,7 +538,7 @@ fn an_unlocated_fold_failure_names_the_batchs_range() {
 // deployment, not a malformed payload (C-0670).
 #[test]
 fn no_component_for_the_request_is_unimplemented() {
-    let err = CodedError::unimplemented(RouterReason::NoComponentOfKind, []);
+    let err = CodedError::keyed(RouterReason::NoComponentOfKind, []);
     assert_eq!(
         err.grpc,
         GrpcCode::Unimplemented,
@@ -497,7 +551,7 @@ fn no_component_for_the_request_is_unimplemented() {
 // decision 14.37, 2026-10-29): INTERNAL, never a policy's OnRefused.
 #[test]
 fn the_routers_own_malformed_input_is_a_bug() {
-    crate::test_support::assert_bug(&CodedError::internal(RouterReason::NoRefusalHandler, []));
+    crate::test_support::assert_bug(&CodedError::keyed(RouterReason::NoRefusalHandler, []));
     crate::test_support::assert_bug(&CodedError::unknown_type(
         RouterReason::UnknownCommandType,
         "/a.B",

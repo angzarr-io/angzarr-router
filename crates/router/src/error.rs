@@ -56,6 +56,40 @@ pub enum GrpcCode {
     DataLoss = 15,
 }
 
+impl GrpcCode {
+    /// The code whose wire number is `number`; `None` for OK, CANCELLED,
+    /// UNAUTHENTICATED and any number that is no status the router emits.
+    pub fn from_wire(number: i32) -> Option<Self> {
+        Some(match number {
+            2 => GrpcCode::Unknown,
+            3 => GrpcCode::InvalidArgument,
+            4 => GrpcCode::DeadlineExceeded,
+            5 => GrpcCode::NotFound,
+            6 => GrpcCode::AlreadyExists,
+            7 => GrpcCode::PermissionDenied,
+            8 => GrpcCode::ResourceExhausted,
+            9 => GrpcCode::FailedPrecondition,
+            10 => GrpcCode::Aborted,
+            11 => GrpcCode::OutOfRange,
+            12 => GrpcCode::Unimplemented,
+            13 => GrpcCode::Internal,
+            14 => GrpcCode::Unavailable,
+            15 => GrpcCode::DataLoss,
+            _ => return None,
+        })
+    }
+
+    /// The code a spec key travels with, from the status its
+    /// `(io.angzarr.v1.reason)` option declares (`RouterReason::status`
+    /// and the other key enums' `status()`; decision 14.65): a
+    /// `ReasonStatus` value's number is its `google.rpc.Code` number.
+    /// `None` for `READINESS`, a readiness refusal that never travels as a
+    /// status, and for `UNSPECIFIED`, which no live key declares.
+    pub fn of_status(status: angzarr_proto::v1::ReasonStatus) -> Option<Self> {
+        Self::from_wire(status as i32)
+    }
+}
+
 /// The status a handler picks for a bug it
 /// marks retryable ([`CodedError::retryable_bug`]; decision 14.37, owner's
 /// rulings 2026-10-29, latest). The statuses are not interchangeable, and
@@ -240,10 +274,9 @@ impl CodedError {
     /// given (C-0682). The coordinator upcast it, and relays the type as sent
     /// beside it (decision 14.39).
     pub fn unknown_type(reason: RouterReason, type_url: &str) -> Self {
-        Self::coded(
-            reason.as_str_name(),
+        Self::keyed(
+            reason,
             [(reason_args::TYPE_URL.to_string(), type_url.to_string())],
-            GrpcCode::Internal,
         )
     }
 
@@ -254,7 +287,7 @@ impl CodedError {
     /// verbatim as `ext_err_txt` (decision 14.37, owner's rulings
     /// 2026-10-29, late); prost gives it no numeric code.
     pub fn undecodable(message_type: &str, error: &prost::DecodeError) -> Self {
-        Self::internal(
+        Self::keyed(
             RouterReason::AnyDecodeFailed,
             [
                 (
@@ -266,21 +299,11 @@ impl CodedError {
         )
     }
 
-    /// A request the router hosts no component for (UNIMPLEMENTED): a
-    /// misroute or a stale deployment.
-    pub(crate) fn unimplemented(
-        reason: RouterReason,
-        extras: impl IntoIterator<Item = (String, String)>,
-    ) -> Self {
-        Self::coded(reason.as_str_name(), extras, GrpcCode::Unimplemented)
-    }
-
     /// Classifies a store-sourced decode failure (DATA_LOSS on the wire).
     pub fn persisted_corrupt(type_url: &str) -> Self {
-        Self::coded(
-            RouterReason::PersistedEventCorrupt.as_str_name(),
+        Self::keyed(
+            RouterReason::PersistedEventCorrupt,
             [(reason_args::TYPE_URL.to_string(), type_url.to_string())],
-            GrpcCode::DataLoss,
         )
     }
 
@@ -314,18 +337,14 @@ impl CodedError {
         if let Some(cause) = cause {
             details.extend(flatten(reason_args::CAUSE, &cause.code, cause.args.clone()));
         }
-        Self::coded(reason.as_str_name(), details, GrpcCode::Internal)
+        Self::keyed(reason, details)
     }
 
     /// An unclassified error that escaped a business handler (INTERNAL):
     /// ROUTER_REASON_UNHANDLED_HANDLER_ERROR with no cause. What escaped stays in the
     /// handler's own log.
     pub fn unhandled() -> Self {
-        Self::coded(
-            RouterReason::UnhandledHandlerError.as_str_name(),
-            [],
-            GrpcCode::Internal,
-        )
+        Self::keyed(RouterReason::UnhandledHandlerError, [])
     }
 
     /// A business handler that panicked (INTERNAL): ROUTER_REASON_UNHANDLED_HANDLER_ERROR
@@ -361,9 +380,8 @@ impl CodedError {
             .next()
             .unwrap_or_default()
             .to_string();
-        Self::rejection(
-            BusinessStatus::FailedPrecondition,
-            RouterReason::CommandRefused.as_str_name(),
+        Self::keyed(
+            RouterReason::CommandRefused,
             [(reason_args::REFUSAL_TYPE.to_string(), full_name)],
         )
         .with_refusal(refusal)
@@ -376,10 +394,9 @@ impl CodedError {
     /// `cause.<arg>=<value>` (decision 14.37); the runtime alerts it and
     /// dead-letters the input, and it never reaches a policy's OnRefused.
     pub fn bug(code: &str, details: impl IntoIterator<Item = (String, String)>) -> Self {
-        Self::coded(
-            RouterReason::UnhandledHandlerError.as_str_name(),
+        Self::keyed(
+            RouterReason::UnhandledHandlerError,
             flatten(reason_args::CAUSE, code, details),
-            GrpcCode::Internal,
         )
     }
 
@@ -410,14 +427,17 @@ impl CodedError {
         Self::coded(code, details, GrpcCode::Aborted)
     }
 
-    /// A bug the router itself finds (INTERNAL), under its own code: a
-    /// type no handler claims, a component's misconfiguration. Never a
-    /// handler's, and never a business refusal (owner ruling, 2026-10-29).
-    pub(crate) fn internal(
+    /// The router's own key `reason` with its args `extras`, under the
+    /// status its `(io.angzarr.v1.reason)` option declares (decision
+    /// 14.65): a type no handler claims, a component's misconfiguration, a
+    /// request for a component the router does not host. Every router key
+    /// travels as a status, so none is a readiness refusal.
+    pub(crate) fn keyed(
         reason: RouterReason,
         extras: impl IntoIterator<Item = (String, String)>,
     ) -> Self {
-        Self::coded(reason.as_str_name(), extras, GrpcCode::Internal)
+        let grpc = GrpcCode::of_status(reason.status()).unwrap_or(GrpcCode::Internal);
+        Self::coded(reason.as_str_name(), extras, grpc)
     }
 
     /// This business rejection carrying its typed refusal object (one of

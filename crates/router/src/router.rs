@@ -388,7 +388,7 @@ impl Component {
     /// one, naming this component and its kind (C-0580, C-0670): a
     /// misconfiguration, INTERNAL.
     fn refuse_another(&self, reason: RouterReason) -> CodedError {
-        CodedError::internal(
+        CodedError::keyed(
             reason,
             [
                 (reason_args::COMPONENT.to_string(), self.name().to_string()),
@@ -457,7 +457,7 @@ impl RouterBuilder {
     /// Validates the configuration and builds the router.
     pub fn build(mut self) -> Result<Router, CodedError> {
         if self.components.is_empty() {
-            return Err(CodedError::internal(RouterReason::NoHandlersRegistered, []));
+            return Err(CodedError::keyed(RouterReason::NoHandlersRegistered, []));
         }
         let component = self.components.remove(0);
         if !self.components.is_empty() {
@@ -478,7 +478,7 @@ pub struct Router {
 }
 
 fn wrong_kind() -> CodedError {
-    CodedError::unimplemented(RouterReason::NoComponentOfKind, [])
+    CodedError::keyed(RouterReason::NoComponentOfKind, [])
 }
 
 impl Router {

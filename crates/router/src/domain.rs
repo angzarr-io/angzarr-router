@@ -407,7 +407,7 @@ impl<S> DomainDispatch<S> {
                         let Some(thunk) =
                             self.refused.get(crate::type_name_from_url(&refused_type))
                         else {
-                            return Err(CodedError::internal(
+                            return Err(CodedError::keyed(
                                 RouterReason::NoRefusalHandler,
                                 [(reason_args::COMMAND_TYPE.to_string(), refused_type)],
                             ));
@@ -534,7 +534,7 @@ impl<S> DomainDispatch<S> {
             }
             pb::ConflictResolution::Commutative => {
                 let Some(resolver) = self.commutative.as_ref() else {
-                    return Err(CodedError::internal(
+                    return Err(CodedError::keyed(
                         RouterReason::ConflictResolutionUnsupported,
                         [],
                     ));
