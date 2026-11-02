@@ -59,6 +59,37 @@ build: (_container "build")
 # Run the unit test bank
 test: (_container "test")
 
+# Build the unit test bank without running it: a failure here is never a red
+# test
+build-tests: (_container "build-tests")
+
+# lefthook's pre-commit and pre-merge-commit tests: every test (`just test`),
+# built first (`just build-tests`; a build failure is refused on every
+# branch). Red tests (the tests build and some fail) are committed on a
+# branch other than the default one, with a warning that it cannot merge
+# until they pass, and refused on the default branch (origin/HEAD, else main)
+# or a detached HEAD; `push-check` (pre-push) keeps them out of the default
+# branch. Both run in the toolchain image, or directly under
+# DEVCONTAINER=true, as every container-side recipe does.
+test-commit:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd '{{TOP}}'
+    # git exports repository-locating variables (GIT_DIR, ...) into a hook;
+    # a test running git (under DEVCONTAINER=true) would act on this
+    # checkout with them.
+    unset $(git rev-parse --local-env-vars)
+    just --justfile '{{TOP}}/justfile' build-tests
+    just --justfile '{{TOP}}/justfile' test && exit 0
+    default=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null) && default=${default#origin/} || default=main
+    branch=$(git symbolic-ref --quiet --short HEAD) || branch=
+    if [ -n "$branch" ] && [ "$branch" != "$default" ]; then
+        echo "RED  tests: red tests committed on $branch, which is allowed off $default; $branch cannot merge into $default (or be pushed to it) until they pass"
+        exit 0
+    fi
+    echo "FAIL tests: red tests cannot be committed on ${branch:-a detached HEAD}. Commit them on a branch." >&2
+    exit 1
+
 # Check Rust formatting (no rewrite; fails on drift)
 fmt-check: (_container "fmt-check")
 

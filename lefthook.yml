@@ -1,7 +1,8 @@
 # Lefthook configuration for angzarr-router
 # https://github.com/evilmartians/lefthook
 #
-# Setup: lefthook install (again after a hook is added or removed here: pre-push was)
+# Setup: lefthook install (again after a hook is added or removed here:
+# pre-push was, then pre-merge-commit)
 # Bypass: none — fix the finding instead.
 
 # Plant the in-submodule pre-commit guard in .git/modules/<name>/hooks/
@@ -49,6 +50,19 @@ pre-commit:
     lint:
       glob: "*.{rs,toml}"
       run: just lint
+
+    # Every test, built first: a build failure is refused on every branch;
+    # red tests are committed off the default branch with a warning (RED)
+    # and refused on it or a detached HEAD (`just test-commit`).
+    tests:
+      run: just test-commit
+
+# A merge commit is checked as a commit is: one bringing red tests onto the
+# default branch is refused, one onto another branch is warned.
+pre-merge-commit:
+  commands:
+    tests:
+      run: just test-commit
 
 # No mutation testing in any hook: it runs while tests are written and judged
 # (`just mutation-push`, by hand), at the end of an unattended run, and in the

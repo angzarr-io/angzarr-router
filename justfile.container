@@ -25,6 +25,10 @@ build:
 test:
     cargo test --manifest-path {{TOP}}/Cargo.toml --workspace
 
+# Build the unit test bank without running it
+build-tests:
+    cargo test --manifest-path {{TOP}}/Cargo.toml --workspace --no-run --quiet
+
 # The wasm test runner, pinned to the wasm-bindgen in Cargo.lock (the CLI
 # and the library must match exactly; the same pin as angzarr-ports').
 WASM_BINDGEN := "0.2.129"
