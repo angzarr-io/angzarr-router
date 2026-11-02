@@ -12,6 +12,7 @@ use prost_types::Any;
 use crate::domain::{CommandContext, DomainDispatch, FactRecord};
 use crate::error::{GrpcCode, RouterReason};
 use crate::pb;
+use crate::rebuild::Rebuilder;
 use crate::test_support::*;
 use crate::{page_event, type_url, TYPE_URL_PREFIX};
 
@@ -422,4 +423,113 @@ fn a_handler_emitting_nothing_answers_an_empty_book() {
         }))
         .expect("dispatch");
     assert_eq!(resp.events, Some(pb::EventBook::default()));
+}
+
+/// A decision's identity, as the coordinator delivers it: a command id, a
+/// correlation and the instant the input was accepted.
+fn identified(mut req: pb::ContextualCommand) -> pb::ContextualCommand {
+    let page = req.command.as_mut().unwrap().page.as_mut().unwrap();
+    page.command_id = Some(uuid_of(1));
+    page.correlation_id = Some(uuid_of(2));
+    req.recorded_at = Some(prost_types::Timestamp {
+        seconds: 1_700_000_000,
+        nanos: 5,
+    });
+    req
+}
+
+/// The meta the coordinator stamps every event of `req`'s decision with,
+/// under rules version "v3" (types.proto, EventMeta).
+fn stamped_meta(req: &pb::ContextualCommand) -> pb::EventMeta {
+    let page = req.command.as_ref().unwrap().page.as_ref().unwrap();
+    pb::EventMeta {
+        causation: page
+            .command_id
+            .clone()
+            .map(pb::event_meta::Causation::CommandId),
+        fact: page.fact_origin.clone(),
+        correlation_id: page.correlation_id.clone(),
+        recorded_at: req.recorded_at,
+        rules_version: "v3".to_string(),
+    }
+}
+
+/// The meta an applier saw, page by page.
+type SeenMeta = Arc<Mutex<Vec<Option<pb::EventMeta>>>>;
+
+/// A rebuilder whose Cover applier records the meta it sees.
+fn meta_recorder() -> (Rebuilder<TestState>, SeenMeta) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let r = fresh_rebuilder().apply_with_context(&cover_full_name(), move |_, _, ctx| {
+        log.lock().unwrap().push(ctx.meta.cloned());
+        Ok(())
+    });
+    (r, seen)
+}
+
+/// The applier's view of `answered`'s pages replayed: each stamped with
+/// `meta`, as the coordinator persists them.
+fn replayed_meta(answered: &pb::EventBook, meta: &pb::EventMeta) -> Vec<Option<pb::EventMeta>> {
+    let (r, seen) = meta_recorder();
+    let persisted = pb::EventBook {
+        pages: answered
+            .pages
+            .iter()
+            .map(|p| pb::EventPage {
+                meta: Some(meta.clone()),
+                ..p.clone()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    r.rebuild(Some(&persisted)).expect("replay");
+    let replayed = seen.lock().unwrap().clone();
+    replayed
+}
+
+// The full-context rule: an applier folding a decision's own events at
+// decide time sees the meta the coordinator stamps them with, the same meta
+// replay hands it.
+#[test]
+fn a_command_s_own_events_fold_with_the_meta_replay_sees() {
+    let (r, seen) = meta_recorder();
+    let d = DomainDispatch::new("agg", "order", r)
+        .with_rules_version("v3")
+        .on_command(&cover_full_name(), |_, _: &mut TestState, _| {
+            Ok(Some(pb::EventBook {
+                pages: vec![event_page(cover_any("a")), event_page(cover_any("b"))],
+                ..Default::default()
+            }))
+        });
+    let req = identified(command_for(cover_any("")));
+    let resp = d.dispatch(&req).expect("dispatch");
+    let meta = stamped_meta(&req);
+    let decided = seen.lock().unwrap().clone();
+    assert_eq!(decided, vec![Some(meta.clone()), Some(meta.clone())]);
+    assert_eq!(decided, replayed_meta(&resp.events.unwrap(), &meta));
+}
+
+#[test]
+fn a_fact_s_recorded_pages_fold_with_the_meta_replay_sees() {
+    let (r, seen) = meta_recorder();
+    let d = DomainDispatch::new("agg", "ledger", r)
+        .with_rules_version("v3")
+        .on_fact(&cover_full_name(), |fact, _: &TestState| {
+            Ok(FactRecord {
+                fact: fact.clone(),
+                flags: vec![cover_any("flag")],
+            })
+        });
+    let mut req = identified(contextual(fact_page(cover_any("f"))));
+    req.command.as_mut().unwrap().page.as_mut().unwrap().fact_origin = Some(pb::FactOrigin {
+        external_id: "pi_1".to_string(),
+        ..Default::default()
+    });
+    let resp = d.dispatch(&req).expect("fact");
+    let meta = stamped_meta(&req);
+    assert!(meta.fact.is_some(), "a fact's meta names its origin");
+    let decided = seen.lock().unwrap().clone();
+    assert_eq!(decided, vec![Some(meta.clone()), Some(meta.clone())]);
+    assert_eq!(decided, replayed_meta(&resp.events.unwrap(), &meta));
 }
