@@ -522,7 +522,13 @@ fn a_fact_s_recorded_pages_fold_with_the_meta_replay_sees() {
             })
         });
     let mut req = identified(contextual(fact_page(cover_any("f"))));
-    req.command.as_mut().unwrap().page.as_mut().unwrap().fact_origin = Some(pb::FactOrigin {
+    req.command
+        .as_mut()
+        .unwrap()
+        .page
+        .as_mut()
+        .unwrap()
+        .fact_origin = Some(pb::FactOrigin {
         external_id: "pi_1".to_string(),
         ..Default::default()
     });

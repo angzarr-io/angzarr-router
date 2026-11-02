@@ -762,7 +762,7 @@ fn a_panicking_applier_of_emitted_pages_is_fold_failed_emitted() {
             &pb::EventMeta::default(),
         )
     })
-        .expect_err("the applier panicked");
+    .expect_err("the applier panicked");
     assert_fold_failed(
         &err,
         "ROUTER_REASON_FOLD_FAILED_EMITTED",
