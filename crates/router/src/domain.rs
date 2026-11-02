@@ -422,7 +422,9 @@ impl<S> DomainDispatch<S> {
                     }
                 };
                 let (mut state, _) = self.rebuilder.rebuild(req.events.as_ref())?;
-                let record = record_with(&state, command_context(req))?;
+                let cctx = command_context(req);
+                let meta = cctx.event_meta(&self.rules_version);
+                let record = record_with(&state, cctx)?;
                 let recorded = pb::EventBook {
                     pages: std::iter::once(record.fact)
                         .chain(record.flags)
@@ -438,6 +440,7 @@ impl<S> DomainDispatch<S> {
                     &recorded.pages,
                     cover,
                     crate::next_sequence(req.events.as_ref()),
+                    &meta,
                 )?;
                 (recorded, state, None)
             }
@@ -502,11 +505,12 @@ impl<S> DomainDispatch<S> {
         let events = req.events.as_ref();
         let next_sequence = crate::next_sequence(events);
         let cover = events.and_then(|b| b.cover.as_ref());
+        let base = command_context(req);
+        let meta = base.event_meta(&self.rules_version);
         let fold_emitted = |state: &mut S, out: &pb::EventBook| {
             self.rebuilder
-                .apply_emitted(state, &out.pages, cover, next_sequence)
+                .apply_emitted(state, &out.pages, cover, next_sequence, &meta)
         };
-        let base = command_context(req);
         let expected_sequence = base.expected_sequence;
         let conflict_resolution = base.conflict_resolution;
         let run = |state: &mut S, cctx: CommandContext| -> Result<pb::EventBook, CodedError> {

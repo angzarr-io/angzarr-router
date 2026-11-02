@@ -106,24 +106,22 @@ pub fn decode_message<M: prost::Message + prost::Name + Default>(
 pub struct PageContext<'a> {
     pub cover: Option<&'a pb::Cover>,
     pub sequence: u64,
-    /// The page's metadata (types.proto, EventMeta): its correlation_id,
-    /// recorded_at and causation. The router stamps nothing; this is the
-    /// page's `meta`, passed through, and `None` exactly when the page
-    /// carries none. Who fills it depends on where the page comes from:
+    /// The page's metadata (types.proto, EventMeta): its causation,
+    /// correlation_id, fact origin, recorded_at and rules version. An
+    /// applier sees the same meta for an event at decide time and on
+    /// replay:
     ///
     /// - A persisted page (a rebuild's history, a projector's or a policy's
     ///   delivered events, a conflict window) carries the meta its
-    ///   coordinator stamped when it recorded the event: the coordinator
-    ///   guarantees it.
+    ///   coordinator stamped when it recorded the event, passed through:
+    ///   `None` only when the page carries none.
     /// - A page folded at decide time ([`rebuild::Rebuilder::apply_emitted`],
     ///   [`rebuild::PageOrigin::Emitted`]: the decision's own events, a
-    ///   recorded fact's) carries what its pages carry when folded. The
-    ///   router's own [`domain`] handler folds them as the handler built
-    ///   them, and a handler's pages carry no meta unless it set one, so its
-    ///   appliers see `None` there and the stamped meta on replay. A host that stamps the decision's own
-    ///   events before folding them (angzarr-embedded's `event_meta`) hands
-    ///   its appliers, at decide time, the meta replay will: the host
-    ///   guarantees that, not the router.
+    ///   recorded fact's) is folded with the meta its coordinator will stamp
+    ///   on it, built from the `ContextualCommand` the router was handed
+    ///   ([`context::CommandContext::event_meta`], the one builder a
+    ///   coordinator stamps with too). The answered pages themselves stay
+    ///   unstamped: the coordinator stamps them.
     ///
     /// A policy reads its trigger's correlation here (decision 14.36: it
     /// may name that correlation as the root).

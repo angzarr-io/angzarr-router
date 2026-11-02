@@ -48,6 +48,35 @@ pub struct CommandContext {
     pub recorded_at: Option<prost_types::Timestamp>,
 }
 
+impl CommandContext {
+    /// The metadata every event of this decision is stamped with
+    /// (types.proto, EventMeta), under `rules_version`: its causation (the
+    /// input's command id, the deduplication key), its fact origin and
+    /// correlation, and the instant it is recorded at
+    /// (`ContextualCommand.recorded_at`). No actor: who did it belongs in a
+    /// security log. No trigger: a policy command's events name their
+    /// command, not the event that set it off; that edge is the command's
+    /// own causation, for tracing.
+    ///
+    /// The ONE builder of it: a coordinator stamps the events it keeps with
+    /// it, from the `ContextualCommand` it handed the handler, and the
+    /// router folds the decision's own events with it
+    /// ([`crate::rebuild::Rebuilder::apply_emitted`]), so an applier reads
+    /// at decide time exactly what replay will hand it.
+    pub fn event_meta(&self, rules_version: &str) -> pb::EventMeta {
+        pb::EventMeta {
+            causation: self
+                .command_id
+                .clone()
+                .map(pb::event_meta::Causation::CommandId),
+            fact: self.fact_origin.clone(),
+            correlation_id: self.correlation_id.clone(),
+            recorded_at: self.recorded_at,
+            rules_version: rules_version.to_string(),
+        }
+    }
+}
+
 /// A stale command's conflict under AGGREGATE_HANDLES (types.proto,
 /// ContextualCommand.conflict_nonce; backlog NC-1): the window of events the
 /// command did not see, and the nonce the handler must hand back through

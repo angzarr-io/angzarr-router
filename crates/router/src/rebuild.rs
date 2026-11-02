@@ -443,22 +443,26 @@ impl<S> Rebuilder<S> {
     }
 
     /// Folds `pages` a handler emitted (not yet persisted) into `state`,
-    /// each seen at the sequence it will be given: `next_sequence` onward,
-    /// in order (the pages themselves stay unstamped). A failure is a
-    /// handler bug naming the command's own event
-    /// ([`PageOrigin::Emitted`]).
+    /// each seen as it will be persisted: at the sequence it will be given
+    /// (`next_sequence` onward, in order) and with the `meta` its
+    /// coordinator will stamp ([`crate::context::CommandContext::event_meta`]),
+    /// so an applier sees at decide time what replay hands it (the pages
+    /// themselves stay unstamped). A failure is a handler bug naming the
+    /// command's own event ([`PageOrigin::Emitted`]).
     pub fn apply_emitted(
         &self,
         state: &mut S,
         pages: &[pb::EventPage],
         cover: Option<&pb::Cover>,
         next_sequence: u64,
+        meta: &pb::EventMeta,
     ) -> Result<(), CodedError> {
         let numbered: Vec<pb::EventPage> = pages
             .iter()
             .zip(next_sequence..)
             .map(|(page, sequence)| pb::EventPage {
                 sequence,
+                meta: Some(meta.clone()),
                 ..page.clone()
             })
             .collect();

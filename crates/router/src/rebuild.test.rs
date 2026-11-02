@@ -753,7 +753,15 @@ fn a_panicking_batched_fold_of_emitted_pages_is_fold_failed_emitted() {
 fn a_panicking_applier_of_emitted_pages_is_fold_failed_emitted() {
     let r = panicking_applier();
     let mut state = TestState::default();
-    let err = answered(|| r.apply_emitted(&mut state, &[event_page(cover_any("a"))], None, 7))
+    let err = answered(|| {
+        r.apply_emitted(
+            &mut state,
+            &[event_page(cover_any("a"))],
+            None,
+            7,
+            &pb::EventMeta::default(),
+        )
+    })
         .expect_err("the applier panicked");
     assert_fold_failed(
         &err,

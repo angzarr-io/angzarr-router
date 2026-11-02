@@ -386,10 +386,12 @@ Business code never decides when, and there is no request flag.
   (`Rebuilder::of_message`); `Rebuilder::with_state_image` declares another.
   Across the C ABI: the state bytes the router holds. A rebuilder with no
   image (`Rebuilder::new` alone) answers no snapshot.
-- **Emitted events fold at the sequences they will get.** The fold sees each
-  emitted page at the head's next sequence onward, so the snapshot equals
-  what a rebuild folds once the coordinator stamps them; the answered pages
-  stay unstamped. Across the C ABI this is one more host fold call per
+- **Emitted events fold as they will be persisted.** The fold sees each
+  emitted page at the head's next sequence onward and with the meta the
+  coordinator will stamp (`CommandContext::event_meta`, built from the
+  `ContextualCommand`), so the snapshot equals what a rebuild folds once the
+  coordinator stamps them, and an applier reads the same meta at decide time
+  and on replay; the answered pages stay unstamped. Across the C ABI this is one more host fold call per
   answer. A failing fold of an emitted event is INTERNAL with the "emitted"
   message, as COMMUTATIVE's already was.
 
