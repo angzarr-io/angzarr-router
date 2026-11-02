@@ -6,15 +6,25 @@
 
 # Plant the in-submodule pre-commit guard in .git/modules/<name>/hooks/
 # (angzarr-project/submodule.just) after checkouts and merges.
+#
+# A fresh clone or `git worktree add` runs post-checkout before any
+# submodule is checked out: angzarr-project/submodule.just is not there, so
+# the justfile's `import?` brings no `install-submodule-hooks`, and there is
+# no submodule checkout to guard either. The step says so, and how to
+# install the guard once the submodules are checked out; with
+# submodule.just there, the recipe runs and its failure fails the hook.
 post-checkout:
   commands:
     install-submodule-hooks:
-      run: just install-submodule-hooks
+      run: &install-submodule-hooks >-
+        if [ -f angzarr-project/submodule.just ]; then just install-submodule-hooks;
+        else echo "no submodule guard installed: angzarr-project is not checked out (git submodule update --init, then just install-submodule-hooks)";
+        fi
 
 post-merge:
   commands:
     install-submodule-hooks:
-      run: just install-submodule-hooks
+      run: *install-submodule-hooks
 
 pre-commit:
   parallel: false
