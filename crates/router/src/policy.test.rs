@@ -309,7 +309,7 @@ fn every_handled_page_answers_one_reaction_in_page_order_an_empty_one_included()
     let shape: Vec<(u64, usize)> = resp
         .reactions
         .iter()
-        .map(|r| (r.trigger_sequence, r.commands.len()))
+        .map(|r| (r.trigger_sequence, r.outputs.len()))
         .collect();
     assert_eq!(
         shape,
@@ -318,7 +318,7 @@ fn every_handled_page_answers_one_reaction_in_page_order_an_empty_one_included()
     );
     assert_eq!(
         resp.reactions[0]
-            .commands
+            .outputs
             .iter()
             .map(|c| crate::command_payload(c.page.as_ref().unwrap())
                 .unwrap()

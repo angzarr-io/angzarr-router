@@ -166,7 +166,7 @@ async fn a_boxed_policy_is_awaited_until_it_answers() {
     let response = pb::PolicyResponse {
         reactions: vec![pb::PolicyReaction {
             trigger_sequence: 1,
-            commands: vec![conf::order_command_for("inventory", "ReserveStock")],
+            outputs: vec![conf::order_command_for("inventory", "ReserveStock")],
         }],
     };
     commands.send(response.clone()).unwrap();

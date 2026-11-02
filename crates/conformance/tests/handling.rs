@@ -442,7 +442,7 @@ async fn policy_not_refused(w: &mut HandlingWorld) {
 async fn one_reaction_unchanged(w: &mut HandlingWorld) {
     let reactions = &policy_answer(w).reactions;
     assert_eq!(reactions.len(), 1, "one reaction");
-    assert_eq!(reactions[0].commands, w.policy_commands, "unchanged");
+    assert_eq!(reactions[0].outputs, w.policy_commands, "unchanged");
 }
 
 #[then(
@@ -452,7 +452,7 @@ async fn one_reaction_command_then_fact(w: &mut HandlingWorld) {
     let reactions = &policy_answer(w).reactions;
     assert_eq!(reactions.len(), 1, "one reaction");
     assert_eq!(
-        reactions[0].commands,
+        reactions[0].outputs,
         [reserve_stock(), stock_hold_requested()],
         "the command then the fact, unchanged"
     );
@@ -467,7 +467,7 @@ async fn holds_reactions(w: &mut HandlingWorld, _count: String, step: &cucumber:
         .iter()
         .map(|r| {
             let types: Vec<&str> = r
-                .commands
+                .outputs
                 .iter()
                 .map(|c| {
                     angzarr_router::command_payload(c.page.as_ref().expect("a page"))

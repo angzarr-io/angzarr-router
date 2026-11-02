@@ -41,7 +41,7 @@ impl PolicyWorld {
         self.response()
             .reactions
             .iter()
-            .flat_map(|r| r.commands.iter().cloned())
+            .flat_map(|r| r.outputs.iter().cloned())
             .collect()
     }
 }
@@ -68,13 +68,9 @@ async fn emits_one_command_in_reaction(w: &mut PolicyWorld, target: String, sequ
     let reactions = &w.response().reactions;
     assert_eq!(reactions.len(), 1, "one reaction, to the one handled page");
     assert_eq!(reactions[0].trigger_sequence, sequence, "its trigger");
+    assert_eq!(reactions[0].outputs.len(), 1, "exactly one command emitted");
     assert_eq!(
-        reactions[0].commands.len(),
-        1,
-        "exactly one command emitted"
-    );
-    assert_eq!(
-        reactions[0].commands[0]
+        reactions[0].outputs[0]
             .cover
             .as_ref()
             .expect("cover")

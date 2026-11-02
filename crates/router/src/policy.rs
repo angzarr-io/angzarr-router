@@ -205,7 +205,8 @@ impl PolicyDispatch {
     /// undeclared types are skipped. The answer holds one
     /// `PolicyReaction` per handled page, in page order, naming its
     /// trigger's sequence, an empty one included, and none for an
-    /// unhandled page (decision 14.42). Emitted commands pass through as
+    /// unhandled page (decision 14.42). Its outputs, commands and facts
+    /// alike (decision 14.69), pass through as
     /// business code returned them, unchecked and unstamped, in emission
     /// order (C-0690). A source with no pages answers no reactions: the
     /// router guards no envelope (decision 14.42).
@@ -227,12 +228,12 @@ impl PolicyDispatch {
                 sequence: page.sequence,
                 meta: page.meta.as_ref(),
             };
-            let commands = call_handler(|| thunk(event_any, &context))?;
+            let outputs = call_handler(|| thunk(event_any, &context))?;
             // One reaction per handled page, an empty one included
             // (decision 14.42).
             resp.reactions.push(pb::PolicyReaction {
                 trigger_sequence: page.sequence,
-                commands,
+                outputs,
             });
         }
 

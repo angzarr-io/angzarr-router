@@ -264,7 +264,7 @@ pub fn caused_by(mut book: pb::CommandBook, trigger: pb::Cover, sequence: u64) -
 pub fn commands_of(resp: &pb::PolicyResponse) -> Vec<pb::CommandBook> {
     resp.reactions
         .iter()
-        .flat_map(|r| r.commands.iter().cloned())
+        .flat_map(|r| r.outputs.iter().cloned())
         .collect()
 }
 

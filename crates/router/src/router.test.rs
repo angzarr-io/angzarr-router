@@ -435,7 +435,7 @@ impl PolicyComponent for Relay {
         Ok(pb::PolicyResponse {
             reactions: vec![pb::PolicyReaction {
                 trigger_sequence: 0,
-                commands: vec![pb::CommandBook::default()],
+                outputs: vec![pb::CommandBook::default()],
             }],
         })
     }
