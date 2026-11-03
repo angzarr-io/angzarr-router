@@ -220,8 +220,20 @@ impl PolicyDispatch {
                 )],
             ));
         };
-        let _ = refused;
-        todo!("RED: the one refusal callback (decision 14.89)");
+        let unrefused = hpb::Refusal::default();
+        let refusal = req.refusal.as_ref().unwrap_or(&unrefused);
+        let trigger = req.trigger.as_ref();
+        let page = trigger.and_then(|t| t.pages.first());
+        let context = RefusalContext {
+            trigger: PageContext {
+                cover: trigger.and_then(|t| t.cover.as_ref()),
+                sequence: page.map_or(0, |p| p.sequence),
+                meta: page.and_then(|p| p.meta.as_ref()),
+            },
+            delivery,
+        };
+        let fact = call_handler(|| refused(command, refusal, &context))?;
+        Ok(hpb::TranslateResponse { fact: Some(fact) })
     }
 }
 

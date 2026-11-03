@@ -366,11 +366,18 @@ impl<S> DomainDispatch<S> {
         cover: Option<&pb::Cover>,
     ) -> Result<Vec<Any>, CodedError> {
         let meta = ctx.event_meta(&self.rules_version);
-        let emit = call_handler(|| thunk(any, state, ctx))?;
-        self.rebuilder
-            .apply_emitted(state, &emit.events, cover, ctx.next_sequence, &meta)?;
-        // RED: the continuation is not yet run (decision 14.104).
-        Ok(emit.events)
+        let mut answered = Vec::new();
+        let mut emit = call_handler(|| thunk(any, state, ctx))?;
+        loop {
+            let at = ctx.next_sequence + answered.len() as u64;
+            self.rebuilder
+                .apply_emitted(state, &emit.events, cover, at, &meta)?;
+            answered.extend(emit.events);
+            let Some(step) = emit.next else {
+                return Ok(answered);
+            };
+            emit = call_handler(|| step(state, ctx))?;
+        }
     }
 
     /// The client library's step-idempotence test helper (decision 14.104):
@@ -388,8 +395,24 @@ impl<S> DomainDispatch<S> {
     where
         S: Clone,
     {
-        let _ = (state, ctx, step);
-        todo!("RED: the step-idempotence helper (decision 14.104)")
+        let first = call_handler(|| step(state, ctx)).map_err(NotIdempotent::Failed)?;
+        let mut after = state.clone();
+        let meta = ctx.event_meta(&self.rules_version);
+        self.rebuilder
+            .apply_emitted(
+                &mut after,
+                &first.events,
+                ctx.cover.as_ref(),
+                ctx.next_sequence,
+                &meta,
+            )
+            .map_err(NotIdempotent::Failed)?;
+        let again = call_handler(|| step(&after, ctx)).map_err(NotIdempotent::Failed)?;
+        match (again.events.is_empty(), again.continues()) {
+            (false, _) => Err(NotIdempotent::EmittedAgain(again.events)),
+            (true, Continues::Somewhere) => Err(NotIdempotent::ContinuedAgain),
+            (true, Continues::Nowhere) => Ok(()),
+        }
     }
 }
 

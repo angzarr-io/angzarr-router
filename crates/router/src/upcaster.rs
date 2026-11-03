@@ -89,8 +89,26 @@ impl UpcasterDispatch {
     /// requested sequence has its entry. A request with no input answers
     /// none. The first failing rule fails the request.
     pub fn dispatch(&self, req: &hpb::UpcastRequest) -> Result<hpb::UpcastResponse, CodedError> {
-        let _ = req;
-        todo!("RED: the keyed answer (decisions 14.96 and 14.97)")
+        let pages = match &req.input {
+            None => Vec::new(),
+            Some(hpb::upcast_request::Input::LonePayload(payload)) => vec![hpb::Upcasted {
+                key: Some(hpb::upcasted::Key::NoSequence(hpb::NoSequence {})),
+                payload: Some(self.upcast(payload)?),
+            }],
+            Some(hpb::upcast_request::Input::Pages(pages)) => pages
+                .events
+                .iter()
+                .map(|page| {
+                    Ok(hpb::Upcasted {
+                        key: Some(hpb::upcasted::Key::Sequence(page.sequence)),
+                        payload: crate::page_event(page)
+                            .map(|event| self.upcast(event))
+                            .transpose()?,
+                    })
+                })
+                .collect::<Result<_, CodedError>>()?,
+        };
+        Ok(hpb::UpcastResponse { pages })
     }
 }
 
