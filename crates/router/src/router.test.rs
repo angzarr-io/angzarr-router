@@ -1,13 +1,15 @@
 //! RouterBuilder / Router: one router hosts ONE component (owner ruling: one
 //! coordinator, one component, one business process). Build-time validation
-//! (C-0060) and dispatch to that component.
+//! (C-0060, C-0580) and dispatch to that component, on the handler layer's
+//! messages (decision 14.78).
 
 use prost_types::Any;
 
-use crate::domain::DomainDispatch;
-use crate::error::{CodedError, RouterReason};
+use crate::domain::{DomainDispatch, Emit};
+use crate::error::{AngzarrReason, CodedError};
+use crate::hpb;
 use crate::pb;
-use crate::policy::PolicyDispatch;
+use crate::policy::{self, PolicyDispatch};
 use crate::projector::ProjectorDispatch;
 use crate::rebuild::Rebuilder;
 use crate::router::{
@@ -15,7 +17,7 @@ use crate::router::{
     ProjectorHandler, Router, RouterBuilder,
 };
 use crate::test_support::{
-    command_page, event_page, fact_page, fresh_rebuilder, now, LedgerState, TestState,
+    command_page, event_page, fact_page, fresh_rebuilder, now, uuid_of, LedgerState, TestState,
 };
 use crate::type_url;
 
@@ -27,108 +29,102 @@ fn any_of_type(fq: &str) -> Any {
 }
 
 /// An aggregate in `domain` handling `commands`, each emitting one event
-/// page tagged (type URL) with `label`.
+/// tagged (type URL) with `label`.
 fn aggregate(label: &'static str, domain: &str, commands: &[&str]) -> DomainDispatch<TestState> {
     let mut agg = DomainDispatch::new(label, domain, fresh_rebuilder());
     for c in commands {
-        agg = agg.on_command(c, move |_, _, _| {
-            Ok(Some(pb::EventBook {
-                pages: vec![event_page(any_of_type(label))],
-                ..Default::default()
-            }))
-        });
+        agg = agg.on_command(c, move |_, _, _| Ok(Emit::of([any_of_type(label)])));
     }
     agg
 }
 
-fn command(domain: &str, fq: &str) -> pb::ContextualCommand {
-    pb::ContextualCommand {
-        command: Some(pb::CommandBook {
+fn command(domain: &str, fq: &str) -> hpb::HandleRequest {
+    hpb::HandleRequest {
+        input: Some(pb::CommandBook {
             cover: Some(pb::Cover {
                 domain: domain.to_string(),
                 ..Default::default()
             }),
             page: Some(command_page(any_of_type(fq))),
-            ..Default::default()
         }),
-        events: None,
         ..Default::default()
     }
 }
 
 /// A Fact-arm delivery of `fq` to `domain`.
-fn fact(domain: &str, fq: &str) -> pb::ContextualCommand {
+fn fact(domain: &str, fq: &str) -> hpb::HandleRequest {
     let mut req = command(domain, fq);
-    req.command.as_mut().unwrap().page = Some(fact_page(any_of_type(fq)));
+    req.input.as_mut().unwrap().page = Some(fact_page(any_of_type(fq)));
     req
 }
 
-fn emitted_label(resp: &pb::CommandHandlerResponse) -> String {
+fn emitted_label(resp: &hpb::HandleResponse) -> String {
     resp.events
-        .as_ref()
-        .and_then(|book| book.pages.first())
-        .and_then(|page| page.payload.as_ref())
+        .first()
         .map(|any| crate::type_name_from_url(&any.type_url).to_string())
         .unwrap_or_default()
 }
 
-fn build_err(builder: RouterBuilder) -> String {
+fn build_err(builder: RouterBuilder) -> CodedError {
     match builder.build() {
         Ok(_) => panic!("expected the build to fail"),
-        Err(err) => err.code,
+        Err(err) => err,
     }
 }
 
 #[test]
 fn an_empty_configuration_fails_to_build() {
     assert_eq!(
-        build_err(RouterBuilder::new()),
-        RouterReason::NoHandlersRegistered.as_str_name(),
+        build_err(RouterBuilder::new()).code,
+        AngzarrReason::NoHandlersRegistered.as_str_name(),
         "C-0060"
     );
 }
 
-/// A builder holding one component of `kind`.
-fn with_one(builder: RouterBuilder, kind: &str) -> RouterBuilder {
+/// A builder holding one component of `kind`, named `name`.
+fn with_one(builder: RouterBuilder, kind: &str, name: &'static str) -> RouterBuilder {
     match kind {
-        "aggregate" => builder.aggregate(aggregate("a", "order", &["test.Create"])),
-        "policy" => builder.policy(PolicyDispatch::new("s", "order", "inventory")),
+        "aggregate" => builder.aggregate(aggregate(name, "order", &["test.Create"])),
+        "policy" => builder.policy(PolicyDispatch::new(name, "order", "inventory")),
         "process manager" => builder.process_manager(
-            DomainDispatch::process_manager("pm", "pm", fresh_rebuilder())
-                .on_command("test.Start", |_, _, _| Ok(None)),
+            DomainDispatch::process_manager(name, "pm", fresh_rebuilder())
+                .on_command("test.Start", |_, _, _| Ok(Emit::none())),
         ),
-        _ => builder.projector(ProjectorDispatch::new("p", || ())),
+        _ => builder.projector(ProjectorDispatch::new(name, || ())),
     }
 }
 
 const KINDS: [&str; 4] = ["aggregate", "policy", "process manager", "projector"];
 
+// C-0580: one owner, the router, and one arg set, each a component name
+// (decisions 14.87 and 14.88): `registered` and `refused`.
 #[test]
 fn a_router_hosts_one_component_and_refuses_a_second_of_any_kind() {
     for first in KINDS {
         assert!(
-            with_one(RouterBuilder::new(), first).build().is_ok(),
+            with_one(RouterBuilder::new(), first, "first")
+                .build()
+                .is_ok(),
             "one {first} builds"
         );
         for second in KINDS {
-            let err = match with_one(with_one(RouterBuilder::new(), first), second).build() {
-                Ok(_) => panic!("a {second} after a {first} must be refused"),
-                Err(err) => err,
-            };
-            assert_eq!(err.code, "ROUTER_REASON_DUPLICATE_COMPONENT");
-            // C-0580: the refusal names the component already registered.
-            let (name, kind) = match first {
-                "aggregate" => ("a", "AGGREGATE"),
-                "policy" => ("s", "POLICY"),
-                "process manager" => ("pm", "PROCESS_MANAGER"),
-                _ => ("p", "PROJECTOR"),
-            };
+            let err = build_err(with_one(
+                with_one(RouterBuilder::new(), first, "first"),
+                second,
+                "second",
+            ));
+            assert_eq!(err.code, "ANGZARR_REASON_DUPLICATE_COMPONENT");
+            assert_eq!(err.grpc, crate::error::GrpcCode::Internal);
             let extra = |key: &str| err.extras.get(key).map(String::as_str);
-            assert_eq!(extra(angzarr_proto::v1::reason_args::COMPONENT), Some(name));
             assert_eq!(
-                extra(angzarr_proto::v1::reason_args::COMPONENT_KIND),
-                Some(kind)
+                extra(angzarr_proto::v1::reason_args::REGISTERED),
+                Some("first")
             );
+            assert_eq!(
+                extra(angzarr_proto::v1::reason_args::REFUSED),
+                Some("second")
+            );
+            assert_eq!(err.extras.len(), 2, "{:?}", err.extras);
         }
     }
 }
@@ -137,9 +133,8 @@ fn a_router_hosts_one_component_and_refuses_a_second_of_any_kind() {
 fn a_router_dispatches_commands_and_facts_to_its_aggregate() {
     let router = RouterBuilder::new()
         .aggregate(
-            aggregate("created", "order", &["test.Create"]).on_fact("test.Paid", |_, _| {
-                Ok(crate::domain::FactRecord::from(any_of_type("paid")))
-            }),
+            aggregate("created", "order", &["test.Create"])
+                .on_fact("test.Paid", |_, _, _| Ok(Emit::of([any_of_type("paid")]))),
         )
         .build()
         .expect("build");
@@ -148,57 +143,53 @@ fn a_router_dispatches_commands_and_facts_to_its_aggregate() {
     let resp = now(router.dispatch_command(&fact("order", "test.Paid"))).expect("fact");
     assert_eq!(emitted_label(&resp), "paid");
     let err = now(router.dispatch_command(&command("order", "test.Unknown"))).unwrap_err();
-    assert_eq!(err.code, "ROUTER_REASON_UNKNOWN_COMMAND_TYPE");
+    assert_eq!(err.code, "ANGZARR_REASON_UNKNOWN_COMMAND_TYPE");
     crate::test_support::assert_bug(&err);
-    assert_eq!(err.grpc, crate::error::GrpcCode::Internal);
     let err = now(router.dispatch_command(&fact("order", "test.Unrecorded"))).unwrap_err();
-    assert_eq!(err.code, RouterReason::NoFactHandler.as_str_name());
+    assert_eq!(err.code, AngzarrReason::NoFactHandler.as_str_name());
     crate::test_support::assert_bug(&err);
 }
 
-fn source(domain: &str) -> pb::EventBook {
-    pb::EventBook {
-        cover: Some(pb::Cover {
-            domain: domain.to_string(),
+fn trigger(domain: &str) -> hpb::ReactRequest {
+    hpb::ReactRequest {
+        trigger: Some(pb::EventBook {
+            cover: Some(pb::Cover {
+                domain: domain.to_string(),
+                ..Default::default()
+            }),
+            pages: vec![event_page(any_of_type("test.Created"))],
             ..Default::default()
         }),
-        pages: vec![event_page(any_of_type("test.Created"))],
-        ..Default::default()
     }
+}
+
+fn reserve() -> hpb::Output {
+    policy::command(Some(uuid_of(1)), any_of_type("test.Reserve"))
 }
 
 #[test]
 fn a_router_runs_its_policy() {
     let router = RouterBuilder::new()
         .policy(
-            PolicyDispatch::new("s", "order", "inventory").on_event("test.Created", |_, _| {
-                Ok(vec![pb::CommandBook {
-                    cover: Some(pb::Cover {
-                        domain: "inventory".to_string(),
-                        root: Some(crate::test_support::uuid_of(1)),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }])
-            }),
+            PolicyDispatch::new("s", "order", "inventory")
+                .on_event("test.Created", |_, _| Ok(vec![reserve()])),
         )
         .build()
         .expect("build");
     assert_eq!(
-        crate::test_support::commands_of(
-            &now(router.dispatch_policy(&source("order"))).expect("policy")
-        )
-        .len(),
-        1
+        now(router.dispatch_react(&trigger("order")))
+            .expect("policy")
+            .outputs,
+        [reserve()]
     );
     // Decision 14.42: the coordinator delivers only the input domain's
-    // events, and the router guards no envelope: a source from another
+    // events, and the router guards no envelope: a trigger from another
     // domain is handled all the same.
     assert_eq!(
-        crate::test_support::commands_of(
-            &now(router.dispatch_policy(&source("billing"))).expect("policy")
-        )
-        .len(),
+        now(router.dispatch_react(&trigger("billing")))
+            .expect("policy")
+            .outputs
+            .len(),
         1
     );
 }
@@ -212,10 +203,7 @@ fn a_router_runs_its_process_manager_as_a_domain() {
             DomainDispatch::process_manager("pm", "pm", Rebuilder::<LedgerState>::of_message())
                 .with_rules_version("9")
                 .on_command("test.Start", |_, _, _| {
-                    Ok(Some(pb::EventBook {
-                        pages: vec![event_page(any_of_type("test.Started"))],
-                        ..Default::default()
-                    }))
+                    Ok(Emit::of([any_of_type("test.Started")]))
                 }),
         )
         .build()
@@ -225,41 +213,53 @@ fn a_router_runs_its_process_manager_as_a_domain() {
     assert_eq!(resp.rules_version, "9");
 }
 
+fn run(domain: &str) -> hpb::ProjectRequest {
+    hpb::ProjectRequest {
+        events: trigger(domain).trigger,
+    }
+}
+
 #[test]
 fn a_router_answers_its_projectors_projection() {
     let router = RouterBuilder::new()
-        .projector(ProjectorDispatch::new("p1", || ()))
+        .projector(
+            ProjectorDispatch::new("p1", || ()).finish(|_, _| Ok(any_of_type("test.Projected"))),
+        )
         .build()
         .expect("build");
-    let projection = now(router.dispatch_projector(&source("order"))).expect("projection");
-    assert_eq!(projection.projector, "p1");
+    let projection = now(router.dispatch_project(&run("order"))).expect("projection");
+    assert_eq!(projection.projection, Some(any_of_type("test.Projected")));
 }
 
 #[test]
 fn a_router_refuses_dispatch_of_another_kind() {
-    let router: Router = with_one(RouterBuilder::new(), "policy")
+    let no_kind = AngzarrReason::NoComponentOfKind.as_str_name();
+    let router: Router = with_one(RouterBuilder::new(), "policy", "s")
         .build()
         .expect("build");
     assert_eq!(
         now(router.dispatch_command(&command("order", "test.Create")))
             .unwrap_err()
             .code,
-        "ROUTER_REASON_NO_COMPONENT_OF_KIND"
+        no_kind
     );
     assert_eq!(
-        now(router.dispatch_projector(&source("order")))
+        now(router.dispatch_project(&run("order")))
             .unwrap_err()
             .code,
-        "ROUTER_REASON_NO_COMPONENT_OF_KIND"
+        no_kind
     );
-    let aggregate_router = with_one(RouterBuilder::new(), "aggregate")
+    let aggregate_router = with_one(RouterBuilder::new(), "aggregate", "a")
         .build()
         .expect("build");
+    let err = now(aggregate_router.dispatch_react(&trigger("order"))).unwrap_err();
+    assert_eq!(err.code, no_kind);
+    assert_eq!(err.grpc, crate::error::GrpcCode::Unimplemented);
     assert_eq!(
-        now(aggregate_router.dispatch_policy(&source("order")))
+        now(aggregate_router.dispatch_translate(&hpb::TranslateRequest::default()))
             .unwrap_err()
             .code,
-        "ROUTER_REASON_NO_COMPONENT_OF_KIND"
+        no_kind
     );
 }
 
@@ -280,22 +280,14 @@ fn boxed_components_build_routers() {
     assert_eq!(emitted_label(&resp), "boxed");
 
     let projector: Box<dyn DynProjectorHandler> =
-        Box::new(ProjectorDispatch::new("p", || ()).finish(|_, _| {
-            Ok(pb::Projection {
-                projector: "boxed".to_string(),
-                ..Default::default()
-            })
-        }));
+        Box::new(ProjectorDispatch::new("p", || ()).finish(|_, _| Ok(any_of_type("boxed"))));
     let router = RouterBuilder::new()
         .projector(projector)
         .build()
         .expect("build");
-    let projection = now(router.dispatch_projector(&pb::EventBook {
-        cover: Some(pb::Cover::default()),
-        ..Default::default()
-    }))
-    .expect("dispatch");
-    assert_eq!(projection.projector, "boxed");
+    let projection =
+        now(router.dispatch_project(&hpb::ProjectRequest::default())).expect("dispatch");
+    assert_eq!(projection.projection, Some(any_of_type("boxed")));
 }
 
 /// A hand-written aggregate.
@@ -308,11 +300,8 @@ impl CommandHandler for Plain {
     fn command_types(&self) -> Vec<String> {
         vec!["test.Plain".to_string()]
     }
-    async fn dispatch(
-        &self,
-        _: &pb::ContextualCommand,
-    ) -> Result<pb::CommandHandlerResponse, CodedError> {
-        Ok(pb::CommandHandlerResponse::default())
+    async fn dispatch(&self, _: &hpb::HandleRequest) -> Result<hpb::HandleResponse, CodedError> {
+        Ok(hpb::HandleResponse::default())
     }
 }
 
@@ -324,24 +313,28 @@ fn a_hand_written_aggregate_builds_a_router() {
         .expect("build");
     assert_eq!(
         now(router.dispatch_command(&command("plain", "test.Plain"))).expect("dispatch"),
-        pb::CommandHandlerResponse::default()
+        hpb::HandleResponse::default()
     );
+    assert_eq!(CommandHandler::kind(&Plain), pb::ComponentKind::Aggregate);
 }
 
-// A hand-written domain is an aggregate unless it says otherwise: the
-// refusal of a second component names it as one (C-0580).
+// A host registering components one at a time (the C ABI) refuses another
+// beside the one it has, naming both (C-0580).
 #[test]
-fn a_hand_written_domain_is_an_aggregate_by_default() {
+fn a_router_refuses_another_component_naming_both() {
     let router = RouterBuilder::new()
         .aggregate(Plain)
         .build()
         .expect("build");
-    let err = router.refuse_another_component();
+    let err = router.refuse_another_component("payment");
+    assert_eq!(err.code, AngzarrReason::DuplicateComponent.as_str_name());
     assert_eq!(
-        err.extras
-            .get(angzarr_proto::v1::reason_args::COMPONENT_KIND)
-            .map(String::as_str),
-        Some("AGGREGATE")
+        err.extras,
+        [
+            ("refused".to_string(), "payment".to_string()),
+            ("registered".to_string(), "plain".to_string()),
+        ]
+        .into()
     );
 }
 
@@ -352,7 +345,7 @@ fn a_dyn_twin_is_its_component_again() {
     let pm: Box<dyn DynCommandHandler> = Box::new(
         DomainDispatch::process_manager("pm", "pm", Rebuilder::<LedgerState>::of_message())
             .with_rules_version("3")
-            .on_command("test.Start", |_, _, _| Ok(None)),
+            .on_command("test.Start", |_, _, _| Ok(Emit::none())),
     );
     let held: &dyn DynCommandHandler = &*pm;
     assert_eq!(CommandHandler::name(held), "pm");
@@ -367,44 +360,46 @@ fn a_dyn_twin_is_its_component_again() {
             .rules_version,
         "3"
     );
+    assert_eq!(CommandHandler::name(&pm), "pm");
+    assert_eq!(CommandHandler::kind(&pm), pb::ComponentKind::ProcessManager);
+    assert_eq!(CommandHandler::command_types(&pm), ["test.Start"]);
 
-    let projector: Box<dyn DynProjectorHandler> = Box::new(ProjectorDispatch::new("p", || ()));
+    let projector: Box<dyn DynProjectorHandler> =
+        Box::new(ProjectorDispatch::new("p", || ()).finish(|_, _| Ok(any_of_type("p"))));
     let held: &dyn DynProjectorHandler = &*projector;
     assert_eq!(ProjectorHandler::name(held), "p");
+    assert_eq!(ProjectorHandler::name(&projector), "p");
     assert_eq!(
-        now(ProjectorHandler::dispatch(held, &source("order")))
+        now(ProjectorHandler::dispatch(held, &run("order")))
             .expect("dispatch")
-            .projector,
-        "p"
+            .projection,
+        Some(any_of_type("p"))
     );
 }
 
-// --- the registration hello (types.proto ComponentDescriptor) ----------------
+// --- the registration descriptor (types.proto ComponentDescriptor) -----------
 
 fn ledger(version: &str) -> DomainDispatch<LedgerState> {
-    DomainDispatch::new("Ledger", "ledger", Rebuilder::of_message())
+    DomainDispatch::new("ledger", "ledger", Rebuilder::of_message())
         .with_rules_version(version)
-        .on_command("test.Ledger", |_, _, _| Ok(None))
+        .on_command("test.Ledger", |_, _, _| Ok(Emit::none()))
 }
 
 // Decision 14.42: angzarr-cli generates the descriptor at build time; the
 // business process answers Describe with it unchanged, and the router builds
-// and checks none. One the router's own descriptor logic would have refused
-// (no rules version, starting types on an aggregate, no state, an output
-// domain) or rebuilt (its inputs) is answered as given, and a router given
-// none answers none.
+// and checks none. One the coordinator would refuse is answered as given,
+// and a router given none answers none.
 #[test]
 fn describe_answers_the_descriptor_it_was_given_unchanged() {
     let given = pb::ComponentDescriptor {
-        name: "Ledger".to_string(),
-        kind: pb::ComponentKind::Aggregate as i32,
-        inputs: vec![pb::Target {
-            domain: "elsewhere".to_string(),
-        }],
+        name: "ledger".to_string(),
         rules_version: String::new(),
-        state: None,
-        starting_types: vec!["test.Ledger".to_string()],
-        output_domain: "inventory".to_string(),
+        kind: Some(pb::component_descriptor::Kind::Policy(
+            pb::PolicyDescriptor {
+                input_domain: String::new(),
+                output_domain: "inventory".to_string(),
+            },
+        )),
     };
     let router = RouterBuilder::new()
         .aggregate(ledger(""))
@@ -420,7 +415,7 @@ fn describe_answers_the_descriptor_it_was_given_unchanged() {
 }
 
 /// A hand-written policy (a policy in another process, say): from `order`,
-/// answering one command per source and translating every refusal into a
+/// answering one output per trigger and translating every refusal into a
 /// fact named for the refused command's type.
 struct Relay;
 
@@ -431,38 +426,36 @@ impl PolicyComponent for Relay {
     fn input_domain(&self) -> &str {
         "order"
     }
-    async fn dispatch(&self, _: &pb::EventBook) -> Result<pb::PolicyResponse, CodedError> {
-        Ok(pb::PolicyResponse {
-            reactions: vec![pb::PolicyReaction {
-                trigger_sequence: 0,
-                outputs: vec![pb::CommandBook::default()],
-            }],
+    async fn react(&self, _: &hpb::ReactRequest) -> Result<hpb::ReactResponse, CodedError> {
+        Ok(hpb::ReactResponse {
+            outputs: vec![reserve()],
         })
     }
-    async fn dispatch_refusal(
+    async fn translate(
         &self,
-        refusal: &pb::Refusal,
-        _: &crate::context::CommandContext,
-    ) -> Result<Option<Any>, CodedError> {
-        let refused = refusal
-            .command
-            .as_ref()
-            .and_then(|c| c.page.as_ref())
-            .and_then(crate::command_payload)
-            .map_or(String::new(), |a| a.type_url.clone());
-        Ok(Some(any_of_type(&format!("relayed{refused}"))))
+        req: &hpb::TranslateRequest,
+    ) -> Result<hpb::TranslateResponse, CodedError> {
+        let refused = match req.command.as_ref().and_then(|d| d.body.as_ref()) {
+            Some(pb::reaction_delivery::Body::Command(a)) => a.type_url.clone(),
+            _ => String::new(),
+        };
+        Ok(hpb::TranslateResponse {
+            fact: Some(any_of_type(&format!("relayed{refused}"))),
+        })
     }
 }
 
 /// A refusal of a `test.Reserve` command, triggered by an `order` event.
-fn reserve_refused() -> pb::Refusal {
-    pb::Refusal {
-        event: Some(source("order")),
-        command: Some(pb::CommandBook {
-            page: Some(command_page(any_of_type("test.Reserve"))),
+fn reserve_refused() -> hpb::TranslateRequest {
+    hpb::TranslateRequest {
+        trigger: trigger("order").trigger,
+        command: Some(pb::ReactionDelivery {
+            body: Some(pb::reaction_delivery::Body::Command(any_of_type(
+                "test.Reserve",
+            ))),
             ..Default::default()
         }),
-        ..Default::default()
+        refusal: Some(hpb::Refusal::default()),
     }
 }
 
@@ -474,69 +467,48 @@ fn a_hand_written_policy_answers_through_policy_component() {
     assert_eq!(PolicyComponent::name(&boxed), "relay");
     assert_eq!(PolicyComponent::input_domain(&boxed), "order");
     assert_eq!(
-        crate::test_support::commands_of(
-            &now(PolicyComponent::dispatch(&boxed, &source("order"))).expect("policy")
-        )
-        .len(),
-        1
+        now(PolicyComponent::react(&boxed, &trigger("order")))
+            .expect("policy")
+            .outputs,
+        [reserve()]
     );
     assert_eq!(
-        now(PolicyComponent::dispatch_refusal(
-            &boxed,
-            &reserve_refused(),
-            &crate::context::CommandContext::default()
-        ))
-        .expect("answered"),
+        now(PolicyComponent::translate(&boxed, &reserve_refused()))
+            .expect("answered")
+            .fact,
         Some(any_of_type("relayed/test.Reserve"))
     );
 }
 
-// A PolicyDispatch through the trait: its translating callback's payload
-// for a refused command it translates, and no translation (None) for one
-// it does not, the runtime then passing the refusal through (decision
-// 14.42).
+// A PolicyDispatch through the trait: its outputs, and its one refusal
+// callback's payload.
 #[test]
 fn a_policy_dispatch_answers_through_policy_component() {
     let dispatch = PolicyDispatch::new("s", "order", "inventory")
-        .on_event("test.Created", |_, _| {
-            Ok(vec![pb::CommandBook {
-                cover: Some(pb::Cover {
-                    domain: "inventory".to_string(),
-                    root: Some(crate::test_support::uuid_of(1)),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }])
-        })
-        .on_refused("test.Reserve", |_, _| Ok(any_of_type("test.ReserveFailed")));
+        .on_event("test.Created", |_, _| Ok(vec![reserve()]))
+        .on_refused(|_, _, _| Ok(any_of_type("test.ReserveFailed")));
     let policy: &dyn DynPolicyComponent = &dispatch;
     assert_eq!(PolicyComponent::name(policy), "s");
     assert_eq!(PolicyComponent::input_domain(policy), "order");
+    assert_eq!(PolicyComponent::name(&dispatch), "s");
+    assert_eq!(PolicyComponent::input_domain(&dispatch), "order");
     assert_eq!(
-        crate::test_support::commands_of(
-            &now(PolicyComponent::dispatch(policy, &source("order"))).expect("policy")
-        )
-        .len(),
-        1
+        now(PolicyComponent::react(policy, &trigger("order")))
+            .expect("policy")
+            .outputs,
+        [reserve()]
     );
-    let ctx = crate::context::CommandContext::default();
     assert_eq!(
-        now(PolicyComponent::dispatch_refusal(
-            policy,
-            &reserve_refused(),
-            &ctx
-        ))
-        .expect("translated"),
+        now(PolicyComponent::translate(policy, &reserve_refused()))
+            .expect("translated")
+            .fact,
         Some(any_of_type("test.ReserveFailed"))
     );
-    let mut other = reserve_refused();
-    other.command = Some(pb::CommandBook {
-        page: Some(command_page(any_of_type("test.Release"))),
-        ..Default::default()
-    });
+    let boxed: Box<dyn DynPolicyComponent> = Box::new(dispatch);
     assert_eq!(
-        now(PolicyComponent::dispatch_refusal(policy, &other, &ctx)).expect("answered"),
-        None,
-        "no callback: no translation"
+        now(PolicyComponent::translate(&boxed, &reserve_refused()))
+            .expect("translated")
+            .fact,
+        Some(any_of_type("test.ReserveFailed"))
     );
 }

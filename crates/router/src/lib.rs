@@ -1,16 +1,23 @@
 //! angzarr-router — the Rust client library's router, and the reference
 //! router (decision 14.42).
 //!
-//! It keeps dispatch only: it routes an input by its type to business code,
-//! folds the starting state and the pages it is given, runs decide or
-//! ingest, reports a stale command's conflicts, runs a policy's handlers
-//! per page and its translating callback, runs a projector, and turns
-//! whatever escapes business code into a key and its args. Everything
-//! generic beside it (upcasting, snapshots, admission, descriptor
-//! validation, the reason catalog and classification, policy output
-//! checks, refusal building, envelope guards, conflict judgement) is the
+//! It keeps dispatch only, on the handler layer's messages
+//! (`io.angzarr.handler.v1`, decision 14.78): it routes a command or a fact
+//! (one `Handle`, decision 14.98) by its type to business code, folds the
+//! starting state and the pages it is given, runs a handler's [`Emit`]
+//! (continuations included, as one decision; decision 14.104), runs a
+//! policy's reaction to its one trigger event and its one refusal
+//! callback (decision 14.89), runs a projector and an upcaster's rules,
+//! and turns whatever escapes business code into a key and its args. It
+//! answers success only: every other outcome is a [`error::CodedError`], a
+//! gRPC status (decision 14.95). Everything generic beside it (upcasting
+//! on the read paths, snapshots, admission, descriptor validation, the
+//! reason catalog and classification, policy output checks, refusal
+//! addressing, envelope guards, the expected-sequence check) is the
 //! coordinator's. angzarr-project's handler-contract tier is its complete
 //! contract, and every router in every language is held to it.
+//!
+//! [`Emit`]: domain::Emit
 
 #![forbid(unsafe_code)]
 
@@ -22,19 +29,26 @@ pub mod projector;
 pub mod rebuild;
 pub mod router;
 pub mod send;
+pub mod upcaster;
 
-/// The io.angzarr.v1 wire types: angzarr-core's angzarr-proto, which
-/// compiles every message of core's package, the ones the router answers
-/// in process too (`CommandHandlerResponse`, `PolicyResponse`, `Refusal`,
-/// `OnRefusedResponse`, `Projection`). The handler services that carry them
-/// are the component contract's (angzarr-proto-component; decision 14.64);
-/// the router needs none. The router generates none; `pb::X` is
+/// The io.angzarr.v1 wire types: angzarr-core's angzarr-proto, core's
+/// records and envelopes (the books, pages and covers the handler layer's
+/// requests carry). The router generates none; `pb::X` is
 /// `angzarr_proto::v1::X`, the one type under two names.
 pub use angzarr_proto::v1 as pb;
 
-/// angzarr-core's wire-type crate, re-exported so a dependent names the
-/// very `angzarr_proto` this router was built with (its types are `pb`'s).
+/// The handler layer's messages (`io.angzarr.handler.v1`, decision
+/// 14.78): angzarr-core's angzarr-proto-handler, what each kind of business
+/// logic is handed and answers. `hpb::X` is
+/// `angzarr_proto_handler::v1::X`. The services that carry them are the
+/// component contract's (angzarr-proto-component); the router needs none.
+pub use angzarr_proto_handler::v1 as hpb;
+
+/// angzarr-core's wire-type crates, re-exported so a dependent names the
+/// very crates this router was built with (their types are `pb`'s and
+/// `hpb`'s).
 pub use angzarr_proto;
+pub use angzarr_proto_handler;
 
 use prost_types::Any;
 
@@ -42,9 +56,6 @@ use prost_types::Any;
 /// the `Any` spec blesses, and prost's `Name::type_url()` default). The
 /// segment after it is the fully-qualified proto name — no resolver host.
 pub const TYPE_URL_PREFIX: &str = "/";
-
-/// The domain a projector declares to consume every domain.
-pub const WILDCARD_DOMAIN: &str = "*";
 
 /// Constructs a canonical (bare) type URL from a fully-qualified type name.
 pub fn type_url(full_name: &str) -> String {
@@ -68,9 +79,14 @@ pub fn next_sequence(book: Option<&pb::EventBook>) -> u64 {
     book.map_or(0, |b| b.next_sequence)
 }
 
-/// The event payload of a page, when the page carries one.
+/// The domain event of a page: its body's `event` arm. A framework
+/// meta-event (the `meta_event` arm, decision 14.106) is never business
+/// code's, so it has none.
 pub fn page_event(page: &pb::EventPage) -> Option<&Any> {
-    page.payload.as_ref()
+    match &page.body {
+        Some(pb::event_page::Body::Event(event)) => Some(event),
+        _ => None,
+    }
 }
 
 /// The payload of a command page's Command arm, when the page carries one.
@@ -90,7 +106,7 @@ pub fn fact_payload(page: &pb::CommandPage) -> Option<&Any> {
 }
 
 /// Decodes bytes a host handed the router as the message `M`: bytes that do
-/// not decode are ROUTER_REASON_ANY_DECODE_FAILED naming `M` as `message_type`
+/// not decode are ANGZARR_REASON_ANY_DECODE_FAILED naming `M` as `message_type`
 /// ([`error::CodedError::undecodable`]; decision 14.37), one condition
 /// whatever the message.
 pub fn decode_message<M: prost::Message + prost::Name + Default>(
@@ -106,22 +122,22 @@ pub fn decode_message<M: prost::Message + prost::Name + Default>(
 pub struct PageContext<'a> {
     pub cover: Option<&'a pb::Cover>,
     pub sequence: u64,
-    /// The page's metadata (types.proto, EventMeta): its causation,
-    /// correlation_id, fact origin, recorded_at and rules version. An
-    /// applier sees the same meta for an event at decide time and on
-    /// replay:
+    /// The page's metadata (types.proto, EventMeta): its causation (the
+    /// command or fact arm, decision 14.102), correlation_id, recorded_at
+    /// and rules version. An applier sees the same meta for an event at
+    /// decide time and on replay:
     ///
     /// - A persisted page (a rebuild's history, a projector's or a policy's
-    ///   delivered events, a conflict window) carries the meta its
-    ///   coordinator stamped when it recorded the event, passed through:
-    ///   `None` only when the page carries none.
+    ///   delivered events) carries the meta its coordinator stamped when it
+    ///   recorded the event, passed through: `None` only when the page
+    ///   carries none.
     /// - A page folded at decide time ([`rebuild::Rebuilder::apply_emitted`],
-    ///   [`rebuild::PageOrigin::Emitted`]: the decision's own events, a
-    ///   recorded fact's) is folded with the meta its coordinator will stamp
-    ///   on it, built from the `ContextualCommand` the router was handed
+    ///   [`rebuild::PageOrigin::Emitted`]: the decision's own events, every
+    ///   step's) is folded with the meta its coordinator will stamp on it,
+    ///   built from the `HandleRequest` the router was handed
     ///   ([`context::CommandContext::event_meta`], the one builder a
-    ///   coordinator stamps with too). The answered pages themselves stay
-    ///   unstamped: the coordinator stamps them.
+    ///   coordinator stamps with too). The answered events themselves are
+    ///   payloads only: the coordinator wraps and stamps them.
     ///
     /// A policy reads its trigger's correlation here (decision 14.36: it
     /// may name that correlation as the root).
@@ -135,10 +151,6 @@ pub(crate) mod test_support;
 #[cfg(test)]
 #[path = "lib.test.rs"]
 mod lib_tests;
-
-#[cfg(test)]
-#[path = "handling.test.rs"]
-mod handling_tests;
 
 #[cfg(test)]
 #[path = "snapshot.test.rs"]

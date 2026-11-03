@@ -1,14 +1,17 @@
 //! Conformance harness support: the generated fixture types, a descriptor
-//! pool for parsing `.txtpb` fixtures, the CounterAggregate built on the
-//! router core, and the "parse a skeleton, set the scenario's data" helpers
-//! the step definitions call. The cucumber step defs live in
-//! `tests/cucumber.rs`.
+//! pool for parsing `.txtpb` fixtures, the tier's components built on the
+//! router core (the CounterAggregate, OrderPolicy and CounterProjector of
+//! fixture/FIXTURE.md; the order aggregate, the fulfillment process manager
+//! and the order-fulfillment policy of handling.feature), and the "parse a
+//! skeleton, set the scenario's data" helpers the step definitions call.
+//! The requests are the handler layer's (`io.angzarr.handler.v1`, decision
+//! 14.78). The cucumber step defs live in `tests/`.
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use angzarr_router::domain::{DomainDispatch, FactRecord};
-use angzarr_router::error::{BusinessStatus, CodedError, HandlerError};
-use angzarr_router::policy::PolicyDispatch;
+use angzarr_router::domain::{DomainDispatch, Emit};
+use angzarr_router::error::{BusinessStatus, CodedError, HandlerError, RetryableStatus};
+use angzarr_router::policy::{self, PolicyDispatch};
 use angzarr_router::projector::ProjectorDispatch;
 use angzarr_router::rebuild::Rebuilder;
 use prost::Message;
@@ -27,13 +30,13 @@ pub mod orders {
     }
 }
 
-/// Re-export the router's framework types under `pb`.
-pub use angzarr_router::pb;
+/// Re-export the router's framework types under `pb` and `hpb`.
+pub use angzarr_router::{hpb, pb};
 pub use counter::CounterState;
 
 const FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/conformance_fds.bin"));
 
-// The orthogonal envelope skeletons — structural scaffold only; the
+// The orthogonal request skeletons — structural scaffold only; the
 // test-meaningful field is omitted and supplied by the step definitions.
 const SKEL_INCREASE: &str = include_str!(
     "../../../angzarr-project/features/handler-contract/fixture/txtpb/command_increase.txtpb"
@@ -48,11 +51,7 @@ const SKEL_INCREASED_EVENT: &str = include_str!(
     "../../../angzarr-project/features/handler-contract/fixture/txtpb/event_increased.txtpb"
 );
 
-/// The CounterAggregate's business rejection code (`IncreaseBy { n: 0 }`).
-/// A fixture code, not a router code.
-pub const VALUE_NOT_POSITIVE: &str = "VALUE_NOT_POSITIVE";
-
-const CONTEXTUAL_COMMAND: &str = "io.angzarr.v1.ContextualCommand";
+const HANDLE_REQUEST: &str = "io.angzarr.handler.v1.HandleRequest";
 const EVENT_PAGE: &str = "io.angzarr.v1.EventPage";
 
 /// What the IncreaseBy handler observed at dispatch time: the historical-state
@@ -69,9 +68,9 @@ pub struct Observed {
 /// Sink the harness passes into the fixture to capture each [`Observed`].
 pub type ObservedSink = Arc<Mutex<Vec<Observed>>>;
 
-/// The descriptor pool over the fixture + framework protos — resolves both
-/// `io.angzarr.v1.*` envelopes and `test.counter.*` payloads, so Any-expanded
-/// textproto fixtures decode.
+/// The descriptor pool over the fixture and framework protos — resolves
+/// `io.angzarr.v1.*` envelopes, `io.angzarr.handler.v1.*` requests and
+/// `test.counter.*` payloads, so Any-expanded textproto fixtures decode.
 pub fn pool() -> &'static DescriptorPool {
     static POOL: OnceLock<DescriptorPool> = OnceLock::new();
     POOL.get_or_init(|| {
@@ -95,6 +94,48 @@ where
         .unwrap_or_else(|e| panic!("transcode {full_name}: {e}"))
 }
 
+/// `msg` packed under the canonical bare prefix.
+pub fn any_of<M: prost::Message + prost::Name>(msg: &M) -> prost_types::Any {
+    prost_types::Any {
+        type_url: angzarr_router::type_url(&M::full_name()),
+        value: msg.encode_to_vec(),
+    }
+}
+
+/// A page whose body is the domain event `event`.
+pub fn event_page(sequence: u64, event: prost_types::Any) -> pb::EventPage {
+    pb::EventPage {
+        body: Some(pb::event_page::Body::Event(event)),
+        meta: None,
+        sequence,
+    }
+}
+
+/// A command page whose Command arm carries `payload`, with no Handling.
+pub fn command_page(payload: prost_types::Any) -> pb::CommandPage {
+    pb::CommandPage {
+        body: Some(pb::command_page::Body::Command(pb::Command {
+            payload: Some(payload),
+            handling: None,
+        })),
+        ..Default::default()
+    }
+}
+
+/// A command page whose Fact arm carries `payload`, from `external_id`.
+pub fn fact_page(payload: prost_types::Any, external_id: &str) -> pb::CommandPage {
+    pb::CommandPage {
+        body: Some(pb::command_page::Body::Fact(pb::Fact {
+            payload: Some(payload),
+            origin: Some(pb::FactOrigin {
+                external_id: external_id.to_string(),
+                description: "conformance".to_string(),
+            }),
+        })),
+        ..Default::default()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The fixture: CounterAggregate on the router (the tier's fixture/FIXTURE.md).
 // ---------------------------------------------------------------------------
@@ -105,17 +146,17 @@ pub fn counter_aggregate(observed: ObservedSink) -> DomainDispatch<CounterState>
         "test.counter.Increased",
         |state: &mut CounterState, event| {
             // Decode the payload so a corrupt persisted event fails the fold
-            // (ROUTER_REASON_UNHANDLED_HANDLER_ERROR: a failing fold is a handler bug).
-            // Increased is empty, so every
-            // well-formed event decodes and simply increments.
+            // (ANGZARR_REASON_FOLD_FAILED: a failing fold is a handler bug).
+            // Increased is empty, so every well-formed event decodes and
+            // simply increments.
             counter::Increased::decode(event.value.as_slice())?;
             state.count += 1;
             Ok(())
         },
     );
 
-    DomainDispatch::new("counter-aggregate", "counter", rebuilder)
-        // n > 0 emits n Increased; n == 0 rejects VALUE_NOT_POSITIVE.
+    DomainDispatch::new("counter", "counter", rebuilder)
+        // n > 0 emits n Increased; n == 0 is refused with its typed refusal.
         .on_command("test.counter.IncreaseBy", move |any, state, ctx| {
             // Record the historical-state evidence (host state never crosses).
             observed.lock().unwrap().push(Observed {
@@ -126,34 +167,27 @@ pub fn counter_aggregate(observed: ObservedSink) -> DomainDispatch<CounterState>
             let cmd = counter::IncreaseBy::decode(any.value.as_slice())
                 .map_err(|e| HandlerError::Other(format!("decode IncreaseBy: {e}")))?;
             if cmd.n == 0 {
-                return Err(HandlerError::Coded(CodedError::rejection(
-                    BusinessStatus::FailedPrecondition,
-                    VALUE_NOT_POSITIVE,
-                    [],
-                )));
+                return Err(value_not_positive(cmd.n).into());
             }
-            let pages = (0..cmd.n)
-                .map(|_| pb::EventPage {
-                    payload: Some(increased_any()),
-                    ..Default::default()
-                })
-                .collect();
-            Ok(Some(pb::EventBook {
-                pages,
-                ..Default::default()
-            }))
+            Ok(Emit::of((0..cmd.n).map(|_| increased_any())))
         })
-        // Unclassified failure → ROUTER_REASON_UNHANDLED_HANDLER_ERROR.
+        // Unclassified failure → ANGZARR_REASON_UNHANDLED_HANDLER_ERROR.
         .on_command("test.counter.FailHard", |_any, _state, _ctx| {
             Err(HandlerError::Other("hard failure".to_string()))
         })
 }
 
+/// IncreaseBy's typed refusal, under the status its message declares
+/// (INVALID_ARGUMENT; fixture/counter.proto).
+pub fn value_not_positive(n: u32) -> CodedError {
+    CodedError::refused(
+        BusinessStatus::InvalidArgument,
+        any_of(&counter::ValueNotPositive { n }),
+    )
+}
+
 fn increased_any() -> prost_types::Any {
-    prost_types::Any {
-        type_url: angzarr_router::type_url("test.counter.Increased"),
-        value: counter::Increased {}.encode_to_vec(),
-    }
+    any_of(&counter::Increased {})
 }
 
 // ---------------------------------------------------------------------------
@@ -162,16 +196,16 @@ fn increased_any() -> prost_types::Any {
 
 /// The projection the CounterProjector folds events into. Host state — it
 /// never crosses the boundary; the harness reads the fold count back out of
-/// the finished Projection.
+/// the answered projection.
 #[derive(Default)]
 pub struct ProjectorState {
     pub count: u32,
 }
 
-/// Build the CounterProjector dispatch table: over `domains` (`"*"` is every
-/// domain) it folds each Increased event into a running count, then finishes
-/// into a Projection whose sequence carries that count and whose payload is
-/// the CounterState. A book from any other domain folds nothing (C-0032).
+/// Build the CounterProjector dispatch table: over `domains` it folds each
+/// Increased event into a running count, then finishes into a projection
+/// payload, the CounterProjectorState carrying that count. A run from any
+/// other domain folds nothing (C-0713).
 pub fn counter_projector(domains: &[&str]) -> ProjectorDispatch<ProjectorState> {
     ProjectorDispatch::new("counter-projector", ProjectorState::default)
         .for_domains(domains.iter().copied())
@@ -187,126 +221,115 @@ pub fn counter_projector(domains: &[&str]) -> ProjectorDispatch<ProjectorState> 
                 Ok(())
             },
         )
-        .finish(|state: &mut ProjectorState, events| {
-            Ok(pb::Projection {
-                cover: events.cover.clone(),
-                projector: "counter-projector".to_string(),
-                next_sequence: u64::from(state.count),
-                projection: Some(prost_types::Any {
-                    type_url: angzarr_router::type_url("test.counter.CounterState"),
-                    value: CounterState { count: state.count }.encode_to_vec(),
-                }),
-            })
+        .finish(|state: &mut ProjectorState, _events| {
+            Ok(any_of(&counter::CounterProjectorState {
+                count: state.count,
+            }))
         })
 }
 
-/// An EventBook of `n` Increased events whose cover carries `domain` — the
+/// A run of `n` Increased events whose cover carries `domain` — the
 /// projector's delivery.
-pub fn delivery(domain: &str, n: u32) -> pb::EventBook {
-    pb::EventBook {
-        cover: Some(pb::Cover {
-            domain: domain.to_string(),
+pub fn delivery(domain: &str, n: u32) -> hpb::ProjectRequest {
+    hpb::ProjectRequest {
+        events: Some(pb::EventBook {
+            cover: Some(pb::Cover {
+                domain: domain.to_string(),
+                ..Default::default()
+            }),
+            pages: (0..u64::from(n))
+                .map(|seq| event_page(seq, increased_any()))
+                .collect(),
             ..Default::default()
         }),
-        pages: (0..n)
-            .map(|_| pb::EventPage {
-                payload: Some(increased_any()),
-                ..Default::default()
-            })
-            .collect(),
-        ..Default::default()
     }
+}
+
+/// The count a CounterProjector answer carries.
+pub fn projected_count(answer: &hpb::ProjectResponse) -> u32 {
+    let payload = answer.projection.as_ref().expect("a projection");
+    counter::CounterProjectorState::decode(payload.value.as_slice())
+        .expect("a CounterProjectorState")
+        .count
 }
 
 // ---------------------------------------------------------------------------
 // The fixture: OrderPolicy on the router core (translation-side dispatch).
 // ---------------------------------------------------------------------------
 
-/// Build the OrderPolicy dispatch table: it translates each Increased source
-/// event into one Reserve command for "inventory" (passed through unstamped),
-/// recording each triggering event's sequence in `seen`. Undeclared events
-/// are skipped.
+/// The root business code names for the OrderPolicy's Reserve.
+pub const RESERVE_ROOT: &str = "inv-7";
+
+/// Build the OrderPolicy dispatch table: it answers each Increased trigger
+/// with one Reserve command for "inventory", rooted at [`RESERVE_ROOT`]
+/// (passed through unstamped), recording each trigger's sequence in `seen`.
+/// Undeclared events are skipped.
 pub fn order_policy(seen: SequenceSink) -> PolicyDispatch {
-    PolicyDispatch::new("order-policy", "order", "inventory").on_event_with_context(
+    PolicyDispatch::new("order-policy", "counter", "inventory").on_event(
         "test.counter.Increased",
         move |_any, source| {
             seen.lock().unwrap().push(source.sequence);
-            Ok(vec![reserve_command_to("inventory")])
+            Ok(vec![reserve_output()])
         },
     )
 }
 
-fn reserve_command_to(domain: &str) -> pb::CommandBook {
-    pb::CommandBook {
-        cover: Some(pb::Cover {
-            domain: domain.to_string(),
-            // A command to an aggregate names its root (decision 14.36).
-            root: Some(pb::Uuid {
-                value: root_of("inv-7").into(),
-            }),
-            ..Default::default()
+fn reserve_output() -> hpb::Output {
+    policy::command(
+        Some(pb::Uuid {
+            value: root_of(RESERVE_ROOT).into(),
         }),
-        page: Some(pb::CommandPage {
-            body: Some(pb::command_page::Body::Command(pb::Command {
-                payload: Some(prost_types::Any {
-                    type_url: angzarr_router::type_url("test.counter.Reserve"),
-                    value: Vec::new(),
-                }),
-            })),
-            ..Default::default()
-        }),
-        ..Default::default()
-    }
+        any_of(&counter::Reserve {}),
+    )
 }
 
-/// A policy source carrying one event of `event_fq` in the "order" domain at
-/// sequence `seq`.
-pub fn policy_event_source(event_fq: &str, seq: u64) -> pb::EventBook {
-    pb::EventBook {
-        cover: Some(pb::Cover {
-            domain: "order".to_string(),
+/// React's request: a trigger book holding one event of `event_fq` in the
+/// "counter" domain at sequence `seq`.
+pub fn policy_event_source(event_fq: &str, seq: u64) -> hpb::ReactRequest {
+    hpb::ReactRequest {
+        trigger: Some(pb::EventBook {
+            cover: Some(pb::Cover {
+                domain: "counter".to_string(),
+                ..Default::default()
+            }),
+            pages: vec![event_page(
+                seq,
+                prost_types::Any {
+                    type_url: angzarr_router::type_url(event_fq),
+                    value: Vec::new(),
+                },
+            )],
             ..Default::default()
         }),
-        pages: vec![pb::EventPage {
-            payload: Some(prost_types::Any {
-                type_url: angzarr_router::type_url(event_fq),
-                value: Vec::new(),
-            }),
-            sequence: seq,
-            ..Default::default()
-        }],
-        ..Default::default()
     }
 }
 
 // ---------------------------------------------------------------------------
-// Skeleton → command helpers: parse the orthogonal envelope, then SET the
+// Skeleton → request helpers: parse the orthogonal request, then SET the
 // scenario's data by field (never string-templating the textproto).
 // ---------------------------------------------------------------------------
 
-/// An IncreaseBy command with the scenario's `n` set on the inner message.
-pub fn increase_command(n: u32) -> pb::ContextualCommand {
-    let mut cc: pb::ContextualCommand = parse_txtpb(CONTEXTUAL_COMMAND, SKEL_INCREASE);
-    let any = inner_command_any(&mut cc);
+/// An IncreaseBy request with the scenario's `n` set on the inner message.
+pub fn increase_command(n: u32) -> hpb::HandleRequest {
+    let mut req: hpb::HandleRequest = parse_txtpb(HANDLE_REQUEST, SKEL_INCREASE);
+    let any = inner_command_any(&mut req);
     let mut inner =
         counter::IncreaseBy::decode(any.value.as_slice()).expect("decode IncreaseBy skeleton");
     inner.n = n;
     any.value = inner.encode_to_vec();
-    cc
+    req
 }
 
-/// The FailHard command (no scenario data).
-pub fn failhard_command() -> pb::ContextualCommand {
-    parse_txtpb(CONTEXTUAL_COMMAND, SKEL_FAILHARD)
+/// The FailHard request (no scenario data).
+pub fn failhard_command() -> hpb::HandleRequest {
+    parse_txtpb(HANDLE_REQUEST, SKEL_FAILHARD)
 }
 
-/// A command whose type has no registered handler (drives ROUTER_REASON_UNKNOWN_COMMAND_TYPE).
-pub fn unhandled_command() -> pb::ContextualCommand {
-    parse_txtpb(CONTEXTUAL_COMMAND, SKEL_UNHANDLED)
+/// A request whose command type has no registered handler (drives
+/// ANGZARR_REASON_UNKNOWN_COMMAND_TYPE).
+pub fn unhandled_command() -> hpb::HandleRequest {
+    parse_txtpb(HANDLE_REQUEST, SKEL_UNHANDLED)
 }
-
-// Envelope-guard negatives: a well-formed skeleton with exactly one structural
-// field cleared, so the guard fires regardless of the rest being valid.
 
 /// Prior history of `n` confirmed increases: the Increased skeleton replayed
 /// at consecutive sequences, with `next_sequence` continuing past them.
@@ -329,12 +352,12 @@ pub fn prior_history(n: u32) -> Option<pb::EventBook> {
 }
 
 /// Prior history whose single Increased event carries undecodable payload
-/// bytes (a truncated varint) → the applier fails the fold, surfacing
-/// ROUTER_REASON_UNHANDLED_HANDLER_ERROR (a handler bug) when a known command rebuilds
+/// bytes (a truncated varint): the applier fails the fold, surfacing
+/// ANGZARR_REASON_FOLD_FAILED (a handler bug) when a known command rebuilds
 /// over it.
 pub fn corrupt_prior_history() -> Option<pb::EventBook> {
     let mut page: pb::EventPage = parse_txtpb(EVENT_PAGE, SKEL_INCREASED_EVENT);
-    if let Some(any) = page.payload.as_mut() {
+    if let Some(pb::event_page::Body::Event(any)) = page.body.as_mut() {
         any.value = vec![0xff, 0xff, 0xff];
     }
     Some(pb::EventBook {
@@ -350,10 +373,7 @@ pub fn corrupt_prior_history() -> Option<pb::EventBook> {
 pub fn starting_state_history(count: u32, sequence: u64, event_at: u64) -> Option<pb::EventBook> {
     Some(pb::EventBook {
         snapshot: Some(pb::Snapshot {
-            state: Some(prost_types::Any {
-                type_url: angzarr_router::type_url("test.counter.CounterState"),
-                value: CounterState { count }.encode_to_vec(),
-            }),
+            state: Some(any_of(&CounterState { count })),
             sequence,
             ..Default::default()
         }),
@@ -366,39 +386,43 @@ pub fn starting_state_history(count: u32, sequence: u64, event_at: u64) -> Optio
     })
 }
 
-fn inner_command_any(cc: &mut pb::ContextualCommand) -> &mut prost_types::Any {
-    let book = cc.command.as_mut().expect("command book");
+fn inner_command_any(req: &mut hpb::HandleRequest) -> &mut prost_types::Any {
+    let book = req.input.as_mut().expect("an input book");
     match book.page.as_mut().and_then(|p| p.body.as_mut()) {
-        Some(pb::command_page::Body::Command(pb::Command { payload: Some(any) })) => any,
+        Some(pb::command_page::Body::Command(pb::Command {
+            payload: Some(any), ..
+        })) => any,
         other => panic!("conformance fixtures carry an inline command, got {other:?}"),
     }
 }
 
-/// Rewrites every Any type URL in `cmd` (the command) and its prior history
-/// (the events) to `prefix` + the fully-qualified name.
-pub fn with_type_url_prefix(mut cmd: pb::ContextualCommand, prefix: &str) -> pb::ContextualCommand {
+/// Rewrites every Any type URL in `req` (the command) and its history (the
+/// events) to `prefix` + the fully-qualified name.
+pub fn with_type_url_prefix(mut req: hpb::HandleRequest, prefix: &str) -> hpb::HandleRequest {
     let rewrite = |any: &mut prost_types::Any| {
         any.type_url = format!(
             "{prefix}{}",
             angzarr_router::type_name_from_url(&any.type_url)
         );
     };
-    if let Some(Some(pb::command_page::Body::Command(pb::Command { payload: Some(any) }))) = cmd
-        .command
+    if let Some(Some(pb::command_page::Body::Command(pb::Command {
+        payload: Some(any), ..
+    }))) = req
+        .input
         .as_mut()
         .and_then(|book| book.page.as_mut())
         .map(|page| page.body.as_mut())
     {
         rewrite(any);
     }
-    if let Some(book) = cmd.events.as_mut() {
+    if let Some(book) = req.history.as_mut() {
         for page in &mut book.pages {
-            if let Some(any) = page.payload.as_mut() {
+            if let Some(pb::event_page::Body::Event(any)) = page.body.as_mut() {
                 rewrite(any);
             }
         }
     }
-    cmd
+    req
 }
 
 // ---------------------------------------------------------------------------
@@ -413,13 +437,18 @@ pub fn root_of(label: &str) -> Vec<u8> {
         .to_vec()
 }
 
+/// The wire UUID for a label ([`root_of`]).
+pub fn uuid_of(label: &str) -> pb::Uuid {
+    pb::Uuid {
+        value: root_of(label).into(),
+    }
+}
+
 /// A cover in `domain` with the root for `label`.
 pub fn cover_of(domain: &str, label: &str) -> pb::Cover {
     pb::Cover {
         domain: domain.to_string(),
-        root: Some(pb::Uuid {
-            value: root_of(label).into(),
-        }),
+        root: Some(uuid_of(label)),
         ..Default::default()
     }
 }
@@ -431,11 +460,7 @@ pub type CoverSink = Arc<Mutex<Vec<Option<pb::Cover>>>>;
 pub type SequenceSink = Arc<Mutex<Vec<u64>>>;
 
 fn increased_page(seq: u64) -> pb::EventPage {
-    pb::EventPage {
-        payload: Some(increased_any()),
-        sequence: seq,
-        ..Default::default()
-    }
+    event_page(seq, increased_any())
 }
 
 /// What a policy handler or a projector fold read of one event: its book's
@@ -443,10 +468,10 @@ fn increased_page(seq: u64) -> pb::EventPage {
 /// C-0758).
 pub type MetaSink = Arc<Mutex<Vec<(Vec<u8>, u64, Option<pb::EventMeta>)>>>;
 
-/// An event's metadata, every field set: produced by the command `command`
-/// (its id the label's UUID v5) in correlation `correlation`, from the fact
-/// whose external id is `fact`, decided under `rules_version`, recorded at
-/// `second`.
+/// An event's metadata, every field set: produced by the fact whose command
+/// id is the label `command`'s UUID v5 and whose external id is `fact`
+/// (the causation's fact arm, decision 14.102), in correlation
+/// `correlation`, decided under `rules_version`, recorded at `second`.
 pub fn full_meta(
     command: &str,
     correlation: &str,
@@ -454,16 +479,15 @@ pub fn full_meta(
     rules_version: &str,
     second: i64,
 ) -> pb::EventMeta {
-    let uuid = |label: &str| pb::Uuid {
-        value: root_of(label).into(),
-    };
     pb::EventMeta {
-        causation: Some(pb::event_meta::Causation::CommandId(uuid(command))),
-        fact: Some(pb::FactOrigin {
-            external_id: fact.to_string(),
-            ..Default::default()
-        }),
-        correlation_id: Some(uuid(correlation)),
+        causation: Some(pb::event_meta::Causation::Fact(pb::FactCause {
+            command_id: Some(uuid_of(command)),
+            origin: Some(pb::FactOrigin {
+                external_id: fact.to_string(),
+                ..Default::default()
+            }),
+        })),
+        correlation_id: Some(uuid_of(correlation)),
         recorded_at: Some(prost_types::Timestamp {
             seconds: second,
             nanos: 0,
@@ -497,11 +521,11 @@ fn read_back(ctx: &angzarr_router::PageContext<'_>) -> (Vec<u8>, u64, Option<pb:
 
 /// The order policy reading back each Increased event's whole context.
 pub fn metadata_policy(seen: MetaSink) -> PolicyDispatch {
-    PolicyDispatch::new("order-policy", "order", "inventory").on_event_with_context(
+    PolicyDispatch::new("order-policy", "counter", "inventory").on_event(
         "test.counter.Increased",
         move |_any, ctx| {
             seen.lock().unwrap().push(read_back(ctx));
-            Ok(vec![reserve_command_to("inventory")])
+            Ok(vec![reserve_output()])
         },
     )
 }
@@ -509,7 +533,7 @@ pub fn metadata_policy(seen: MetaSink) -> PolicyDispatch {
 /// The tracking projector reading back each Increased event's whole
 /// context.
 pub fn metadata_projector(seen: MetaSink) -> ProjectorDispatch<()> {
-    ProjectorDispatch::new("Tracker", || ()).on_event(
+    ProjectorDispatch::new("tracker", || ()).on_event(
         "test.counter.Increased",
         move |_p, _e, ctx| {
             seen.lock().unwrap().push(read_back(ctx));
@@ -532,83 +556,65 @@ pub fn ledger_aggregate(seen: CoverSink, applied: SequenceSink) -> DomainDispatc
             Ok(())
         },
     );
-    DomainDispatch::new("Ledger", "ledger", rebuilder)
+    DomainDispatch::new("ledger", "ledger", rebuilder)
         .on_command("test.counter.IncreaseBy", move |_cmd, _state, cctx| {
             seen.lock().unwrap().push(cctx.cover.clone());
-            Ok(Some(pb::EventBook {
-                pages: vec![pb::EventPage {
-                    payload: Some(increased_any()),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }))
+            Ok(Emit::of([increased_any()]))
         })
-        .on_fact("test.counter.Increased", |fact, state: &CounterState| {
-            Ok(FactRecord {
-                fact: fact.clone(),
-                flags: vec![prost_types::Any {
-                    type_url: angzarr_router::type_url("test.counter.CounterState"),
-                    value: CounterState {
+        .on_fact(
+            "test.counter.Increased",
+            |fact, state: &CounterState, _ctx| {
+                Ok(Emit::of([
+                    fact.clone(),
+                    any_of(&CounterState {
                         count: state.count + 1,
-                    }
-                    .encode_to_vec(),
-                }],
-            })
-        })
+                    }),
+                ]))
+            },
+        )
 }
 
 /// An IncreaseBy command for the ledger root `label`.
-pub fn ledger_command(label: &str) -> pb::ContextualCommand {
-    pb::ContextualCommand {
-        command: Some(pb::CommandBook {
+pub fn ledger_command(label: &str) -> hpb::HandleRequest {
+    hpb::HandleRequest {
+        input: Some(pb::CommandBook {
             cover: Some(cover_of("ledger", label)),
-            page: Some(pb::CommandPage {
-                body: Some(pb::command_page::Body::Command(pb::Command {
-                    payload: Some(prost_types::Any {
-                        type_url: angzarr_router::type_url("test.counter.IncreaseBy"),
-                        value: counter::IncreaseBy { n: 1 }.encode_to_vec(),
-                    }),
-                })),
-                ..Default::default()
-            }),
-            ..Default::default()
+            page: Some(command_page(any_of(&counter::IncreaseBy { n: 1 }))),
         }),
         ..Default::default()
     }
 }
 
 /// [`ledger_command`] over prior Increased events at `sequences`.
-pub fn ledger_command_over(label: &str, sequences: &[u64]) -> pb::ContextualCommand {
-    let mut cc = ledger_command(label);
-    cc.events = Some(pb::EventBook {
+pub fn ledger_command_over(label: &str, sequences: &[u64]) -> hpb::HandleRequest {
+    let mut req = ledger_command(label);
+    req.history = Some(pb::EventBook {
         pages: sequences.iter().map(|s| increased_page(*s)).collect(),
         next_sequence: sequences.last().map_or(0, |s| s + 1),
         ..Default::default()
     });
-    cc
+    req
 }
 
 /// A `test.counter.<fact>` fact (empty payload) for the ledger, delivered in
 /// the Fact arm over `prior` Increased events.
-pub fn ledger_fact(fact: &str, prior: u64) -> pb::ContextualCommand {
-    let mut cc = ledger_command("ledger-1");
-    cc.command.as_mut().expect("command book").page = Some(pb::CommandPage {
-        body: Some(pb::command_page::Body::Fact(pb::Fact {
-            payload: Some(prost_types::Any {
-                type_url: angzarr_router::type_url(&format!("test.counter.{fact}")),
-                value: Vec::new(),
-            }),
-        })),
-        ..Default::default()
-    });
+pub fn ledger_fact(fact: &str, prior: u64) -> hpb::HandleRequest {
+    let mut req = ledger_command("ledger-1");
+    req.input.as_mut().expect("an input book").page = Some(fact_page(
+        prost_types::Any {
+            type_url: angzarr_router::type_url(&format!("test.counter.{fact}")),
+            value: Vec::new(),
+        },
+        "fact-1",
+    ));
     if prior > 0 {
-        cc.events = Some(pb::EventBook {
+        req.history = Some(pb::EventBook {
             pages: (0..prior).map(increased_page).collect(),
             next_sequence: prior,
             ..Default::default()
         });
     }
-    cc
+    req
 }
 
 /// (root bytes, sequence) pairs a projector fold observed.
@@ -617,7 +623,7 @@ pub type PageSink = Arc<Mutex<Vec<(Vec<u8>, u64)>>>;
 /// The tracking projector: every Increased fold records its book's root and
 /// the page's sequence.
 pub fn tracking_projector(seen: PageSink) -> ProjectorDispatch<()> {
-    ProjectorDispatch::new("Tracker", || ()).on_event(
+    ProjectorDispatch::new("tracker", || ()).on_event(
         "test.counter.Increased",
         move |_p, _e, ctx| {
             let root = ctx
@@ -631,33 +637,22 @@ pub fn tracking_projector(seen: PageSink) -> ProjectorDispatch<()> {
     )
 }
 
-/// A book of Increased events of "counter" root `label` at `sequences`.
-pub fn tracked_book(label: &str, sequences: &[u64]) -> pb::EventBook {
-    pb::EventBook {
-        cover: Some(cover_of("counter", label)),
-        pages: sequences.iter().map(|s| increased_page(*s)).collect(),
-        ..Default::default()
+/// A run of Increased events of "counter" root `label` at `sequences`.
+pub fn tracked_book(label: &str, sequences: &[u64]) -> hpb::ProjectRequest {
+    hpb::ProjectRequest {
+        events: Some(pb::EventBook {
+            cover: Some(cover_of("counter", label)),
+            pages: sequences.iter().map(|s| increased_page(*s)).collect(),
+            ..Default::default()
+        }),
     }
 }
 
 // ---------------------------------------------------------------------------
-// The order aggregate and the Fulfillment process manager: the
+// The order aggregate and the fulfillment process manager: the
 // handler-contract tier (angzarr-project
-// features/handler-contract/handling.feature, C-0533..C-0550).
+// features/handler-contract/handling.feature).
 // ---------------------------------------------------------------------------
-
-/// How the order aggregate's AddItem handler settles a conflict window under
-/// AGGREGATE_HANDLES.
-#[derive(Debug, Clone, Default)]
-pub enum Settle {
-    /// resolve_conflicts with the nonce it was given.
-    #[default]
-    Delivered,
-    /// Never call resolve_conflicts.
-    Never,
-    /// resolve_conflicts with this value instead.
-    With(Vec<u8>),
-}
 
 /// What business code saw when it ran.
 #[derive(Debug, Clone, PartialEq)]
@@ -665,12 +660,6 @@ pub struct OrderObserved {
     /// The fully-qualified type business code received.
     pub handled: String,
     pub item: String,
-    pub expected_sequence: u64,
-    pub conflict_resolution: pb::ConflictResolution,
-    /// The conflict window's sequences, when business code got a conflict.
-    pub window: Option<Vec<u64>>,
-    /// The nonce, when business code got a conflict.
-    pub nonce: Option<Vec<u8>>,
     /// The item keys of the state it decided on, sorted.
     pub items: Vec<String>,
     /// When its input was accepted, as its context said
@@ -678,25 +667,21 @@ pub struct OrderObserved {
     pub recorded_at: Option<prost_types::Timestamp>,
 }
 
-/// How the order aggregate's AddItem handler fails, when it does (decision
-/// 14.37, C-0667..C-0672). The text each "logs for itself" is for the
-/// handler's own log: it is handed to nothing that crosses a boundary.
+/// How the order aggregate's AddItem handler (or a fact handler) fails,
+/// when it does (decision 14.37). The text each "logs for itself" is for
+/// the handler's own log: it is handed to nothing that crosses a boundary.
 #[derive(Debug, Clone)]
 pub enum AddItemFails {
-    /// An untyped business rejection under `status`: `code` and `args`.
-    Rejects {
-        status: BusinessStatus,
-        code: String,
-        args: Vec<(String, String)>,
-        logs: String,
-    },
-    /// A typed refusal: the refusal object ItemOutOfStock.
+    /// A typed refusal: the refusal object ItemOutOfStock, under the
+    /// FAILED_PRECONDITION its message declares.
     Refuses { item: String, on_hand: u32 },
     /// An unclassified error whose text is `text`.
     Errs { text: String },
     /// A panic with `text`.
     Panics { text: String },
-    /// A bug with its own `code` and `args`.
+    /// A bug with its own `code` and `args`: what a key of business code's
+    /// own is, a rejection that is not a typed refusal included (decision
+    /// 14.95).
     Bug {
         code: String,
         args: Vec<(String, String)>,
@@ -712,7 +697,7 @@ pub enum AddItemFails {
     /// A bug the handler marks retryable, under the `status` it picks,
     /// with its own `code` and `args`.
     BugRetryable {
-        status: angzarr_router::error::RetryableStatus,
+        status: RetryableStatus,
         code: String,
         args: Vec<(String, String)>,
         logs: String,
@@ -720,24 +705,17 @@ pub enum AddItemFails {
 }
 
 impl AddItemFails {
-    fn fail(&self) -> HandlerError {
+    /// The failure as business code answers it.
+    pub fn fail(&self) -> HandlerError {
         match self {
-            AddItemFails::Rejects {
-                status,
-                code,
-                args,
-                logs,
-            } => {
-                let _ = logs; // the handler's own log
-                CodedError::rejection(*status, code, args.clone()).into()
-            }
-            AddItemFails::Refuses { item, on_hand } => {
-                CodedError::refused(orders_any(&orders::v1::ItemOutOfStock {
+            AddItemFails::Refuses { item, on_hand } => CodedError::refused(
+                BusinessStatus::FailedPrecondition,
+                any_of(&orders::v1::ItemOutOfStock {
                     item: item.clone(),
                     on_hand: *on_hand,
-                }))
-                .into()
-            }
+                }),
+            )
+            .into(),
             AddItemFails::Errs { text } => HandlerError::Other(text.clone()),
             AddItemFails::Panics { text } => panic!("{text}"),
             AddItemFails::Bug { code, args, logs } => {
@@ -761,38 +739,51 @@ impl AddItemFails {
     }
 }
 
+/// What the order aggregate's AddItem returns: its ItemAdded, and the
+/// continuation its Emit carries (decision 14.104; C-0848 to C-0852).
+#[derive(Debug, Clone, Default)]
+pub enum AddItemReturns {
+    /// Emit of ItemAdded alone.
+    #[default]
+    ItemAdded,
+    /// Then a step that records OrderNoteAdded "restock <item>" when the
+    /// item's quantity reaches 1, and continues nowhere.
+    ThenRestockNote,
+    /// Then a step that records what it saw in its state into the sink and
+    /// emits nothing.
+    ThenObserve(OrderSink),
+    /// Then a step that fails as given.
+    ThenFails(AddItemFails),
+    /// Then `n` steps, each recording one OrderNoteAdded and continuing to
+    /// the next.
+    ThenChain(u32),
+}
+
+/// What the order aggregate's ItemDelivered fact handler returns, or how it
+/// fails (C-0845, C-0851).
+#[derive(Debug, Clone, Default)]
+pub enum FactReturns {
+    /// Emit of the fact's own event alone.
+    #[default]
+    Recorded,
+    /// Then a step that records OrderNoteAdded "delivered <item>".
+    ThenDeliveredNote,
+    /// It fails as given.
+    Fails(AddItemFails),
+}
+
+/// How the order aggregate is built for a scenario.
+#[derive(Debug, Clone, Default)]
+pub struct OrderBehaviour {
+    pub rules_version: String,
+    /// How AddItem fails, when it does.
+    pub fails: Option<AddItemFails>,
+    pub returns: AddItemReturns,
+    pub fact: FactReturns,
+}
+
 /// Sink the harness passes into the order fixtures.
 pub type OrderSink = Arc<Mutex<Vec<OrderObserved>>>;
-
-/// The generated `changed(before, after)` for `OrderState` (backlog CR-1):
-/// `items[<item>]` per item, `shipping_address`, and the wildcard `*notes`
-/// for the unmarked notes.
-pub fn order_changed(
-    before: &orders::v1::OrderState,
-    after: &orders::v1::OrderState,
-) -> Vec<String> {
-    let keys: std::collections::BTreeSet<&String> =
-        before.items.keys().chain(after.items.keys()).collect();
-    let mut units: Vec<String> = keys
-        .into_iter()
-        .filter(|k| before.items.get(*k) != after.items.get(*k))
-        .map(|k| format!("items[{k}]"))
-        .collect();
-    if before.shipping_address != after.shipping_address {
-        units.push("shipping_address".to_string());
-    }
-    if before.notes != after.notes {
-        units.push("*notes".to_string());
-    }
-    units
-}
-
-fn orders_any<M: prost::Message + prost::Name>(msg: &M) -> prost_types::Any {
-    prost_types::Any {
-        type_url: angzarr_router::type_url(&M::full_name()),
-        value: msg.encode_to_vec(),
-    }
-}
 
 fn sorted_items(state: &orders::v1::OrderState) -> Vec<String> {
     let mut items: Vec<String> = state.items.keys().cloned().collect();
@@ -800,33 +791,15 @@ fn sorted_items(state: &orders::v1::OrderState) -> Vec<String> {
     items
 }
 
-/// The order aggregate (domain "order") at `rules_version`: ItemAdded bumps
-/// an item, OrderNoteAdded sets the notes, a starting state decodes as
-/// OrderState;
-/// AddItem records what business code saw in `seen`, settles per `settle`
-/// and records ItemAdded; the fact ItemDelivered is recorded as received;
-/// COMMUTATIVE runs through [`order_changed`].
-pub fn order_aggregate(
-    rules_version: &str,
-    settle: Settle,
-    seen: OrderSink,
-) -> DomainDispatch<orders::v1::OrderState> {
-    order_aggregate_with(rules_version, settle, seen, None)
-}
-
 /// The item whose ItemAdded the order aggregate's fold refuses to fold
 /// (C-0670's failing folds).
 pub const ROTTEN_ITEM: &str = "rotten";
 
-/// [`order_aggregate`] whose AddItem fails as `fails` says, when given
-/// (decision 14.37). Its ItemAdded fold fails on the item [`ROTTEN_ITEM`].
-pub fn order_aggregate_with(
-    rules_version: &str,
-    settle: Settle,
-    seen: OrderSink,
-    fails: Option<AddItemFails>,
-) -> DomainDispatch<orders::v1::OrderState> {
-    let rebuilder = Rebuilder::of_message()
+/// The order state's rebuilder: ItemAdded bumps an item (and fails on
+/// [`ROTTEN_ITEM`]), ItemDelivered records a delivery, OrderNoteAdded sets
+/// the notes; a starting state decodes as OrderState.
+pub fn order_rebuilder() -> Rebuilder<orders::v1::OrderState> {
+    Rebuilder::of_message()
         .apply(
             "orders.v1.ItemAdded",
             |state: &mut orders::v1::OrderState, event| {
@@ -852,158 +825,191 @@ pub fn order_aggregate_with(
                 state.notes = orders::v1::OrderNoteAdded::decode(event.value.as_slice())?.note;
                 Ok(())
             },
-        );
+        )
+}
+
+/// An OrderNoteAdded of `note`.
+pub fn note(note: &str) -> prost_types::Any {
+    any_of(&orders::v1::OrderNoteAdded {
+        note: note.to_string(),
+    })
+}
+
+/// The restock step of C-0848 and C-0853: OrderNoteAdded "restock <item>"
+/// while the item's quantity is 1 and no such note is in the state.
+pub fn restock_step(
+    item: String,
+) -> impl Fn(
+    &orders::v1::OrderState,
+    &angzarr_router::context::CommandContext,
+) -> Result<Emit<orders::v1::OrderState>, HandlerError>
+       + Clone
+       + 'static {
+    move |state, _ctx| {
+        let wanted = format!("restock {item}");
+        if state.items.get(&item) == Some(&1) && state.notes != wanted {
+            return Ok(Emit::of([note(&wanted)]));
+        }
+        Ok(Emit::none())
+    }
+}
+
+/// `n` chained steps, each recording one OrderNoteAdded and continuing to
+/// the next.
+fn chain(n: u32) -> Emit<orders::v1::OrderState> {
+    let mut emit = Emit::none();
+    for k in 1..=n {
+        emit = emit.then(move |_state, _ctx| Ok(Emit::of([note(&format!("note {k}"))])));
+    }
+    emit
+}
+
+/// AddItem's answer for `item` under `returns`.
+fn add_item_emit(item: String, returns: &AddItemReturns) -> Emit<orders::v1::OrderState> {
+    let added = Emit::of([any_of(&orders::v1::ItemAdded { item: item.clone() })]);
+    match returns.clone() {
+        AddItemReturns::ItemAdded => added,
+        AddItemReturns::ThenRestockNote => added.then(restock_step(item)),
+        AddItemReturns::ThenObserve(sink) => added.then(move |state, ctx| {
+            sink.lock().unwrap().push(OrderObserved {
+                handled: "step".to_string(),
+                item: String::new(),
+                items: sorted_items(state),
+                recorded_at: ctx.recorded_at,
+            });
+            Ok(Emit::none())
+        }),
+        AddItemReturns::ThenFails(fails) => added.then(move |_state, _ctx| Err(fails.fail())),
+        AddItemReturns::ThenChain(n) => added.then(move |_state, _ctx| Ok(chain(n))),
+    }
+}
+
+/// The order aggregate (domain "order") behaving as `behaviour`: AddItem
+/// records what business code saw in `seen`, then fails or answers its
+/// Emit; Acknowledge answers no events; the fact ItemDelivered is recorded
+/// as received (or as `behaviour.fact` says).
+pub fn order_aggregate(
+    behaviour: OrderBehaviour,
+    seen: OrderSink,
+) -> DomainDispatch<orders::v1::OrderState> {
     let facts = seen.clone();
-    DomainDispatch::new("order", "order", rebuilder)
+    let OrderBehaviour {
+        rules_version,
+        fails,
+        returns,
+        fact,
+    } = behaviour;
+    DomainDispatch::new("order", "order", order_rebuilder())
         .with_rules_version(rules_version)
-        .with_commutative(order_changed)
         .on_command("orders.v1.AddItem", move |cmd, state, cctx| {
-            let item = orders::v1::AddItem::decode(cmd.value.as_slice())
-                .map_err(|e| HandlerError::Other(format!("decode AddItem: {e}")))?
-                .item;
+            let item = angzarr_router::decode_message::<orders::v1::AddItem>(&cmd.value)?.item;
             seen.lock().unwrap().push(OrderObserved {
                 handled: angzarr_router::type_name_from_url(&cmd.type_url).to_string(),
                 item: item.clone(),
-                expected_sequence: cctx.expected_sequence,
-                conflict_resolution: cctx.conflict_resolution,
-                window: cctx
-                    .conflict
-                    .as_ref()
-                    .map(|c| c.window().iter().map(|p| p.sequence).collect()),
-                nonce: cctx.conflict.as_ref().map(|c| c.nonce().to_vec()),
                 items: sorted_items(state),
                 recorded_at: cctx.recorded_at,
             });
             if let Some(fails) = &fails {
                 return Err(fails.fail());
             }
-            if let Some(conflict) = cctx.conflict.as_ref() {
-                match &settle {
-                    Settle::Delivered => {
-                        conflict.resolve_conflicts(conflict.window(), conflict.nonce())
-                    }
-                    Settle::Never => {}
-                    Settle::With(value) => conflict.resolve_conflicts(conflict.window(), value),
-                }
-            }
-            Ok(Some(pb::EventBook {
-                pages: vec![pb::EventPage {
-                    payload: Some(orders_any(&orders::v1::ItemAdded { item })),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }))
+            Ok(add_item_emit(item, &returns))
         })
         // Acknowledge: business code answers with no events.
-        .on_command("orders.v1.Acknowledge", |_cmd, _state, _cctx| Ok(None))
-        .on_fact_with_context("orders.v1.ItemDelivered", move |fact, state, cctx| {
-            let item = orders::v1::ItemDelivered::decode(fact.value.as_slice())
-                .map_err(|e| HandlerError::Other(format!("decode ItemDelivered: {e}")))?
-                .item;
+        .on_command("orders.v1.Acknowledge", |_cmd, _state, _cctx| {
+            Ok(Emit::none())
+        })
+        .on_fact("orders.v1.ItemDelivered", move |payload, state, cctx| {
+            // A payload that does not decode is ANY_DECODE_FAILED, naming
+            // its message type (C-0670).
+            let item =
+                angzarr_router::decode_message::<orders::v1::ItemDelivered>(&payload.value)?.item;
             facts.lock().unwrap().push(OrderObserved {
-                handled: angzarr_router::type_name_from_url(&fact.type_url).to_string(),
-                item,
-                expected_sequence: 0,
-                conflict_resolution: pb::ConflictResolution::Unspecified,
-                window: None,
-                nonce: None,
+                handled: angzarr_router::type_name_from_url(&payload.type_url).to_string(),
+                item: item.clone(),
                 items: sorted_items(state),
                 recorded_at: cctx.recorded_at,
             });
-            Ok(FactRecord::from(fact.clone()))
+            let recorded = Emit::of([payload.clone()]);
+            match &fact {
+                FactReturns::Recorded => Ok(recorded),
+                FactReturns::ThenDeliveredNote => {
+                    let delivered = format!("delivered {item}");
+                    Ok(recorded.then(move |_state, _ctx| Ok(Emit::of([note(&delivered)]))))
+                }
+                FactReturns::Fails(fails) => Err(fails.fail()),
+            }
         })
 }
 
 fn order_event(kind: &str, value: &str) -> prost_types::Any {
     match kind {
-        "ItemAdded" => orders_any(&orders::v1::ItemAdded {
+        "ItemAdded" => any_of(&orders::v1::ItemAdded {
             item: value.to_string(),
         }),
-        "OrderNoteAdded" => orders_any(&orders::v1::OrderNoteAdded {
-            note: value.to_string(),
-        }),
+        "OrderNoteAdded" => note(value),
         other => panic!("no order event {other}"),
     }
 }
 
+/// The order stream's history of `history` ((event kind, value) at
+/// sequences 0..) and an optional delivered snapshot.
+pub fn order_history(
+    history: &[(String, String)],
+    snapshot: Option<pb::Snapshot>,
+) -> pb::EventBook {
+    pb::EventBook {
+        cover: Some(cover_of("order", "order-1")),
+        snapshot,
+        pages: history
+            .iter()
+            .zip(0u64..)
+            .map(|((kind, value), sequence)| event_page(sequence, order_event(kind, value)))
+            .collect(),
+        next_sequence: history.len() as u64,
+    }
+}
+
 /// An `orders.v1.<command>` command for `item` to the order aggregate, over
-/// `history` ((event kind, value) at sequences 0..) and an optional delivered
-/// snapshot, resolved to `(expected_sequence, resolution, nonce)` when given.
+/// `history` and an optional delivered snapshot.
 pub fn order_command(
     command: &str,
     item: &str,
     history: &[(String, String)],
-    handling: Option<(u64, pb::ConflictResolution, Vec<u8>)>,
     snapshot: Option<pb::Snapshot>,
-) -> pb::ContextualCommand {
-    let (handling, nonce) = match handling {
-        Some((expected, resolution, nonce)) => (
-            Some(pb::Handling {
-                expected_sequence: Some(expected),
-                conflict_resolution: resolution as i32,
-            }),
-            nonce,
-        ),
-        None => (None, Vec::new()),
-    };
-    pb::ContextualCommand {
-        command: Some(pb::CommandBook {
-            cover: Some(pb::Cover {
-                domain: "order".to_string(),
-                ..Default::default()
-            }),
-            page: Some(pb::CommandPage {
-                body: Some(pb::command_page::Body::Command(pb::Command {
-                    payload: Some(prost_types::Any {
-                        type_url: angzarr_router::type_url(&format!("orders.v1.{command}")),
-                        // Every orders.v1 command carries its item in field 1.
-                        value: orders::v1::AddItem {
-                            item: item.to_string(),
-                        }
-                        .encode_to_vec(),
-                    }),
-                })),
-                ..Default::default()
-            }),
-            handling,
+) -> hpb::HandleRequest {
+    hpb::HandleRequest {
+        input: Some(pb::CommandBook {
+            cover: Some(cover_of("order", "order-1")),
+            page: Some(command_page(prost_types::Any {
+                type_url: angzarr_router::type_url(&format!("orders.v1.{command}")),
+                // Every orders.v1 command carries its item in field 1.
+                value: orders::v1::AddItem {
+                    item: item.to_string(),
+                }
+                .encode_to_vec(),
+            })),
         }),
-        events: Some(pb::EventBook {
-            snapshot,
-            pages: history
-                .iter()
-                .zip(0u64..)
-                .map(|((kind, value), sequence)| pb::EventPage {
-                    payload: Some(order_event(kind, value)),
-                    sequence,
-                    ..Default::default()
-                })
-                .collect(),
-            next_sequence: history.len() as u64,
-            ..Default::default()
-        }),
-        conflict_nonce: nonce.into(),
+        history: Some(order_history(history, snapshot)),
         recorded_at: None,
+        causation: None,
     }
 }
 
-/// An `orders.v1.<fact>` fact for `item`, delivered in the Fact arm.
-pub fn order_fact(fact: &str, item: &str) -> pb::ContextualCommand {
-    let mut cc = order_command("AddItem", item, &[], None, None);
-    let page = cc
-        .command
-        .as_mut()
-        .and_then(|b| b.page.as_mut())
-        .expect("command page");
-    page.body = Some(pb::command_page::Body::Fact(pb::Fact {
-        payload: Some(prost_types::Any {
+/// An `orders.v1.<fact>` fact for `item`, delivered in the Fact arm over
+/// `history`.
+pub fn order_fact(fact: &str, item: &str, history: &[(String, String)]) -> hpb::HandleRequest {
+    let mut req = order_command("AddItem", item, history, None);
+    req.input.as_mut().expect("an input book").page = Some(fact_page(
+        prost_types::Any {
             type_url: angzarr_router::type_url(&format!("orders.v1.{fact}")),
             value: orders::v1::ItemDelivered {
                 item: item.to_string(),
             }
             .encode_to_vec(),
-        }),
-    }));
-    cc
+        },
+        "delivery-1",
+    ));
+    req
 }
 
 /// A delivered snapshot of OrderState holding `items`, recorded under
@@ -1011,7 +1017,7 @@ pub fn order_fact(fact: &str, item: &str) -> pb::ContextualCommand {
 pub fn order_snapshot(items: &[&str], rules_version: &str) -> pb::Snapshot {
     pb::Snapshot {
         sequence: 0,
-        state: Some(orders_any(&orders::v1::OrderState {
+        state: Some(any_of(&orders::v1::OrderState {
             items: items.iter().map(|i| (i.to_string(), 1)).collect(),
             ..Default::default()
         })),
@@ -1019,18 +1025,13 @@ pub fn order_snapshot(items: &[&str], rules_version: &str) -> pb::Snapshot {
     }
 }
 
-/// The Fulfillment process manager at `rules_version`: a domain (decision
-/// 14.31) whose StartFulfillment command, its starting input, records
-/// nothing.
-pub fn fulfillment_pm(rules_version: &str) -> DomainDispatch<orders::v1::FulfillmentState> {
-    fulfillment_pm_writing(rules_version, false)
-}
-
-/// [`fulfillment_pm`] that, when `writes`, answers StartFulfillment with one
-/// FulfillmentStarted event, which counts into its state's `placed`.
-pub fn fulfillment_pm_writing(
+/// The fulfillment process manager at `rules_version`: a domain (decision
+/// 14.31) whose StartFulfillment command, its starting input, records one
+/// FulfillmentStarted event when `writes` says so (it counts into its
+/// state's `placed`), or nothing.
+pub fn fulfillment_pm(
     rules_version: &str,
-    writes: bool,
+    writes: Writes,
 ) -> DomainDispatch<orders::v1::FulfillmentState> {
     let rebuilder = Rebuilder::of_message().apply(
         "orders.v1.FulfillmentStarted",
@@ -1039,84 +1040,85 @@ pub fn fulfillment_pm_writing(
             Ok(())
         },
     );
-    DomainDispatch::process_manager("Fulfillment", "fulfillment", rebuilder)
+    DomainDispatch::process_manager("fulfillment", "fulfillment", rebuilder)
         .with_rules_version(rules_version)
         .on_command("orders.v1.StartFulfillment", move |_c, _s, _ctx| {
-            Ok(writes.then(|| pb::EventBook {
-                pages: vec![pb::EventPage {
-                    payload: Some(orders_any(&orders::v1::FulfillmentStarted {})),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }))
+            Ok(match writes {
+                Writes::FulfillmentStarted => {
+                    Emit::of([any_of(&orders::v1::FulfillmentStarted {})])
+                }
+                Writes::Nothing => Emit::none(),
+            })
         })
 }
 
-/// A StartFulfillment command for the Fulfillment instance of correlation
+/// Whether the fulfillment process manager writes its event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Writes {
+    FulfillmentStarted,
+    Nothing,
+}
+
+/// A StartFulfillment command for the fulfillment instance of correlation
 /// "order-1" (its root; decision 14.30), over no prior events.
-pub fn start_fulfillment() -> pb::ContextualCommand {
-    let mut book = order_command_for("fulfillment", "StartFulfillment");
-    book.cover.as_mut().expect("a cover").root = Some(pb::Uuid {
-        value: root_of("order-1").into(),
-    });
-    pb::ContextualCommand {
-        command: Some(book),
+pub fn start_fulfillment() -> hpb::HandleRequest {
+    hpb::HandleRequest {
+        input: Some(pb::CommandBook {
+            cover: Some(cover_of("fulfillment", "order-1")),
+            page: Some(command_page(any_of(&orders::v1::StartFulfillment {}))),
+        }),
         ..Default::default()
     }
 }
 
-/// The Fulfillment process manager's state with `placed`, as its process
+/// The fulfillment process manager's state with `placed`, as its process
 /// state image.
 pub fn fulfillment_state(placed: u32) -> prost_types::Any {
-    orders_any(&orders::v1::FulfillmentState { placed })
+    any_of(&orders::v1::FulfillmentState { placed })
 }
 
 /// An order state image read back: its type URL, its items (sorted) with
-/// their quantities, and its delivered items in order. (Map encoding order
-/// is unspecified, so images compare decoded.)
-pub fn read_order_state(image: &prost_types::Any) -> (String, Vec<(String, u32)>, Vec<String>) {
+/// their quantities, its delivered items in order, and its notes. (Map
+/// encoding order is unspecified, so images compare decoded.)
+pub fn read_order_state(
+    image: &prost_types::Any,
+) -> (String, Vec<(String, u32)>, Vec<String>, String) {
     let state = orders::v1::OrderState::decode(image.value.as_slice()).expect("OrderState");
     let mut items: Vec<(String, u32)> = state.items.into_iter().collect();
     items.sort();
-    (image.type_url.clone(), items, state.delivered)
+    (image.type_url.clone(), items, state.delivered, state.notes)
 }
 
-/// An `orders.v1.<command>` command book for `domain` (empty payload).
-pub fn order_command_for(domain: &str, command: &str) -> pb::CommandBook {
-    pb::CommandBook {
-        cover: Some(pb::Cover {
-            domain: domain.to_string(),
-            // A command to an aggregate names its root (decision 14.36).
-            root: Some(pb::Uuid {
-                value: root_of("inv-7").into(),
-            }),
-            ..Default::default()
-        }),
-        page: Some(pb::CommandPage {
-            body: Some(pb::command_page::Body::Command(pb::Command {
-                payload: Some(prost_types::Any {
-                    type_url: angzarr_router::type_url(&format!("orders.v1.{command}")),
-                    value: Vec::new(),
-                }),
-            })),
-            ..Default::default()
-        }),
+/// An "order" trigger book: one OrderPlaced event of the order stream
+/// "order-1" at `sequence`.
+pub fn order_placed_trigger(sequence: u64) -> pb::EventBook {
+    pb::EventBook {
+        cover: Some(cover_of("order", "order-1")),
+        pages: vec![event_page(sequence, any_of(&orders::v1::OrderPlaced {}))],
         ..Default::default()
     }
 }
 
-/// A policy source: one OrderPlaced event from "order".
-pub fn order_placed_source() -> pb::EventBook {
-    pb::EventBook {
-        cover: Some(pb::Cover {
-            domain: "order".to_string(),
-            ..Default::default()
-        }),
-        pages: vec![pb::EventPage {
-            payload: Some(orders_any(&orders::v1::OrderPlaced {})),
-            ..Default::default()
-        }],
-        ..Default::default()
+/// The router's status of a gRPC code's name (`FAILED_PRECONDITION`), as
+/// the features spell it.
+pub fn status_named(name: &str) -> angzarr_router::error::GrpcCode {
+    use angzarr_router::error::GrpcCode;
+    match name {
+        "UNKNOWN" => GrpcCode::Unknown,
+        "INVALID_ARGUMENT" => GrpcCode::InvalidArgument,
+        "DEADLINE_EXCEEDED" => GrpcCode::DeadlineExceeded,
+        "NOT_FOUND" => GrpcCode::NotFound,
+        "ALREADY_EXISTS" => GrpcCode::AlreadyExists,
+        "PERMISSION_DENIED" => GrpcCode::PermissionDenied,
+        "RESOURCE_EXHAUSTED" => GrpcCode::ResourceExhausted,
+        "FAILED_PRECONDITION" => GrpcCode::FailedPrecondition,
+        "ABORTED" => GrpcCode::Aborted,
+        "OUT_OF_RANGE" => GrpcCode::OutOfRange,
+        "UNIMPLEMENTED" => GrpcCode::Unimplemented,
+        "INTERNAL" => GrpcCode::Internal,
+        "UNAVAILABLE" => GrpcCode::Unavailable,
+        "DATA_LOSS" => GrpcCode::DataLoss,
+        other => panic!("no status {other}"),
     }
 }
 
@@ -1124,13 +1126,13 @@ pub fn order_placed_source() -> pb::EventBook {
 mod smoke {
     use super::*;
 
-    /// The whole pipeline works: compile counter.proto, extern the framework
+    /// The whole pipeline works: compile the fixtures, extern the framework
     /// types to the router crate, build the pool, and parse an Any-expanded
-    /// envelope skeleton into the router's own ContextualCommand.
+    /// request skeleton into the router's own HandleRequest.
     #[test]
-    fn parses_increase_envelope_skeleton() {
-        let cc: pb::ContextualCommand = parse_txtpb(CONTEXTUAL_COMMAND, SKEL_INCREASE);
-        let book = cc.command.expect("command book");
+    fn parses_the_increase_request_skeleton() {
+        let req: hpb::HandleRequest = parse_txtpb(HANDLE_REQUEST, SKEL_INCREASE);
+        let book = req.input.expect("an input book");
         assert_eq!(book.cover.as_ref().expect("cover").domain, "counter");
         let any = angzarr_router::command_payload(book.page.as_ref().expect("page"))
             .expect("command any");

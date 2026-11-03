@@ -5,6 +5,7 @@
 mod common;
 
 use angzarr_router::error::CodedError;
+use angzarr_router::hpb;
 use angzarr_router::pb;
 use angzarr_router::router::{CommandHandler, PolicyComponent, ProjectorHandler};
 use angzarr_router_conformance as conf;
@@ -17,7 +18,7 @@ struct ContextWorld {
     covers: conf::CoverSink,
     applied: conf::SequenceSink,
     pages: conf::PageSink,
-    fact: Option<Result<pb::CommandHandlerResponse, CodedError>>,
+    fact: Option<Result<hpb::HandleResponse, CodedError>>,
     /// What a policy handler or a projector fold read of its event.
     read: conf::MetaSink,
 }
@@ -98,8 +99,10 @@ fn metadata(text: &str) -> pb::EventMeta {
 )]
 async fn policy_metadata(w: &mut ContextWorld, label: String, sequence: u64, meta: String) {
     let policy = conf::metadata_policy(w.read.clone());
-    let book = conf::metadata_book(&label, sequence, metadata(&meta));
-    PolicyComponent::dispatch(&policy, &book)
+    let trigger = hpb::ReactRequest {
+        trigger: Some(conf::metadata_book(&label, sequence, metadata(&meta))),
+    };
+    PolicyComponent::react(&policy, &trigger)
         .await
         .expect("dispatch");
 }
@@ -109,8 +112,10 @@ async fn policy_metadata(w: &mut ContextWorld, label: String, sequence: u64, met
 )]
 async fn projector_metadata(w: &mut ContextWorld, label: String, sequence: u64, meta: String) {
     let projector = conf::metadata_projector(w.read.clone());
-    let book = conf::metadata_book(&label, sequence, metadata(&meta));
-    ProjectorHandler::dispatch(&projector, &book)
+    let run = hpb::ProjectRequest {
+        events: Some(conf::metadata_book(&label, sequence, metadata(&meta))),
+    };
+    ProjectorHandler::dispatch(&projector, &run)
         .await
         .expect("dispatch");
 }
@@ -125,27 +130,20 @@ async fn saw_metadata(w: &mut ContextWorld, label: String, sequence: u64, meta: 
     );
 }
 
-fn recorded(w: &ContextWorld) -> &pb::EventBook {
-    w.fact
+fn recorded(w: &ContextWorld) -> &[prost_types::Any] {
+    &w.fact
         .as_ref()
         .expect("a fact was handled")
         .as_ref()
         .expect("fact handling succeeded")
         .events
-        .as_ref()
-        .expect("the recorded events")
 }
 
 #[then(regex = r"^the Increased fact is recorded, flagged by the count (\d+)$")]
 async fn recorded_and_flagged(w: &mut ContextWorld, count: u32) {
     let recorded: Vec<(String, Option<u32>)> = recorded(w)
-        .pages
         .iter()
-        .map(|page| {
-            let any = page
-                .payload
-                .as_ref()
-                .expect("a recorded page carries its event");
+        .map(|any| {
             let name = angzarr_router::type_name_from_url(&any.type_url).to_string();
             let count = (name == "test.counter.CounterState").then(|| {
                 conf::CounterState::decode(any.value.as_slice())

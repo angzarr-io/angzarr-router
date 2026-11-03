@@ -5,16 +5,19 @@
 //! upcaster sidecar before the router sees it (decision 14.39).
 //!
 //! [`RouterBuilder`] takes the component and validates the configuration at
-//! build time: no component is ROUTER_REASON_NO_HANDLERS_REGISTERED (C-0060); a second
-//! component, of any kind, is ROUTER_REASON_DUPLICATE_COMPONENT.
-//! The built [`Router`] dispatches to that component:
+//! build time: no component is ANGZARR_REASON_NO_HANDLERS_REGISTERED (C-0060); a second
+//! component, of any kind, is ANGZARR_REASON_DUPLICATE_COMPONENT, naming the
+//! one registered and the one refused (C-0580).
+//! The built [`Router`] dispatches to that component, on the handler
+//! layer's messages (decision 14.78):
 //!
-//! - a command or a fact (a page's Fact arm) to the domain: an aggregate, or
-//!   a process manager, which is a domain (decision 14.31) served the same
-//!   way, once the coordinator has admitted it (decision 14.42);
-//! - a policy source to the policy, when it comes from the policy's input domain,
-//!   and a refusal of one of its commands to the policy's OnRefused;
-//! - an EventBook to the projector, one Projection.
+//! - `Handle`, a command or a fact (decision 14.98), to the domain: an
+//!   aggregate, or a process manager, which is a domain (decision 14.31)
+//!   served the same way, once the coordinator has admitted it (decision
+//!   14.42);
+//! - `React`, one trigger event, and `Translate`, one refusal of a command
+//!   it sent, to the policy;
+//! - `Project`, one stream's run, to the projector.
 //!
 //! The component may be registered boxed (`Box<dyn DynCommandHandler>` and so
 //! on). Transport (gRPC servers), health and readiness stay with the host.
@@ -22,7 +25,8 @@
 use std::future::Future;
 
 use crate::domain::DomainDispatch;
-use crate::error::{CodedError, RouterReason};
+use crate::error::{AngzarrReason, CodedError};
+use crate::hpb;
 use crate::pb;
 use crate::policy::PolicyDispatch;
 use crate::projector::ProjectorDispatch;
@@ -47,11 +51,12 @@ pub trait CommandHandler: MaybeSend + MaybeSync {
     }
     /// The fully-qualified command types it handles.
     fn command_types(&self) -> Vec<String>;
-    /// `CommandHandlerService.Handle`: a command or a fact.
+    /// `CommandHandlerService.Handle`: a command or a fact (decision
+    /// 14.98), answered success only (decision 14.95).
     fn dispatch(
         &self,
-        req: &pb::ContextualCommand,
-    ) -> impl Future<Output = Result<pb::CommandHandlerResponse, CodedError>> + MaybeSend;
+        req: &hpb::HandleRequest,
+    ) -> impl Future<Output = Result<hpb::HandleResponse, CodedError>> + MaybeSend;
 }
 
 /// [`CommandHandler`], object-safe: its future boxed. Every
@@ -68,8 +73,8 @@ pub trait DynCommandHandler: MaybeSend + MaybeSync {
     /// [`CommandHandler::dispatch`], boxed.
     fn dispatch<'a>(
         &'a self,
-        req: &'a pb::ContextualCommand,
-    ) -> BoxFuture<'a, Result<pb::CommandHandlerResponse, CodedError>>;
+        req: &'a hpb::HandleRequest,
+    ) -> BoxFuture<'a, Result<hpb::HandleResponse, CodedError>>;
 }
 
 impl<T: CommandHandler> DynCommandHandler for T {
@@ -84,8 +89,8 @@ impl<T: CommandHandler> DynCommandHandler for T {
     }
     fn dispatch<'a>(
         &'a self,
-        req: &'a pb::ContextualCommand,
-    ) -> BoxFuture<'a, Result<pb::CommandHandlerResponse, CodedError>> {
+        req: &'a hpb::HandleRequest,
+    ) -> BoxFuture<'a, Result<hpb::HandleResponse, CodedError>> {
         Box::pin(CommandHandler::dispatch(self, req))
     }
 }
@@ -100,10 +105,7 @@ impl CommandHandler for dyn DynCommandHandler + '_ {
     fn command_types(&self) -> Vec<String> {
         DynCommandHandler::command_types(self)
     }
-    async fn dispatch(
-        &self,
-        req: &pb::ContextualCommand,
-    ) -> Result<pb::CommandHandlerResponse, CodedError> {
+    async fn dispatch(&self, req: &hpb::HandleRequest) -> Result<hpb::HandleResponse, CodedError> {
         DynCommandHandler::dispatch(self, req).await
     }
 }
@@ -120,8 +122,8 @@ impl<T: CommandHandler + ?Sized> CommandHandler for Box<T> {
     }
     fn dispatch(
         &self,
-        req: &pb::ContextualCommand,
-    ) -> impl Future<Output = Result<pb::CommandHandlerResponse, CodedError>> + MaybeSend {
+        req: &hpb::HandleRequest,
+    ) -> impl Future<Output = Result<hpb::HandleResponse, CodedError>> + MaybeSend {
         (**self).dispatch(req)
     }
 }
@@ -139,43 +141,39 @@ impl<S> CommandHandler for DomainDispatch<S> {
     /// [`DomainDispatch::dispatch`]'s answer, ready.
     fn dispatch(
         &self,
-        req: &pb::ContextualCommand,
-    ) -> impl Future<Output = Result<pb::CommandHandlerResponse, CodedError>> + MaybeSend {
+        req: &hpb::HandleRequest,
+    ) -> impl Future<Output = Result<hpb::HandleResponse, CodedError>> + MaybeSend {
         std::future::ready(DomainDispatch::dispatch(self, req))
     }
 }
 
-/// A policy as a runtime holds it (decisions 14.41, 14.42): a
+/// A policy as a runtime holds it (decisions 14.41, 14.42, 14.78): a
 /// [`PolicyDispatch`], or one written by hand (a policy in another process,
-/// behind its `PolicyService`). It answers its commands and its refusals'
-/// translations; the runtime checks its source, stamps and checks its
-/// commands, builds a pass-through refusal fact when there is no
-/// translation, and addresses every refusal fact. It carries no descriptor
-/// (nor does any component): descriptors are generated by angzarr-cli.
+/// behind its `PolicyService`). It answers its reactions and its refusals'
+/// translations; the runtime addresses, stamps and checks its outputs and
+/// delivers its refusal facts. It carries no descriptor (nor does any
+/// component): descriptors are generated by angzarr-cli.
 ///
-/// Kernel-facing, as [`CommandHandler`] is: its dispatch is awaited, a
+/// Kernel-facing, as [`CommandHandler`] is: its calls are awaited, a
 /// [`PolicyDispatch`] answering at once. Held boxed as
 /// `Box<dyn DynPolicyComponent>`.
 pub trait PolicyComponent: MaybeSend + MaybeSync {
     /// The component's name.
     fn name(&self) -> &str;
-    /// The one domain whose events it handles, and to which its refusal
+    /// The one domain whose events it reacts to, and to which its refusal
     /// facts go.
     fn input_domain(&self) -> &str;
-    /// `PolicyService.Handle`: the commands for one source book.
-    fn dispatch(
+    /// `PolicyService.React`: the outputs for one trigger event.
+    fn react(
         &self,
-        source: &pb::EventBook,
-    ) -> impl Future<Output = Result<pb::PolicyResponse, CodedError>> + MaybeSend;
-    /// `PolicyService.OnRefused`: the payload of the fact its translating
-    /// callback for the refused command's type answers, the refused
-    /// command's context `ctx` beside it; `None` when it has no callback
-    /// for that type (no translation).
-    fn dispatch_refusal(
+        req: &hpb::ReactRequest,
+    ) -> impl Future<Output = Result<hpb::ReactResponse, CodedError>> + MaybeSend;
+    /// `PolicyService.Translate`: one refusal of a command it sent, as a
+    /// fact of its own source.
+    fn translate(
         &self,
-        refusal: &pb::Refusal,
-        ctx: &crate::context::CommandContext,
-    ) -> impl Future<Output = Result<Option<prost_types::Any>, CodedError>> + MaybeSend;
+        req: &hpb::TranslateRequest,
+    ) -> impl Future<Output = Result<hpb::TranslateResponse, CodedError>> + MaybeSend;
 }
 
 /// [`PolicyComponent`], object-safe: its futures boxed. Every
@@ -186,17 +184,16 @@ pub trait DynPolicyComponent: MaybeSend + MaybeSync {
     fn name(&self) -> &str;
     /// [`PolicyComponent::input_domain`].
     fn input_domain(&self) -> &str;
-    /// [`PolicyComponent::dispatch`], boxed.
-    fn dispatch<'a>(
+    /// [`PolicyComponent::react`], boxed.
+    fn react<'a>(
         &'a self,
-        source: &'a pb::EventBook,
-    ) -> BoxFuture<'a, Result<pb::PolicyResponse, CodedError>>;
-    /// [`PolicyComponent::dispatch_refusal`], boxed.
-    fn dispatch_refusal<'a>(
+        req: &'a hpb::ReactRequest,
+    ) -> BoxFuture<'a, Result<hpb::ReactResponse, CodedError>>;
+    /// [`PolicyComponent::translate`], boxed.
+    fn translate<'a>(
         &'a self,
-        refusal: &'a pb::Refusal,
-        ctx: &'a crate::context::CommandContext,
-    ) -> BoxFuture<'a, Result<Option<prost_types::Any>, CodedError>>;
+        req: &'a hpb::TranslateRequest,
+    ) -> BoxFuture<'a, Result<hpb::TranslateResponse, CodedError>>;
 }
 
 impl<T: PolicyComponent> DynPolicyComponent for T {
@@ -206,18 +203,17 @@ impl<T: PolicyComponent> DynPolicyComponent for T {
     fn input_domain(&self) -> &str {
         PolicyComponent::input_domain(self)
     }
-    fn dispatch<'a>(
+    fn react<'a>(
         &'a self,
-        source: &'a pb::EventBook,
-    ) -> BoxFuture<'a, Result<pb::PolicyResponse, CodedError>> {
-        Box::pin(PolicyComponent::dispatch(self, source))
+        req: &'a hpb::ReactRequest,
+    ) -> BoxFuture<'a, Result<hpb::ReactResponse, CodedError>> {
+        Box::pin(PolicyComponent::react(self, req))
     }
-    fn dispatch_refusal<'a>(
+    fn translate<'a>(
         &'a self,
-        refusal: &'a pb::Refusal,
-        ctx: &'a crate::context::CommandContext,
-    ) -> BoxFuture<'a, Result<Option<prost_types::Any>, CodedError>> {
-        Box::pin(PolicyComponent::dispatch_refusal(self, refusal, ctx))
+        req: &'a hpb::TranslateRequest,
+    ) -> BoxFuture<'a, Result<hpb::TranslateResponse, CodedError>> {
+        Box::pin(PolicyComponent::translate(self, req))
     }
 }
 
@@ -228,15 +224,14 @@ impl PolicyComponent for dyn DynPolicyComponent + '_ {
     fn input_domain(&self) -> &str {
         DynPolicyComponent::input_domain(self)
     }
-    async fn dispatch(&self, source: &pb::EventBook) -> Result<pb::PolicyResponse, CodedError> {
-        DynPolicyComponent::dispatch(self, source).await
+    async fn react(&self, req: &hpb::ReactRequest) -> Result<hpb::ReactResponse, CodedError> {
+        DynPolicyComponent::react(self, req).await
     }
-    async fn dispatch_refusal(
+    async fn translate(
         &self,
-        refusal: &pb::Refusal,
-        ctx: &crate::context::CommandContext,
-    ) -> Result<Option<prost_types::Any>, CodedError> {
-        DynPolicyComponent::dispatch_refusal(self, refusal, ctx).await
+        req: &hpb::TranslateRequest,
+    ) -> Result<hpb::TranslateResponse, CodedError> {
+        DynPolicyComponent::translate(self, req).await
     }
 }
 
@@ -247,18 +242,17 @@ impl<T: PolicyComponent + ?Sized> PolicyComponent for Box<T> {
     fn input_domain(&self) -> &str {
         (**self).input_domain()
     }
-    fn dispatch(
+    fn react(
         &self,
-        source: &pb::EventBook,
-    ) -> impl Future<Output = Result<pb::PolicyResponse, CodedError>> + MaybeSend {
-        (**self).dispatch(source)
+        req: &hpb::ReactRequest,
+    ) -> impl Future<Output = Result<hpb::ReactResponse, CodedError>> + MaybeSend {
+        (**self).react(req)
     }
-    fn dispatch_refusal(
+    fn translate(
         &self,
-        refusal: &pb::Refusal,
-        ctx: &crate::context::CommandContext,
-    ) -> impl Future<Output = Result<Option<prost_types::Any>, CodedError>> + MaybeSend {
-        (**self).dispatch_refusal(refusal, ctx)
+        req: &hpb::TranslateRequest,
+    ) -> impl Future<Output = Result<hpb::TranslateResponse, CodedError>> + MaybeSend {
+        (**self).translate(req)
     }
 }
 
@@ -269,20 +263,19 @@ impl PolicyComponent for PolicyDispatch {
     fn input_domain(&self) -> &str {
         PolicyDispatch::input_domain(self)
     }
-    /// [`PolicyDispatch::dispatch`]'s answer, ready.
-    fn dispatch(
+    /// [`PolicyDispatch::react`]'s answer, ready.
+    fn react(
         &self,
-        source: &pb::EventBook,
-    ) -> impl Future<Output = Result<pb::PolicyResponse, CodedError>> + MaybeSend {
-        std::future::ready(PolicyDispatch::dispatch(self, source))
+        req: &hpb::ReactRequest,
+    ) -> impl Future<Output = Result<hpb::ReactResponse, CodedError>> + MaybeSend {
+        std::future::ready(PolicyDispatch::react(self, req))
     }
-    /// [`PolicyDispatch::translate_refusal`]'s answer, ready.
-    fn dispatch_refusal(
+    /// [`PolicyDispatch::translate`]'s answer, ready.
+    fn translate(
         &self,
-        refusal: &pb::Refusal,
-        ctx: &crate::context::CommandContext,
-    ) -> impl Future<Output = Result<Option<prost_types::Any>, CodedError>> + MaybeSend {
-        std::future::ready(PolicyDispatch::translate_refusal(self, refusal, ctx))
+        req: &hpb::TranslateRequest,
+    ) -> impl Future<Output = Result<hpb::TranslateResponse, CodedError>> + MaybeSend {
+        std::future::ready(PolicyDispatch::translate(self, req))
     }
 }
 
@@ -294,11 +287,11 @@ impl PolicyComponent for PolicyDispatch {
 pub trait ProjectorHandler: MaybeSend + MaybeSync {
     /// The component's name.
     fn name(&self) -> &str;
-    /// `ProjectorService.Handle`.
+    /// `ProjectorService.Project`: one stream's run (decision 14.78).
     fn dispatch(
         &self,
-        events: &pb::EventBook,
-    ) -> impl Future<Output = Result<pb::Projection, CodedError>> + MaybeSend;
+        req: &hpb::ProjectRequest,
+    ) -> impl Future<Output = Result<hpb::ProjectResponse, CodedError>> + MaybeSend;
 }
 
 /// [`ProjectorHandler`], object-safe: its future boxed. Every
@@ -310,8 +303,8 @@ pub trait DynProjectorHandler: MaybeSend + MaybeSync {
     /// [`ProjectorHandler::dispatch`], boxed.
     fn dispatch<'a>(
         &'a self,
-        events: &'a pb::EventBook,
-    ) -> BoxFuture<'a, Result<pb::Projection, CodedError>>;
+        req: &'a hpb::ProjectRequest,
+    ) -> BoxFuture<'a, Result<hpb::ProjectResponse, CodedError>>;
 }
 
 impl<T: ProjectorHandler> DynProjectorHandler for T {
@@ -320,9 +313,9 @@ impl<T: ProjectorHandler> DynProjectorHandler for T {
     }
     fn dispatch<'a>(
         &'a self,
-        events: &'a pb::EventBook,
-    ) -> BoxFuture<'a, Result<pb::Projection, CodedError>> {
-        Box::pin(ProjectorHandler::dispatch(self, events))
+        req: &'a hpb::ProjectRequest,
+    ) -> BoxFuture<'a, Result<hpb::ProjectResponse, CodedError>> {
+        Box::pin(ProjectorHandler::dispatch(self, req))
     }
 }
 
@@ -330,8 +323,11 @@ impl ProjectorHandler for dyn DynProjectorHandler + '_ {
     fn name(&self) -> &str {
         DynProjectorHandler::name(self)
     }
-    async fn dispatch(&self, events: &pb::EventBook) -> Result<pb::Projection, CodedError> {
-        DynProjectorHandler::dispatch(self, events).await
+    async fn dispatch(
+        &self,
+        req: &hpb::ProjectRequest,
+    ) -> Result<hpb::ProjectResponse, CodedError> {
+        DynProjectorHandler::dispatch(self, req).await
     }
 }
 
@@ -341,9 +337,9 @@ impl<T: ProjectorHandler + ?Sized> ProjectorHandler for Box<T> {
     }
     fn dispatch(
         &self,
-        events: &pb::EventBook,
-    ) -> impl Future<Output = Result<pb::Projection, CodedError>> + MaybeSend {
-        (**self).dispatch(events)
+        req: &hpb::ProjectRequest,
+    ) -> impl Future<Output = Result<hpb::ProjectResponse, CodedError>> + MaybeSend {
+        (**self).dispatch(req)
     }
 }
 
@@ -354,9 +350,9 @@ impl<P> ProjectorHandler for ProjectorDispatch<P> {
     /// [`ProjectorDispatch::dispatch`]'s answer, ready.
     fn dispatch(
         &self,
-        events: &pb::EventBook,
-    ) -> impl Future<Output = Result<pb::Projection, CodedError>> + MaybeSend {
-        std::future::ready(ProjectorDispatch::dispatch(self, events))
+        req: &hpb::ProjectRequest,
+    ) -> impl Future<Output = Result<hpb::ProjectResponse, CodedError>> + MaybeSend {
+        std::future::ready(ProjectorDispatch::dispatch(self, req))
     }
 }
 
@@ -376,29 +372,16 @@ impl Component {
         }
     }
 
-    fn kind(&self) -> pb::ComponentKind {
-        match self {
-            Component::Aggregate(c) => DynCommandHandler::kind(&**c),
-            Component::Policy(_) => pb::ComponentKind::Policy,
-            Component::Projector(_) => pb::ComponentKind::Projector,
-        }
-    }
-
-    /// The refusal of a second component (ROUTER_REASON_DUPLICATE_COMPONENT) beside this
-    /// one, naming this component and its kind (C-0580, C-0670): a
-    /// misconfiguration, INTERNAL.
-    fn refuse_another(&self, reason: RouterReason) -> CodedError {
+    /// The refusal of a second component, `refused`, beside this one
+    /// (ANGZARR_REASON_DUPLICATE_COMPONENT, C-0580 and C-0670): a
+    /// misconfiguration, INTERNAL, naming this component as `registered`
+    /// and the refused one's name as `refused` (decisions 14.87 and 14.88).
+    fn refuse_another(&self, refused: &str) -> CodedError {
         CodedError::keyed(
-            reason,
+            AngzarrReason::DuplicateComponent,
             [
-                (reason_args::COMPONENT.to_string(), self.name().to_string()),
-                (
-                    reason_args::COMPONENT_KIND.to_string(),
-                    self.kind()
-                        .as_str_name()
-                        .trim_start_matches("COMPONENT_KIND_")
-                        .to_string(),
-                ),
+                (reason_args::REGISTERED.to_string(), self.name().to_string()),
+                (reason_args::REFUSED.to_string(), refused.to_string()),
             ],
         )
     }
@@ -457,11 +440,11 @@ impl RouterBuilder {
     /// Validates the configuration and builds the router.
     pub fn build(mut self) -> Result<Router, CodedError> {
         if self.components.is_empty() {
-            return Err(CodedError::keyed(RouterReason::NoHandlersRegistered, []));
+            return Err(CodedError::keyed(AngzarrReason::NoHandlersRegistered, []));
         }
         let component = self.components.remove(0);
-        if !self.components.is_empty() {
-            return Err(component.refuse_another(RouterReason::DuplicateComponent));
+        if let Some(second) = self.components.first() {
+            return Err(component.refuse_another(second.name()));
         }
         Ok(Router {
             component,
@@ -471,23 +454,23 @@ impl RouterBuilder {
 }
 
 /// The one component of one business process, ready to dispatch. Dispatching
-/// a kind the router does not host is ROUTER_REASON_NO_COMPONENT_OF_KIND (UNIMPLEMENTED).
+/// a kind the router does not host is ANGZARR_REASON_NO_COMPONENT_OF_KIND (UNIMPLEMENTED).
 pub struct Router {
     component: Component,
     descriptor: Option<pb::ComponentDescriptor>,
 }
 
 fn wrong_kind() -> CodedError {
-    CodedError::keyed(RouterReason::NoComponentOfKind, [])
+    CodedError::keyed(AngzarrReason::NoComponentOfKind, [])
 }
 
 impl Router {
-    /// The refusal of another component registered beside this one
-    /// (ROUTER_REASON_DUPLICATE_COMPONENT naming this one; C-0580), for hosts that
-    /// register components one at a time (the C ABI).
-    pub fn refuse_another_component(&self) -> CodedError {
-        self.component
-            .refuse_another(RouterReason::DuplicateComponent)
+    /// The refusal of another component, `refused`, registered beside
+    /// this one (ANGZARR_REASON_DUPLICATE_COMPONENT naming this one as
+    /// `registered`; C-0580), for hosts that register components one at a
+    /// time (the C ABI).
+    pub fn refuse_another_component(&self, refused: &str) -> CodedError {
+        self.component.refuse_another(refused)
     }
 
     /// The descriptor `ComponentService.Describe` answers: the one the
@@ -497,54 +480,51 @@ impl Router {
         self.descriptor.as_ref()
     }
 
-    /// The policy's OnRefused (policy.proto): the refusal fact for its own
-    /// source domain, passed through or translated, the callback handed the
-    /// refused command's context `ctx`
-    /// ([`PolicyDispatch::dispatch_refusal`]).
-    pub async fn dispatch_refusal(
-        &self,
-        refusal: &pb::Refusal,
-        ctx: &crate::context::CommandContext,
-    ) -> Result<pb::OnRefusedResponse, CodedError> {
-        match &self.component {
-            Component::Policy(policy) => policy.dispatch_refusal(refusal, ctx),
-            _ => Err(wrong_kind()),
-        }
-    }
-
-    /// Handles a command or a fact with the domain (an aggregate or a
-    /// process manager).
+    /// `Handle`: a command or a fact, with the domain (an aggregate or a
+    /// process manager; decision 14.98).
     pub async fn dispatch_command(
         &self,
-        req: &pb::ContextualCommand,
-    ) -> Result<pb::CommandHandlerResponse, CodedError> {
+        req: &hpb::HandleRequest,
+    ) -> Result<hpb::HandleResponse, CodedError> {
         match &self.component {
             Component::Aggregate(aggregate) => DynCommandHandler::dispatch(&**aggregate, req).await,
             _ => Err(wrong_kind()),
         }
     }
 
-    /// Runs the policy over a source. The coordinator delivers only its
-    /// input domain's events; the router guards no envelope (decision
-    /// 14.42).
-    pub async fn dispatch_policy(
+    /// `React`: the policy's outputs for one trigger event. The coordinator
+    /// delivers only its input domain's events; the router guards no
+    /// envelope (decision 14.42).
+    pub async fn dispatch_react(
         &self,
-        source: &pb::EventBook,
-    ) -> Result<pb::PolicyResponse, CodedError> {
+        req: &hpb::ReactRequest,
+    ) -> Result<hpb::ReactResponse, CodedError> {
         match &self.component {
-            Component::Policy(policy) => PolicyComponent::dispatch(policy, source).await,
+            Component::Policy(policy) => PolicyComponent::react(policy, req).await,
             _ => Err(wrong_kind()),
         }
     }
 
-    /// Runs the projector over the book: one Projection.
-    pub async fn dispatch_projector(
+    /// `Translate`: the policy's one refusal callback on a refusal of a
+    /// command it sent (decision 14.89).
+    pub async fn dispatch_translate(
         &self,
-        events: &pb::EventBook,
-    ) -> Result<pb::Projection, CodedError> {
+        req: &hpb::TranslateRequest,
+    ) -> Result<hpb::TranslateResponse, CodedError> {
+        match &self.component {
+            Component::Policy(policy) => PolicyComponent::translate(policy, req).await,
+            _ => Err(wrong_kind()),
+        }
+    }
+
+    /// `Project`: the projector over one stream's run.
+    pub async fn dispatch_project(
+        &self,
+        req: &hpb::ProjectRequest,
+    ) -> Result<hpb::ProjectResponse, CodedError> {
         match &self.component {
             Component::Projector(projector) => {
-                DynProjectorHandler::dispatch(&**projector, events).await
+                DynProjectorHandler::dispatch(&**projector, req).await
             }
             _ => Err(wrong_kind()),
         }

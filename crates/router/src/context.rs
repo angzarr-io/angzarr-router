@@ -1,75 +1,95 @@
-//! The context every handler is handed beside its input and rebuilt state
-//! ([`CommandContext`]), the conflict it acknowledges under
-//! AGGREGATE_HANDLES ([`Conflict`]), and the context a `ContextualCommand`
-//! hands its handler ([`command_context`]), which a runtime passes on with a
-//! refusal to the refused policy's translating callback. Kernel: every
-//! component dispatcher reads it.
+//! The context every command or fact handler is handed beside its input
+//! and rebuilt state ([`CommandContext`]), from the `HandleRequest` the
+//! coordinator delivered ([`command_context`]): the full angzarr context,
+//! read-only (decision 46, Q1), withholding nothing but what is truly
+//! internal. Kernel: every component dispatcher reads it, and a coordinator
+//! stamps a decision's events with its [`CommandContext::event_meta`].
 
-use std::sync::{Arc, Mutex};
-
+use crate::hpb;
 use crate::pb;
+
+/// The input's kind, by its book's body arm (decision 14.79), with what
+/// that kind alone carries.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InputArm {
+    /// A command (the Command arm): its expected sequence as the client
+    /// sent it (`Handling.expected_sequence`; unset: the client stated
+    /// none). The coordinator never stamps it, and has already refused a
+    /// command whose expected sequence is not the head (decision 14.94).
+    Command { expected_sequence: Option<u64> },
+    /// A fact (the Fact arm): where it came from (`Fact.origin`), copied
+    /// onto every event it produces (the fact arm of their causation).
+    Fact { origin: Option<pb::FactOrigin> },
+}
+
+impl Default for InputArm {
+    fn default() -> Self {
+        InputArm::Command {
+            expected_sequence: None,
+        }
+    }
+}
 
 /// Per-dispatch facts the business method may need beyond its typed
 /// command and rebuilt state.
 #[derive(Debug, Clone, Default)]
 pub struct CommandContext {
-    /// The aggregate's next event sequence, derived from the prior-events
-    /// book the coordinator supplied.
+    /// The stream's next event sequence: the history's head
+    /// (`EventBook.next_sequence`), computed by the coordinator on load.
     pub next_sequence: u64,
-    /// The "does this aggregate exist" signal — true when the prior-events
-    /// book carried any history (pages or a starting state). Exposed
-    /// because state factories produce non-default zero states, so business
-    /// code cannot infer existence from state.
+    /// The "does this stream exist" signal: true when the history carried
+    /// any (pages or a starting state). Exposed because state factories
+    /// produce non-default zero states, so business code cannot infer
+    /// existence from state.
     pub had_prior_events: bool,
-    /// The cover of the command being handled: the aggregate's own domain
-    /// and root.
+    /// The cover of the input being handled: the stream's domain, root and
+    /// edition.
     pub cover: Option<pb::Cover>,
-    /// The resolved `Handling.expected_sequence`: the head the command was
-    /// issued against (stamped by the coordinator when the caller sent none).
-    pub expected_sequence: u64,
-    /// The resolved `Handling.conflict_resolution`.
-    pub conflict_resolution: pb::ConflictResolution,
-    /// The conflict to resolve: `Some` only under AGGREGATE_HANDLES. Under
-    /// STRICT there is no window, and under COMMUTATIVE the router resolves
-    /// the window itself, so the handler never sees the nonce.
-    pub conflict: Option<Conflict>,
+    /// The input's kind and what it alone carries.
+    pub arm: InputArm,
     /// The input's command id (types.proto, CommandPage.command_id): a
     /// client's, a policy's derived one, or a fact's derived from its
     /// origin; as delivered.
     pub command_id: Option<pb::Uuid>,
     /// The input's correlation (CommandPage.correlation_id), as delivered.
     pub correlation_id: Option<pb::Uuid>,
-    /// A fact's origin (CommandPage.fact_origin); `None` for a command.
-    pub fact_origin: Option<pb::FactOrigin>,
-    /// When the input was accepted (types.proto,
-    /// ContextualCommand.recorded_at; decision 14.37): stamped by the
-    /// coordinator, or the angzarr-embedded kernel, as delivered. Business
-    /// code reads it rather than a clock of its own.
+    /// When the input was accepted (`HandleRequest.recorded_at`; decision
+    /// 14.37): stamped by the coordinator, or the angzarr-embedded kernel,
+    /// as delivered. Business code reads it rather than a clock of its own.
     pub recorded_at: Option<prost_types::Timestamp>,
+    /// A policy's output or a refusal fact only: its trigger, the event the
+    /// policy reacted to (`HandleRequest.causation`; decision 14.79). Unset
+    /// for a client's input. Never stamped on the events the input
+    /// produces (their causation is the input).
+    pub causation: Option<pb::EventRef>,
 }
 
 impl CommandContext {
     /// The metadata every event of this decision is stamped with
-    /// (types.proto, EventMeta), under `rules_version`: its causation (the
-    /// input's command id, the deduplication key), its fact origin and
-    /// correlation, and the instant it is recorded at
-    /// (`ContextualCommand.recorded_at`). No actor: who did it belongs in a
-    /// security log. No trigger: a policy command's events name their
-    /// command, not the event that set it off; that edge is the command's
-    /// own causation, for tracing.
+    /// (types.proto, EventMeta), under `rules_version`: its causation, the
+    /// input's arm with its command id (the deduplication key) and, for a
+    /// fact, its origin (decision 14.102); its correlation; and the instant
+    /// it is recorded at (`HandleRequest.recorded_at`). No actor: who did it
+    /// belongs in a security log. No trigger: a policy's input's events name
+    /// that input, not the event that set it off.
     ///
     /// The ONE builder of it: a coordinator stamps the events it keeps with
-    /// it, from the `ContextualCommand` it handed the handler, and the
-    /// router folds the decision's own events with it
+    /// it, from the `HandleRequest` it handed the handler, and the router
+    /// folds the decision's own events with it
     /// ([`crate::rebuild::Rebuilder::apply_emitted`]), so an applier reads
     /// at decide time exactly what replay will hand it.
     pub fn event_meta(&self, rules_version: &str) -> pb::EventMeta {
+        let causation = match &self.arm {
+            InputArm::Command { .. } => pb::event_meta::Causation::Command(pb::CommandCause {
+                command_id: self.command_id.clone(),
+            }),
+            InputArm::Fact { origin } => pb::event_meta::Causation::Fact(pb::FactCause {
+                command_id: self.command_id.clone(),
+                origin: origin.clone(),
+            }),
+        };
         pb::EventMeta {
-            causation: self
-                .command_id
-                .clone()
-                .map(pb::event_meta::Causation::CommandId),
-            fact: self.fact_origin.clone(),
+            causation: Some(causation),
             correlation_id: self.correlation_id.clone(),
             recorded_at: self.recorded_at,
             rules_version: rules_version.to_string(),
@@ -77,111 +97,40 @@ impl CommandContext {
     }
 }
 
-/// A stale command's conflict under AGGREGATE_HANDLES (types.proto,
-/// ContextualCommand.conflict_nonce; backlog NC-1): the window of events the
-/// command did not see, and the nonce the handler must hand back through
-/// [`Conflict::resolve_conflicts`] before returning. The router reports the
-/// nonce it handed back (`ConflictReport.resolved_nonce`); a coordinator
-/// that finds any other value than the delivered one discards the output,
-/// COORDINATOR_REASON_CONFLICT_UNRESOLVED (ABORTED; decision 14.42).
-#[derive(Debug, Clone, Default)]
-pub struct Conflict {
-    window: Vec<pb::EventPage>,
-    nonce: Vec<u8>,
-    resolved: Arc<Mutex<Option<Vec<u8>>>>,
-}
-
-impl Conflict {
-    /// A conflict over `window` with the delivered `nonce`.
-    pub fn new(window: Vec<pb::EventPage>, nonce: Vec<u8>) -> Self {
-        Conflict {
-            window,
-            nonce,
-            resolved: Arc::default(),
-        }
-    }
-
-    /// The events the command did not see: the pages at sequences
-    /// `expected_sequence..head`, in order.
-    pub fn window(&self) -> &[pb::EventPage] {
-        &self.window
-    }
-
-    /// The nonce delivered with the command.
-    pub fn nonce(&self) -> &[u8] {
-        &self.nonce
-    }
-
-    /// The handler's declaration that it examined the window (the spec's
-    /// `resolve_conflicts(window, nonce)`). Only `nonce` is checked: it must
-    /// be exactly the delivered value.
-    pub fn resolve_conflicts(&self, window: &[pb::EventPage], nonce: &[u8]) {
-        let _ = window;
-        *self.resolved.lock().unwrap_or_else(|e| e.into_inner()) = Some(nonce.to_vec());
-    }
-
-    /// The nonce the handler last passed to
-    /// [`resolve_conflicts`](Self::resolve_conflicts), empty if it never
-    /// called it: what the router reports (`ConflictReport.resolved_nonce`,
-    /// decision 14.42).
-    pub fn resolved_nonce(&self) -> Vec<u8> {
-        self.resolved
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-            .unwrap_or_default()
+/// The input's arm as its book's page carries it. A page with no body is
+/// read as a command with no expected sequence: the router guards no
+/// envelope (decision 14.42).
+fn arm_of(page: Option<&pb::CommandPage>) -> InputArm {
+    match page.and_then(|p| p.body.as_ref()) {
+        Some(pb::command_page::Body::Fact(fact)) => InputArm::Fact {
+            origin: fact.origin.clone(),
+        },
+        Some(pb::command_page::Body::Command(command)) => InputArm::Command {
+            expected_sequence: command.handling.and_then(|h| h.expected_sequence),
+        },
+        None => InputArm::default(),
     }
 }
 
-/// The context a handler of `req` is handed, from the `ContextualCommand`
+/// The context a handler of `req` is handed, from the `HandleRequest`
 /// alone, whole: the next sequence and whether the stream has history
-/// (pages or a starting state) from its prior-events book; its cover, resolved
-/// Handling and identity as delivered; and, under AGGREGATE_HANDLES only,
-/// the conflict (the window from the expected sequence on, and the
-/// delivered nonce). What a runtime passes on with a refusal of `req` to
-/// its policy's translating callback
-/// ([`crate::policy::PolicyDispatch::dispatch_refusal`]).
-pub fn command_context(req: &pb::ContextualCommand) -> CommandContext {
-    let events = req.events.as_ref();
-    let next_sequence = crate::next_sequence(events);
-    let book = req.command.as_ref();
-    let handling = book.and_then(|b| b.handling).unwrap_or_default();
+/// (pages or a starting state) from its history; its cover, arm and
+/// identity as delivered; when it was accepted; and, for a policy's input,
+/// its trigger.
+pub fn command_context(req: &hpb::HandleRequest) -> CommandContext {
+    let history = req.history.as_ref();
+    let book = req.input.as_ref();
     let page = book.and_then(|b| b.page.as_ref());
-    let expected_sequence = handling.expected_sequence.unwrap_or(next_sequence);
-    let conflict_resolution = pb::ConflictResolution::try_from(handling.conflict_resolution)
-        .unwrap_or(pb::ConflictResolution::Unspecified);
-    let conflict = (conflict_resolution == pb::ConflictResolution::AggregateHandles).then(|| {
-        Conflict::new(
-            window_pages(events, expected_sequence),
-            req.conflict_nonce.to_vec(),
-        )
-    });
     CommandContext {
-        next_sequence,
-        had_prior_events: events.is_some_and(|b| !b.pages.is_empty() || b.snapshot.is_some()),
+        next_sequence: crate::next_sequence(history),
+        had_prior_events: history.is_some_and(|b| !b.pages.is_empty() || b.snapshot.is_some()),
         cover: book.and_then(|b| b.cover.clone()),
-        expected_sequence,
-        conflict_resolution,
-        conflict,
+        arm: arm_of(page),
         command_id: page.and_then(|p| p.command_id.clone()),
         correlation_id: page.and_then(|p| p.correlation_id.clone()),
-        fact_origin: page.and_then(|p| p.fact_origin.clone()),
         recorded_at: req.recorded_at,
+        causation: req.causation.clone(),
     }
-}
-
-/// The window under AGGREGATE_HANDLES: the prior-events pages at sequences
-/// `expected..`.
-pub(crate) fn window_pages(events: Option<&pb::EventBook>, expected: u64) -> Vec<pb::EventPage> {
-    events
-        .map(|b| {
-            b.pages
-                .iter()
-                .filter(|p| p.sequence >= expected)
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 #[cfg(test)]

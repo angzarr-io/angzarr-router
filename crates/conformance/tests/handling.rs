@@ -1,15 +1,18 @@
 //! Binds angzarr-project's handler-contract tier
 //! (features/handler-contract/handling.feature; the spec is the source, read
 //! from the submodule) to the Rust core: the order aggregate, the
-//! Fulfillment process manager (a domain, decision 14.31) and the
-//! OrderFulfillment policy, built by hand over the tier's orders.v1 fixture
-//! messages.
+//! fulfillment process manager (a domain, decision 14.31) and the
+//! order-fulfillment policy, built by hand over the tier's orders.v1
+//! fixture messages, on the handler layer's messages (decision 14.78).
 
 mod common;
 
-use angzarr_router::error::{CodedError, GrpcCode, RetryableStatus};
+use angzarr_router::domain::{Emit, NotIdempotent};
+use angzarr_router::error::{CodedError, GrpcCode, HandlerError, RetryableStatus};
+use angzarr_router::hpb;
 use angzarr_router::pb;
-use angzarr_router::router::CommandHandler;
+use angzarr_router::policy::{self, PolicyDispatch};
+use angzarr_router::router::{CommandHandler, RouterBuilder};
 use angzarr_router_conformance as conf;
 use cucumber::writer::Stats as _;
 use cucumber::{given, then, when, World};
@@ -26,34 +29,51 @@ impl std::fmt::Debug for Registered {
     }
 }
 
+/// How the order-fulfillment policy's one refusal callback answers.
+#[derive(Debug, Clone, Default)]
+enum Callback {
+    /// No callback: a policy written by hand without one.
+    #[default]
+    None,
+    /// A StockShort is translated into the "order" fact StockUnavailable;
+    /// every other refusal answers a Bug (C-0691, C-0854).
+    StockShortToStockUnavailable,
+}
+
+/// The step C-0853's helper checks.
+#[derive(Debug, Clone, Copy)]
+enum StepUnderCheck {
+    /// Records OrderNoteAdded "restock apple" only while no such note is in
+    /// the state.
+    OnlyWhileAbsent,
+    /// Records OrderNoteAdded "restock apple" whenever it runs.
+    Always,
+}
+
 #[derive(Debug, Default, World)]
 struct HandlingWorld {
     rules_version: String,
     pm_rules_version: String,
-    settle: conf::Settle,
+    behaviour: conf::OrderBehaviour,
     seen: conf::OrderSink,
+    /// What a continuation step saw (C-0849).
+    step_seen: conf::OrderSink,
     snapshot: Option<pb::Snapshot>,
-    result: Option<Result<pb::CommandHandlerResponse, CodedError>>,
-    pm_result: Option<Result<pb::CommandHandlerResponse, CodedError>>,
-    pm_placed: u32,
-    policy: Option<(String, String, String)>,
-    /// What the policy's business code answers each OrderPlaced with.
-    policy_commands: Vec<pb::CommandBook>,
-    /// The policy's ReserveStock refusal callback returns this fact, when
-    /// it has one (C-0691).
-    translates_to: Option<prost_types::Any>,
-    /// The refusals the policy's callback was called with.
-    translated: Arc<Mutex<Vec<pb::Refusal>>>,
-    /// The refusal handed to the policy, and its answer (C-0691, C-0692).
-    refusal: Option<pb::Refusal>,
-    refusal_answer: Option<Result<pb::OnRefusedResponse, CodedError>>,
     /// The pages of a delivery after its snapshot (C-0688).
     delivery_pages: Vec<pb::EventPage>,
-    policy_result: Option<Result<pb::PolicyResponse, CodedError>>,
+    result: Option<Result<hpb::HandleResponse, CodedError>>,
+    pm_result: Option<Result<hpb::HandleResponse, CodedError>>,
+    pm_writes: Option<conf::Writes>,
+    policy: Option<(String, String, String)>,
+    /// What the policy's business code answers each OrderPlaced with.
+    policy_outputs: Vec<hpb::Output>,
+    react_result: Option<Result<hpb::ReactResponse, CodedError>>,
+    callback: Callback,
+    /// The refused commands and refusals the callback was called with.
+    translated: Arc<Mutex<Vec<(prost_types::Any, hpb::Refusal)>>>,
+    translate_result: Option<Result<hpb::TranslateResponse, CodedError>>,
     registered: Option<Registered>,
     second_refusal: Option<CodedError>,
-    /// How AddItem fails, when it does (decision 14.37).
-    fails: Option<conf::AddItemFails>,
     /// When the delivery says its input was accepted (C-0671).
     recorded_at: Option<prost_types::Timestamp>,
     /// A handler's panic that escaped the router, with its text.
@@ -61,21 +81,28 @@ struct HandlingWorld {
     /// The answer to one of C-0670's conditions: `Ok` when it was not
     /// refused.
     outcome: Option<Result<(), CodedError>>,
+    step_under_check: Option<StepUnderCheck>,
+    step_check: Option<Result<(), NotIdempotent>>,
 }
 
 impl HandlingWorld {
+    fn order(&self) -> angzarr_router::domain::DomainDispatch<conf::orders::v1::OrderState> {
+        conf::order_aggregate(
+            conf::OrderBehaviour {
+                rules_version: self.rules_version.clone(),
+                ..self.behaviour.clone()
+            },
+            self.seen.clone(),
+        )
+    }
+
     /// Dispatches through the kernel-facing [`CommandHandler`], awaiting
     /// its answer.
-    async fn dispatch(&mut self, mut req: pb::ContextualCommand) {
+    async fn dispatch(&mut self, mut req: hpb::HandleRequest) {
         if self.recorded_at.is_some() {
             req.recorded_at = self.recorded_at;
         }
-        let order = conf::order_aggregate_with(
-            &self.rules_version,
-            self.settle.clone(),
-            self.seen.clone(),
-            self.fails.clone(),
-        );
+        let order = self.order();
         // A handler's panic is the router's to answer (decision 14.37);
         // one that escapes is recorded, for the Then steps to fail on.
         let answer = std::panic::AssertUnwindSafe(CommandHandler::dispatch(&order, &req))
@@ -95,35 +122,39 @@ impl HandlingWorld {
         }
     }
 
-    /// The error the scenario's input was refused with: one of C-0670's
-    /// conditions, or the handled command's.
+    /// The error the scenario's call failed with: one of C-0670's
+    /// conditions, a Translate's, or the handled input's.
     fn the_error(&self) -> &CodedError {
-        match &self.outcome {
-            Some(outcome) => outcome
+        if let Some(outcome) = &self.outcome {
+            return outcome
                 .as_ref()
-                .expect_err("expected the condition refused, it was not"),
-            None => self.refusal(),
+                .expect_err("expected the condition refused, it was not");
         }
+        if let Some(translated) = &self.translate_result {
+            return translated.as_ref().expect_err("expected Translate to fail");
+        }
+        self.refusal()
     }
 
-    fn accepted(&self) -> &pb::CommandHandlerResponse {
+    fn accepted(&self) -> &hpb::HandleResponse {
         self.result
             .as_ref()
-            .expect("a command was handled")
+            .expect("an input was handled")
             .as_ref()
-            .expect("expected the command accepted")
+            .expect("expected the input accepted")
     }
 
     fn refusal(&self) -> &CodedError {
         if let Some(text) = &self.escaped {
             panic!(
                 "the handler's panic escaped the router instead of being answered \
-                 ROUTER_REASON_UNHANDLED_HANDLER_ERROR with cause ROUTER_REASON_HANDLER_PANICKED: {text:?}"
+                 ANGZARR_REASON_UNHANDLED_HANDLER_ERROR with cause \
+                 ANGZARR_REASON_HANDLER_PANICKED: {text:?}"
             );
         }
         self.result
             .as_ref()
-            .expect("a command was handled")
+            .expect("an input was handled")
             .as_ref()
             .expect_err("expected a refusal")
     }
@@ -138,700 +169,8 @@ impl HandlingWorld {
     }
 }
 
-/// The `Kind "value"` pairs of `ItemAdded "pear", ItemAdded "plum" and ...`.
-fn history(list: &str) -> Vec<(String, String)> {
-    let parts: Vec<&str> = list.split('"').collect();
-    parts
-        .chunks(2)
-        .filter(|c| c.len() == 2)
-        .map(|c| {
-            let kind = c[0]
-                .trim()
-                .trim_start_matches(',')
-                .trim_start_matches("and")
-                .trim();
-            (kind.to_string(), c[1].to_string())
-        })
-        .collect()
-}
-
-fn resolution(name: &str) -> pb::ConflictResolution {
-    match name {
-        "STRICT" => pb::ConflictResolution::Strict,
-        "AGGREGATE_HANDLES" => pb::ConflictResolution::AggregateHandles,
-        "COMMUTATIVE" => pb::ConflictResolution::Commutative,
-        other => panic!("unknown resolution {other}"),
-    }
-}
-
-// --- the version -------------------------------------------------------------
-
-#[given(regex = r#"^an "order" business binary built as version "([^"]*)"$"#)]
-async fn order_binary(w: &mut HandlingWorld, version: String) {
-    w.rules_version = version;
-}
-
-#[given(regex = r#"^a "Fulfillment" process manager built as version "([^"]*)"$"#)]
-async fn fulfillment(w: &mut HandlingWorld, version: String) {
-    w.pm_rules_version = version;
-}
-
-#[when("the process manager handles a StartFulfillment command")]
-async fn pm_handles(w: &mut HandlingWorld) {
-    let pm = conf::fulfillment_pm(&w.pm_rules_version);
-    w.pm_result = Some(CommandHandler::dispatch(&pm, &conf::start_fulfillment()).await);
-}
-
-#[then(regex = r#"^the answer reports rules version "([^"]*)"$"#)]
-async fn reports(w: &mut HandlingWorld, version: String) {
-    let reported = match (&w.result, &w.pm_result) {
-        (_, Some(pm)) => pm.as_ref().expect("the PM answered").rules_version.clone(),
-        (Some(_), None) => w.accepted().rules_version.clone(),
-        (None, None) => panic!("nothing was handled"),
-    };
-    assert_eq!(reported, version);
-}
-
-#[given(
-    regex = r#"^a delivered snapshot of the order state recorded under rules version "([^"]*)"$"#
-)]
-async fn delivered_snapshot(w: &mut HandlingWorld, version: String) {
-    w.snapshot = Some(conf::order_snapshot(&["fig"], &version));
-}
-
-#[when(regex = r#"^AddItem "([^"]*)" is handled over that snapshot$"#)]
-async fn over_snapshot(w: &mut HandlingWorld, item: String) {
-    let snapshot = w.snapshot.clone();
-    w.dispatch(conf::order_command("AddItem", &item, &[], None, snapshot))
-        .await;
-}
-
-#[then("business code decides on the snapshot's state")]
-async fn decided_on_snapshot(w: &mut HandlingWorld) {
-    assert_eq!(w.observed().items, vec!["fig".to_string()]);
-}
-
-// --- commands, facts and upcasting --------------------------------------------
-
-#[when(regex = r#"^(\w+) "([^"]*)" is handled over no prior events$"#)]
-async fn handled(w: &mut HandlingWorld, command: String, item: String) {
-    w.dispatch(conf::order_command(&command, &item, &[], None, None))
-        .await;
-}
-
-#[when(regex = r#"^a fact (\w+) "([^"]*)" is handled over no prior events$"#)]
-async fn fact_handled(w: &mut HandlingWorld, fact: String, item: String) {
-    w.dispatch(conf::order_fact(&fact, &item)).await;
-}
-
-// --- the state on every answer (C-0570, C-0571; decisions 14.12, 14.14) -------
-
-#[given("business code that never mentions snapshots")]
-async fn never_mentions_snapshots(_w: &mut HandlingWorld) {}
-
-#[when(regex = r#"^(.+) is handled over ItemAdded "([^"]*)"$"#)]
-async fn delivery_over(w: &mut HandlingWorld, delivery: String, prior: String) {
-    let history = [("ItemAdded".to_string(), prior)];
-    let quoted = |text: &str| text.split('"').nth(1).unwrap_or_default().to_string();
-    let req = if delivery == "a command that business code answers with no events" {
-        conf::order_command("Acknowledge", "", &history, None, None)
-    } else if let Some(fact) = delivery.strip_prefix("a fact ") {
-        let mut req = conf::order_fact(fact.split(' ').next().unwrap(), &quoted(fact));
-        req.events = conf::order_command("AddItem", "", &history, None, None).events;
-        req
-    } else {
-        let command = delivery.split(' ').next().unwrap().to_string();
-        conf::order_command(&command, &quoted(&delivery), &history, None, None)
-    };
-    w.dispatch(req).await;
-}
-
-#[then(regex = r#"^the answer carries the order state with (.+) as its snapshot state$"#)]
-async fn answer_carries_state(w: &mut HandlingWorld, described: String) {
-    // `items "pear" and "apple"`, `item "pear"`, or `item "pear" and "apple"
-    // delivered` (the last quoted item delivered).
-    let quoted: Vec<&str> = described.split('"').skip(1).step_by(2).collect();
-    let (items, delivered) = if described.ends_with("delivered") {
-        quoted.split_at(quoted.len() - 1)
-    } else {
-        (quoted.as_slice(), &[][..])
-    };
-    let snapshot = w
-        .accepted()
-        .events
-        .as_ref()
-        .and_then(|b| b.snapshot.clone())
-        .expect("the answer's snapshot");
-    let mut expected: Vec<(String, u32)> = items.iter().map(|i| (i.to_string(), 1)).collect();
-    expected.sort();
-    assert_eq!(
-        conf::read_order_state(&snapshot.state.expect("a state")),
-        (
-            "/orders.v1.OrderState".to_string(),
-            expected,
-            delivered.iter().map(|d| d.to_string()).collect()
-        )
-    );
-}
-
-#[when(
-    regex = r"^the process manager handles a StartFulfillment command (and writes a FulfillmentStarted event|without writing a process event)$"
-)]
-async fn pm_handles_writing(w: &mut HandlingWorld, writing: String) {
-    let writes = writing.starts_with("and writes");
-    w.pm_placed = u32::from(writes);
-    let pm = conf::fulfillment_pm_writing(&w.pm_rules_version, writes);
-    w.pm_result = Some(CommandHandler::dispatch(&pm, &conf::start_fulfillment()).await);
-}
-
-fn pm_answer(w: &HandlingWorld) -> &pb::CommandHandlerResponse {
-    w.pm_result
-        .as_ref()
-        .expect("the PM handled")
-        .as_ref()
-        .expect("the PM answered")
-}
-
-#[then("the answer's snapshot state is the process manager's state after the command")]
-async fn pm_snapshot_state(w: &mut HandlingWorld) {
-    assert_eq!(
-        pm_answer(w)
-            .events
-            .as_ref()
-            .and_then(|b| b.snapshot.as_ref())
-            .and_then(|s| s.state.clone()),
-        Some(conf::fulfillment_state(w.pm_placed))
-    );
-}
-
-#[then("none of the answer's event pages carry a state")]
-async fn pm_pages_carry_no_state(w: &mut HandlingWorld) {
-    let events = pm_answer(w).events.as_ref().expect("its events");
-    // The state rides the snapshot only: every page is the PM's event.
-    assert_eq!(events.pages.len() as u32, w.pm_placed);
-    assert!(events.pages.iter().all(|p| p
-        .payload
-        .as_ref()
-        .is_some_and(|a| a.type_url.ends_with("orders.v1.FulfillmentStarted"))));
-}
-
-// --- policies: the router translates, the coordinator checks (14.42) ---------
-
-#[given(regex = r#"^an? "([^"]*)" policy translating "([^"]*)" events into "([^"]*)" commands$"#)]
-async fn policy_translating(w: &mut HandlingWorld, name: String, input: String, output: String) {
-    w.policy = Some((name, input, output));
-}
-
-/// A ReserveStock command for "inventory", as the policy's business code
-/// answers an OrderPlaced with.
-fn reserve_stock() -> pb::CommandBook {
-    conf::order_command_for("inventory", "ReserveStock")
-}
-
-#[given("its business code answers each OrderPlaced event with one ReserveStock command")]
-async fn answers_reserve_stock(w: &mut HandlingWorld) {
-    w.policy_commands = vec![reserve_stock()];
-}
-
-#[given(
-    regex = r#"^its business code answers an OrderPlaced event with a ShipOrder command for "([^"]*)" that names no root, no edition and another correlation$"#
-)]
-async fn answers_unchecked(w: &mut HandlingWorld, domain: String) {
-    let mut command = conf::order_command_for(&domain, "ShipOrder");
-    let cover = command.cover.as_mut().expect("a cover");
-    cover.root = None;
-    cover.edition = None;
-    command.page.as_mut().expect("a page").correlation_id = Some(pb::Uuid {
-        value: conf::root_of("another-correlation").into(),
-    });
-    w.policy_commands = vec![command];
-}
-
-/// A StockHoldRequested fact for "inventory", as the policy's business code
-/// answers an OrderPlaced with when its destination declares that type a
-/// fact (decision 14.69): the Fact arm, its payload alone.
-fn stock_hold_requested() -> pb::CommandBook {
-    let mut fact = conf::order_command_for("inventory", "StockHoldRequested");
-    let page = fact.page.as_mut().expect("a page");
-    page.body = match page.body.take() {
-        Some(pb::command_page::Body::Command(command)) => {
-            Some(pb::command_page::Body::Fact(pb::Fact {
-                payload: command.payload,
-            }))
-        }
-        other => other,
-    };
-    fact
-}
-
-#[given(
-    "its business code answers an OrderPlaced event with a ReserveStock command and then a StockHoldRequested fact"
-)]
-async fn answers_command_then_fact(w: &mut HandlingWorld) {
-    w.policy_commands = vec![reserve_stock(), stock_hold_requested()];
-}
-
-/// The policy from `policy_translating`, answering each OrderPlaced with
-/// `policy_commands`, handling `source`.
-async fn handle_policy(w: &mut HandlingWorld, source: pb::EventBook) {
-    let (name, input, output) = w.policy.clone().expect("a policy");
-    let commands = w.policy_commands.clone();
-    let policy = angzarr_router::policy::PolicyDispatch::new(name, input, output)
-        .on_event("orders.v1.OrderPlaced", move |_e, _c| Ok(commands.clone()));
-    let router = angzarr_router::router::RouterBuilder::new()
-        .policy(policy)
-        .build()
-        .expect("one policy");
-    w.policy_result = Some(router.dispatch_policy(&source).await);
-}
-
-/// An "order" book of `events` ((type, sequence)), from the order stream
-/// "order-1".
-fn order_book(events: &[(&str, u64)]) -> pb::EventBook {
-    pb::EventBook {
-        cover: Some(conf::cover_of("order", "order-1")),
-        pages: events
-            .iter()
-            .map(|(kind, sequence)| pb::EventPage {
-                sequence: *sequence,
-                payload: Some(prost_types::Any {
-                    type_url: angzarr_router::type_url(&format!("orders.v1.{kind}")),
-                    value: Vec::new(),
-                }),
-                ..Default::default()
-            })
-            .collect(),
-        ..Default::default()
-    }
-}
-
-#[when("the OrderPlaced event is handled")]
-async fn policy_handles(w: &mut HandlingWorld) {
-    handle_policy(w, order_book(&[("OrderPlaced", 1)])).await;
-}
-
-#[when(
-    regex = r"^a book holding OrderPlaced at sequence (\d+), an OrderNoteAdded at sequence (\d+) and OrderPlaced at sequence (\d+) is handled$"
-)]
-async fn policy_handles_book(w: &mut HandlingWorld, first: u64, note: u64, second: u64) {
-    handle_policy(
-        w,
-        order_book(&[
-            ("OrderPlaced", first),
-            ("OrderNoteAdded", note),
-            ("OrderPlaced", second),
-        ]),
-    )
-    .await;
-}
-
-fn policy_answer(w: &HandlingWorld) -> &pb::PolicyResponse {
-    w.policy_result
-        .as_ref()
-        .expect("the policy handled")
-        .as_ref()
-        .expect("the policy answered")
-}
-
-#[then("the answer is not refused")]
-async fn policy_not_refused(w: &mut HandlingWorld) {
-    policy_answer(w);
-}
-
-#[then("the answer's one reaction carries that ShipOrder command unchanged")]
-async fn one_reaction_unchanged(w: &mut HandlingWorld) {
-    let reactions = &policy_answer(w).reactions;
-    assert_eq!(reactions.len(), 1, "one reaction");
-    assert_eq!(reactions[0].outputs, w.policy_commands, "unchanged");
-}
-
-#[then(
-    "the answer's one reaction carries the ReserveStock command and then the StockHoldRequested fact, unchanged"
-)]
-async fn one_reaction_command_then_fact(w: &mut HandlingWorld) {
-    let reactions = &policy_answer(w).reactions;
-    assert_eq!(reactions.len(), 1, "one reaction");
-    assert_eq!(
-        reactions[0].outputs,
-        [reserve_stock(), stock_hold_requested()],
-        "the command then the fact, unchanged"
-    );
-}
-
-#[then(regex = r"^the answer holds (\w+) reactions, in page order:$")]
-async fn holds_reactions(w: &mut HandlingWorld, _count: String, step: &cucumber::gherkin::Step) {
-    let table = step.table.as_ref().expect("a table");
-    let expected: Vec<Vec<String>> = table.rows.iter().skip(1).cloned().collect();
-    let actual: Vec<Vec<String>> = policy_answer(w)
-        .reactions
-        .iter()
-        .map(|r| {
-            let types: Vec<&str> = r
-                .outputs
-                .iter()
-                .map(|c| {
-                    angzarr_router::command_payload(c.page.as_ref().expect("a page"))
-                        .map(|p| angzarr_router::type_name_from_url(&p.type_url))
-                        .expect("a command")
-                })
-                .collect();
-            let commands = match types.as_slice() {
-                [one] => format!("one {}", one.trim_start_matches("orders.v1.")),
-                other => panic!("expected one command per reaction, got {other:?}"),
-            };
-            vec![r.trigger_sequence.to_string(), commands]
-        })
-        .collect();
-    assert_eq!(actual, expected);
-}
-
-#[then(regex = r"^no reaction names sequence (\d+)$")]
-async fn no_reaction_for(w: &mut HandlingWorld, sequence: u64) {
-    assert!(policy_answer(w)
-        .reactions
-        .iter()
-        .all(|r| r.trigger_sequence != sequence));
-}
-
-// --- OnRefused: a translation or none (C-0691, C-0692; decision 14.42) ---------
-
-#[given(
-    regex = r#"^an "([^"]*)" policy whose (\w+) refusals are translated by a callback returning the "([^"]*)" fact (\w+)$"#
-)]
-async fn policy_translating_refusals(
-    w: &mut HandlingWorld,
-    name: String,
-    _command: String,
-    input: String,
-    fact: String,
-) {
-    w.policy = Some((name, input, "inventory".to_string()));
-    w.translates_to = Some(prost_types::Any {
-        type_url: angzarr_router::type_url(&format!("orders.v1.{fact}")),
-        value: conf::orders::v1::StockUnavailable {
-            item: "apple".to_string(),
-        }
-        .encode_to_vec(),
-    });
-}
-
-#[given(regex = r#"^an "([^"]*)" policy with no callback for (\w+) refusals$"#)]
-async fn policy_without_callback(w: &mut HandlingWorld, name: String, _command: String) {
-    w.policy = Some((name, "order".to_string(), "inventory".to_string()));
-}
-
-#[when(regex = r"^the policy is given the refusal of a (\w+) it sent$")]
-async fn policy_given_refusal(w: &mut HandlingWorld, command: String) {
-    let (name, input, output) = w.policy.clone().expect("a policy");
-    let mut sent = conf::order_command_for(&output, &command);
-    sent.page.as_mut().expect("a page").command_id = Some(pb::Uuid {
-        value: conf::root_of("refused-1").into(),
-    });
-    let refusal = pb::Refusal {
-        event: Some(order_book(&[("OrderPlaced", 1)])),
-        command: Some(sent),
-        response: None,
-    };
-    let mut policy = angzarr_router::policy::PolicyDispatch::new(name, input, output);
-    if let Some(fact) = w.translates_to.clone() {
-        let calls = w.translated.clone();
-        policy = policy.on_refused(&format!("orders.v1.{command}"), move |refusal, _ctx| {
-            calls.lock().unwrap().push(refusal.clone());
-            Ok(fact.clone())
-        });
-    }
-    let router = angzarr_router::router::RouterBuilder::new()
-        .policy(policy)
-        .build()
-        .expect("one policy");
-    w.refusal_answer = Some(
-        router
-            .dispatch_refusal(
-                &refusal,
-                &angzarr_router::context::CommandContext::default(),
-            )
-            .await,
-    );
-    w.refusal = Some(refusal);
-}
-
-fn refusal_answer(w: &HandlingWorld) -> &pb::OnRefusedResponse {
-    w.refusal_answer
-        .as_ref()
-        .expect("the policy was given a refusal")
-        .as_ref()
-        .expect("the policy answered")
-}
-
-#[then("the callback is called with that refusal")]
-async fn callback_called(w: &mut HandlingWorld) {
-    assert_eq!(
-        *w.translated.lock().unwrap(),
-        vec![w.refusal.clone().expect("a refusal")]
-    );
-}
-
-#[then(regex = r"^the answer's fact page carries (\w+) as its only content$")]
-async fn fact_page_only(w: &mut HandlingWorld, fact: String) {
-    let page = refusal_answer(w)
-        .fact
-        .as_ref()
-        .and_then(|f| f.page.as_ref())
-        .expect("a fact page");
-    let expected = pb::CommandPage {
-        body: Some(pb::command_page::Body::Fact(pb::Fact {
-            payload: w.translates_to.clone(),
-        })),
-        ..Default::default()
-    };
-    assert!(w
-        .translates_to
-        .as_ref()
-        .is_some_and(|a| a.type_url.ends_with(&fact)));
-    assert_eq!(*page, expected, "the payload alone");
-}
-
-#[then("the answer's fact sets no cover, no handling and no identity")]
-async fn fact_unaddressed(w: &mut HandlingWorld) {
-    let fact = refusal_answer(w).fact.as_ref().expect("a fact");
-    assert_eq!(fact.cover, None);
-    assert_eq!(fact.handling, None);
-    let page = fact.page.as_ref().expect("a page");
-    assert_eq!(page.command_id, None);
-    assert_eq!(page.correlation_id, None);
-    assert_eq!(page.causation_id, None);
-    assert_eq!(page.fact_origin, None);
-}
-
-#[then("the answer carries no fact")]
-async fn no_fact(w: &mut HandlingWorld) {
-    assert_eq!(refusal_answer(w).fact, None, "no translation");
-}
-
-// --- one component per business process (C-0580; decision 14.19) ------------
-
-#[given(r#"the "order" business binary has its "order" aggregate registered"#)]
-async fn order_registered(w: &mut HandlingWorld) {
-    let order = conf::order_aggregate(&w.rules_version, w.settle.clone(), w.seen.clone());
-    // The descriptor angzarr-cli generates for it (decision 14.42).
-    let descriptor = pb::ComponentDescriptor {
-        name: "order".to_string(),
-        kind: pb::ComponentKind::Aggregate as i32,
-        rules_version: w.rules_version.clone(),
-        ..Default::default()
-    };
-    w.registered = Some(Registered(
-        angzarr_router::router::RouterBuilder::new()
-            .aggregate(order)
-            .descriptor(descriptor)
-            .build()
-            .expect("the order aggregate"),
-    ));
-}
-
-// The native builder takes a process's component at once: registering a
-// second beside the order aggregate refuses the whole configuration, and the
-// process keeps the one it has.
-#[when(
-    regex = r#"^an? (aggregate|policy|process manager|projector) component "([^"]*)" is registered in the same business process$"#
-)]
-async fn second_registered(w: &mut HandlingWorld, kind: String, name: String) {
-    let order = conf::order_aggregate(&w.rules_version, w.settle.clone(), w.seen.clone());
-    let builder = angzarr_router::router::RouterBuilder::new().aggregate(order);
-    let builder = match kind.as_str() {
-        "aggregate" => builder.aggregate(angzarr_router::domain::DomainDispatch::new(
-            name.clone(),
-            name,
-            angzarr_router::rebuild::Rebuilder::new(|| ()),
-        )),
-        "policy" => builder.policy(angzarr_router::policy::PolicyDispatch::new(
-            name,
-            "order",
-            "inventory",
-        )),
-        "process manager" => builder.process_manager(conf::fulfillment_pm(&w.rules_version)),
-        _ => builder.projector(angzarr_router::projector::ProjectorDispatch::new(
-            name,
-            || (),
-        )),
-    };
-    w.second_refusal = builder.build().err();
-}
-
-#[then(
-    regex = r#"^the registration is refused with reason (\w+), naming the "order" aggregate already registered$"#
-)]
-async fn refused_naming_order(w: &mut HandlingWorld, reason: String) {
-    let err = w.second_refusal.as_ref().expect("refused");
-    assert_eq!(err.code, reason);
-    assert_eq!(
-        err.extras.get("component").map(String::as_str),
-        Some("order")
-    );
-    assert_eq!(
-        err.extras.get("component_kind").map(String::as_str),
-        Some("AGGREGATE")
-    );
-}
-
-#[then(r#"the business process describes only the "order" aggregate"#)]
-async fn describes_only_order(w: &mut HandlingWorld) {
-    let hello = w
-        .registered
-        .as_ref()
-        .expect("registered")
-        .0
-        .component_descriptor()
-        .expect("its description");
-    assert_eq!(hello.name, "order");
-    assert_eq!(hello.kind(), pb::ComponentKind::Aggregate);
-}
-
-#[then("the command is accepted")]
-async fn command_accepted(w: &mut HandlingWorld) {
-    w.accepted();
-}
-
-#[then("business code is not invoked")]
-async fn not_invoked(w: &mut HandlingWorld) {
-    assert!(w.seen.lock().unwrap().is_empty());
-}
-
-// --- conflicts -----------------------------------------------------------------
-
-#[given("business code settles conflicts with the nonce it was given")]
-async fn settles(w: &mut HandlingWorld) {
-    w.settle = conf::Settle::Delivered;
-}
-
-#[given("business code does not settle conflicts")]
-async fn does_not_settle(w: &mut HandlingWorld) {
-    w.settle = conf::Settle::Never;
-}
-
-#[given(regex = r#"^business code settles conflicts with nonce "([^"]*)"$"#)]
-async fn settles_with(w: &mut HandlingWorld, nonce: String) {
-    w.settle = conf::Settle::With(nonce.into_bytes());
-}
-
-#[when(
-    regex = r#"^AddItem "([^"]*)" is handled (STRICT|AGGREGATE_HANDLES|COMMUTATIVE) at expected sequence (\d+) over (.+?)(?: with nonce "([^"]*)")?$"#
-)]
-async fn handled_resolving(
-    w: &mut HandlingWorld,
-    item: String,
-    name: String,
-    expected: u64,
-    events: String,
-    nonce: String,
-) {
-    w.dispatch(conf::order_command(
-        "AddItem",
-        &item,
-        &history(&events),
-        Some((expected, resolution(&name), nonce.into_bytes())),
-        None,
-    ))
-    .await;
-}
-
-#[then(regex = r"^business code saw expected sequence (\d+) under (\w+)$")]
-async fn saw_handling(w: &mut HandlingWorld, expected: u64, name: String) {
-    let seen = w.observed();
-    assert_eq!(seen.expected_sequence, expected);
-    assert_eq!(seen.conflict_resolution, resolution(&name));
-}
-
-#[then("business code saw no conflict window and no nonce")]
-async fn saw_no_conflict(w: &mut HandlingWorld) {
-    let seen = w.observed();
-    assert_eq!(seen.window, None);
-    assert_eq!(seen.nonce, None);
-}
-
-#[then(regex = r"^business code saw the window at sequences (\d+) and (\d+)$")]
-async fn saw_window(w: &mut HandlingWorld, first: u64, second: u64) {
-    assert_eq!(w.observed().window, Some(vec![first, second]));
-}
-
-#[then(regex = r#"^business code saw items (.+) in its state$"#)]
-async fn saw_items(w: &mut HandlingWorld, items: String) {
-    // `"pear" and "plum"`, or `"pear", "plum" and "fig"`; the fixture
-    // records the state's items sorted.
-    let mut expected: Vec<String> = items
-        .split('"')
-        .skip(1)
-        .step_by(2)
-        .map(str::to_string)
-        .collect();
-    expected.sort();
-    assert_eq!(w.observed().items, expected);
-}
-
-// --- folding what it is given (C-0688; decision 14.40) -------------------------
-
-#[given(
-    regex = r#"^a delivered snapshot at sequence (\d+) of the order state with item "([^"]*)"$"#
-)]
-async fn snapshot_at(w: &mut HandlingWorld, sequence: u64, item: String) {
-    w.snapshot = Some(pb::Snapshot {
-        sequence,
-        ..conf::order_snapshot(&[&item], "")
-    });
-}
-
-#[given(regex = r"^the delivery's pages are (.+)$")]
-async fn delivery_pages(w: &mut HandlingWorld, pages: String) {
-    // `ItemAdded "plum" at sequence 5 and ItemAdded "fig" at sequence 6`.
-    w.delivery_pages = pages
-        .split(" and ")
-        .map(|page| {
-            let mut parts = page.split('"');
-            let kind = parts.next().expect("a kind").trim().to_string();
-            let item = parts.next().expect("an item").to_string();
-            let sequence = parts
-                .next()
-                .and_then(|rest| rest.trim().strip_prefix("at sequence "))
-                .and_then(|n| n.parse().ok())
-                .expect("at sequence N");
-            let mut req = conf::order_command("AddItem", "", &[(kind, item)], None, None);
-            let mut page = req.events.take().expect("a book").pages.remove(0);
-            page.sequence = sequence;
-            page
-        })
-        .collect();
-}
-
-#[when(regex = r#"^AddItem "([^"]*)" is handled over that delivery$"#)]
-async fn over_delivery(w: &mut HandlingWorld, item: String) {
-    let mut req = conf::order_command("AddItem", &item, &[], None, w.snapshot.clone());
-    let book = req.events.as_mut().expect("a book");
-    book.next_sequence = w.delivery_pages.last().map_or(0, |p| p.sequence + 1);
-    book.pages = w.delivery_pages.clone();
-    w.dispatch(req).await;
-}
-
-// --- the conflict report (C-0542 to C-0550; decision 14.42) -------------------
-
-fn reported(w: &HandlingWorld) -> pb::ConflictReport {
-    w.accepted()
-        .conflict
-        .clone()
-        .expect("the answer reports the conflict")
-}
-
-#[then(regex = r#"^the answer reports resolved nonce "([^"]*)"$"#)]
-async fn reports_nonce(w: &mut HandlingWorld, nonce: String) {
-    assert_eq!(reported(w).resolved_nonce, nonce.into_bytes());
-}
-
-#[then("the answer reports no resolved nonce")]
-async fn reports_no_nonce(w: &mut HandlingWorld) {
-    assert!(reported(w).resolved_nonce.is_empty(), "an empty nonce");
-}
-
-/// `"items[pear]"`, or several quoted units joined by commas and "and".
-fn quoted_units(text: &str) -> Vec<String> {
+/// The quoted strings of `text`, in order.
+fn quoted(text: &str) -> Vec<String> {
     text.split('"')
         .skip(1)
         .step_by(2)
@@ -839,38 +178,15 @@ fn quoted_units(text: &str) -> Vec<String> {
         .collect()
 }
 
-#[then(regex = r#"^the answer reports window units (".*") and command units (".*")$"#)]
-async fn reports_units(w: &mut HandlingWorld, window: String, command: String) {
-    let report = reported(w);
-    assert_eq!(report.window_units, quoted_units(&window), "window units");
-    assert_eq!(
-        report.command_units,
-        quoted_units(&command),
-        "command units"
-    );
+/// The type name and decoded string field 1 of an orders.v1 payload.
+fn order_payload(any: &prost_types::Any) -> (String, String) {
+    let name = angzarr_router::type_name_from_url(&any.type_url).to_string();
+    // Every orders.v1 event the scenarios name carries its text in field 1.
+    let text = conf::orders::v1::ItemAdded::decode(any.value.as_slice())
+        .map(|m| m.item)
+        .unwrap_or_default();
+    (name, text)
 }
-
-#[then("the answer carries business code's events")]
-async fn carries_events(w: &mut HandlingWorld) {
-    let item = w.observed().item;
-    let events = w.accepted().events.as_ref().expect("its events");
-    let added: Vec<String> = events
-        .pages
-        .iter()
-        .map(|p| {
-            let payload = p.payload.as_ref().expect("a payload");
-            assert!(payload.type_url.ends_with("orders.v1.ItemAdded"));
-            conf::orders::v1::ItemAdded::decode(payload.value.as_slice())
-                .expect("ItemAdded")
-                .item
-        })
-        .collect();
-    assert_eq!(added, vec![item], "business code's one ItemAdded");
-}
-
-// --- errors are a key and an argument map (decision 14.37) --------------------
-//
-// The extras render as the status's google.rpc.ErrorInfo metadata.
 
 fn grpc_name(code: GrpcCode) -> &'static str {
     match code {
@@ -908,119 +224,437 @@ fn expected_metadata(text: &str) -> Vec<(String, Option<String>)> {
         .collect()
 }
 
-fn add_item_fails(w: &mut HandlingWorld, fails: conf::AddItemFails) {
-    w.fails = Some(fails);
+// --- the version -------------------------------------------------------------
+
+#[given(regex = r#"^an "order" business binary built as version "([^"]*)"$"#)]
+async fn order_binary(w: &mut HandlingWorld, version: String) {
+    w.rules_version = version;
+}
+
+#[given(regex = r#"^a "fulfillment" process manager built as version "([^"]*)"$"#)]
+async fn fulfillment(w: &mut HandlingWorld, version: String) {
+    w.pm_rules_version = version;
+}
+
+async fn pm_handle(w: &mut HandlingWorld, writes: conf::Writes) {
+    w.pm_writes = Some(writes);
+    let pm = conf::fulfillment_pm(&w.pm_rules_version, writes);
+    w.pm_result = Some(CommandHandler::dispatch(&pm, &conf::start_fulfillment()).await);
+}
+
+#[when("the process manager handles a StartFulfillment command")]
+async fn pm_handles(w: &mut HandlingWorld) {
+    pm_handle(w, conf::Writes::Nothing).await;
+}
+
+#[when(
+    regex = r"^the process manager handles a StartFulfillment command (and writes a FulfillmentStarted event|without writing a process event)$"
+)]
+async fn pm_handles_writing(w: &mut HandlingWorld, writing: String) {
+    let writes = match writing.starts_with("and writes") {
+        true => conf::Writes::FulfillmentStarted,
+        false => conf::Writes::Nothing,
+    };
+    pm_handle(w, writes).await;
+}
+
+fn pm_answer(w: &HandlingWorld) -> &hpb::HandleResponse {
+    w.pm_result
+        .as_ref()
+        .expect("the PM handled")
+        .as_ref()
+        .expect("the PM answered")
+}
+
+#[then(regex = r#"^the answer reports rules version "([^"]*)"$"#)]
+async fn reports(w: &mut HandlingWorld, version: String) {
+    let reported = match (&w.result, &w.pm_result) {
+        (_, Some(_)) => pm_answer(w).rules_version.clone(),
+        (Some(_), None) => w.accepted().rules_version.clone(),
+        (None, None) => panic!("nothing was handled"),
+    };
+    assert_eq!(reported, version);
+}
+
+#[then("the answer's state is the process manager's state after the command")]
+async fn pm_state(w: &mut HandlingWorld) {
+    let placed = match w.pm_writes.expect("the PM handled") {
+        conf::Writes::FulfillmentStarted => 1,
+        conf::Writes::Nothing => 0,
+    };
+    assert_eq!(pm_answer(w).state, Some(conf::fulfillment_state(placed)));
+}
+
+#[then(regex = r"^the answer's events are (one FulfillmentStarted payload, nothing else|empty)$")]
+async fn pm_events(w: &mut HandlingWorld, events: String) {
+    let answered: Vec<String> = pm_answer(w)
+        .events
+        .iter()
+        .map(|e| angzarr_router::type_name_from_url(&e.type_url).to_string())
+        .collect();
+    let expected: Vec<String> = match events.as_str() {
+        "empty" => vec![],
+        _ => vec!["orders.v1.FulfillmentStarted".to_string()],
+    };
+    assert_eq!(answered, expected);
 }
 
 #[given(
-    regex = r#"^business code rejects AddItem with code (\w+) and arg (\w+) "([^"]*)", and logs "([^"]*)" for itself$"#
+    regex = r#"^a delivered snapshot of the order state recorded under rules version "([^"]*)"$"#
 )]
-async fn rejects_with_code(
-    w: &mut HandlingWorld,
-    code: String,
-    name: String,
-    value: String,
-    logs: String,
-) {
-    add_item_fails(
-        w,
-        conf::AddItemFails::Rejects {
-            status: angzarr_router::error::BusinessStatus::FailedPrecondition,
-            code,
-            args: vec![(name, value)],
-            logs,
-        },
+async fn delivered_snapshot(w: &mut HandlingWorld, version: String) {
+    w.snapshot = Some(conf::order_snapshot(&["fig"], &version));
+}
+
+#[when(regex = r#"^AddItem "([^"]*)" is handled over that snapshot$"#)]
+async fn over_snapshot(w: &mut HandlingWorld, item: String) {
+    let snapshot = w.snapshot.clone();
+    w.dispatch(conf::order_command("AddItem", &item, &[], snapshot))
+        .await;
+}
+
+#[then("business code decides on the snapshot's state")]
+async fn decided_on_snapshot(w: &mut HandlingWorld) {
+    assert_eq!(w.observed().items, vec!["fig".to_string()]);
+}
+
+#[then("the command is accepted")]
+async fn command_accepted(w: &mut HandlingWorld) {
+    w.accepted();
+}
+
+// --- registration (C-0580) ----------------------------------------------------
+
+#[given(r#"the "order" business binary has its "order" aggregate registered"#)]
+async fn order_registered(w: &mut HandlingWorld) {
+    // The descriptor angzarr-cli generates for it (decision 14.42).
+    let descriptor = pb::ComponentDescriptor {
+        name: "order".to_string(),
+        rules_version: w.rules_version.clone(),
+        kind: Some(pb::component_descriptor::Kind::Aggregate(
+            pb::AggregateDescriptor {
+                domain: "order".to_string(),
+                state: Some(pb::StateDescriptor {
+                    type_name: "orders.v1.OrderState".to_string(),
+                }),
+            },
+        )),
+    };
+    w.registered = Some(Registered(
+        RouterBuilder::new()
+            .aggregate(w.order())
+            .descriptor(descriptor)
+            .build()
+            .expect("the order aggregate"),
+    ));
+}
+
+// The native builder takes a process's component at once: registering a
+// second beside the order aggregate refuses the whole configuration, and the
+// process keeps the one it has.
+#[when(
+    regex = r#"^an? (aggregate|policy|process manager|projector) component "([^"]*)" is registered in the same business process$"#
+)]
+async fn second_registered(w: &mut HandlingWorld, kind: String, name: String) {
+    let builder = RouterBuilder::new().aggregate(w.order());
+    let builder = match kind.as_str() {
+        "aggregate" => builder.aggregate(angzarr_router::domain::DomainDispatch::new(
+            name.clone(),
+            name,
+            angzarr_router::rebuild::Rebuilder::new(|| ()),
+        )),
+        "policy" => builder.policy(PolicyDispatch::new(name, "order", "inventory")),
+        "process manager" => {
+            builder.process_manager(angzarr_router::domain::DomainDispatch::process_manager(
+                name.clone(),
+                name,
+                angzarr_router::rebuild::Rebuilder::new(|| ()),
+            ))
+        }
+        _ => builder.projector(angzarr_router::projector::ProjectorDispatch::new(
+            name,
+            || (),
+        )),
+    };
+    w.second_refusal = builder.build().err();
+}
+
+#[then(regex = r"^the registration is refused INTERNAL with reason (\w+)$")]
+async fn registration_refused(w: &mut HandlingWorld, reason: String) {
+    let err = w.second_refusal.as_ref().expect("refused");
+    assert_eq!(err.code, reason);
+    assert_eq!(err.grpc, GrpcCode::Internal);
+}
+
+async fn registered_and_refused(w: &mut HandlingWorld, registered: String, refused: String) {
+    let err = match &w.second_refusal {
+        Some(err) => err,
+        None => w.the_error(),
+    };
+    assert_eq!(err.extras.get("registered"), Some(&registered));
+    assert_eq!(err.extras.get("refused"), Some(&refused));
+}
+
+#[then(r#"the business process describes only the "order" aggregate"#)]
+async fn describes_only_order(w: &mut HandlingWorld) {
+    let described = w
+        .registered
+        .as_ref()
+        .expect("registered")
+        .0
+        .component_descriptor()
+        .expect("its description");
+    assert_eq!(described.name, "order");
+    assert!(matches!(
+        described.kind,
+        Some(pb::component_descriptor::Kind::Aggregate(_))
+    ));
+}
+
+// --- the state on every answer (C-0570; decisions 14.12, 14.14) ---------------
+
+#[given("business code that never mentions snapshots")]
+async fn never_mentions_snapshots(_w: &mut HandlingWorld) {}
+
+#[when(regex = r#"^(.+) is handled over ItemAdded "([^"]*)"$"#)]
+async fn delivery_over(w: &mut HandlingWorld, delivery: String, prior: String) {
+    let history = [("ItemAdded".to_string(), prior)];
+    let req = if delivery == "a command that business code answers with no events" {
+        conf::order_command("Acknowledge", "", &history, None)
+    } else if let Some(fact) = delivery.strip_prefix("a fact ") {
+        let name = fact.split(' ').next().unwrap();
+        conf::order_fact(name, &quoted(fact)[0], &history)
+    } else {
+        let command = delivery.split(' ').next().unwrap().to_string();
+        conf::order_command(&command, &quoted(&delivery)[0], &history, None)
+    };
+    w.dispatch(req).await;
+}
+
+/// The answer's state, read back.
+fn answered_state(w: &HandlingWorld) -> (String, Vec<(String, u32)>, Vec<String>, String) {
+    let state = w.accepted().state.as_ref().expect("the answer's state");
+    conf::read_order_state(state)
+}
+
+#[then(regex = r#"^the answer carries the order state with (.+) as its state$"#)]
+async fn answer_carries_state(w: &mut HandlingWorld, described: String) {
+    if described == "both folded in" {
+        // C-0848: ItemAdded "apple" and OrderNoteAdded "restock apple".
+        let (_, items, _, notes) = answered_state(w);
+        assert_eq!(items, vec![("apple".to_string(), 1)]);
+        assert_eq!(notes, "restock apple");
+        return;
+    }
+    // `items "pear" and "apple"`, `item "pear"`, `item "apple"`, or `item
+    // "pear" and "apple" delivered` (the last quoted item delivered).
+    let quoted = quoted(&described);
+    let (items, delivered) = if described.ends_with("delivered") {
+        quoted.split_at(quoted.len() - 1)
+    } else {
+        (quoted.as_slice(), &[][..])
+    };
+    let mut expected: Vec<(String, u32)> = items.iter().map(|i| (i.to_string(), 1)).collect();
+    expected.sort();
+    let (type_url, items, delivered_items, _) = answered_state(w);
+    assert_eq!(
+        (type_url, items, delivered_items),
+        (
+            "/orders.v1.OrderState".to_string(),
+            expected,
+            delivered.to_vec()
+        )
     );
 }
+
+// --- inputs --------------------------------------------------------------------
+
+#[when(regex = r#"^(\w+) "([^"]*)" is handled over no prior events$"#)]
+async fn handled(w: &mut HandlingWorld, command: String, item: String) {
+    w.dispatch(conf::order_command(&command, &item, &[], None))
+        .await;
+}
+
+#[when(regex = r#"^a fact (\w+) "([^"]*)" is handled over no prior events$"#)]
+async fn fact_handled(w: &mut HandlingWorld, fact: String, item: String) {
+    w.dispatch(conf::order_fact(&fact, &item, &[])).await;
+}
+
+#[then("business code is not invoked")]
+async fn not_invoked(w: &mut HandlingWorld) {
+    assert!(w.seen.lock().unwrap().is_empty());
+}
+
+// --- outcomes (decision 14.95) ------------------------------------------------
+
+/// A failure as a scenario names it, after "business code for X ".
+fn failure(text: &str) -> conf::AddItemFails {
+    let args = |text: &str| -> Vec<(String, String)> {
+        let quoted = quoted(text);
+        let name = text
+            .split(" and arg ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .expect("an arg name");
+        vec![(name.to_string(), quoted[0].clone())]
+    };
+    let code = |text: &str| -> String {
+        text.split("code ")
+            .nth(1)
+            .and_then(|rest| rest.split([' ', ',']).next())
+            .expect("a code")
+            .to_string()
+    };
+    if text.starts_with("refuses with the refusal object ItemOutOfStock") {
+        let quoted = quoted(text);
+        let on_hand = text.rsplit(' ').next().unwrap().parse().unwrap();
+        return conf::AddItemFails::Refuses {
+            item: quoted[0].clone(),
+            on_hand,
+        };
+    }
+    if text.starts_with("asks for a re-run") {
+        return conf::AddItemFails::Immediate {
+            code: code(text),
+            args: args(text),
+            logs: String::new(),
+        };
+    }
+    if let Some(rest) = text.strip_prefix("fails with a retryable bug under ") {
+        let status = match rest.split(',').next().unwrap() {
+            "UNAVAILABLE" => RetryableStatus::Unavailable,
+            "DEADLINE_EXCEEDED" => RetryableStatus::DeadlineExceeded,
+            "RESOURCE_EXHAUSTED" => RetryableStatus::ResourceExhausted,
+            other => panic!("no retryable status {other}"),
+        };
+        return conf::AddItemFails::BugRetryable {
+            status,
+            code: code(text),
+            args: args(text),
+            logs: String::new(),
+        };
+    }
+    if text.starts_with("fails with code ") {
+        return conf::AddItemFails::Bug {
+            code: code(text),
+            args: args(text),
+            logs: String::new(),
+        };
+    }
+    if text.starts_with("fails with an unclassified error") {
+        let text = quoted(text).first().cloned().unwrap_or_default();
+        return conf::AddItemFails::Errs { text };
+    }
+    if text.starts_with("panics with ") {
+        return conf::AddItemFails::Panics {
+            text: quoted(text)[0].clone(),
+        };
+    }
+    panic!("no failure {text}")
+}
+
+#[given(
+    regex = r#"^business code for AddItem (refuses with .*|asks for a re-run .*|fails with .*|panics with .*)$"#
+)]
+async fn add_item_fails(w: &mut HandlingWorld, fails: String) {
+    w.behaviour.fails = Some(failure(&fails));
+}
+
+#[given(regex = r#"^business code for the fact ItemDelivered (fails with .*)$"#)]
+async fn fact_fails(w: &mut HandlingWorld, fails: String) {
+    w.behaviour.fact = conf::FactReturns::Fails(failure(&fails));
+}
+
+#[then(regex = r"^the call fails with status (\w+) and reason (\w+)$")]
+async fn call_fails(w: &mut HandlingWorld, status: String, reason: String) {
+    let err = w.the_error();
+    assert_eq!(err.code, reason, "the reason key ({err:?})");
+    assert_eq!(grpc_name(err.grpc), status, "the gRPC status");
+}
+
+#[then("no HandleResponse is answered")]
+async fn no_handle_response(w: &mut HandlingWorld) {
+    assert!(w.result.as_ref().expect("handled").is_err());
+}
+
+#[then(regex = r#"^the answer's events are one ItemAdded "([^"]*)" payload$"#)]
+async fn one_item_added(w: &mut HandlingWorld, item: String) {
+    let answered: Vec<_> = w.accepted().events.iter().map(order_payload).collect();
+    assert_eq!(answered, vec![("orders.v1.ItemAdded".to_string(), item)]);
+}
+
+#[then("the answer carries no cover, no sequence, no command id and no event metadata")]
+async fn no_coordinator_fields(w: &mut HandlingWorld) {
+    // HandleResponse is the events as payloads, the state and the rules
+    // version, and nothing the coordinator stamps (decision 14.78).
+    let hpb::HandleResponse {
+        events: _,
+        state: _,
+        rules_version: _,
+    } = w.accepted();
+}
+
+#[then("the answer carries no refusal_type and no status details")]
+async fn no_refusal_parts(w: &mut HandlingWorld) {
+    let err = w.the_error();
+    assert!(!err.extras.contains_key("refusal_type"), "{err:?}");
+    assert!(err.refusal.is_none(), "{err:?}");
+}
+
+// --- typed refusals (decision 14.95) -------------------------------------------
 
 #[given(
     regex = r#"^business code refuses AddItem with the refusal object ItemOutOfStock with item "([^"]*)" and on_hand (\d+)$"#
 )]
-async fn refuses_typed(w: &mut HandlingWorld, item: String, on_hand: u32) {
-    add_item_fails(w, conf::AddItemFails::Refuses { item, on_hand });
+async fn refuses_out_of_stock(w: &mut HandlingWorld, item: String, on_hand: u32) {
+    w.behaviour.fails = Some(conf::AddItemFails::Refuses { item, on_hand });
 }
 
+#[given("AddItem declares no refuses types")]
+async fn no_refuses(_w: &mut HandlingWorld) {}
+
+// A command whose refuses names nothing cannot refuse (decision 14.95): the
+// router has no untyped rejection, so business code's own key is a bug's
+// cause.
 #[given(
-    regex = r#"^business code for AddItem (?:returns|fails with) an unclassified error whose text is "([^"]*)"$"#
+    regex = r#"^business code rejects AddItem with code (\w+) and arg (\w+) "([^"]*)", and logs "([^"]*)" for itself$"#
 )]
-async fn errs_with_text(w: &mut HandlingWorld, text: String) {
-    add_item_fails(w, conf::AddItemFails::Errs { text });
-}
-
-#[given(regex = r#"^business code for AddItem panics with "([^"]*)"$"#)]
-async fn panics_with(w: &mut HandlingWorld, text: String) {
-    add_item_fails(w, conf::AddItemFails::Panics { text });
-}
-
-#[given(
-    regex = r#"^business code for AddItem fails with code (\w+) and arg (\w+) "([^"]*)", and logs "([^"]*)" for itself$"#
-)]
-async fn fails_with_bug(
+async fn rejects_untyped(
     w: &mut HandlingWorld,
     code: String,
     name: String,
     value: String,
     logs: String,
 ) {
-    add_item_fails(
-        w,
-        conf::AddItemFails::Bug {
-            code,
-            args: vec![(name, value)],
-            logs,
-        },
-    );
+    w.behaviour.fails = Some(conf::AddItemFails::Bug {
+        code,
+        args: vec![(name, value)],
+        logs,
+    });
 }
 
-// C-0678 (decision 14.37, latest): a bug the handler marks retryable,
-// under the status it picks.
 #[given(
-    regex = r#"^business code for AddItem fails with a retryable bug under (\w+), code (\w+) and arg (\w+) "([^"]*)", and logs "([^"]*)" for itself$"#
+    regex = r"^business code refuses the counter's IncreaseBy with the refusal object ValueNotPositive with n (\d+)$"
 )]
-async fn fails_with_retryable_bug(
-    w: &mut HandlingWorld,
-    status: String,
-    code: String,
-    name: String,
-    value: String,
-    logs: String,
-) {
-    add_item_fails(
-        w,
-        conf::AddItemFails::BugRetryable {
-            status: match status.as_str() {
-                "UNAVAILABLE" => RetryableStatus::Unavailable,
-                "DEADLINE_EXCEEDED" => RetryableStatus::DeadlineExceeded,
-                "RESOURCE_EXHAUSTED" => RetryableStatus::ResourceExhausted,
-                other => panic!("{other} is no retryable status a handler picks"),
-            },
-            code,
-            args: vec![(name, value)],
-            logs,
-        },
-    );
+async fn counter_refuses(_w: &mut HandlingWorld, _n: u32) {
+    // The CounterAggregate refuses IncreaseBy 0 so (fixture/counter.proto).
 }
 
-// C-0679 (decision 14.37, latest): a handler's immediate-return business
-// error, under its own code.
+#[when(regex = r"^IncreaseBy (\d+) is handled over no prior events$")]
+async fn increase_handled(w: &mut HandlingWorld, n: u32) {
+    let counter = conf::counter_aggregate(conf::ObservedSink::default());
+    w.result = Some(CommandHandler::dispatch(&counter, &conf::increase_command(n)).await);
+}
+
 #[given(
     regex = r#"^business code rejects AddItem for immediate return with code (\w+) and arg (\w+) "([^"]*)", and logs "([^"]*)" for itself$"#
 )]
-async fn rejects_for_immediate_return(
-    w: &mut HandlingWorld,
-    code: String,
-    name: String,
-    value: String,
-    logs: String,
-) {
-    add_item_fails(
-        w,
-        conf::AddItemFails::Immediate {
-            code,
-            args: vec![(name, value)],
-            logs,
-        },
-    );
+async fn immediate(w: &mut HandlingWorld, code: String, name: String, value: String, logs: String) {
+    w.behaviour.fails = Some(conf::AddItemFails::Immediate {
+        code,
+        args: vec![(name, value)],
+        logs,
+    });
 }
 
 #[then(
@@ -1039,6 +673,14 @@ async fn refused_with_reason(w: &mut HandlingWorld, status: String, reason: Stri
 
 #[then(regex = r"^the refusal's error info carries (.+)$")]
 async fn error_info_carries(w: &mut HandlingWorld, metadata: String) {
+    if metadata.starts_with("registered ") {
+        return registered_and_refused(
+            w,
+            quoted(&metadata)[0].clone(),
+            quoted(&metadata)[1].clone(),
+        )
+        .await;
+    }
     let err = w.the_error();
     match metadata.as_str() {
         "no other metadata" => assert!(
@@ -1098,6 +740,19 @@ async fn details_carry_out_of_stock(w: &mut HandlingWorld, item: String, on_hand
     );
 }
 
+#[then(regex = r"^the refusal's status details carry the ValueNotPositive with n (\d+)$")]
+async fn details_carry_value(w: &mut HandlingWorld, n: u32) {
+    let refusal = w
+        .the_error()
+        .refusal
+        .as_deref()
+        .expect("the typed refusal in the status details");
+    assert_eq!(
+        conf::counter::ValueNotPositive::decode(refusal.value.as_slice()).unwrap(),
+        conf::counter::ValueNotPositive { n }
+    );
+}
+
 #[then(regex = r#"^no part of the answer carries the text "([^"]*)"$"#)]
 async fn no_text(w: &mut HandlingWorld, text: String) {
     let err = w.the_error();
@@ -1113,11 +768,44 @@ async fn no_text(w: &mut HandlingWorld, text: String) {
     }
 }
 
-// C-0670's conditions, each driven through the router's public API.
+// --- C-0670's conditions, each driven through the router's public API ----------
 
-fn with_payload_type(mut req: pb::ContextualCommand, type_url: &str) -> pb::ContextualCommand {
+fn condition(w: &mut HandlingWorld, outcome: Result<(), CodedError>) {
+    w.outcome = Some(outcome);
+}
+
+fn items(n: u64) -> Vec<(String, String)> {
+    (0..n)
+        .map(|i| ("ItemAdded".to_string(), format!("item-{i}")))
+        .collect()
+}
+
+async fn order_outcome(w: &HandlingWorld, req: hpb::HandleRequest) -> Result<(), CodedError> {
+    CommandHandler::dispatch(&w.order(), &req).await.map(|_| ())
+}
+
+#[when(regex = r"^the state fold fails on a persisted event at sequence (\d+)$")]
+async fn fold_fails_persisted(w: &mut HandlingWorld, sequence: u64) {
+    let mut history = items(sequence);
+    history.push(("ItemAdded".to_string(), conf::ROTTEN_ITEM.to_string()));
+    let outcome = order_outcome(w, conf::order_command("AddItem", "apple", &history, None)).await;
+    condition(w, outcome);
+}
+
+#[when(regex = r"^the state fold fails on an event the command emitted at sequence (\d+)$")]
+async fn fold_fails_emitted(w: &mut HandlingWorld, sequence: u64) {
+    let history = items(sequence);
+    let outcome = order_outcome(
+        w,
+        conf::order_command("AddItem", conf::ROTTEN_ITEM, &history, None),
+    )
+    .await;
+    condition(w, outcome);
+}
+
+fn with_payload_type(mut req: hpb::HandleRequest, type_url: &str) -> hpb::HandleRequest {
     let page = req
-        .command
+        .input
         .as_mut()
         .and_then(|b| b.page.as_mut())
         .expect("a page");
@@ -1130,156 +818,558 @@ fn with_payload_type(mut req: pb::ContextualCommand, type_url: &str) -> pb::Cont
     req
 }
 
-fn condition(w: &mut HandlingWorld, outcome: Result<(), CodedError>) {
-    w.outcome = Some(outcome);
-}
-
-fn items(n: u64) -> Vec<(String, String)> {
-    (0..n)
-        .map(|i| ("ItemAdded".to_string(), format!("item-{i}")))
-        .collect()
-}
-
-#[when(regex = r"^the state fold fails on a persisted event at sequence (\d+)$")]
-async fn fold_fails_persisted(w: &mut HandlingWorld, sequence: u64) {
-    let mut history = items(sequence);
-    history.push(("ItemAdded".to_string(), conf::ROTTEN_ITEM.to_string()));
-    w.dispatch(conf::order_command(
-        "AddItem", "apple", &history, None, None,
-    ))
-    .await;
-    let outcome = w.result.take().expect("handled").map(|_| ());
-    condition(w, outcome);
-}
-
-#[when(regex = r"^the state fold fails on an event the command emitted at sequence (\d+)$")]
-async fn fold_fails_emitted(w: &mut HandlingWorld, sequence: u64) {
-    let history = items(sequence);
-    w.dispatch(conf::order_command(
-        "AddItem",
-        conf::ROTTEN_ITEM,
-        &history,
-        None,
-        None,
-    ))
-    .await;
-    let outcome = w.result.take().expect("handled").map(|_| ());
-    condition(w, outcome);
-}
-
 #[when(regex = r#"^a command of type "([^"]*)" arrives$"#)]
 async fn command_of_type(w: &mut HandlingWorld, type_url: String) {
-    w.dispatch(with_payload_type(
-        conf::order_command("AddItem", "apple", &[], None, None),
-        &type_url,
-    ))
-    .await;
-    let outcome = w.result.take().expect("handled").map(|_| ());
+    let req = with_payload_type(conf::order_command("AddItem", "x", &[], None), &type_url);
+    let outcome = order_outcome(w, req).await;
     condition(w, outcome);
 }
 
 #[when(regex = r#"^a fact of type "([^"]*)" arrives$"#)]
 async fn fact_of_type(w: &mut HandlingWorld, type_url: String) {
-    w.dispatch(with_payload_type(
-        conf::order_fact("ItemDelivered", "apple"),
-        &type_url,
-    ))
-    .await;
-    let outcome = w.result.take().expect("handled").map(|_| ());
+    let req = with_payload_type(conf::order_fact("ItemDelivered", "x", &[]), &type_url);
+    let outcome = order_outcome(w, req).await;
     condition(w, outcome);
 }
 
-#[when(regex = r"^a CommandRefused for (\w+) arrives with no on_refused_(\w+)$")]
-async fn command_refused_unhandled(w: &mut HandlingWorld, command: String, _none: String) {
-    let refused = pb::CommandRefused {
-        command: Some(conf::order_command_for("order", &command)),
-        ..Default::default()
-    };
-    let mut req = conf::order_fact("ItemDelivered", "apple");
-    let req_page = req
-        .command
-        .as_mut()
-        .and_then(|b| b.page.as_mut())
-        .expect("a page");
-    req_page.body = Some(pb::command_page::Body::Fact(pb::Fact {
-        payload: Some(prost_types::Any {
-            type_url: angzarr_router::type_url("io.angzarr.v1.CommandRefused"),
-            value: refused.encode_to_vec(),
-        }),
-    }));
-    w.dispatch(req).await;
-    let outcome = w.result.take().expect("handled").map(|_| ());
-    condition(w, outcome);
-}
-
-#[when("a CommandRefused fact arrives whose payload does not decode")]
-async fn command_refused_undecodable(w: &mut HandlingWorld) {
-    let mut req = conf::order_fact("ItemDelivered", "apple");
+#[when("a fact ItemDelivered arrives whose payload does not decode")]
+async fn undecodable_fact(w: &mut HandlingWorld) {
+    let mut req = conf::order_fact("ItemDelivered", "x", &[]);
     let page = req
-        .command
+        .input
         .as_mut()
         .and_then(|b| b.page.as_mut())
         .expect("a page");
-    page.body = Some(pb::command_page::Body::Fact(pb::Fact {
-        payload: Some(prost_types::Any {
-            type_url: angzarr_router::type_url("io.angzarr.v1.CommandRefused"),
-            value: vec![0xff, 0xff, 0xff],
-        }),
-    }));
-    w.dispatch(req).await;
-    let outcome = w.result.take().expect("handled").map(|_| ());
+    if let Some(pb::command_page::Body::Fact(fact)) = page.body.as_mut() {
+        fact.payload.as_mut().expect("a payload").value = vec![0xff, 0xff, 0xff];
+    }
+    let outcome = order_outcome(w, req).await;
     condition(w, outcome);
 }
 
-#[when("a COMMUTATIVE command reaches a state with no resolver")]
-async fn commutative_without_resolver(w: &mut HandlingWorld) {
-    let order = angzarr_router::domain::DomainDispatch::new(
-        "order",
-        "order",
-        angzarr_router::rebuild::Rebuilder::new(|| ()),
-    )
-    .on_command("orders.v1.AddItem", |_cmd, _state, _cctx| Ok(None));
-    let req = conf::order_command(
-        "AddItem",
-        "apple",
-        &[],
-        Some((0, pb::ConflictResolution::Commutative, Vec::new())),
-        None,
-    );
-    condition(w, CommandHandler::dispatch(&order, &req).await.map(|_| ()));
+/// A ReserveStock as the order-fulfillment policy's coordinator delivered
+/// it: to the "inventory" stream of "inv-7", in the command arm.
+fn delivered_reserve_stock() -> pb::ReactionDelivery {
+    pb::ReactionDelivery {
+        cover: Some(conf::cover_of("inventory", "inv-7")),
+        body: Some(pb::reaction_delivery::Body::Command(conf::any_of(
+            &conf::orders::v1::ReserveStock {
+                item: "apple".to_string(),
+            },
+        ))),
+        command_id: Some(conf::uuid_of("reserve-1")),
+        correlation_id: Some(conf::uuid_of("order-1")),
+        causation: Some(pb::EventRef {
+            stream: Some(conf::cover_of("order", "order-1")),
+            sequence: 3,
+        }),
+        component: "order-fulfillment".to_string(),
+    }
+}
+
+/// Translate's request: the trigger, the delivered ReserveStock, and the
+/// refusal `typed` under FAILED_PRECONDITION.
+fn translate_request(typed: prost_types::Any) -> hpb::TranslateRequest {
+    hpb::TranslateRequest {
+        trigger: Some(conf::order_placed_trigger(3)),
+        command: Some(delivered_reserve_stock()),
+        refusal: Some(hpb::Refusal {
+            status: pb::RefusalStatus::FailedPrecondition as i32,
+            typed: Some(typed),
+        }),
+    }
+}
+
+fn stock_short(item: &str, on_hand: u32) -> prost_types::Any {
+    conf::any_of(&conf::orders::v1::StockShort {
+        item: item.to_string(),
+        on_hand,
+    })
+}
+
+#[when(
+    "a policy written by hand with no refusal callback is given a refusal of a ReserveStock it sent"
+)]
+async fn no_refusal_callback(w: &mut HandlingWorld) {
+    let router = RouterBuilder::new()
+        .policy(PolicyDispatch::new(
+            "order-fulfillment",
+            "order",
+            "inventory",
+        ))
+        .build()
+        .expect("one policy");
+    let outcome = router
+        .dispatch_translate(&translate_request(stock_short("apple", 0)))
+        .await
+        .map(|_| ());
+    condition(w, outcome);
 }
 
 #[when(r#"a policy is dispatched to the business process hosting the "order" aggregate"#)]
 async fn policy_to_aggregate(w: &mut HandlingWorld) {
-    let order = conf::order_aggregate(&w.rules_version, w.settle.clone(), w.seen.clone());
-    let router = angzarr_router::router::RouterBuilder::new()
-        .aggregate(order)
+    let router = RouterBuilder::new()
+        .aggregate(w.order())
         .build()
         .expect("the order aggregate");
-    condition(
-        w,
-        router
-            .dispatch_policy(&conf::order_placed_source())
-            .await
-            .map(|_| ()),
-    );
+    let outcome = router
+        .dispatch_react(&hpb::ReactRequest {
+            trigger: Some(conf::order_placed_trigger(0)),
+        })
+        .await
+        .map(|_| ());
+    condition(w, outcome);
 }
 
-#[when("the router is built with two components")]
-async fn built_with_two_components(w: &mut HandlingWorld) {
-    let order = conf::order_aggregate(&w.rules_version, w.settle.clone(), w.seen.clone());
-    let built = angzarr_router::router::RouterBuilder::new()
-        .aggregate(order)
+#[when(r#"the router is built with the "order" aggregate and then a "payment" aggregate"#)]
+async fn two_components(w: &mut HandlingWorld) {
+    let outcome = RouterBuilder::new()
+        .aggregate(w.order())
         .aggregate(angzarr_router::domain::DomainDispatch::new(
             "payment",
             "payment",
             angzarr_router::rebuild::Rebuilder::new(|| ()),
         ))
-        .build();
-    condition(w, built.map(|_| ()));
+        .build()
+        .map(|_| ());
+    condition(w, outcome);
 }
 
-// --- when the input was accepted (C-0671; decision 14.37) ---------------------
+// --- Emit (decision 14.104) ----------------------------------------------------
+
+#[given(
+    regex = r#"^business code for AddItem returns Emit of ItemAdded "([^"]*)", then a step that records OrderNoteAdded "([^"]*)" when an item's quantity reaches 1 and continues nowhere$"#
+)]
+async fn emit_restock(w: &mut HandlingWorld, _item: String, _note: String) {
+    w.behaviour.returns = conf::AddItemReturns::ThenRestockNote;
+}
+
+#[given(regex = r#"^business code for AddItem returns Emit of ItemAdded "([^"]*)", then a step$"#)]
+async fn emit_observing(w: &mut HandlingWorld, _item: String) {
+    w.behaviour.returns = conf::AddItemReturns::ThenObserve(w.step_seen.clone());
+}
+
+#[given(
+    regex = r#"^business code for AddItem returns Emit of ItemAdded "([^"]*)", then a step that (refuses with .*|fails with .*)$"#
+)]
+async fn emit_failing(w: &mut HandlingWorld, _item: String, fails: String) {
+    w.behaviour.returns = conf::AddItemReturns::ThenFails(failure(&fails));
+}
+
+#[given(
+    regex = r#"^business code for AddItem returns Emit of ItemAdded "([^"]*)", then (\d+) steps, each recording one OrderNoteAdded and continuing to the next$"#
+)]
+async fn emit_chain(w: &mut HandlingWorld, _item: String, steps: u32) {
+    w.behaviour.returns = conf::AddItemReturns::ThenChain(steps);
+}
+
+#[given(
+    regex = r#"^business code for the fact ItemDelivered returns Emit of the fact's own event, then a step that records OrderNoteAdded "([^"]*)"$"#
+)]
+async fn fact_emit(w: &mut HandlingWorld, _note: String) {
+    w.behaviour.fact = conf::FactReturns::ThenDeliveredNote;
+}
+
+/// The answer's events, as `(type name, text)` pairs.
+fn answered_events(w: &HandlingWorld) -> Vec<(String, String)> {
+    w.accepted().events.iter().map(order_payload).collect()
+}
+
+#[then(
+    regex = r#"^the answer's events are ItemAdded "([^"]*)" and OrderNoteAdded "([^"]*)", in that order$"#
+)]
+async fn item_then_note(w: &mut HandlingWorld, item: String, note: String) {
+    assert_eq!(
+        answered_events(w),
+        vec![
+            ("orders.v1.ItemAdded".to_string(), item),
+            ("orders.v1.OrderNoteAdded".to_string(), note),
+        ]
+    );
+}
+
+#[then(regex = r#"^the step saw items (.+) in its state$"#)]
+async fn step_saw(w: &mut HandlingWorld, list: String) {
+    let mut expected = quoted(&list);
+    expected.sort();
+    let seen = w
+        .step_seen
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("the step ran");
+    assert_eq!(seen.items, expected);
+}
+
+#[then("no events are answered")]
+async fn no_events_answered(w: &mut HandlingWorld) {
+    assert!(
+        w.result.as_ref().expect("handled").is_err(),
+        "an error answers no events"
+    );
+}
+
+#[then(
+    regex = r#"^the answer's events are the fact's own event and OrderNoteAdded "([^"]*)", in that order$"#
+)]
+async fn fact_then_note(w: &mut HandlingWorld, note: String) {
+    assert_eq!(
+        answered_events(w),
+        vec![
+            ("orders.v1.ItemDelivered".to_string(), "apple".to_string()),
+            ("orders.v1.OrderNoteAdded".to_string(), note),
+        ]
+    );
+}
+
+#[then(
+    regex = r#"^the answer's events are ItemAdded "([^"]*)" and (\d+) OrderNoteAdded events, in order$"#
+)]
+async fn item_then_notes(w: &mut HandlingWorld, item: String, n: u32) {
+    let mut expected = vec![("orders.v1.ItemAdded".to_string(), item)];
+    expected.extend((1..=n).map(|k| ("orders.v1.OrderNoteAdded".to_string(), format!("note {k}"))));
+    assert_eq!(answered_events(w), expected);
+}
+
+#[then("the call is not refused")]
+async fn not_refused(w: &mut HandlingWorld) {
+    w.accepted();
+}
+
+#[given(
+    regex = r#"^a step that records OrderNoteAdded "([^"]*)" (only while no such note is in the state|whenever it runs)$"#
+)]
+async fn step_under_check(w: &mut HandlingWorld, _note: String, when: String) {
+    w.step_under_check = Some(match when.as_str() {
+        "whenever it runs" => StepUnderCheck::Always,
+        _ => StepUnderCheck::OnlyWhileAbsent,
+    });
+}
+
+#[when("the client library's step-idempotence test helper runs it")]
+async fn helper_runs(w: &mut HandlingWorld) {
+    let state = conf::orders::v1::OrderState {
+        items: [("apple".to_string(), 1)].into(),
+        ..Default::default()
+    };
+    let ctx = angzarr_router::context::CommandContext::default();
+    let order = w.order();
+    let restock = conf::restock_step("apple".to_string());
+    w.step_check = Some(match w.step_under_check.expect("a step") {
+        StepUnderCheck::OnlyWhileAbsent => order.check_step_idempotent(&state, &ctx, restock),
+        StepUnderCheck::Always => order.check_step_idempotent(&state, &ctx, |_state, _ctx| {
+            Ok(Emit::of([conf::note("restock apple")]))
+        }),
+    });
+}
+
+#[then(regex = r"^the helper (passes|fails, naming the events the second run emitted)$")]
+async fn helper_verdict(w: &mut HandlingWorld, verdict: String) {
+    let check = w.step_check.as_ref().expect("the helper ran");
+    match verdict.as_str() {
+        "passes" => assert_eq!(check, &Ok(())),
+        _ => assert_eq!(
+            check,
+            &Err(NotIdempotent::EmittedAgain(vec![conf::note(
+                "restock apple"
+            )]))
+        ),
+    }
+}
+
+// --- folding what it is given (C-0688; decision 14.40) -------------------------
+
+#[given(
+    regex = r#"^a delivered snapshot at sequence (\d+) of the order state with item "([^"]*)"$"#
+)]
+async fn snapshot_at(w: &mut HandlingWorld, sequence: u64, item: String) {
+    let mut snapshot = conf::order_snapshot(&[&item], "1.0.0");
+    snapshot.sequence = sequence;
+    w.snapshot = Some(snapshot);
+}
+
+#[given(regex = r"^the delivery's pages are (.+)$")]
+async fn delivery_pages(w: &mut HandlingWorld, list: String) {
+    // `ItemAdded "plum" at sequence 5 and ItemAdded "fig" at sequence 6`.
+    w.delivery_pages = list
+        .split(" and ")
+        .map(|part| {
+            let item = quoted(part)[0].clone();
+            let sequence = part.rsplit(' ').next().unwrap().parse().unwrap();
+            conf::event_page(
+                sequence,
+                conf::any_of(&conf::orders::v1::ItemAdded { item }),
+            )
+        })
+        .collect();
+}
+
+#[when(regex = r#"^AddItem "([^"]*)" is handled over that delivery$"#)]
+async fn over_delivery(w: &mut HandlingWorld, item: String) {
+    let mut req = conf::order_command("AddItem", &item, &[], w.snapshot.clone());
+    let history = req.history.as_mut().expect("a history");
+    history.pages = w.delivery_pages.clone();
+    history.next_sequence = w.delivery_pages.last().map_or(0, |p| p.sequence + 1);
+    w.dispatch(req).await;
+}
+
+#[then(regex = r#"^business code saw items (.+) in its state$"#)]
+async fn saw_items(w: &mut HandlingWorld, list: String) {
+    let mut expected = quoted(&list);
+    expected.sort();
+    assert_eq!(w.observed().items, expected);
+}
+
+// --- policies: React and Translate (decisions 46 Q3, 14.69, 14.89) ------------
+
+#[given(regex = r#"^an? "([^"]*)" policy translating "([^"]*)" events into "([^"]*)" inputs$"#)]
+async fn policy_translating(w: &mut HandlingWorld, name: String, input: String, output: String) {
+    w.policy = Some((name, input, output));
+}
+
+fn reserve_stock(root: Option<pb::Uuid>) -> hpb::Output {
+    policy::command(
+        root,
+        conf::any_of(&conf::orders::v1::ReserveStock {
+            item: "apple".to_string(),
+        }),
+    )
+}
+
+fn stock_hold_requested() -> hpb::Output {
+    policy::fact(
+        Some(conf::uuid_of("inv-7")),
+        conf::any_of(&conf::orders::v1::StockHoldRequested {
+            item: "apple".to_string(),
+        }),
+    )
+}
+
+#[given("its business code answers each OrderPlaced event with one ReserveStock command")]
+async fn answers_reserve_stock(w: &mut HandlingWorld) {
+    w.policy_outputs = vec![reserve_stock(Some(conf::uuid_of("inv-7")))];
+}
+
+#[given(
+    "its business code answers an OrderPlaced event with a ReserveStock command that names no root"
+)]
+async fn answers_rootless(w: &mut HandlingWorld) {
+    w.policy_outputs = vec![reserve_stock(None)];
+}
+
+#[given(
+    "its business code answers an OrderPlaced event with a ReserveStock command and then a StockHoldRequested fact"
+)]
+async fn answers_command_then_fact(w: &mut HandlingWorld) {
+    w.policy_outputs = vec![
+        reserve_stock(Some(conf::uuid_of("inv-7"))),
+        stock_hold_requested(),
+    ];
+}
+
+async fn react(w: &mut HandlingWorld, trigger: pb::EventBook) {
+    let (name, input, output) = w.policy.clone().expect("a policy");
+    let outputs = w.policy_outputs.clone();
+    let policy = PolicyDispatch::new(name, input, output)
+        .on_event("orders.v1.OrderPlaced", move |_e, _c| Ok(outputs.clone()));
+    let router = RouterBuilder::new()
+        .policy(policy)
+        .build()
+        .expect("one policy");
+    w.react_result = Some(
+        router
+            .dispatch_react(&hpb::ReactRequest {
+                trigger: Some(trigger),
+            })
+            .await,
+    );
+}
+
+#[when(regex = r"^React is handed a trigger book holding only OrderPlaced at sequence (\d+)$")]
+async fn react_at(w: &mut HandlingWorld, sequence: u64) {
+    react(w, conf::order_placed_trigger(sequence)).await;
+}
+
+#[when("React is handed a trigger book holding only that OrderPlaced event")]
+async fn react_that(w: &mut HandlingWorld) {
+    react(w, conf::order_placed_trigger(1)).await;
+}
+
+fn reacted(w: &HandlingWorld) -> &[hpb::Output] {
+    &w.react_result
+        .as_ref()
+        .expect("the policy reacted")
+        .as_ref()
+        .expect("the policy answered")
+        .outputs
+}
+
+#[then("the answer holds one output, a ReserveStock in the command arm")]
+async fn one_reserve_output(w: &mut HandlingWorld) {
+    let outputs = reacted(w);
+    assert_eq!(outputs.len(), 1);
+    assert!(matches!(
+        &outputs[0].body,
+        Some(hpb::output::Body::Command(any)) if any.type_url == "/orders.v1.ReserveStock"
+    ));
+}
+
+#[then("no output names a trigger sequence")]
+async fn no_trigger_sequence(w: &mut HandlingWorld) {
+    // An Output is a root and a payload in its arm (decision 14.78); the
+    // answer has no trigger sequence to group outputs by.
+    let hpb::ReactResponse { outputs: _ } = w
+        .react_result
+        .as_ref()
+        .expect("reacted")
+        .as_ref()
+        .expect("answered");
+}
+
+#[then("the answer's one output carries that ReserveStock in the command arm, with no root")]
+async fn rootless_output(w: &mut HandlingWorld) {
+    assert_eq!(reacted(w), [reserve_stock(None)]);
+}
+
+#[then("the output carries no domain, no edition, no command id and no correlation")]
+async fn output_carries_nothing_else(w: &mut HandlingWorld) {
+    let hpb::Output { root: _, body: _ } = &reacted(w)[0];
+}
+
+#[then("the answer is not refused")]
+async fn react_not_refused(w: &mut HandlingWorld) {
+    reacted(w);
+}
+
+#[then(
+    "the answer's outputs are the ReserveStock in the command arm and then the StockHoldRequested in the fact arm, unchanged"
+)]
+async fn command_then_fact(w: &mut HandlingWorld) {
+    assert_eq!(
+        reacted(w),
+        [
+            reserve_stock(Some(conf::uuid_of("inv-7"))),
+            stock_hold_requested()
+        ]
+    );
+}
+
+#[given(
+    regex = r#"^an "([^"]*)" policy whose refusal callback translates a ReserveStock refused StockShort into the "order" fact StockUnavailable$"#
+)]
+async fn callback_translates(w: &mut HandlingWorld, name: String) {
+    w.policy = Some((name, "order".to_string(), "inventory".to_string()));
+    w.callback = Callback::StockShortToStockUnavailable;
+}
+
+#[given(
+    regex = r#"^an "([^"]*)" policy whose refusal callback answers a Bug for every refusal but StockShort$"#
+)]
+async fn callback_bugs(w: &mut HandlingWorld, name: String) {
+    w.policy = Some((name, "order".to_string(), "inventory".to_string()));
+    w.callback = Callback::StockShortToStockUnavailable;
+}
+
+async fn translate(w: &mut HandlingWorld, typed: prost_types::Any) {
+    let (name, input, output) = w.policy.clone().expect("a policy");
+    let translated = w.translated.clone();
+    let policy = match w.callback {
+        Callback::None => PolicyDispatch::new(name, input, output),
+        Callback::StockShortToStockUnavailable => PolicyDispatch::new(name, input, output)
+            .on_refused(move |command, refusal, _ctx| {
+                translated
+                    .lock()
+                    .unwrap()
+                    .push((command.clone(), refusal.clone()));
+                let typed = refusal
+                    .typed
+                    .as_ref()
+                    .ok_or_else(|| HandlerError::Coded(CodedError::bug("NO_REFUSAL_OBJECT", [])))?;
+                if angzarr_router::type_name_from_url(&typed.type_url) != "orders.v1.StockShort" {
+                    // Every other arm answers a Bug (decision 14.89).
+                    return Err(CodedError::bug("UNHANDLED_REFUSAL", []).into());
+                }
+                let short = conf::orders::v1::StockShort::decode(typed.value.as_slice())
+                    .map_err(|e| HandlerError::Other(e.to_string()))?;
+                Ok(conf::any_of(&conf::orders::v1::StockUnavailable {
+                    item: short.item,
+                }))
+            }),
+    };
+    let router = RouterBuilder::new()
+        .policy(policy)
+        .build()
+        .expect("one policy");
+    w.translate_result = Some(router.dispatch_translate(&translate_request(typed)).await);
+}
+
+#[when(
+    regex = r#"^Translate is handed the refusal StockShort with item "([^"]*)" and on_hand (\d+), under FAILED_PRECONDITION, of a ReserveStock it sent$"#
+)]
+async fn translate_stock_short(w: &mut HandlingWorld, item: String, on_hand: u32) {
+    translate(w, stock_short(&item, on_hand)).await;
+}
+
+#[when("Translate is handed a refusal of another type of a ReserveStock it sent")]
+async fn translate_other(w: &mut HandlingWorld) {
+    translate(
+        w,
+        conf::any_of(&conf::orders::v1::ItemOutOfStock {
+            item: "apple".to_string(),
+            on_hand: 0,
+        }),
+    )
+    .await;
+}
+
+#[then("the callback is called with that ReserveStock and that StockShort")]
+async fn callback_called(w: &mut HandlingWorld) {
+    let translated = w.translated.lock().unwrap();
+    assert_eq!(translated.len(), 1, "called once");
+    let (command, refusal) = &translated[0];
+    let Some(pb::reaction_delivery::Body::Command(delivered)) = delivered_reserve_stock().body
+    else {
+        panic!("the delivery's command arm");
+    };
+    assert_eq!(command, &delivered);
+    assert_eq!(refusal.status(), pb::RefusalStatus::FailedPrecondition);
+    assert_eq!(refusal.typed, Some(stock_short("apple", 0)));
+}
+
+#[then("the answer is the fact StockUnavailable as its only content")]
+async fn answer_is_stock_unavailable(w: &mut HandlingWorld) {
+    let answer = w
+        .translate_result
+        .as_ref()
+        .expect("translated")
+        .as_ref()
+        .expect("answered");
+    assert_eq!(
+        answer.fact,
+        Some(conf::any_of(&conf::orders::v1::StockUnavailable {
+            item: "apple".to_string()
+        }))
+    );
+}
+
+#[then("the answer sets no cover, no handling and no identity")]
+async fn answer_sets_nothing_else(w: &mut HandlingWorld) {
+    // TranslateResponse is the fact's payload alone (decision 14.78).
+    let hpb::TranslateResponse { fact: _ } = w
+        .translate_result
+        .as_ref()
+        .expect("translated")
+        .as_ref()
+        .expect("answered");
+}
+
+#[then("no fact is answered")]
+async fn no_fact(w: &mut HandlingWorld) {
+    assert!(w.translate_result.as_ref().expect("translated").is_err());
+}
+
+// --- recorded_at (C-0671; decision 14.37) ---------------------------------------
 
 #[given(regex = r#"^the delivery says its input was accepted at "([^"]*)"$"#)]
 async fn accepted_at(w: &mut HandlingWorld, at: String) {
@@ -1292,7 +1382,7 @@ async fn read_accepted_at(w: &mut HandlingWorld, at: String) {
     assert_eq!(
         w.observed().recorded_at,
         Some(expected),
-        "CommandContext.recorded_at is the delivery's ContextualCommand.recorded_at"
+        "CommandContext.recorded_at is the delivery's HandleRequest.recorded_at"
     );
 }
 

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use prost::Message;
 use prost_types::Any;
 
-use crate::error::RouterReason;
+use crate::error::AngzarrReason;
 use crate::pb;
 use crate::rebuild::{FoldFailure, PageOrigin, Rebuilder};
 use crate::test_support::*;
@@ -75,7 +75,7 @@ fn an_applier_failing_on_a_persisted_event_is_a_handler_bug_naming_it() {
     let type_url = crate::type_url(&cover_full_name());
     assert_fold_failed(
         &err,
-        "ROUTER_REASON_FOLD_FAILED",
+        "ANGZARR_REASON_FOLD_FAILED",
         &[
             (reason_args::SEQUENCE, "5"),
             (reason_args::TYPE_URL, type_url.as_str()),
@@ -101,8 +101,7 @@ fn an_applier_failing_on_a_persisted_event_is_a_handler_bug_naming_it() {
 #[test]
 fn an_applier_failing_with_a_coded_error_gives_the_fold_its_cause() {
     let r = fresh_rebuilder().apply(&cover_full_name(), |_state: &mut TestState, _event| {
-        Err(Box::new(crate::error::CodedError::rejection(
-            crate::error::BusinessStatus::FailedPrecondition,
+        Err(Box::new(crate::error::CodedError::immediate(
             "BAD_COVER",
             [("field".to_string(), "domain".to_string())],
         )))
@@ -113,7 +112,7 @@ fn an_applier_failing_with_a_coded_error_gives_the_fold_its_cause() {
             ..Default::default()
         }))
         .expect_err("the applier failed");
-    assert_eq!(err.code, "ROUTER_REASON_FOLD_FAILED");
+    assert_eq!(err.code, "ANGZARR_REASON_FOLD_FAILED");
     assert_eq!(
         err.extras.get("cause").map(String::as_str),
         Some("BAD_COVER")
@@ -156,7 +155,7 @@ fn a_starting_state_the_codec_cannot_decode_is_persisted_event_corrupt() {
         ..Default::default()
     };
     let err = r.rebuild(Some(&book)).expect_err("unloadable");
-    assert_eq!(err.code, RouterReason::PersistedEventCorrupt.as_str_name());
+    assert_eq!(err.code, AngzarrReason::PersistedEventCorrupt.as_str_name());
 }
 
 #[test]
@@ -474,7 +473,7 @@ fn a_batched_fold_sees_every_page_in_one_call() {
         pages: vec![
             sequenced_event_page(1, cover_any("at-the-snapshot")),
             sequenced_event_page(2, cover_any("a")),
-            sequenced_event_page(3, pb::EventPage::default().payload.unwrap_or_default()),
+            sequenced_event_page(3, prost_types::Any::default()),
         ],
         ..Default::default()
     };
@@ -535,7 +534,7 @@ fn a_batched_fold_failure_names_the_page_it_indexes() {
     let type_url = crate::type_url(&cover_full_name());
     assert_fold_failed(
         &err,
-        "ROUTER_REASON_FOLD_FAILED",
+        "ANGZARR_REASON_FOLD_FAILED",
         &[
             (reason_args::SEQUENCE, "5"),
             (reason_args::TYPE_URL, type_url.as_str()),
@@ -571,7 +570,7 @@ fn an_unlocated_or_out_of_range_fold_failure_names_the_batchs_range() {
             .expect_err("the fold failed");
         assert_fold_failed(
             &err,
-            "ROUTER_REASON_FOLD_FAILED",
+            "ANGZARR_REASON_FOLD_FAILED",
             &[
                 (reason_args::FIRST_SEQUENCE, "4"),
                 (reason_args::LAST_SEQUENCE, "6"),
@@ -599,14 +598,14 @@ fn folding_emitted_pages_says_the_command_emitted_them() {
         .expect_err("failed");
     assert_fold_failed(
         &err,
-        "ROUTER_REASON_FOLD_FAILED_EMITTED",
+        "ANGZARR_REASON_FOLD_FAILED_EMITTED",
         &[(reason_args::SEQUENCE, "4")],
         "/test.State",
     );
     let err = r
         .apply_pages(&mut state, &book.pages, None, PageOrigin::Persisted)
         .expect_err("failed");
-    assert_eq!(err.code, "ROUTER_REASON_FOLD_FAILED");
+    assert_eq!(err.code, "ANGZARR_REASON_FOLD_FAILED");
 
     // Per-page appliers say the same.
     let r = cover_applier(fresh_rebuilder());
@@ -618,7 +617,7 @@ fn folding_emitted_pages_says_the_command_emitted_them() {
             PageOrigin::Emitted,
         )
         .expect_err("failed");
-    assert_eq!(err.code, "ROUTER_REASON_FOLD_FAILED_EMITTED");
+    assert_eq!(err.code, "ANGZARR_REASON_FOLD_FAILED_EMITTED");
 }
 
 #[test]
@@ -655,8 +654,8 @@ fn apply_page_goes_through_a_batched_fold_when_registered() {
 // --- a panicking applier or batched fold (decision 14.37) -------------------
 //
 // A panic in a fold is a handler bug like an error is: the fold fails as
-// ROUTER_REASON_FOLD_FAILED (ROUTER_REASON_FOLD_FAILED_EMITTED for the command's own events) with cause
-// ROUTER_REASON_HANDLER_PANICKED, and the router answers rather than unwinding into its
+// ANGZARR_REASON_FOLD_FAILED (ANGZARR_REASON_FOLD_FAILED_EMITTED for the command's own events) with cause
+// ANGZARR_REASON_HANDLER_PANICKED, and the router answers rather than unwinding into its
 // host. The panic's message stays in the handler's own log.
 
 /// A rebuilder over "/test.State" whose Cover applier panics.
@@ -675,11 +674,11 @@ fn panicking_fold() -> Rebuilder<TestState> {
         .with_fold(|_s: &mut TestState, _pages, _cover| panic!("index out of bounds"))
 }
 
-/// The fold failed with cause ROUTER_REASON_HANDLER_PANICKED and no other cause args.
+/// The fold failed with cause ANGZARR_REASON_HANDLER_PANICKED and no other cause args.
 fn assert_panicked_cause(err: &crate::error::CodedError) {
     assert_eq!(
         err.extras.get(reason_args::CAUSE).map(String::as_str),
-        Some(RouterReason::HandlerPanicked.as_str_name()),
+        Some(AngzarrReason::HandlerPanicked.as_str_name()),
         "a panicking fold's cause: {:?}",
         err.extras
     );
@@ -703,7 +702,7 @@ fn a_panicking_applier_fails_the_rebuild_naming_the_page() {
     let type_url = crate::type_url(&cover_full_name());
     assert_fold_failed(
         &err,
-        "ROUTER_REASON_FOLD_FAILED",
+        "ANGZARR_REASON_FOLD_FAILED",
         &[
             (reason_args::SEQUENCE, "4"),
             (reason_args::TYPE_URL, type_url.as_str()),
@@ -719,7 +718,7 @@ fn a_panicking_batched_fold_fails_the_rebuild_naming_the_batchs_range() {
     let err = answered(|| r.rebuild(Some(&three_pages()))).expect_err("the fold panicked");
     assert_fold_failed(
         &err,
-        "ROUTER_REASON_FOLD_FAILED",
+        "ANGZARR_REASON_FOLD_FAILED",
         &[
             (reason_args::FIRST_SEQUENCE, "4"),
             (reason_args::LAST_SEQUENCE, "6"),
@@ -739,7 +738,7 @@ fn a_panicking_batched_fold_of_emitted_pages_is_fold_failed_emitted() {
         .expect_err("the fold panicked");
     assert_fold_failed(
         &err,
-        "ROUTER_REASON_FOLD_FAILED_EMITTED",
+        "ANGZARR_REASON_FOLD_FAILED_EMITTED",
         &[
             (reason_args::FIRST_SEQUENCE, "4"),
             (reason_args::LAST_SEQUENCE, "6"),
@@ -756,7 +755,7 @@ fn a_panicking_applier_of_emitted_pages_is_fold_failed_emitted() {
     let err = answered(|| {
         r.apply_emitted(
             &mut state,
-            &[event_page(cover_any("a"))],
+            &[cover_any("a")],
             None,
             7,
             &pb::EventMeta::default(),
@@ -765,7 +764,7 @@ fn a_panicking_applier_of_emitted_pages_is_fold_failed_emitted() {
     .expect_err("the applier panicked");
     assert_fold_failed(
         &err,
-        "ROUTER_REASON_FOLD_FAILED_EMITTED",
+        "ANGZARR_REASON_FOLD_FAILED_EMITTED",
         &[(reason_args::SEQUENCE, "7")],
         "/test.State",
     );
@@ -780,7 +779,7 @@ fn a_panicking_batched_fold_of_one_page_names_it() {
         .expect_err("the fold panicked");
     assert_fold_failed(
         &err,
-        "ROUTER_REASON_FOLD_FAILED",
+        "ANGZARR_REASON_FOLD_FAILED",
         &[
             (reason_args::FIRST_SEQUENCE, "9"),
             (reason_args::LAST_SEQUENCE, "9"),
@@ -791,7 +790,7 @@ fn a_panicking_batched_fold_of_one_page_names_it() {
 }
 
 // A panicking codec is a defect in user code, not corrupt data (corrupt
-// bytes are a decode error): ROUTER_REASON_FOLD_FAILED with cause ROUTER_REASON_HANDLER_PANICKED, naming
+// bytes are a decode error): ANGZARR_REASON_FOLD_FAILED with cause ANGZARR_REASON_HANDLER_PANICKED, naming
 // the snapshot by its sequence and its state's type URL.
 #[test]
 fn a_panicking_codec_fails_the_rebuild_naming_the_snapshot() {
@@ -810,7 +809,7 @@ fn a_panicking_codec_fails_the_rebuild_naming_the_snapshot() {
     let err = answered(|| r.rebuild(Some(&book))).expect_err("the codec panicked");
     assert_fold_failed(
         &err,
-        "ROUTER_REASON_FOLD_FAILED",
+        "ANGZARR_REASON_FOLD_FAILED",
         &[
             (reason_args::SEQUENCE, "3"),
             (reason_args::TYPE_URL, snap_state.type_url.as_str()),

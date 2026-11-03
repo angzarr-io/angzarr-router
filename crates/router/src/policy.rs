@@ -1,49 +1,85 @@
-//! PolicyDispatch — the stateless source-event → commands translator.
+//! PolicyDispatch — a stateless policy: React to one source event,
+//! Translate one refusal of a command it sent (decision 14.78;
+//! docs/design/policies.md §6).
 //!
-//! A policy holds NO state and rebuilds nothing: every page of the source book
-//! is a fresh trigger. Declared event types emit commands; an undeclared
-//! event type is skipped (C-0051), not an error. There is no compensation
-//! input. Emitted commands pass through as the handler returned them,
-//! grouped by the page that triggered them (decision 14.42): the policy's
-//! coordinator checks each one's destination, edition, root and
-//! correlation, stamps the trigger's edition, and stamps its identity,
-//! causation and correlation.
+//! A policy holds NO state and rebuilds nothing. React is handed ONE
+//! trigger event (decision 46, Q3: a policy is a function of one event and
+//! is called once per trigger): a declared event type answers its outputs,
+//! an undeclared one nothing (C-0051, C-0710). An output is the destination
+//! stream's root and the payload in the arm of its kind, a command or a
+//! fact (decisions 14.78 and 14.91): everything else (its domain, edition,
+//! identity, correlation and causation) is the coordinator's, which also
+//! checks every output (decision 14.42). The router passes the outputs
+//! through as business code returned them, in order.
 //!
-//! Refusals (policy.proto, PolicyService, Refusals; decisions 14.31, 14.42):
-//! when one of the policy's commands is refused,
-//! [`PolicyDispatch::dispatch_refusal`] (the policy's OnRefused) runs the
-//! callback the policy registers for the refused command's type
-//! ([`PolicyDispatch::on_refused`]) and answers the domestic fact's payload
-//! it returns (translate), or, with no callback, answers that it has no
-//! translation. The coordinator builds the pass-through `CommandRefused`
-//! itself, and addresses and identifies every refusal fact.
+//! Refusals take ONE path (decision 46 #5) through ONE callback per policy
+//! (decision 14.89, [`PolicyDispatch::on_refused`]): it takes the refused
+//! command and its target's typed refusal, and answers a domestic fact's
+//! payload, or a bug for a refusal it does not handle. There is no
+//! pass-through and no policy that declines; a policy written by hand with
+//! no callback answers ANGZARR_REASON_NO_REFUSAL_HANDLER.
 
 use std::collections::HashMap;
 
 use prost_types::Any;
 
-use crate::context::CommandContext;
-use crate::error::{call_handler, CodedError, HandlerError};
+use crate::error::{call_handler, AngzarrReason, CodedError, HandlerError};
+use crate::hpb;
 use crate::pb;
 use crate::PageContext;
+use angzarr_proto::v1::reason_args;
 
-/// Translates one source event into commands. Generated thunks unmarshal
-/// to the typed event and call the typed business method; the source event's
-/// place arrives as a [`PageContext`] (the source book's cover and the
-/// event's sequence).
+/// Reacts to one source event. Generated thunks unmarshal to the typed
+/// event and call the typed business method; the event's place and
+/// metadata arrive as a [`PageContext`]. It answers the outputs, built with
+/// [`command`] and [`fact`].
 pub type EventFn = Box<
-    dyn for<'a> Fn(&Any, &PageContext<'a>) -> Result<Vec<pb::CommandBook>, HandlerError>
+    dyn for<'a> Fn(&Any, &PageContext<'a>) -> Result<Vec<hpb::Output>, HandlerError> + Send + Sync,
+>;
+
+/// A command for the policy's destination stream rooted at `root`: an
+/// Output in the command arm (decision 14.91), what generated code builds
+/// for a type its destination declares `(command)`.
+pub fn command(root: Option<pb::Uuid>, payload: Any) -> hpb::Output {
+    hpb::Output {
+        root,
+        body: Some(hpb::output::Body::Command(payload)),
+    }
+}
+
+/// A fact for the policy's destination stream rooted at `root`: an Output
+/// in the fact arm (decision 14.91), what generated code builds for a type
+/// its destination declares `(fact)`.
+pub fn fact(root: Option<pb::Uuid>, payload: Any) -> hpb::Output {
+    hpb::Output {
+        root,
+        body: Some(hpb::output::Body::Fact(payload)),
+    }
+}
+
+/// What the policy's one refusal callback is handed beside the refused
+/// command and its refusal: the full context, read-only (decision 46, Q1).
+#[derive(Debug, Clone, Copy)]
+pub struct RefusalContext<'a> {
+    /// The triggering event the policy reacted to: its cover, sequence and
+    /// metadata (the refused command's causation).
+    pub trigger: PageContext<'a>,
+    /// The refused command exactly as it was delivered (decision 14.79):
+    /// its cover (the destination and root) and the identity the
+    /// coordinator stamped.
+    pub delivery: &'a pb::ReactionDelivery,
+}
+
+/// The policy's ONE refusal callback (decision 14.89): the refused
+/// command's payload (its target's command choice), the target's typed
+/// refusal with the status it travelled as, and the context; answers a fact
+/// of the policy's own source domain, packed, or a bug for a refusal it does
+/// not handle.
+pub type RefusalFn = Box<
+    dyn for<'a> Fn(&Any, &hpb::Refusal, &RefusalContext<'a>) -> Result<Any, HandlerError>
         + Send
         + Sync,
 >;
-
-/// A policy's translating callback for one refused command type: reads the
-/// `Refusal` (the triggering event, the command as sent, the target's
-/// response with its typed refusal object) and the refused command's
-/// [`CommandContext`] (as its target's handler was handed it), and returns
-/// a fact of the policy's source domain, packed.
-pub type RefusalFn =
-    Box<dyn Fn(&pb::Refusal, &CommandContext) -> Result<Any, HandlerError> + Send + Sync>;
 
 /// The dispatch table for one policy component.
 pub struct PolicyDispatch {
@@ -51,13 +87,13 @@ pub struct PolicyDispatch {
     input_domain: String,
     output_domain: String,
     handlers: HashMap<String, EventFn>,
-    refusals: HashMap<String, RefusalFn>,
+    refused: Option<RefusalFn>,
 }
 
 impl PolicyDispatch {
-    /// An empty policy table translating events of its one source domain,
-    /// `input_domain`, into commands for its one destination domain,
-    /// `output_domain` (options.proto ComponentOptions; decision 14.24).
+    /// An empty policy table reacting to events of its one source domain,
+    /// `input_domain`, with commands and facts for its one destination
+    /// domain, `output_domain` (decision 14.24).
     pub fn new(
         name: impl Into<String>,
         input_domain: impl Into<String>,
@@ -68,30 +104,17 @@ impl PolicyDispatch {
             input_domain: input_domain.into(),
             output_domain: output_domain.into(),
             handlers: HashMap::new(),
-            refusals: HashMap::new(),
+            refused: None,
         }
     }
 
-    /// Registers the translation thunk for a fully-qualified event type; it
-    /// receives the source book's cover.
+    /// Registers the reaction to a fully-qualified event type; it receives
+    /// the event's [`PageContext`]: the source book's cover, the event's
+    /// sequence and its metadata.
     pub fn on_event(
-        self,
-        full_name: &str,
-        thunk: impl Fn(&Any, Option<&pb::Cover>) -> Result<Vec<pb::CommandBook>, HandlerError>
-            + Send
-            + Sync
-            + 'static,
-    ) -> Self {
-        self.on_event_with_context(full_name, move |any, source| thunk(any, source.cover))
-    }
-
-    /// Registers the translation thunk for a fully-qualified event type; it
-    /// receives the source event's [`PageContext`]: the source book's cover
-    /// and the event's sequence (0 when the page carries none).
-    pub fn on_event_with_context(
         mut self,
         full_name: &str,
-        thunk: impl for<'a> Fn(&Any, &PageContext<'a>) -> Result<Vec<pb::CommandBook>, HandlerError>
+        thunk: impl for<'a> Fn(&Any, &PageContext<'a>) -> Result<Vec<hpb::Output>, HandlerError>
             + Send
             + Sync
             + 'static,
@@ -100,77 +123,18 @@ impl PolicyDispatch {
         self
     }
 
-    /// Registers the translating callback for refusals of the
-    /// fully-qualified command type `command` (translate mode; policy.proto,
-    /// Refusals). Its presence IS translate mode for that command; a refused
-    /// command of a type with none is passed through. The callback reads the
-    /// `Refusal` and the refused command's [`CommandContext`], whole.
+    /// Registers the policy's ONE refusal callback (decision 14.89),
+    /// replacing any earlier one: every refusal of a command the policy
+    /// sent reaches it.
     pub fn on_refused(
         mut self,
-        command: &str,
-        thunk: impl Fn(&pb::Refusal, &CommandContext) -> Result<Any, HandlerError>
+        thunk: impl for<'a> Fn(&Any, &hpb::Refusal, &RefusalContext<'a>) -> Result<Any, HandlerError>
             + Send
             + Sync
             + 'static,
     ) -> Self {
-        self.refusals.insert(command.to_string(), Box::new(thunk));
+        self.refused = Some(Box::new(thunk));
         self
-    }
-
-    /// `PolicyService.OnRefused`: the translation of the refusal
-    /// ([`Self::translate_refusal`]) as a fact page carrying only the
-    /// callback's payload (C-0691), or, with no callback for the refused
-    /// command's type, an empty answer: no translation (C-0692). Its cover,
-    /// handling and identity are the coordinator's to set, as is the
-    /// pass-through fact. The callback is handed `ctx`, the refused
-    /// command's context as its target's handler was handed it: the
-    /// runtime passes on [`command_context`](crate::context::command_context)
-    /// of the `ContextualCommand` it delivered. Over the wire, policy.proto's
-    /// OnRefused request is the `Refusal` alone, so a server answering it
-    /// knows only what the refused command's book carries (its cover,
-    /// identity and Handling): the next sequence, the history flag and the
-    /// conflict stay unset there. A failing callback is a policy bug
-    /// (dead-lettered and alerted).
-    pub fn dispatch_refusal(
-        &self,
-        refusal: &pb::Refusal,
-        ctx: &CommandContext,
-    ) -> Result<pb::OnRefusedResponse, CodedError> {
-        let fact = self
-            .translate_refusal(refusal, ctx)?
-            .map(|payload| pb::CommandBook {
-                page: Some(pb::CommandPage {
-                    body: Some(pb::command_page::Body::Fact(pb::Fact {
-                        payload: Some(payload),
-                    })),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            });
-        Ok(pb::OnRefusedResponse { fact })
-    }
-
-    /// The translation of a refusal: the payload of the translating
-    /// callback for the refused command's type, handed the `Refusal` and
-    /// `ctx` (a failing one is a policy bug, as in [`Self::dispatch_refusal`]);
-    /// `None` when there is none for that type, the coordinator then
-    /// passing the refusal through (decision 14.42).
-    pub fn translate_refusal(
-        &self,
-        refusal: &pb::Refusal,
-        ctx: &CommandContext,
-    ) -> Result<Option<Any>, CodedError> {
-        let refused_type = refusal
-            .command
-            .as_ref()
-            .and_then(|c| c.page.as_ref())
-            .and_then(crate::command_payload)
-            .map(|p| crate::type_name_from_url(&p.type_url).to_string())
-            .unwrap_or_default();
-        match self.refusals.get(&refused_type) {
-            Some(translate) => call_handler(|| translate(refusal, ctx)).map(Some),
-            None => Ok(None),
-        }
     }
 
     /// The component name.
@@ -183,8 +147,9 @@ impl PolicyDispatch {
         &self.input_domain
     }
 
-    /// The one domain its commands go to: the descriptor's output domain,
-    /// which the coordinator checks them against (decision 14.42).
+    /// The one domain its commands and facts go to: the descriptor's
+    /// output domain, which the coordinator addresses them to and checks
+    /// them against (decision 14.42).
     pub fn output_domain(&self) -> &str {
         &self.output_domain
     }
@@ -194,50 +159,69 @@ impl PolicyDispatch {
         self.handlers.keys().cloned().collect()
     }
 
-    /// The subscription map: input domain → declared event types.
-    pub fn subscriptions(&self) -> HashMap<String, Vec<String>> {
-        let mut m = HashMap::new();
-        m.insert(self.input_domain.clone(), self.event_types());
-        m
+    /// `PolicyService.React`: the outputs for the trigger book's one event
+    /// (decision 46, Q3), as business code returned them, commands and facts
+    /// in one index space and in order (decision 14.69); none for an
+    /// undeclared event type, or a book with no page. The router guards no
+    /// envelope (decision 14.42): the coordinator hands one page.
+    pub fn react(&self, req: &hpb::ReactRequest) -> Result<hpb::ReactResponse, CodedError> {
+        let Some(trigger) = req.trigger.as_ref() else {
+            return Ok(hpb::ReactResponse::default());
+        };
+        let Some((page, event)) = trigger
+            .pages
+            .first()
+            .and_then(|page| crate::page_event(page).map(|event| (page, event)))
+        else {
+            return Ok(hpb::ReactResponse::default());
+        };
+        let Some(thunk) = self
+            .handlers
+            .get(crate::type_name_from_url(&event.type_url))
+        else {
+            return Ok(hpb::ReactResponse::default()); // a policy reacts to its declared types only (C-0051)
+        };
+        let context = PageContext {
+            cover: trigger.cover.as_ref(),
+            sequence: page.sequence,
+            meta: page.meta.as_ref(),
+        };
+        let outputs = call_handler(|| thunk(event, &context))?;
+        Ok(hpb::ReactResponse { outputs })
     }
 
-    /// Walks EVERY page of the source book: declared event types emit;
-    /// undeclared types are skipped. The answer holds one
-    /// `PolicyReaction` per handled page, in page order, naming its
-    /// trigger's sequence, an empty one included, and none for an
-    /// unhandled page (decision 14.42). Its outputs, commands and facts
-    /// alike (decision 14.69), pass through as
-    /// business code returned them, unchecked and unstamped, in emission
-    /// order (C-0690). A source with no pages answers no reactions: the
-    /// router guards no envelope (decision 14.42).
-    pub fn dispatch(&self, source: &pb::EventBook) -> Result<pb::PolicyResponse, CodedError> {
-        let mut resp = pb::PolicyResponse::default();
-
-        for page in &source.pages {
-            let Some(event_any) = crate::page_event(page) else {
-                continue;
-            };
-            let Some(thunk) = self
-                .handlers
-                .get(crate::type_name_from_url(&event_any.type_url))
-            else {
-                continue; // a policy handles only its declared types (spec C-0051)
-            };
-            let context = PageContext {
-                cover: source.cover.as_ref(),
-                sequence: page.sequence,
-                meta: page.meta.as_ref(),
-            };
-            let outputs = call_handler(|| thunk(event_any, &context))?;
-            // One reaction per handled page, an empty one included
-            // (decision 14.42).
-            resp.reactions.push(pb::PolicyReaction {
-                trigger_sequence: page.sequence,
-                outputs,
-            });
-        }
-
-        Ok(resp)
+    /// `PolicyService.Translate`: the policy's one refusal callback run on
+    /// the refused command's payload and the target's refusal, its answer
+    /// the domestic fact's payload alone (C-0691): the coordinator
+    /// addresses, identifies and delivers it. A failing callback, or one
+    /// answering a bug for a refusal it does not handle, is a policy bug
+    /// (dead-lettered and alerted; C-0854). With no callback (a policy
+    /// written by hand), ANGZARR_REASON_NO_REFUSAL_HANDLER naming the
+    /// refused command's type URL (C-0670).
+    pub fn translate(
+        &self,
+        req: &hpb::TranslateRequest,
+    ) -> Result<hpb::TranslateResponse, CodedError> {
+        let untyped = Any::default();
+        let delivered = pb::ReactionDelivery::default();
+        let delivery = req.command.as_ref().unwrap_or(&delivered);
+        let command = match &delivery.body {
+            Some(
+                pb::reaction_delivery::Body::Command(any) | pb::reaction_delivery::Body::Fact(any),
+            ) => any,
+            None => &untyped,
+        };
+        let Some(refused) = self.refused.as_ref() else {
+            return Err(CodedError::keyed(
+                AngzarrReason::NoRefusalHandler,
+                [(
+                    reason_args::COMMAND_TYPE.to_string(),
+                    command.type_url.clone(),
+                )],
+            ));
+        };
+        let _ = refused;
+        todo!("RED: the one refusal callback (decision 14.89)");
     }
 }
 
@@ -248,7 +232,3 @@ mod policy_tests;
 #[cfg(test)]
 #[path = "refusal.test.rs"]
 mod refusal_tests;
-
-#[cfg(test)]
-#[path = "addressing.test.rs"]
-mod addressing_tests;

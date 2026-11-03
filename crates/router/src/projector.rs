@@ -1,19 +1,24 @@
 //! ProjectorDispatch — the events → projection table.
 //!
-//! One projection instance per delivery folds every declared event page in
+//! `ProjectorService.Project` (decision 14.78): one projection instance
+//! per delivery folds every declared event page of one stream's run in
 //! order (the instance is reused across pages — spec C-0086), then an
-//! optional Finish packs it into the wire Projection (without one, the
-//! Projection carries the cover, the projector's name and its next
-//! sequence). Unlike the aggregate
-//! there is no prior-state rebuild, no snapshot, and no rejection path: an
-//! event with no registered handler is skipped with a warn; events whose book cover carries an undeclared domain
-//! never fold, though Finish still runs.
+//! optional Finish packs it into the answer's projection, payload only
+//! (`ProjectResponse.projection`): the coordinator builds the Projection
+//! record (its cover, projector and position) and marks the run only on
+//! this affirmative answer (decision 14.97). Without a Finish the answer
+//! carries no projection. Unlike the aggregate there is no prior-state
+//! rebuild, no snapshot, and no refusal path: an event with no registered
+//! handler is skipped with a warn; a run whose cover carries an undeclared
+//! domain never folds, though Finish still runs. There is no wildcard
+//! domain (decision 14.53): a projector lists every domain it reads.
 
 use std::collections::{HashMap, HashSet};
 
 use prost_types::Any;
 
-use crate::error::{call_handler, map_handler_error, CodedError, HandlerError, RouterReason};
+use crate::error::{call_handler, map_handler_error, AngzarrReason, CodedError, HandlerError};
+use crate::hpb;
 use crate::pb;
 use crate::rebuild::{fold_error, page_fold_error, FoldFailure, PageOrigin};
 
@@ -24,10 +29,10 @@ pub use crate::PageContext;
 pub type EventFn<P> =
     Box<dyn for<'a> Fn(&mut P, &Any, &PageContext<'a>) -> Result<(), HandlerError> + Send + Sync>;
 
-/// Packs the folded projection instance into the wire Projection. When
-/// absent, dispatch returns a default Projection (cover + projector name).
+/// Packs the folded projection instance into the answer's projection
+/// payload. When absent, the answer carries none.
 pub type FinishFn<P> =
-    Box<dyn Fn(&mut P, &pb::EventBook) -> Result<pb::Projection, HandlerError> + Send + Sync>;
+    Box<dyn Fn(&mut P, &pb::EventBook) -> Result<prost_types::Any, HandlerError> + Send + Sync>;
 
 /// Folds every page of a consumed book into the projection in one call: the
 /// batched alternative to per-type folds, for a projection the router holds
@@ -82,9 +87,9 @@ impl<P> ProjectorDispatch<P> {
         self
     }
 
-    /// Restricts folding to books whose cover carries one of these domains;
-    /// [`crate::WILDCARD_DOMAIN`] (`"*"`) among them consumes every domain.
-    /// Unset (the default) consumes every domain.
+    /// Restricts folding to books whose cover carries one of these domains,
+    /// each named (no wildcard, decision 14.53). Unset (the default)
+    /// consumes every domain.
     pub fn for_domains(mut self, domains: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.domains = Some(domains.into_iter().map(Into::into).collect());
         self
@@ -103,12 +108,11 @@ impl<P> ProjectorDispatch<P> {
         self
     }
 
-    /// Registers the finisher that packs the folded instance into the wire
-    /// Projection (its sequence and custom payload). Without it dispatch
-    /// returns a default Projection carrying the cover and projector name.
+    /// Registers the finisher that packs the folded instance into the
+    /// answer's projection payload. Without it the answer carries none.
     pub fn finish(
         mut self,
-        thunk: impl Fn(&mut P, &pb::EventBook) -> Result<pb::Projection, HandlerError>
+        thunk: impl Fn(&mut P, &pb::EventBook) -> Result<prost_types::Any, HandlerError>
             + Send
             + Sync
             + 'static,
@@ -127,18 +131,22 @@ impl<P> ProjectorDispatch<P> {
         self.handlers.keys().cloned().collect()
     }
 
-    /// Folds every page of the book into one projection instance, then runs
-    /// the finisher (or returns a default Projection). An undeclared domain
-    /// folds nothing but still finishes; an event type with no thunk is
-    /// skipped. It guards no envelope (decision 14.42): a book with no
-    /// cover is read as one with an empty cover.
-    pub fn dispatch(&self, events: &pb::EventBook) -> Result<pb::Projection, CodedError> {
+    /// `ProjectorService.Project`: folds every page of the request's run
+    /// into one projection instance, then runs the finisher, answering its
+    /// payload (none without one). An undeclared domain folds nothing but
+    /// still finishes; an event type with no thunk, and a meta-event, are
+    /// skipped. It guards no envelope (decision 14.42): a request with no
+    /// run is an empty one, and a run with no cover is read as one with an
+    /// empty cover.
+    pub fn dispatch(&self, req: &hpb::ProjectRequest) -> Result<hpb::ProjectResponse, CodedError> {
+        let unsent = pb::EventBook::default();
+        let events = req.events.as_ref().unwrap_or(&unsent);
         let uncovered = pb::Cover::default();
         let cover = events.cover.as_ref().unwrap_or(&uncovered);
 
         let mut projection = (self.factory)();
         let consumed = match self.domains.as_ref() {
-            Some(set) => set.contains(crate::WILDCARD_DOMAIN) || set.contains(&cover.domain),
+            Some(set) => set.contains(&cover.domain),
             None => true,
         };
 
@@ -186,31 +194,17 @@ impl<P> ProjectorDispatch<P> {
             }
         }
 
-        match self.finish.as_ref() {
-            Some(finish) => call_handler(|| finish(&mut projection, events)),
-            None => Ok(pb::Projection {
-                cover: Some(cover.clone()),
-                projector: self.name.clone(),
-                next_sequence: next_sequence_after(events),
-                ..Default::default()
-            }),
-        }
+        let projection = match self.finish.as_ref() {
+            Some(finish) => Some(call_handler(|| finish(&mut projection, events))?),
+            None => None,
+        };
+        Ok(hpb::ProjectResponse { projection })
     }
-}
-
-/// The projector's position after `events` (types.proto, Projection): the
-/// last page's sequence + 1, or the book's next_sequence when it has no
-/// pages.
-pub fn next_sequence_after(events: &pb::EventBook) -> u64 {
-    events
-        .pages
-        .last()
-        .map_or(events.next_sequence, |page| page.sequence + 1)
 }
 
 /// Runs a projector's fold handler: its failure is the fold's cause, a key
 /// and args (decision 14.37): a coded error's own, a panic's
-/// ROUTER_REASON_HANDLER_PANICKED, and none for an unclassified error, whose text stays in
+/// ANGZARR_REASON_HANDLER_PANICKED, and none for an unclassified error, whose text stays in
 /// its own log.
 fn fold_handler(
     handler: impl FnOnce() -> Result<(), HandlerError>,
@@ -223,7 +217,7 @@ fn fold_handler(
             Err(None)
         }
         Err(_) => Err(Some(pb::Diagnostic {
-            code: RouterReason::HandlerPanicked.as_str_name().to_string(),
+            code: AngzarrReason::HandlerPanicked.as_str_name().to_string(),
             ..Default::default()
         })),
     }

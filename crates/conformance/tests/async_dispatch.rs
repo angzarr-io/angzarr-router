@@ -2,7 +2,7 @@
 //! stays sync.
 //!
 //! The coordinator awaits [`CommandHandler::dispatch`],
-//! [`PolicyComponent::dispatch`] and `dispatch_refusal`, and
+//! [`PolicyComponent::react`] and [`PolicyComponent::translate`], and
 //! [`ProjectorHandler::dispatch`]. The router's own components
 //! ([`DomainDispatch`], [`PolicyDispatch`], [`ProjectorDispatch`]) wrap the
 //! business code's synchronous functions in a ready future: they answer on
@@ -19,9 +19,9 @@ use std::pin::pin;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
-use angzarr_router::context::CommandContext;
 use angzarr_router::domain::DomainDispatch;
 use angzarr_router::error::CodedError;
+use angzarr_router::hpb;
 use angzarr_router::pb;
 use angzarr_router::policy::PolicyDispatch;
 use angzarr_router::projector::ProjectorDispatch;
@@ -47,7 +47,7 @@ async fn answer_of<T>(pending: &Pending<T>) -> T {
 }
 
 /// A domain behind I/O: its answer arrives when the test sends it.
-struct RemoteDomain(Pending<pb::CommandHandlerResponse>);
+struct RemoteDomain(Pending<hpb::HandleResponse>);
 
 impl CommandHandler for RemoteDomain {
     fn name(&self) -> &str {
@@ -56,18 +56,15 @@ impl CommandHandler for RemoteDomain {
     fn command_types(&self) -> Vec<String> {
         vec!["test.counter.IncreaseBy".to_string()]
     }
-    async fn dispatch(
-        &self,
-        _req: &pb::ContextualCommand,
-    ) -> Result<pb::CommandHandlerResponse, CodedError> {
+    async fn dispatch(&self, _req: &hpb::HandleRequest) -> Result<hpb::HandleResponse, CodedError> {
         Ok(answer_of(&self.0).await)
     }
 }
 
 /// A policy behind I/O.
 struct RemotePolicy {
-    commands: Pending<pb::PolicyResponse>,
-    translation: Pending<prost_types::Any>,
+    reactions: Pending<hpb::ReactResponse>,
+    translation: Pending<hpb::TranslateResponse>,
 }
 
 impl PolicyComponent for RemotePolicy {
@@ -77,34 +74,69 @@ impl PolicyComponent for RemotePolicy {
     fn input_domain(&self) -> &str {
         "order"
     }
-    async fn dispatch(&self, _source: &pb::EventBook) -> Result<pb::PolicyResponse, CodedError> {
-        Ok(answer_of(&self.commands).await)
+    async fn react(&self, _req: &hpb::ReactRequest) -> Result<hpb::ReactResponse, CodedError> {
+        Ok(answer_of(&self.reactions).await)
     }
-    async fn dispatch_refusal(
+    async fn translate(
         &self,
-        _refusal: &pb::Refusal,
-        _ctx: &CommandContext,
-    ) -> Result<Option<prost_types::Any>, CodedError> {
-        Ok(Some(answer_of(&self.translation).await))
+        _req: &hpb::TranslateRequest,
+    ) -> Result<hpb::TranslateResponse, CodedError> {
+        Ok(answer_of(&self.translation).await)
     }
 }
 
 /// A projector behind I/O.
-struct RemoteProjector(Pending<pb::Projection>);
+struct RemoteProjector(Pending<hpb::ProjectResponse>);
 
 impl ProjectorHandler for RemoteProjector {
     fn name(&self) -> &str {
         "remote-projector"
     }
-    async fn dispatch(&self, _events: &pb::EventBook) -> Result<pb::Projection, CodedError> {
+    async fn dispatch(
+        &self,
+        _req: &hpb::ProjectRequest,
+    ) -> Result<hpb::ProjectResponse, CodedError> {
         Ok(answer_of(&self.0).await)
     }
 }
 
-fn answered_with(label: &str) -> pb::CommandHandlerResponse {
-    pb::CommandHandlerResponse {
+fn answered_with(label: &str) -> hpb::HandleResponse {
+    hpb::HandleResponse {
         rules_version: label.to_string(),
         ..Default::default()
+    }
+}
+
+fn projected(label: &str) -> hpb::ProjectResponse {
+    hpb::ProjectResponse {
+        projection: Some(prost_types::Any {
+            type_url: angzarr_router::type_url(label),
+            value: vec![],
+        }),
+    }
+}
+
+fn reacted() -> hpb::ReactResponse {
+    hpb::ReactResponse {
+        outputs: vec![angzarr_router::policy::command(
+            Some(conf::uuid_of("inv-7")),
+            conf::any_of(&conf::orders::v1::ReserveStock {
+                item: "apple".to_string(),
+            }),
+        )],
+    }
+}
+
+fn stock_unreserved() -> prost_types::Any {
+    prost_types::Any {
+        type_url: angzarr_router::type_url("orders.v1.StockUnreserved"),
+        value: vec![],
+    }
+}
+
+fn trigger() -> hpb::ReactRequest {
+    hpb::ReactRequest {
+        trigger: Some(conf::order_placed_trigger(1)),
     }
 }
 
@@ -136,52 +168,43 @@ async fn a_router_awaits_a_projector_that_answers_later() {
         .projector(RemoteProjector(pending))
         .build()
         .expect("one projector");
-    let book = conf::delivery("counter", 1);
-    let mut dispatched = pin!(router.dispatch_projector(&book));
+    let run = conf::delivery("counter", 1);
+    let mut dispatched = pin!(router.dispatch_project(&run));
     assert!(poll!(dispatched.as_mut()).is_pending());
-    let projection = pb::Projection {
-        projector: "later".to_string(),
-        ..Default::default()
-    };
-    answer.send(projection.clone()).unwrap();
-    assert_eq!(poll!(dispatched.as_mut()), Poll::Ready(Ok(projection)));
+    answer.send(projected("later")).unwrap();
+    assert_eq!(
+        poll!(dispatched.as_mut()),
+        Poll::Ready(Ok(projected("later")))
+    );
 }
 
 // A remote policy is held boxed, through its object-safe twin, as the
 // coordinator holds every hand-written component.
 #[tokio::test]
 async fn a_boxed_policy_is_awaited_until_it_answers() {
-    let (commands, pending_commands) = waiting();
+    let (reactions, pending_reactions) = waiting();
     let (translation, pending_translation) = waiting();
     let policy: Box<dyn DynPolicyComponent> = Box::new(RemotePolicy {
-        commands: pending_commands,
+        reactions: pending_reactions,
         translation: pending_translation,
     });
     assert_eq!(PolicyComponent::name(&policy), "remote-policy");
     assert_eq!(PolicyComponent::input_domain(&policy), "order");
 
-    let source = conf::order_placed_source();
-    let mut handled = pin!(PolicyComponent::dispatch(&policy, &source));
+    let req = trigger();
+    let mut handled = pin!(PolicyComponent::react(&policy, &req));
     assert!(poll!(handled.as_mut()).is_pending());
-    let response = pb::PolicyResponse {
-        reactions: vec![pb::PolicyReaction {
-            trigger_sequence: 1,
-            outputs: vec![conf::order_command_for("inventory", "ReserveStock")],
-        }],
-    };
-    commands.send(response.clone()).unwrap();
-    assert_eq!(poll!(handled.as_mut()), Poll::Ready(Ok(response)));
+    reactions.send(reacted()).unwrap();
+    assert_eq!(poll!(handled.as_mut()), Poll::Ready(Ok(reacted())));
 
-    let refusal = pb::Refusal::default();
-    let ctx = CommandContext::default();
-    let mut translated = pin!(PolicyComponent::dispatch_refusal(&policy, &refusal, &ctx));
+    let req = hpb::TranslateRequest::default();
+    let mut translated = pin!(PolicyComponent::translate(&policy, &req));
     assert!(poll!(translated.as_mut()).is_pending());
-    let fact = prost_types::Any {
-        type_url: angzarr_router::type_url("orders.v1.StockUnreserved"),
-        value: vec![],
+    let fact = hpb::TranslateResponse {
+        fact: Some(stock_unreserved()),
     };
     translation.send(fact.clone()).unwrap();
-    assert_eq!(poll!(translated.as_mut()), Poll::Ready(Ok(Some(fact))));
+    assert_eq!(poll!(translated.as_mut()), Poll::Ready(Ok(fact)));
 }
 
 #[tokio::test]
@@ -207,10 +230,10 @@ async fn boxed_domains_and_projectors_dispatch_through_their_twins() {
     let (answer, pending) = waiting();
     let projector: Box<dyn DynProjectorHandler> = Box::new(RemoteProjector(pending));
     assert_eq!(ProjectorHandler::name(&projector), "remote-projector");
-    answer.send(pb::Projection::default()).unwrap();
+    answer.send(projected("boxed")).unwrap();
     assert_eq!(
         ProjectorHandler::dispatch(&projector, &conf::delivery("counter", 1)).await,
-        Ok(pb::Projection::default())
+        Ok(projected("boxed"))
     );
 }
 
@@ -220,6 +243,12 @@ async fn first_poll<F: Future>(future: F) -> F::Output {
         Poll::Ready(answer) => answer,
         Poll::Pending => panic!("business code is synchronous: no I/O to wait on"),
     }
+}
+
+/// A policy whose one refusal callback answers StockUnreserved.
+fn translating() -> PolicyDispatch {
+    PolicyDispatch::new("p", "order", "inventory")
+        .on_refused(|_command, _refusal, _ctx| Ok(stock_unreserved()))
 }
 
 // No behaviour change: each of the router's own components answers on the
@@ -241,42 +270,26 @@ async fn the_routers_own_components_answer_on_the_first_poll() {
     let policy: PolicyDispatch = conf::order_policy(Default::default());
     let source = conf::policy_event_source("test.counter.Increased", 3);
     assert_eq!(
-        first_poll(PolicyComponent::dispatch(&policy, &source)).await,
-        policy.dispatch(&source)
+        first_poll(PolicyComponent::react(&policy, &source)).await,
+        policy.react(&source)
     );
-    let refusal = pb::Refusal {
-        command: Some(conf::order_command_for("inventory", "ReserveStock")),
-        ..Default::default()
-    };
-    let ctx = CommandContext::default();
-    let translating = PolicyDispatch::new("p", "order", "inventory").on_refused(
-        "orders.v1.ReserveStock",
-        |_refusal, _ctx| {
-            Ok(prost_types::Any {
-                type_url: angzarr_router::type_url("orders.v1.StockUnreserved"),
-                value: vec![],
-            })
-        },
+    let refusal = hpb::TranslateRequest::default();
+    let translating = translating();
+    assert_eq!(
+        first_poll(PolicyComponent::translate(&translating, &refusal)).await,
+        translating.translate(&refusal)
     );
     assert_eq!(
-        first_poll(PolicyComponent::dispatch_refusal(
-            &translating,
-            &refusal,
-            &ctx
-        ))
-        .await,
-        translating.translate_refusal(&refusal, &ctx)
-    );
-    assert!(
-        matches!(translating.translate_refusal(&refusal, &ctx), Ok(Some(_))),
+        translating.translate(&refusal).map(|t| t.fact),
+        Ok(Some(stock_unreserved())),
         "the translation is answered"
     );
 
     let projector: ProjectorDispatch<_> = conf::counter_projector(&["counter"]);
-    let book = conf::delivery("counter", 2);
+    let run = conf::delivery("counter", 2);
     assert_eq!(
-        first_poll(ProjectorHandler::dispatch(&projector, &book)).await,
-        projector.dispatch(&book)
+        first_poll(ProjectorHandler::dispatch(&projector, &run)).await,
+        projector.dispatch(&run)
     );
 }
 
@@ -295,30 +308,28 @@ async fn a_router_hosting_its_own_components_answers_on_the_first_poll() {
     assert!(answer.is_ok());
 
     let router = RouterBuilder::new()
-        .policy(conf::order_policy(Default::default()))
+        .policy(translating())
         .build()
         .expect("one policy");
-    let source = conf::policy_event_source("test.counter.Increased", 1);
-    let answer = first_poll(router.dispatch_policy(&source)).await;
+    let source = trigger();
     assert_eq!(
-        answer,
-        conf::order_policy(Default::default()).dispatch(&source)
+        first_poll(router.dispatch_react(&source)).await,
+        translating().react(&source)
     );
-    let refusal = pb::Refusal::default();
-    let ctx = CommandContext::default();
+    let refusal = hpb::TranslateRequest::default();
     assert_eq!(
-        first_poll(router.dispatch_refusal(&refusal, &ctx)).await,
-        conf::order_policy(Default::default()).dispatch_refusal(&refusal, &ctx)
+        first_poll(router.dispatch_translate(&refusal)).await,
+        translating().translate(&refusal)
     );
 
     let router = RouterBuilder::new()
         .projector(conf::counter_projector(&["counter"]))
         .build()
         .expect("one projector");
-    let book = conf::delivery("counter", 1);
+    let run = conf::delivery("counter", 1);
     assert_eq!(
-        first_poll(router.dispatch_projector(&book)).await,
-        conf::counter_projector(&["counter"]).dispatch(&book)
+        first_poll(router.dispatch_project(&run)).await,
+        conf::counter_projector(&["counter"]).dispatch(&run)
     );
 }
 
@@ -350,7 +361,7 @@ async fn dispatch_spawns_on_a_multi_threaded_runtime() {
     let policy: Arc<dyn DynPolicyComponent> = Arc::new(conf::order_policy(Default::default()));
     let task = tokio::spawn(async move {
         let source = conf::policy_event_source("test.counter.Increased", 1);
-        sent(PolicyComponent::dispatch(&*policy, &source)).await
+        sent(PolicyComponent::react(&*policy, &source)).await
     });
     assert!(task.await.unwrap().is_ok());
 }

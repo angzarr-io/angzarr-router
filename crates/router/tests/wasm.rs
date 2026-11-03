@@ -16,9 +16,8 @@ use std::pin::pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
-use angzarr_router::context::CommandContext;
 use angzarr_router::error::CodedError;
-use angzarr_router::pb;
+use angzarr_router::hpb;
 use angzarr_router::router::{
     CommandHandler, DynCommandHandler, DynPolicyComponent, DynProjectorHandler, PolicyComponent,
     ProjectorHandler, RouterBuilder,
@@ -40,11 +39,8 @@ impl CommandHandler for RcDomain {
     fn command_types(&self) -> Vec<String> {
         Vec::new()
     }
-    async fn dispatch(
-        &self,
-        _req: &pb::ContextualCommand,
-    ) -> Result<pb::CommandHandlerResponse, CodedError> {
-        Ok(pb::CommandHandlerResponse {
+    async fn dispatch(&self, _req: &hpb::HandleRequest) -> Result<hpb::HandleResponse, CodedError> {
+        Ok(hpb::HandleResponse {
             rules_version: across_an_await(Rc::clone(&self.0)).await,
             ..Default::default()
         })
@@ -60,17 +56,16 @@ impl PolicyComponent for RcPolicy {
     fn input_domain(&self) -> &str {
         &self.0
     }
-    async fn dispatch(&self, _source: &pb::EventBook) -> Result<pb::PolicyResponse, CodedError> {
+    async fn react(&self, _req: &hpb::ReactRequest) -> Result<hpb::ReactResponse, CodedError> {
         across_an_await(Rc::clone(&self.0)).await;
-        Ok(pb::PolicyResponse::default())
+        Ok(hpb::ReactResponse::default())
     }
-    async fn dispatch_refusal(
+    async fn translate(
         &self,
-        _refusal: &pb::Refusal,
-        _ctx: &CommandContext,
-    ) -> Result<Option<prost_types::Any>, CodedError> {
+        _req: &hpb::TranslateRequest,
+    ) -> Result<hpb::TranslateResponse, CodedError> {
         across_an_await(Rc::clone(&self.0)).await;
-        Ok(None)
+        Ok(hpb::TranslateResponse::default())
     }
 }
 
@@ -80,10 +75,15 @@ impl ProjectorHandler for RcProjector {
     fn name(&self) -> &str {
         &self.0
     }
-    async fn dispatch(&self, _events: &pb::EventBook) -> Result<pb::Projection, CodedError> {
-        Ok(pb::Projection {
-            projector: across_an_await(Rc::clone(&self.0)).await,
-            ..Default::default()
+    async fn dispatch(
+        &self,
+        _req: &hpb::ProjectRequest,
+    ) -> Result<hpb::ProjectResponse, CodedError> {
+        Ok(hpb::ProjectResponse {
+            projection: Some(prost_types::Any {
+                type_url: across_an_await(Rc::clone(&self.0)).await,
+                value: Vec::new(),
+            }),
         })
     }
 }
@@ -101,15 +101,18 @@ fn a_router_hosts_components_that_are_not_send() {
         .aggregate(RcDomain(Rc::from("rc")))
         .build()
         .expect("one domain");
-    let answer = now(router.dispatch_command(&pb::ContextualCommand::default()));
+    let answer = now(router.dispatch_command(&hpb::HandleRequest::default()));
     assert_eq!(answer.expect("answered").rules_version, "rc");
 
     let router = RouterBuilder::new()
         .projector(RcProjector(Rc::from("rc")))
         .build()
         .expect("one projector");
-    let answer = now(router.dispatch_projector(&pb::EventBook::default()));
-    assert_eq!(answer.expect("answered").projector, "rc");
+    let answer = now(router.dispatch_project(&hpb::ProjectRequest::default()));
+    assert_eq!(
+        answer.expect("answered").projection.map(|p| p.type_url),
+        Some("rc".to_string())
+    );
 }
 
 #[wasm_bindgen_test]
@@ -118,12 +121,7 @@ fn components_that_are_not_send_box_through_their_twins() {
     let policy: Box<dyn DynPolicyComponent> = Box::new(RcPolicy(Rc::from("rc")));
     let projector: Box<dyn DynProjectorHandler> = Box::new(RcProjector(Rc::from("rc")));
     assert!(now(CommandHandler::dispatch(&domain, &Default::default())).is_ok());
-    assert!(now(PolicyComponent::dispatch(&policy, &Default::default())).is_ok());
-    assert!(now(PolicyComponent::dispatch_refusal(
-        &policy,
-        &Default::default(),
-        &CommandContext::default()
-    ))
-    .is_ok());
+    assert!(now(PolicyComponent::react(&policy, &Default::default())).is_ok());
+    assert!(now(PolicyComponent::translate(&policy, &Default::default())).is_ok());
     assert!(now(ProjectorHandler::dispatch(&projector, &Default::default())).is_ok());
 }

@@ -1,541 +1,523 @@
-//! DomainDispatch contracts, transliterated from client-go's
-//! engine_test.go + engine_boundaries_test.go aggregate subset:
-//! validate-before-rebuild, exact envelope guard codes, CommandContext
-//! evidence, the Fact arm's ingest path, and pass-through of emitted
-//! events.
+//! DomainDispatch: one Handle for commands and facts (decision 14.98),
+//! routed by arm and type before rebuild; every handler's Emit run to its
+//! end as one decision (decision 14.104), with no step cap; success only,
+//! every other outcome an error (decision 14.95), a fact's error always a
+//! bug's (decision 14.72); the step-idempotence test helper.
 
 use std::sync::{Arc, Mutex};
 
 use prost::Message;
 use prost_types::Any;
 
-use crate::domain::{CommandContext, DomainDispatch, FactRecord};
-use crate::error::{GrpcCode, RouterReason};
+use crate::domain::{Continues, DomainDispatch, Emit, InputArm, NotIdempotent};
+use crate::error::{
+    AngzarrReason, BusinessStatus, CodedError, GrpcCode, HandlerError, RetryableStatus,
+};
+use crate::hpb;
 use crate::pb;
-use crate::rebuild::Rebuilder;
 use crate::test_support::*;
-use crate::{page_event, type_url, TYPE_URL_PREFIX};
+use crate::type_url;
 
-fn test_agg_dispatch() -> (DomainDispatch<TestState>, Arc<Mutex<Vec<CommandContext>>>) {
-    let contexts = Arc::new(Mutex::new(Vec::new()));
-    let seen = contexts.clone();
-    let d = DomainDispatch::new("agg-test", "order", cover_applier(fresh_rebuilder())).on_command(
-        &cover_full_name(),
-        move |_, _, cctx| {
-            seen.lock().unwrap().push(cctx);
-            Ok(Some(pb::EventBook {
-                pages: vec![pb::EventPage::default()],
-                ..Default::default()
-            }))
-        },
-    );
-    (d, contexts)
+fn typed(fq: &str, key: &str) -> Any {
+    let mut any = cover_any(key);
+    any.type_url = type_url(fq);
+    any
 }
 
-fn events_of(resp: &pb::CommandHandlerResponse) -> Option<&pb::EventBook> {
-    resp.events.as_ref()
+/// Each applied Cover event's domain and sequence, in order.
+type Applied = Arc<Mutex<Vec<(String, u64)>>>;
+
+fn recording(applied: Applied) -> crate::rebuild::Rebuilder<TestState> {
+    fresh_rebuilder().apply_with_context(&cover_full_name(), move |s: &mut TestState, any, ctx| {
+        let domain = pb::Cover::decode(any.value.as_slice())?.domain;
+        applied.lock().unwrap().push((domain.clone(), ctx.sequence));
+        s.applied.push(domain);
+        Ok(())
+    })
 }
 
-#[test]
-fn absent_events_fresh_state_no_prior_history() {
-    let (d, contexts) = test_agg_dispatch();
-    let resp = d.dispatch(&command_for(cover_any(""))).expect("dispatch");
-    assert!(events_of(&resp).is_some(), "expected events result");
-    let cctx = contexts.lock().unwrap()[0].clone();
-    assert!(
-        !cctx.had_prior_events,
-        "had_prior_events for absent events (the Exists() bug)"
-    );
-    assert_eq!(cctx.next_sequence, 0);
+/// A domain whose `test.Bump(key)` emits a bump of `key`, and whose fact
+/// `test.Seen(key)` records a bump of `key`.
+fn bumps(applied: Applied) -> DomainDispatch<TestState> {
+    DomainDispatch::new("bumps", "bumps", recording(applied))
+        .with_rules_version("1.4.2")
+        .on_command("test.Bump", |cmd, _state, _ctx| {
+            let key = pb::Cover::decode(cmd.value.as_slice()).unwrap().domain;
+            Ok(Emit::of([cover_any(&key)]))
+        })
+        .on_fact("test.Seen", |fact, _state, _ctx| {
+            let key = pb::Cover::decode(fact.value.as_slice()).unwrap().domain;
+            Ok(Emit::of([cover_any(&key)]))
+        })
 }
 
-#[test]
-fn prior_events_reach_state_and_context() {
-    let (d, contexts) = test_agg_dispatch();
-    let mut cmd = command_for(cover_any(""));
-    let mut prior = book_of_covers(&["p1", "p2"]);
-    prior.next_sequence = 2;
-    cmd.events = Some(prior);
-
-    d.dispatch(&cmd).expect("dispatch");
-    let cctx = contexts.lock().unwrap()[0].clone();
-    assert!(cctx.had_prior_events, "had_prior_events with 2 prior pages");
-    assert_ne!(
-        cctx.next_sequence, 0,
-        "next_sequence not derived from prior events"
-    );
-}
-
-#[test]
-fn unknown_command_coded_before_rebuild() {
-    let (d, _) = test_agg_dispatch();
-    // No handler for Snapshot; corrupt prior events would surface
-    // ROUTER_REASON_PERSISTED_EVENT_CORRUPT if the dispatcher rebuilt before validating
-    // the command type.
-    let mut cmd = command_for(any_of(&pb::Snapshot::default()));
-    cmd.events = Some(pb::EventBook {
-        pages: vec![event_page(corrupt_cover_any())],
+/// `req` over a history of bumps of `history`, at sequences 0...
+fn over(mut req: hpb::HandleRequest, history: &[&str]) -> hpb::HandleRequest {
+    req.history = Some(pb::EventBook {
+        pages: history
+            .iter()
+            .zip(0..)
+            .map(|(k, seq)| sequenced_event_page(seq, cover_any(k)))
+            .collect(),
+        next_sequence: history.len() as u64,
         ..Default::default()
     });
-
-    let err = d.dispatch(&cmd).expect_err("unknown command must fail");
-    assert_eq!(
-        err.code, "ROUTER_REASON_UNKNOWN_COMMAND_TYPE",
-        "validate before rebuild"
-    );
+    req
 }
 
-// Spec: command_handler.proto, CommandHandlerService.Handle step 2 ("A type
-// URL that reaches no registered handler is refused INVALID_ARGUMENT, naming
-// the type URL"); decision 12.11; backlog VC-1.
+fn events_of(resp: &hpb::HandleResponse) -> Vec<String> {
+    resp.events
+        .iter()
+        .map(|e| pb::Cover::decode(e.value.as_slice()).unwrap().domain)
+        .collect()
+}
+
+// --- routing, before rebuild (decision 14.98) -----------------------------------
+
 #[test]
-fn an_unknown_type_is_invalid_argument_naming_its_type_url() {
-    let (d, _) = test_agg_dispatch();
-    let url = type_url("test.Unknown");
-    let unknown = Any {
-        type_url: url.clone(),
-        value: Vec::new(),
-    };
+fn a_command_runs_its_command_handler_and_a_fact_its_fact_handler() {
+    let applied = Applied::default();
+    let resp = bumps(applied.clone())
+        .dispatch(&command_for(typed("test.Bump", "a")))
+        .expect("handled");
+    assert_eq!(events_of(&resp), ["a"]);
+    assert_eq!(resp.rules_version, "1.4.2");
+    let resp = bumps(applied)
+        .dispatch(&request(fact_page(typed("test.Seen", "f"))))
+        .expect("recorded");
+    assert_eq!(events_of(&resp), ["f"]);
+}
+
+#[test]
+fn an_arm_that_does_not_match_its_handlers_kind_is_refused_naming_the_type() {
+    let d = bumps(Applied::default());
+    // A fact type sent as a command, and a command type sent as a fact.
     let err = d
-        .dispatch(&command_for(unknown.clone()))
-        .expect_err("an unknown command type");
-    assert_eq!(err.grpc, GrpcCode::Internal);
-    // Decision 14.37: the key is the status message; the args name the type.
-    assert_eq!(err.code, "ROUTER_REASON_UNKNOWN_COMMAND_TYPE");
-    crate::test_support::assert_bug(&err);
-    assert_eq!(err.status_message(), "ROUTER_REASON_UNKNOWN_COMMAND_TYPE");
-    assert_eq!(err.extras.get("type_url"), Some(&url));
-    // C-0682: the router upcasts nothing, so names no upcast type; the
-    // coordinator relays the type as sent beside it (decision 14.39).
-    assert_eq!(err.extras.get("upcast_type_url"), None);
-
+        .dispatch(&command_for(typed("test.Seen", "x")))
+        .expect_err("no command handler");
+    assert_eq!(err.code, AngzarrReason::UnknownCommandType.as_str_name());
+    assert_eq!(err.extras.get("type_url"), Some(&type_url("test.Seen")));
+    assert_bug(&err);
     let err = d
-        .dispatch(&contextual(fact_page(unknown)))
-        .expect_err("an unknown fact type");
-    assert_eq!(err.code, RouterReason::NoFactHandler.as_str_name());
-    crate::test_support::assert_bug(&err);
-    assert_eq!(err.grpc, GrpcCode::Internal);
-    assert_eq!(
-        err.status_message(),
-        RouterReason::NoFactHandler.as_str_name()
-    );
-    assert_eq!(err.extras.get("type_url"), Some(&url));
+        .dispatch(&request(fact_page(typed("test.Bump", "x"))))
+        .expect_err("no fact handler");
+    assert_eq!(err.code, AngzarrReason::NoFactHandler.as_str_name());
+    assert_eq!(err.extras.get("type_url"), Some(&type_url("test.Bump")));
+    assert_bug(&err);
 }
 
+// The router guards no envelope: no input, no page or no payload is a
+// command of no type; a fact with no payload is a fact of no type.
 #[test]
-fn corrupt_prior_event_fails_command() {
-    let (d, _) = test_agg_dispatch();
-    let mut cmd = command_for(cover_any(""));
-    cmd.events = Some(pb::EventBook {
-        pages: vec![event_page(corrupt_cover_any())],
-        ..Default::default()
-    });
-
-    let err = d.dispatch(&cmd).expect_err("corrupt prior event must fail");
-    assert_eq!(
-        err.code, "ROUTER_REASON_FOLD_FAILED",
-        "never validate against truncated state; a failing fold is a handler bug"
-    );
-    assert_eq!(err.grpc, crate::error::GrpcCode::Internal);
-}
-
-// Decision 14.42: the router guards no envelope. A delivery with no book,
-// no page, no arm, or no payload is routed as a command of no type, and no
-// handler claims one; the handler never runs.
-#[test]
-fn a_delivery_missing_its_input_is_a_command_of_no_type() {
-    let (d, seen) = test_agg_dispatch();
+fn a_delivery_with_no_payload_is_an_input_of_no_type() {
+    let d = bumps(Applied::default());
     for req in [
-        pb::ContextualCommand::default(),
-        pb::ContextualCommand {
-            command: Some(pb::CommandBook::default()),
-            ..Default::default()
-        },
-        contextual(pb::CommandPage::default()),
-        command_for(Any::default()),
-        contextual(pb::CommandPage {
-            body: Some(pb::command_page::Body::Command(pb::Command {
-                payload: None,
-            })),
+        hpb::HandleRequest::default(),
+        request(pb::CommandPage::default()),
+        request(pb::CommandPage {
+            body: Some(pb::command_page::Body::Command(pb::Command::default())),
             ..Default::default()
         }),
     ] {
         let err = d.dispatch(&req).expect_err("no type");
-        assert_eq!(err.code, RouterReason::UnknownCommandType.as_str_name());
-        assert_eq!(err.extras.get("type_url").map(String::as_str), Some(""));
+        assert_eq!(err.code, AngzarrReason::UnknownCommandType.as_str_name());
+        assert_eq!(err.extras.get("type_url"), Some(&String::new()));
     }
-    assert!(seen.lock().unwrap().is_empty(), "the handler never ran");
-}
-
-#[test]
-fn name_and_domain_are_exact() {
-    let (d, _) = test_agg_dispatch();
-    assert_eq!(d.name(), "agg-test");
-    assert_eq!(d.domain(), "order");
-}
-
-#[test]
-fn command_types_exact() {
-    let d = DomainDispatch::new("agg", "orders", fresh_rebuilder())
-        .on_command("test.CreateOrder", |_, _: &mut TestState, _| {
-            Ok(Some(pb::EventBook::default()))
-        });
-    assert_eq!(d.command_types(), vec!["test.CreateOrder".to_string()]);
-}
-
-// --- facts: the Fact arm of the command page ------------------------------
-
-/// An aggregate folding Cover events whose Cover fact handler records the
-/// fact annotated with the domains folded so far, flagged by one Cover event
-/// naming the fact.
-fn fact_aggregate() -> DomainDispatch<TestState> {
-    DomainDispatch::new("agg-test", "ledger", cover_applier(fresh_rebuilder())).on_fact(
-        &cover_full_name(),
-        |fact, state: &TestState| {
-            let folded = pb::Cover::decode(fact.value.as_slice()).unwrap().domain;
-            Ok(FactRecord {
-                fact: cover_any(&format!("{folded}<{}>", state.applied.join(","))),
-                flags: vec![cover_any(&format!("flag:{folded}"))],
-            })
-        },
-    )
-}
-
-fn recorded_domains(book: &pb::EventBook) -> Vec<String> {
-    book.pages
-        .iter()
-        .map(|p| match page_event(p) {
-            Some(any) => pb::Cover::decode(any.value.as_slice()).unwrap().domain,
-            None => String::new(),
-        })
-        .collect()
-}
-
-/// A fact delivery of a Cover fact named `name` over `prior` Cover events.
-fn fact_delivery(name: &str, prior: &[&str]) -> pb::ContextualCommand {
-    let mut req = contextual(fact_page(cover_any(name)));
-    if !prior.is_empty() {
-        req.events = Some(book_of_covers(prior));
-    }
-    req
-}
-
-#[test]
-fn a_fact_is_recorded_then_flagged_against_the_folded_state() {
-    let resp = fact_aggregate()
-        .dispatch(&fact_delivery("f1", &["p", "q"]))
-        .expect("fact");
-    let book = resp.events.expect("events");
-    assert_eq!(
-        recorded_domains(&book),
-        vec!["f1<p,q>", "flag:f1"],
-        "the fact, then its flags, against the rebuilt state"
-    );
-    assert_eq!(book.cover, None, "the coordinator supplies the cover");
-    assert!(
-        book.pages
-            .iter()
-            .all(|p| p.meta.is_none() && p.sequence == 0),
-        "payloads only: the coordinator stamps sequences and meta"
-    );
-}
-
-#[test]
-fn a_fact_recorded_as_received_needs_no_flags() {
-    let d = DomainDispatch::new("agg-test", "ledger", fresh_rebuilder())
-        .on_fact(&cover_full_name(), |fact, _s: &TestState| {
-            Ok(FactRecord::from(fact.clone()))
-        });
-    let resp = d.dispatch(&fact_delivery("f1", &[])).expect("fact");
-    assert_eq!(recorded_domains(&resp.events.unwrap()), vec!["f1"]);
-}
-
-#[test]
-fn an_undeclared_fact_type_is_refused_before_any_handler_runs() {
-    let ran = Arc::new(Mutex::new(0));
-    let seen = ran.clone();
-    let d = DomainDispatch::new("agg-test", "ledger", cover_applier(fresh_rebuilder())).on_fact(
-        &cover_full_name(),
-        move |fact, _s: &TestState| {
-            *seen.lock().unwrap() += 1;
-            Ok(FactRecord::from(fact.clone()))
-        },
-    );
-    let mut req = contextual(fact_page(Any {
-        type_url: type_url("test.Undeclared"),
-        value: Vec::new(),
-    }));
-    // A corrupt history would surface ROUTER_REASON_PERSISTED_EVENT_CORRUPT had the
-    // dispatcher rebuilt before refusing the fact.
-    req.events = Some(pb::EventBook {
-        pages: vec![event_page(corrupt_cover_any())],
-        ..Default::default()
-    });
-    let err = d.dispatch(&req).expect_err("an undeclared fact type");
-    assert_eq!(err.code, RouterReason::NoFactHandler.as_str_name());
-    crate::test_support::assert_bug(&err);
-    assert_eq!(err.grpc, GrpcCode::Internal);
-    assert_eq!(
-        err.extras.get("type_url").map(String::as_str),
-        Some(type_url("test.Undeclared").as_str())
-    );
-    assert_eq!(*ran.lock().unwrap(), 0, "no fact handler ran");
-}
-
-// The body arm is the fact marker: an arm that does not match the
-// registered handler's kind is refused, never run by the other kind.
-#[test]
-fn a_command_type_sent_as_a_fact_is_refused() {
-    let (d, contexts) = test_agg_dispatch();
     let err = d
-        .dispatch(&contextual(fact_page(cover_any("x"))))
-        .expect_err("a command type in the Fact arm");
-    assert_eq!(err.code, RouterReason::NoFactHandler.as_str_name());
-    crate::test_support::assert_bug(&err);
-    assert!(
-        contexts.lock().unwrap().is_empty(),
-        "no command handler ran"
-    );
-}
-
-#[test]
-fn a_fact_type_sent_as_a_command_is_refused() {
-    let err = fact_aggregate()
-        .dispatch(&command_for(cover_any("f1")))
-        .expect_err("a fact type in the Command arm");
-    assert_eq!(err.code, "ROUTER_REASON_UNKNOWN_COMMAND_TYPE");
-    crate::test_support::assert_bug(&err);
-}
-
-#[test]
-fn a_fact_without_a_payload_is_a_fact_of_no_type() {
-    let err = fact_aggregate()
-        .dispatch(&contextual(pb::CommandPage {
-            body: Some(pb::command_page::Body::Fact(pb::Fact { payload: None })),
+        .dispatch(&request(pb::CommandPage {
+            body: Some(pb::command_page::Body::Fact(pb::Fact::default())),
             ..Default::default()
         }))
-        .expect_err("a fact with no payload");
-    assert_eq!(err.code, RouterReason::NoFactHandler.as_str_name());
-    crate::test_support::assert_bug(&err);
+        .expect_err("no type");
+    assert_eq!(err.code, AngzarrReason::NoFactHandler.as_str_name());
 }
 
+// An unknown input is reported before any rebuild: a corrupt history is
+// never folded for it.
 #[test]
-fn a_corrupt_prior_event_fails_the_fact() {
-    let mut req = fact_delivery("f1", &[]);
-    req.events = Some(pb::EventBook {
+fn an_unknown_input_is_refused_before_the_history_is_folded() {
+    let d = bumps(Applied::default());
+    let mut req = command_for(typed("test.Unknown", "x"));
+    req.history = Some(pb::EventBook {
         pages: vec![event_page(corrupt_cover_any())],
+        next_sequence: 1,
         ..Default::default()
     });
-    let err = fact_aggregate()
-        .dispatch(&req)
-        .expect_err("corrupt history");
-    // Decision 14.37: its own key, not ROUTER_REASON_UNHANDLED_HANDLER_ERROR.
-    assert_eq!(err.code, "ROUTER_REASON_FOLD_FAILED");
+    let err = d.dispatch(&req).expect_err("unknown");
+    assert_eq!(err.code, AngzarrReason::UnknownCommandType.as_str_name());
+    let mut req = command_for(typed("test.Bump", "x"));
+    req.history = Some(pb::EventBook {
+        pages: vec![event_page(corrupt_cover_any())],
+        next_sequence: 1,
+        ..Default::default()
+    });
+    let err = d.dispatch(&req).expect_err("the history does not fold");
+    assert_eq!(err.code, AngzarrReason::FoldFailed.as_str_name());
+}
+
+// --- Emit: one decision, no step cap (decision 14.104) ----------------------------
+
+/// A domain whose `test.Bump` emits `a`, then runs `steps` in order.
+fn chained(
+    applied: Applied,
+    first: impl Fn() -> Emit<TestState> + Send + Sync + 'static,
+) -> DomainDispatch<TestState> {
+    DomainDispatch::new("chained", "chained", recording(applied))
+        .on_command("test.Bump", move |_cmd, _state, _ctx| Ok(first()))
 }
 
 #[test]
-fn a_failing_fact_handler_fails_the_request() {
-    let d = DomainDispatch::new("agg-test", "ledger", fresh_rebuilder())
-        .on_fact(&cover_full_name(), |_f, _s: &TestState| {
-            Err(crate::error::HandlerError::Other("broken".to_string()))
-        });
-    let err = d
-        .dispatch(&fact_delivery("f1", &[]))
-        .expect_err("handler error");
-    assert_eq!(err.code, RouterReason::UnhandledHandlerError.as_str_name());
+fn every_steps_events_are_answered_in_order_as_one_list() {
+    let applied = Applied::default();
+    let d = chained(applied.clone(), || {
+        Emit::of([cover_any("a")])
+            .then(|_state, _ctx| {
+                Ok(Emit::of([cover_any("b")]).then(|_state, _ctx| Ok(Emit::of([cover_any("c")]))))
+            })
+            .then(|_state, _ctx| Ok(Emit::of([cover_any("d")])))
+    });
+    let resp = d
+        .dispatch(&over(command_for(typed("test.Bump", "")), &["h"]))
+        .expect("decided");
+    assert_eq!(events_of(&resp), ["a", "b", "c", "d"]);
+    // Each step's events are folded at the sequences they will be given,
+    // on from the history's head, before the next step runs.
+    assert_eq!(
+        *applied.lock().unwrap(),
+        [
+            ("h".to_string(), 0),
+            ("a".to_string(), 1),
+            ("b".to_string(), 2),
+            ("c".to_string(), 3),
+            ("d".to_string(), 4)
+        ]
+    );
+    assert_eq!(resp.state, None, "TestState has no codec");
 }
 
-// Decision 14.37: a handler that panics is a bug, ROUTER_REASON_UNHANDLED_HANDLER_ERROR
-// with cause ROUTER_REASON_HANDLER_PANICKED; the panic's message stays in the handler's
-// own log and the router answers, rather than unwinding into its host.
 #[test]
-fn a_panicking_handler_is_a_bug_caused_by_handler_panicked() {
-    let d = DomainDispatch::new("agg-test", "order", cover_applier(fresh_rebuilder()))
-        .on_command(&cover_full_name(), |_, _, _| panic!("index out of bounds"));
-    let req = command_for(cover_any("a"));
-    let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| d.dispatch(&req)));
-    let err = match answer {
-        Ok(result) => result.expect_err("a panic is no success"),
-        Err(_) => panic!(
-            "the handler's panic escaped the router: it answers ROUTER_REASON_HANDLER_PANICKED"
-        ),
-    };
-    assert_eq!(err.grpc, GrpcCode::Internal);
-    assert_eq!(err.code, RouterReason::UnhandledHandlerError.as_str_name());
+fn a_step_decides_on_the_state_with_every_earlier_event_folded_in() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let captured = seen.clone();
+    let d = chained(Applied::default(), move || {
+        let captured = captured.clone();
+        Emit::of([cover_any("a")]).then(
+            move |state: &TestState, ctx: &crate::context::CommandContext| {
+                captured
+                    .lock()
+                    .unwrap()
+                    .push((state.applied.clone(), ctx.next_sequence));
+                Ok(Emit::none())
+            },
+        )
+    });
+    d.dispatch(&over(command_for(typed("test.Bump", "")), &["h"]))
+        .expect("decided");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![(vec!["h".to_string(), "a".to_string()], 1)],
+        "the step sees the earlier events folded in, and the input's own context"
+    );
+}
+
+#[test]
+fn a_refusal_or_a_bug_in_any_step_fails_the_whole_decision() {
+    let refusing = chained(Applied::default(), || {
+        Emit::of([cover_any("a")]).then(|_state, _ctx| {
+            Err(CodedError::refused(BusinessStatus::FailedPrecondition, cover_any("no")).into())
+        })
+    });
+    let err = refusing
+        .dispatch(&command_for(typed("test.Bump", "")))
+        .expect_err("refused");
+    assert_eq!(err.code, AngzarrReason::CommandRefused.as_str_name());
+    assert_eq!(err.grpc, GrpcCode::FailedPrecondition);
+    let failing = chained(Applied::default(), || {
+        Emit::of([cover_any("a")]).then(|_state, _ctx| Err(HandlerError::Other("boom".to_string())))
+    });
+    assert_eq!(
+        failing
+            .dispatch(&command_for(typed("test.Bump", "")))
+            .expect_err("a bug")
+            .code,
+        AngzarrReason::UnhandledHandlerError.as_str_name()
+    );
+    let panicking = chained(Applied::default(), || {
+        Emit::of([cover_any("a")]).then(|_state, _ctx| panic!("step panicked"))
+    });
+    let err = panicking
+        .dispatch(&command_for(typed("test.Bump", "")))
+        .expect_err("a bug");
     assert_eq!(
         err.extras.get("cause").map(String::as_str),
-        Some("ROUTER_REASON_HANDLER_PANICKED")
+        Some("ANGZARR_REASON_HANDLER_PANICKED")
     );
-    assert!(!format!("{err:?}").contains("index out of bounds"));
 }
 
 #[test]
-fn fact_types_exact() {
-    assert_eq!(fact_aggregate().fact_types(), vec![cover_full_name()]);
+fn a_steps_event_that_does_not_fold_is_fold_failed_emitted_at_its_sequence() {
+    let d = chained(Applied::default(), || {
+        Emit::of([cover_any("a")]).then(|_state, _ctx| Ok(Emit::of([corrupt_cover_any()])))
+    });
+    let err = d
+        .dispatch(&over(command_for(typed("test.Bump", "")), &["h", "i"]))
+        .expect_err("does not fold");
+    assert_eq!(err.code, AngzarrReason::FoldFailedEmitted.as_str_name());
+    assert_eq!(err.extras.get("sequence").map(String::as_str), Some("3"));
 }
 
-// The emitted EventBook passes through exactly as the handler returned it:
-// the coordinator stamps the cover, sequences and meta (and refuses output
-// that sets them), so the router adds nothing and polices nothing.
+// There is no step cap: a long chain is answered whole.
 #[test]
-fn the_emitted_book_passes_through_unstamped() {
-    let emitted = pb::EventBook {
-        pages: vec![
-            pb::EventPage::default(),
-            pb::EventPage {
-                sequence: 99,
-                ..Default::default()
-            },
-        ],
-        ..Default::default()
+fn a_long_chain_has_no_step_cap() {
+    let d = chained(Applied::default(), || {
+        let mut emit = Emit::of([cover_any("first")]);
+        for _ in 0..100 {
+            emit = emit.then(|_state, _ctx| Ok(Emit::of([cover_any("step")])));
+        }
+        emit
+    });
+    let resp = d
+        .dispatch(&command_for(typed("test.Bump", "")))
+        .expect("decided");
+    assert_eq!(resp.events.len(), 101);
+}
+
+#[test]
+fn an_emit_shows_its_own_events_and_whether_it_continues() {
+    let plain: Emit<TestState> = Emit::of([cover_any("a")]);
+    assert_eq!(plain.events(), [cover_any("a")]);
+    assert_eq!(plain.continues(), Continues::Nowhere);
+    let next = plain.then(|_s, _c| Ok(Emit::none()));
+    assert_eq!(next.continues(), Continues::Somewhere);
+    assert_eq!(next.events(), [cover_any("a")], "then adds no events");
+    assert!(Emit::<TestState>::none().events().is_empty());
+    let shown = format!("{next:?}");
+    assert!(shown.contains("Somewhere"), "{shown}");
+    assert!(shown.contains("Emit"), "{shown}");
+}
+
+// --- a fact's handling never refuses (decisions 14.72 and 14.98) ------------------
+
+fn fact_failing(fail: fn() -> HandlerError) -> DomainDispatch<TestState> {
+    DomainDispatch::new("facts", "facts", fresh_rebuilder())
+        .on_fact("test.Seen", move |_fact, _state, _ctx| Err(fail()))
+        .on_command("test.Bump", move |_cmd, _state, _ctx| Err(fail()))
+}
+
+#[test]
+fn a_facts_refusal_or_rerun_is_answered_as_a_bug_and_a_commands_is_not() {
+    let refused = || {
+        HandlerError::from(CodedError::refused(
+            BusinessStatus::FailedPrecondition,
+            cover_any("no"),
+        ))
     };
-    let returned = emitted.clone();
-    let d = DomainDispatch::new("agg", "order", fresh_rebuilder())
-        .on_command("test.Create", move |_, _: &mut TestState, _| {
-            Ok(Some(returned.clone()))
-        });
-    let mut req = command_for(Any {
-        type_url: format!("{TYPE_URL_PREFIX}test.Create"),
-        value: Vec::new(),
-    });
-    req.command.as_mut().unwrap().cover = Some(pb::Cover {
-        domain: "order".to_string(),
+    let err = fact_failing(refused)
+        .dispatch(&request(fact_page(typed("test.Seen", ""))))
+        .expect_err("a bug");
+    assert_eq!(err.code, AngzarrReason::UnhandledHandlerError.as_str_name());
+    assert_eq!(err.grpc, GrpcCode::Internal);
+    assert_eq!(err.refusal, None);
+    let err = fact_failing(refused)
+        .dispatch(&command_for(typed("test.Bump", "")))
+        .expect_err("refused");
+    assert_eq!(err.code, AngzarrReason::CommandRefused.as_str_name());
+    let retryable = || {
+        HandlerError::from(CodedError::retryable_bug(
+            RetryableStatus::Unavailable,
+            "LEDGER_OFFLINE",
+            [],
+        ))
+    };
+    let err = fact_failing(retryable)
+        .dispatch(&request(fact_page(typed("test.Seen", ""))))
+        .expect_err("a retryable bug");
+    assert_eq!(err.grpc, GrpcCode::Unavailable, "a bug's own status");
+}
+
+// --- the context, and the state's cover --------------------------------------------
+
+#[test]
+fn a_handler_and_its_appliers_see_the_input_and_the_streams_cover() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let captured = seen.clone();
+    let covers = Arc::new(Mutex::new(Vec::new()));
+    let applier_covers = covers.clone();
+    let rebuilder = fresh_rebuilder().apply_with_context(
+        &cover_full_name(),
+        move |_s: &mut TestState, _any, ctx| {
+            applier_covers.lock().unwrap().push(ctx.cover.cloned());
+            Ok(())
+        },
+    );
+    let d = DomainDispatch::new("ctx", "ctx", rebuilder).on_fact(
+        "test.Seen",
+        move |_fact, _state, ctx| {
+            captured.lock().unwrap().push(ctx.arm.clone());
+            Ok(Emit::of([cover_any("x")]))
+        },
+    );
+    let mut req = request(fact_page(typed("test.Seen", "")));
+    req.input.as_mut().unwrap().cover = Some(stream("ctx", None, 3));
+    d.dispatch(&req).expect("recorded");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![InputArm::Fact {
+            origin: Some(origin("ext-1"))
+        }]
+    );
+    // With no history the emitted events fold under the input's cover.
+    assert_eq!(*covers.lock().unwrap(), vec![Some(stream("ctx", None, 3))]);
+    covers.lock().unwrap().clear();
+    req.history = Some(pb::EventBook {
+        cover: Some(stream("ctx", None, 4)),
         ..Default::default()
     });
-    req.events = Some(pb::EventBook {
-        next_sequence: 5,
-        pages: vec![pb::EventPage::default()],
-        ..Default::default()
-    });
-    let resp = d.dispatch(&req).expect("dispatch");
-    assert_eq!(resp.events, Some(emitted));
+    d.dispatch(&req).expect("recorded");
+    assert_eq!(
+        *covers.lock().unwrap(),
+        vec![Some(stream("ctx", None, 4))],
+        "the history's cover first"
+    );
+}
+
+#[test]
+fn accessors_report_name_domain_kind_and_types() {
+    let d = bumps(Applied::default());
+    assert_eq!(d.name(), "bumps");
+    assert_eq!(d.domain(), "bumps");
+    assert_eq!(d.kind(), pb::ComponentKind::Aggregate);
+    assert_eq!(d.command_types(), ["test.Bump"]);
+    assert_eq!(d.fact_types(), ["test.Seen"]);
+    let pm = DomainDispatch::process_manager("pm", "fulfillment", fresh_rebuilder());
+    assert_eq!(pm.kind(), pb::ComponentKind::ProcessManager);
+    assert_eq!(pm.domain(), "fulfillment");
+    assert_eq!(pm.name(), "pm");
+    assert!(pm.command_types().is_empty() && pm.fact_types().is_empty());
+}
+
+#[test]
+fn an_undeclared_rules_version_reports_empty() {
+    let resp = DomainDispatch::new("t", "t", fresh_rebuilder())
+        .on_command("test.Bump", |_, _, _| Ok(Emit::none()))
+        .dispatch(&command_for(typed("test.Bump", "")))
+        .expect("handled");
     assert_eq!(resp.rules_version, "");
 }
 
+// --- the step-idempotence test helper (decision 14.104) ---------------------------
+
+/// A state the helper can copy, folding Cover events by domain.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Notes {
+    notes: Vec<String>,
+}
+
+fn notes() -> DomainDispatch<Notes> {
+    let rebuilder = crate::rebuild::Rebuilder::new(Notes::default).apply(
+        &cover_full_name(),
+        |s: &mut Notes, any| {
+            s.notes
+                .push(pb::Cover::decode(any.value.as_slice())?.domain);
+            Ok(())
+        },
+    );
+    DomainDispatch::new("notes", "notes", rebuilder)
+}
+
 #[test]
-fn a_handler_emitting_nothing_answers_an_empty_book() {
-    let d = DomainDispatch::new("agg", "order", fresh_rebuilder())
-        .on_command("test.Create", |_, _: &mut TestState, _| Ok(None));
-    let resp = d
-        .dispatch(&command_for(Any {
-            type_url: type_url("test.Create"),
-            value: Vec::new(),
-        }))
-        .expect("dispatch");
-    assert_eq!(resp.events, Some(pb::EventBook::default()));
-}
-
-/// A decision's identity, as the coordinator delivers it: a command id, a
-/// correlation and the instant the input was accepted.
-fn identified(mut req: pb::ContextualCommand) -> pb::ContextualCommand {
-    let page = req.command.as_mut().unwrap().page.as_mut().unwrap();
-    page.command_id = Some(uuid_of(1));
-    page.correlation_id = Some(uuid_of(2));
-    req.recorded_at = Some(prost_types::Timestamp {
-        seconds: 1_700_000_000,
-        nanos: 5,
-    });
-    req
-}
-
-/// The meta the coordinator stamps every event of `req`'s decision with,
-/// under rules version "v3" (types.proto, EventMeta).
-fn stamped_meta(req: &pb::ContextualCommand) -> pb::EventMeta {
-    let page = req.command.as_ref().unwrap().page.as_ref().unwrap();
-    pb::EventMeta {
-        causation: page
-            .command_id
-            .clone()
-            .map(pb::event_meta::Causation::CommandId),
-        fact: page.fact_origin.clone(),
-        correlation_id: page.correlation_id.clone(),
-        recorded_at: req.recorded_at,
-        rules_version: "v3".to_string(),
-    }
-}
-
-/// The meta an applier saw, page by page.
-type SeenMeta = Arc<Mutex<Vec<Option<pb::EventMeta>>>>;
-
-/// A rebuilder whose Cover applier records the meta it sees.
-fn meta_recorder() -> (Rebuilder<TestState>, SeenMeta) {
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let log = seen.clone();
-    let r = fresh_rebuilder().apply_with_context(&cover_full_name(), move |_, _, ctx| {
-        log.lock().unwrap().push(ctx.meta.cloned());
+fn a_step_that_emits_nothing_on_its_own_result_is_idempotent() {
+    let ctx = crate::context::CommandContext::default();
+    let once = |state: &Notes, _ctx: &crate::context::CommandContext| {
+        if state.notes.iter().any(|n| n == "restock") {
+            return Ok(Emit::none());
+        }
+        Ok(Emit::of([cover_any("restock")]))
+    };
+    assert_eq!(
+        notes().check_step_idempotent(&Notes::default(), &ctx, once),
         Ok(())
-    });
-    (r, seen)
+    );
 }
 
-/// The applier's view of `answered`'s pages replayed: each stamped with
-/// `meta`, as the coordinator persists them.
-fn replayed_meta(answered: &pb::EventBook, meta: &pb::EventMeta) -> Vec<Option<pb::EventMeta>> {
-    let (r, seen) = meta_recorder();
-    let persisted = pb::EventBook {
-        pages: answered
-            .pages
-            .iter()
-            .map(|p| pb::EventPage {
-                meta: Some(meta.clone()),
-                ..p.clone()
-            })
-            .collect(),
+#[test]
+fn a_step_that_emits_again_names_the_events_the_second_run_emitted() {
+    let ctx = crate::context::CommandContext::default();
+    let always = |_state: &Notes, _ctx: &crate::context::CommandContext| {
+        Ok(Emit::of([cover_any("restock")]))
+    };
+    assert_eq!(
+        notes().check_step_idempotent(&Notes::default(), &ctx, always),
+        Err(NotIdempotent::EmittedAgain(vec![cover_any("restock")]))
+    );
+}
+
+#[test]
+fn a_step_that_continues_again_is_not_idempotent() {
+    let ctx = crate::context::CommandContext::default();
+    let continuing = |_state: &Notes, _ctx: &crate::context::CommandContext| {
+        Ok(Emit::none().then(|_s, _c| Ok(Emit::none())))
+    };
+    assert_eq!(
+        notes().check_step_idempotent(&Notes::default(), &ctx, continuing),
+        Err(NotIdempotent::ContinuedAgain)
+    );
+}
+
+#[test]
+fn a_failing_step_or_fold_fails_the_check() {
+    let ctx = crate::context::CommandContext::default();
+    let failing = |_state: &Notes, _ctx: &crate::context::CommandContext| {
+        Err(HandlerError::Other("boom".to_string()))
+    };
+    assert!(matches!(
+        notes().check_step_idempotent(&Notes::default(), &ctx, failing),
+        Err(NotIdempotent::Failed(err)) if err.code == AngzarrReason::UnhandledHandlerError.as_str_name()
+    ));
+    let unfoldable =
+        |_state: &Notes, _ctx: &crate::context::CommandContext| Ok(Emit::of([corrupt_cover_any()]));
+    assert!(matches!(
+        notes().check_step_idempotent(&Notes::default(), &ctx, unfoldable),
+        Err(NotIdempotent::Failed(err)) if err.code == AngzarrReason::FoldFailedEmitted.as_str_name()
+    ));
+    // The second run fails: the state its first run produced breaks it.
+    let second_fails = |state: &Notes, _ctx: &crate::context::CommandContext| {
+        if state.notes.is_empty() {
+            return Ok(Emit::of([cover_any("x")]));
+        }
+        Err(HandlerError::Other("second".to_string()))
+    };
+    assert!(matches!(
+        notes().check_step_idempotent(&Notes::default(), &ctx, second_fails),
+        Err(NotIdempotent::Failed(_))
+    ));
+}
+
+// The helper folds the first run's events at the context's next sequence,
+// as the decision would.
+#[test]
+fn the_helper_folds_the_first_runs_events_at_the_contexts_head() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let captured = seen.clone();
+    let rebuilder = crate::rebuild::Rebuilder::new(Notes::default).apply_with_context(
+        &cover_full_name(),
+        move |s: &mut Notes, any, ctx| {
+            captured.lock().unwrap().push(ctx.sequence);
+            s.notes
+                .push(pb::Cover::decode(any.value.as_slice())?.domain);
+            Ok(())
+        },
+    );
+    let ctx = crate::context::CommandContext {
+        next_sequence: 7,
         ..Default::default()
     };
-    r.rebuild(Some(&persisted)).expect("replay");
-    let replayed = seen.lock().unwrap().clone();
-    replayed
-}
-
-// The full-context rule: an applier folding a decision's own events at
-// decide time sees the meta the coordinator stamps them with, the same meta
-// replay hands it.
-#[test]
-fn a_command_s_own_events_fold_with_the_meta_replay_sees() {
-    let (r, seen) = meta_recorder();
-    let d = DomainDispatch::new("agg", "order", r)
-        .with_rules_version("v3")
-        .on_command(&cover_full_name(), |_, _: &mut TestState, _| {
-            Ok(Some(pb::EventBook {
-                pages: vec![event_page(cover_any("a")), event_page(cover_any("b"))],
-                ..Default::default()
-            }))
-        });
-    let req = identified(command_for(cover_any("")));
-    let resp = d.dispatch(&req).expect("dispatch");
-    let meta = stamped_meta(&req);
-    let decided = seen.lock().unwrap().clone();
-    assert_eq!(decided, vec![Some(meta.clone()), Some(meta.clone())]);
-    assert_eq!(decided, replayed_meta(&resp.events.unwrap(), &meta));
-}
-
-#[test]
-fn a_fact_s_recorded_pages_fold_with_the_meta_replay_sees() {
-    let (r, seen) = meta_recorder();
-    let d = DomainDispatch::new("agg", "ledger", r)
-        .with_rules_version("v3")
-        .on_fact(&cover_full_name(), |fact, _: &TestState| {
-            Ok(FactRecord {
-                fact: fact.clone(),
-                flags: vec![cover_any("flag")],
-            })
-        });
-    let mut req = identified(contextual(fact_page(cover_any("f"))));
-    req.command
-        .as_mut()
-        .unwrap()
-        .page
-        .as_mut()
-        .unwrap()
-        .fact_origin = Some(pb::FactOrigin {
-        external_id: "pi_1".to_string(),
-        ..Default::default()
-    });
-    let resp = d.dispatch(&req).expect("fact");
-    let meta = stamped_meta(&req);
-    assert!(meta.fact.is_some(), "a fact's meta names its origin");
-    let decided = seen.lock().unwrap().clone();
-    assert_eq!(decided, vec![Some(meta.clone()), Some(meta.clone())]);
-    assert_eq!(decided, replayed_meta(&resp.events.unwrap(), &meta));
+    let once = |state: &Notes, _ctx: &crate::context::CommandContext| match state.notes.is_empty() {
+        true => Ok(Emit::of([cover_any("a"), cover_any("b")])),
+        false => Ok(Emit::none()),
+    };
+    DomainDispatch::new("n", "n", rebuilder)
+        .check_step_idempotent(&Notes::default(), &ctx, once)
+        .expect("idempotent");
+    assert_eq!(*seen.lock().unwrap(), vec![7, 8]);
 }

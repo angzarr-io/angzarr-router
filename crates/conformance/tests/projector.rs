@@ -1,12 +1,13 @@
 //! Cucumber harness for the handler-contract tier's
 //! `projector_dispatch.feature`: drives it against the Rust router's
-//! ProjectorDispatch. Every router binds the same feature; only this
-//! step-definition layer differs.
+//! ProjectorDispatch, through Project (one stream's run, decision 14.78).
+//! Every router binds the same feature; only this step-definition layer
+//! differs.
 
 mod common;
 
 use angzarr_router::error::CodedError;
-use angzarr_router::pb;
+use angzarr_router::hpb;
 use angzarr_router::router::ProjectorHandler;
 use angzarr_router_conformance as conf;
 use cucumber::writer::Stats as _;
@@ -14,26 +15,28 @@ use cucumber::{given, then, when, World};
 
 #[derive(Debug, Default, World)]
 struct ProjectorWorld {
-    /// Outcome of the dispatched delivery.
-    result: Option<Result<pb::Projection, CodedError>>,
+    /// Outcome of the dispatched run.
+    result: Option<Result<hpb::ProjectResponse, CodedError>>,
     /// The projector's declared domains.
     domains: Vec<&'static str>,
 }
 
 impl ProjectorWorld {
-    /// Dispatches through the kernel-facing [`ProjectorHandler`], awaiting
+    /// Projects through the kernel-facing [`ProjectorHandler`], awaiting
     /// its answer.
-    async fn dispatch(&mut self, book: pb::EventBook) {
+    async fn project(&mut self, req: hpb::ProjectRequest) {
         let projector = conf::counter_projector(&self.domains);
-        self.result = Some(ProjectorHandler::dispatch(&projector, &book).await);
+        self.result = Some(ProjectorHandler::dispatch(&projector, &req).await);
     }
 
-    fn projection(&self) -> &pb::Projection {
-        self.result
-            .as_ref()
-            .expect("a delivery was dispatched")
-            .as_ref()
-            .expect("expected a successful projection")
+    fn count(&self) -> u32 {
+        conf::projected_count(
+            self.result
+                .as_ref()
+                .expect("a run was dispatched")
+                .as_ref()
+                .expect("expected a successful projection"),
+        )
     }
 }
 
@@ -42,20 +45,15 @@ async fn a_counter_projection(w: &mut ProjectorWorld) {
     w.domains = vec!["counter"];
 }
 
-#[given("a counter projection over every domain")]
-async fn a_counter_projection_over_every_domain(w: &mut ProjectorWorld) {
-    w.domains = vec![angzarr_router::WILDCARD_DOMAIN];
-}
-
 #[when(regex = r#"^(\d+) events are delivered in domain "([^"]*)"$"#)]
 async fn events_delivered(w: &mut ProjectorWorld, count: u32, domain: String) {
-    w.dispatch(conf::delivery(&domain, count)).await;
+    w.project(conf::delivery(&domain, count)).await;
 }
 
 #[then(regex = r"^the projection records (\d+) events?$")]
-async fn records_count(w: &mut ProjectorWorld, count: u64) {
+async fn records_count(w: &mut ProjectorWorld, count: u32) {
     assert_eq!(
-        w.projection().next_sequence,
+        w.count(),
         count,
         "every delivered event folds into one projection"
     );
@@ -63,11 +61,7 @@ async fn records_count(w: &mut ProjectorWorld, count: u64) {
 
 #[then("the projection records nothing")]
 async fn records_nothing(w: &mut ProjectorWorld) {
-    assert_eq!(
-        w.projection().next_sequence,
-        0,
-        "an undeclared domain folds nothing"
-    );
+    assert_eq!(w.count(), 0, "an undeclared domain folds nothing");
 }
 
 #[tokio::main]

@@ -1,16 +1,18 @@
 //! The state on every answer (owner ruling, round 7; decision 14.12): the
-//! router fills `events.snapshot.state` with the state after the emitted
+//! router fills `HandleResponse.state` with the state after the emitted
 //! events, encoded by the state's codec, on every domain's answer (an
 //! aggregate's or a process manager's, a PM being a domain; decision 14.31).
 //! Business code never decides when; the coordinator decides whether to
-//! write it and stamps its sequence and rules version (decision 14.40).
+//! write it as a snapshot and stamps its sequence and rules version
+//! (decisions 14.40 and 14.78).
 
 use std::collections::BTreeMap;
 
 use prost::Message;
 use prost_types::Any;
 
-use crate::domain::{DomainDispatch, FactRecord};
+use crate::domain::{DomainDispatch, Emit};
+use crate::hpb;
 use crate::pb;
 use crate::rebuild::Rebuilder;
 use crate::test_support::*;
@@ -48,41 +50,28 @@ fn image(pairs: &[(&str, u32)]) -> Any {
 }
 
 /// The aggregate: `test.Bump(key)` emits one bump of `key`, `test.Nothing`
-/// emits nothing, `test.Refuse` is rejected; the fact `test.Note(key)` is
+/// emits nothing, `test.Refuse` is refused; the fact `test.Note(key)` is
 /// recorded and flagged with a bump of "flag".
 fn items(rebuilder: Rebuilder<Items>) -> DomainDispatch<Items> {
     DomainDispatch::new("items", "items", rebuilder)
         .with_rules_version("7")
         .on_command("test.Bump", |cmd, _state, _cctx| {
             let key = pb::Cover::decode(cmd.value.as_slice()).unwrap().domain;
-            Ok(Some(pb::EventBook {
-                pages: vec![event_page(cover_any(&key))],
-                ..Default::default()
-            }))
+            Ok(Emit::of([cover_any(&key)]))
         })
-        .on_command("test.Nothing", |_cmd, _state, _cctx| Ok(None))
+        .on_command("test.Nothing", |_cmd, _state, _cctx| Ok(Emit::none()))
         .on_command("test.Refuse", |_cmd, _state, _cctx| {
-            Err(crate::error::HandlerError::Coded(
-                crate::error::CodedError::rejection(
-                    crate::error::BusinessStatus::FailedPrecondition,
-                    "NO",
-                    [],
-                ),
-            ))
+            Err(crate::error::CodedError::refused(
+                crate::error::BusinessStatus::FailedPrecondition,
+                cover_any("no"),
+            )
+            .into())
         })
-        .on_fact("test.Note", |fact, _state| {
-            Ok(FactRecord {
-                fact: cover_any(&pb::Cover::decode(fact.value.as_slice()).unwrap().domain),
-                flags: vec![cover_any("flag")],
-            })
-        })
-        .with_commutative(|before: &Items, after: &Items| {
-            let keys: std::collections::BTreeSet<&String> =
-                before.items.keys().chain(after.items.keys()).collect();
-            keys.into_iter()
-                .filter(|k| before.items.get(*k) != after.items.get(*k))
-                .map(|k| format!("items[{k}]"))
-                .collect()
+        .on_fact("test.Note", |fact, _state, _cctx| {
+            Ok(Emit::of([
+                cover_any(&pb::Cover::decode(fact.value.as_slice()).unwrap().domain),
+                cover_any("flag"),
+            ]))
         })
 }
 
@@ -93,8 +82,8 @@ fn typed(fq: &str, key: &str) -> Any {
 }
 
 /// `command` over a history bumping `history` at sequences 0...
-fn over(mut req: pb::ContextualCommand, history: &[&str]) -> pb::ContextualCommand {
-    req.events = Some(pb::EventBook {
+fn over(mut req: hpb::HandleRequest, history: &[&str]) -> hpb::HandleRequest {
+    req.history = Some(pb::EventBook {
         pages: history
             .iter()
             .zip(0..)
@@ -106,11 +95,10 @@ fn over(mut req: pb::ContextualCommand, history: &[&str]) -> pb::ContextualComma
     req
 }
 
-fn snapshot_of(resp: &pb::CommandHandlerResponse) -> pb::Snapshot {
-    resp.events
-        .as_ref()
-        .and_then(|b| b.snapshot.clone())
-        .expect("every answer carries the post-command snapshot")
+fn state_of(resp: &hpb::HandleResponse) -> Any {
+    resp.state
+        .clone()
+        .expect("every answer carries the post-command state")
 }
 
 #[test]
@@ -118,11 +106,9 @@ fn a_command_answers_the_state_after_its_events() {
     let resp = items(items_rebuilder())
         .dispatch(&over(command_for(typed("test.Bump", "a")), &["a", "b"]))
         .expect("accepted");
-    let snapshot = snapshot_of(&resp);
-    assert_eq!(snapshot.state, Some(image(&[("a", 2), ("b", 1)])));
-    assert_eq!(snapshot.sequence, 0, "the coordinator stamps the sequence");
-    assert_eq!(snapshot.rules_version, "", "and the rules version");
-    assert_eq!(resp.events.unwrap().pages.len(), 1);
+    assert_eq!(state_of(&resp), image(&[("a", 2), ("b", 1)]));
+    assert_eq!(resp.rules_version, "7");
+    assert_eq!(resp.events, vec![cover_any("a")]);
 }
 
 #[test]
@@ -130,95 +116,35 @@ fn a_command_emitting_nothing_still_answers_the_current_state() {
     let resp = items(items_rebuilder())
         .dispatch(&over(command_for(typed("test.Nothing", "")), &["a"]))
         .expect("accepted");
-    assert_eq!(snapshot_of(&resp).state, Some(image(&[("a", 1)])));
-    assert!(resp.events.unwrap().pages.is_empty());
+    assert_eq!(state_of(&resp), image(&[("a", 1)]));
+    assert!(resp.events.is_empty());
 }
 
 #[test]
 fn a_rejection_answers_a_status_and_no_body() {
-    // command_handler.proto: a rejection is a gRPC error status, never a
-    // response message, so it carries no snapshot.
+    // Decision 14.95: a refusal is a gRPC error status, never a response
+    // message, so it carries no state.
     let err = items(items_rebuilder())
         .dispatch(&over(command_for(typed("test.Refuse", "")), &["a"]))
-        .expect_err("rejected");
-    assert_eq!(err.code, "NO");
+        .expect_err("refused");
+    assert_eq!(err.code, "ANGZARR_REASON_COMMAND_REFUSED");
 }
 
 #[test]
 fn a_fact_answers_the_state_after_its_record() {
     let resp = items(items_rebuilder())
-        .dispatch(&over(
-            contextual(fact_page(typed("test.Note", "n"))),
-            &["a"],
-        ))
+        .dispatch(&over(request(fact_page(typed("test.Note", "n"))), &["a"]))
         .expect("recorded");
-    assert_eq!(
-        snapshot_of(&resp).state,
-        Some(image(&[("a", 1), ("flag", 1), ("n", 1)]))
-    );
-}
-
-fn handled(
-    key: &str,
-    history: &[&str],
-    expected: u64,
-    resolution: pb::ConflictResolution,
-) -> pb::ContextualCommand {
-    let mut req = over(command_for(typed("test.Bump", key)), history);
-    req.command.as_mut().unwrap().handling = Some(pb::Handling {
-        expected_sequence: Some(expected),
-        conflict_resolution: resolution as i32,
-    });
-    req.conflict_nonce = b"n".to_vec().into();
-    req
+    assert_eq!(state_of(&resp), image(&[("a", 1), ("flag", 1), ("n", 1)]));
 }
 
 #[test]
-fn a_commutative_command_answers_the_head_plus_its_events() {
-    let resp = items(items_rebuilder())
-        .dispatch(&handled(
-            "a",
-            &["b", "b"],
-            0,
-            pb::ConflictResolution::Commutative,
-        ))
-        .expect("disjoint");
-    assert_eq!(snapshot_of(&resp).state, Some(image(&[("a", 1), ("b", 2)])));
-}
-
-#[test]
-fn an_aggregate_handles_command_answers_the_head_plus_its_events() {
-    let resolving = DomainDispatch::new("items", "items", items_rebuilder()).on_command(
-        "test.Bump",
-        |cmd, _state, cctx| {
-            if let Some(conflict) = cctx.conflict.as_ref() {
-                conflict.resolve_conflicts(conflict.window(), conflict.nonce());
-            }
-            let key = pb::Cover::decode(cmd.value.as_slice()).unwrap().domain;
-            Ok(Some(pb::EventBook {
-                pages: vec![event_page(cover_any(&key))],
-                ..Default::default()
-            }))
-        },
-    );
-    let resp = resolving
-        .dispatch(&handled(
-            "a",
-            &["b"],
-            0,
-            pb::ConflictResolution::AggregateHandles,
-        ))
-        .expect("resolved");
-    assert_eq!(snapshot_of(&resp).state, Some(image(&[("a", 1), ("b", 1)])));
-}
-
-#[test]
-fn a_rebuilder_with_no_state_message_answers_no_snapshot() {
+fn a_rebuilder_with_no_state_message_answers_no_state() {
     let resp = DomainDispatch::new("t", "t", cover_applier(fresh_rebuilder()))
-        .on_command("test.Nothing", |_, _, _| Ok(None))
+        .on_command("test.Nothing", |_, _, _| Ok(Emit::none()))
         .dispatch(&command_for(typed("test.Nothing", "")))
         .expect("accepted");
-    assert!(resp.events.unwrap().snapshot.is_none());
+    assert!(resp.state.is_none());
 }
 
 #[test]
@@ -250,25 +176,20 @@ fn of_messages_codec_decodes_the_state_it_encodes() {
 
 #[test]
 fn an_emitted_event_that_does_not_fold_fails_the_command() {
-    let corrupt = DomainDispatch::new("items", "items", items_rebuilder()).on_command(
-        "test.Bump",
-        |_cmd, _state, _cctx| {
-            Ok(Some(pb::EventBook {
-                pages: vec![event_page(corrupt_cover_any())],
-                ..Default::default()
-            }))
-        },
-    );
+    let corrupt = DomainDispatch::new("items", "items", items_rebuilder())
+        .on_command("test.Bump", |_cmd, _state, _cctx| {
+            Ok(Emit::of([corrupt_cover_any()]))
+        });
     let err = corrupt
         .dispatch(&command_for(typed("test.Bump", "a")))
         .expect_err("the emitted event does not fold");
-    // Decision 14.37: its own key, not ROUTER_REASON_UNHANDLED_HANDLER_ERROR.
-    assert_eq!(err.code, "ROUTER_REASON_FOLD_FAILED_EMITTED");
+    // Decision 14.37: its own key, not ANGZARR_REASON_UNHANDLED_HANDLER_ERROR.
+    assert_eq!(err.code, "ANGZARR_REASON_FOLD_FAILED_EMITTED");
 }
 
-// The snapshot must equal what a rebuild would fold once the events are
-// stamped, so the fold sees each emitted page at the sequence it will get
-// (the head's next sequence onward); the answered pages stay unstamped.
+// The state must equal what a rebuild would fold once the events are
+// stamped, so the fold sees each emitted event at the sequence it will get
+// (the head's next sequence onward); the answered events stay payloads.
 #[test]
 fn emitted_events_fold_at_the_sequences_they_will_be_given() {
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -282,14 +203,10 @@ fn emitted_events_fold_at_the_sequences_they_will_be_given() {
     );
     let resp = DomainDispatch::new("items", "items", rebuilder)
         .on_command("test.Bump", |_cmd, _state, _cctx| {
-            Ok(Some(pb::EventBook {
-                pages: vec![event_page(cover_any("x")), event_page(cover_any("y"))],
-                ..Default::default()
-            }))
+            Ok(Emit::of([cover_any("x"), cover_any("y")]))
         })
         .dispatch(&over(command_for(typed("test.Bump", "a")), &["a", "b"]))
         .expect("accepted");
     assert_eq!(*seen.lock().unwrap(), vec![0, 1, 2, 3]);
-    let pages = resp.events.unwrap().pages;
-    assert!(pages.iter().all(|p| p.sequence == 0), "answered unstamped");
+    assert_eq!(resp.events, vec![cover_any("x"), cover_any("y")]);
 }

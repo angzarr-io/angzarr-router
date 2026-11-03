@@ -5,9 +5,15 @@
 //! key as its reason and the args as its metadata, and text is rendered only
 //! where it is shown, from a catalog keyed by the code.
 //!
+//! Every outcome but success is one of these (decision 14.95): a typed
+//! refusal ([`CodedError::refused`], a command's only), a re-run
+//! ([`CodedError::immediate`], ABORTED) or a bug ([`CodedError::bug`] and
+//! the router's own keys). There is no untyped business rejection: a key
+//! business code raises of its own is a bug's cause.
+//!
 //! The router answers a status and a key, and never classifies (decision
 //! 14.42): which of decision 14.37's four classes a status is, and what
-//! reaches a policy's OnRefused, are the coordinator's. No class,
+//! reaches a policy's Translate, are the coordinator's. No class,
 //!
 //! ```compile_fail
 //! use angzarr_router::error::ErrorClass;
@@ -79,14 +85,16 @@ impl GrpcCode {
         })
     }
 
-    /// The code a spec key travels with, from the status its
-    /// `(io.angzarr.v1.reason)` option declares (`RouterReason::status`
-    /// and the other key enums' `status()`; decision 14.65): a
-    /// `ReasonStatus` value's number is its `google.rpc.Code` number.
-    /// `None` for `READINESS`, a readiness refusal that never travels as a
-    /// status, and for `UNSPECIFIED`, which no live key declares.
-    pub fn of_status(status: angzarr_proto::v1::ReasonStatus) -> Option<Self> {
-        Self::from_wire(status as i32)
+    /// The code a spec key travels with, from the surface its
+    /// `(io.angzarr.v1.reason)` option declares (`AngzarrReason::surface`
+    /// and the transports' keys'; decisions 14.65 and 14.104): its
+    /// `google.rpc.Code`. `None` for a readiness refusal, which never
+    /// travels as a status, and for `UNSPECIFIED`, which declares none.
+    pub fn of_surface(surface: Option<angzarr_proto::ReasonSurface>) -> Option<Self> {
+        match surface? {
+            angzarr_proto::ReasonSurface::GrpcStatus(code) => Self::from_wire(code as i32),
+            angzarr_proto::ReasonSurface::Readiness => None,
+        }
     }
 }
 
@@ -116,13 +124,15 @@ impl From<RetryableStatus> for GrpcCode {
     }
 }
 
-/// The statuses a business refusal may carry, and only those: a handler's
-/// [`CodedError::rejection`] takes one, so a bug's or a retryable status
-/// is refused by type (owner ruling, 2026-10-29).
+/// The statuses a typed refusal may carry, and only those: the business
+/// statuses of `io.angzarr.v1.RefusalStatus`, one of which each refusal
+/// message declares as its `(refusal_status)` (decisions 14.82 and 14.95).
+/// [`CodedError::refused`] takes one, so a bug's or a retryable status is
+/// refused by type (owner ruling, 2026-10-29).
 ///
 /// ```compile_fail
 /// use angzarr_router::error::{CodedError, GrpcCode};
-/// let _ = CodedError::rejection(GrpcCode::Internal, "BROKEN", []);
+/// let _ = CodedError::refused(GrpcCode::Internal, prost_types::Any::default());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BusinessStatus {
@@ -147,6 +157,43 @@ impl From<BusinessStatus> for GrpcCode {
     }
 }
 
+/// A refusal message's declared status (`io.angzarr.v1.RefusalStatus`),
+/// as generated code reads it: `UNSPECIFIED`, which no refusal may
+/// declare (decision 14.95), is refused with itself.
+impl TryFrom<angzarr_proto::v1::RefusalStatus> for BusinessStatus {
+    type Error = angzarr_proto::v1::RefusalStatus;
+    fn try_from(
+        status: angzarr_proto::v1::RefusalStatus,
+    ) -> Result<Self, angzarr_proto::v1::RefusalStatus> {
+        use angzarr_proto::v1::RefusalStatus;
+        match status {
+            RefusalStatus::InvalidArgument => Ok(BusinessStatus::InvalidArgument),
+            RefusalStatus::NotFound => Ok(BusinessStatus::NotFound),
+            RefusalStatus::AlreadyExists => Ok(BusinessStatus::AlreadyExists),
+            RefusalStatus::PermissionDenied => Ok(BusinessStatus::PermissionDenied),
+            RefusalStatus::FailedPrecondition => Ok(BusinessStatus::FailedPrecondition),
+            RefusalStatus::OutOfRange => Ok(BusinessStatus::OutOfRange),
+            RefusalStatus::Unspecified => Err(status),
+        }
+    }
+}
+
+/// The handler layer's `RefusalStatus` of a business status: what a refused
+/// policy's Translate is handed (`io.angzarr.handler.v1.Refusal.status`).
+impl From<BusinessStatus> for angzarr_proto::v1::RefusalStatus {
+    fn from(status: BusinessStatus) -> Self {
+        use angzarr_proto::v1::RefusalStatus;
+        match status {
+            BusinessStatus::FailedPrecondition => RefusalStatus::FailedPrecondition,
+            BusinessStatus::InvalidArgument => RefusalStatus::InvalidArgument,
+            BusinessStatus::NotFound => RefusalStatus::NotFound,
+            BusinessStatus::AlreadyExists => RefusalStatus::AlreadyExists,
+            BusinessStatus::OutOfRange => RefusalStatus::OutOfRange,
+            BusinessStatus::PermissionDenied => RefusalStatus::PermissionDenied,
+        }
+    }
+}
+
 /// A status a host or a binding hands over at run time is checked: a
 /// non-business status is refused with itself.
 impl TryFrom<GrpcCode> for BusinessStatus {
@@ -164,17 +211,17 @@ impl TryFrom<GrpcCode> for BusinessStatus {
     }
 }
 
-/// The router's reason keys (decisions 14.37, 14.42, 14.44) are
-/// [`RouterReason`], reasons.proto's enum: one value per condition, each
-/// answered as its full value name ([`RouterReason::as_str_name`],
-/// prefix included), its own status message and `ErrorInfo` reason. The
-/// coordinator's keys (admission, descriptor validation, policy output
-/// checks, refusal facts, conflict judgement) are its own; the retired ones
-/// are reserved there and never answered again.
-pub use angzarr_proto::v1::RouterReason;
+/// The router's reason keys (decisions 14.37, 14.42, 14.44) are core's
+/// [`AngzarrReason`], reasons.proto's one enum for core's layer (decision
+/// 14.104): one value per condition, each answered as its full value name
+/// ([`AngzarrReason::as_str_name`], `ANGZARR_REASON_` included), its own
+/// status message and `ErrorInfo` reason. The router raises only the keys
+/// whose comment says "Raised by the router"; the coordinator's are its
+/// own.
+pub use angzarr_proto::v1::AngzarrReason;
 
 // The args' names: the `ErrorInfo` metadata keys of the reasons, each
-// declared on its `RouterReason` value's `(io.angzarr.v1.reason)` option
+// declared on its `AngzarrReason` value's `(io.angzarr.v1.reason)` option
 // in reasons.proto and generated into angzarr-proto (decision 14.60), never
 // typed here. A wrapped cause flattens under `cause` as `cause.<arg>`; a
 // third-party library's own text travels verbatim as `ext_err_txt`
@@ -202,17 +249,17 @@ pub struct CodedError {
     pub code: String,
     pub extras: BTreeMap<String, String>,
     pub grpc: GrpcCode,
-    /// A business rejection's TYPED refusal object, packed: one of the
-    /// command's `CommandOptions.refuses` types (options.proto; decision
-    /// 14.31). Carried in the rejection's status details; the refused
-    /// policy receives it as `RefusalResponse.refusal`. Boxed, so the
-    /// common error stays small.
+    /// A refusal's TYPED refusal object, packed: one of the command's
+    /// `CommandOptions.refuses` types (options.proto; decision 14.95).
+    /// Carried in the refusal's status details; the refused policy's
+    /// Translate receives it as `Refusal.typed`. Boxed, so the common error
+    /// stays small.
     pub refusal: Option<Box<prost_types::Any>>,
 }
 
-/// What a business handler may fail with: a coded error (rejections and
+/// What a business handler may fail with: a coded error (refusals and
 /// classified failures keep their code and gRPC code) or an unclassified
-/// error, which the boundary maps to ROUTER_REASON_UNHANDLED_HANDLER_ERROR with no cause.
+/// error, which the boundary maps to ANGZARR_REASON_UNHANDLED_HANDLER_ERROR with no cause.
 /// `Other`'s text is for the handler's own log; it never crosses a
 /// boundary (decision 14.37).
 #[derive(Debug)]
@@ -269,11 +316,11 @@ impl CodedError {
     }
 
     /// A command or fact whose type URL reaches no registered handler
-    /// (`code` ROUTER_REASON_UNKNOWN_COMMAND_TYPE or ROUTER_REASON_NO_FACT_HANDLER): a bug (INTERNAL;
+    /// (`code` ANGZARR_REASON_UNKNOWN_COMMAND_TYPE or ANGZARR_REASON_NO_FACT_HANDLER): a bug (INTERNAL;
     /// owner ruling, 2026-10-29), its one arg `type_url` the type it was
     /// given (C-0682). The coordinator upcast it, and relays the type as sent
     /// beside it (decision 14.39).
-    pub fn unknown_type(reason: RouterReason, type_url: &str) -> Self {
+    pub fn unknown_type(reason: AngzarrReason, type_url: &str) -> Self {
         Self::keyed(
             reason,
             [(reason_args::TYPE_URL.to_string(), type_url.to_string())],
@@ -281,14 +328,14 @@ impl CodedError {
     }
 
     /// Bytes that do not decode as the message `message_type` (its
-    /// fully-qualified name): ROUTER_REASON_ANY_DECODE_FAILED, a bug (INTERNAL), one
+    /// fully-qualified name): ANGZARR_REASON_ANY_DECODE_FAILED, a bug (INTERNAL), one
     /// condition whatever the message, `message_type` its arg. prost's
     /// `error` is a third-party library's, so its own text travels
     /// verbatim as `ext_err_txt` (decision 14.37, owner's rulings
     /// 2026-10-29, late); prost gives it no numeric code.
     pub fn undecodable(message_type: &str, error: &prost::DecodeError) -> Self {
         Self::keyed(
-            RouterReason::AnyDecodeFailed,
+            AngzarrReason::AnyDecodeFailed,
             [
                 (
                     reason_args::MESSAGE_TYPE.to_string(),
@@ -302,20 +349,20 @@ impl CodedError {
     /// Classifies a store-sourced decode failure (DATA_LOSS on the wire).
     pub fn persisted_corrupt(type_url: &str) -> Self {
         Self::keyed(
-            RouterReason::PersistedEventCorrupt,
+            AngzarrReason::PersistedEventCorrupt,
             [(reason_args::TYPE_URL.to_string(), type_url.to_string())],
         )
     }
 
-    /// A fold of events that failed (INTERNAL), under `code`: ROUTER_REASON_FOLD_FAILED
-    /// for persisted events, ROUTER_REASON_FOLD_FAILED_EMITTED for the events the command
+    /// A fold of events that failed (INTERNAL), under `code`: ANGZARR_REASON_FOLD_FAILED
+    /// for persisted events, ANGZARR_REASON_FOLD_FAILED_EMITTED for the events the command
     /// emitted. Those events were accepted (or emitted) by the same apply
     /// logic, so the failure is a handler regression, never corrupt data.
     /// `at` names the failing page or, when it is unknown, the batch's
     /// range; `cause`, the fold's own failure as a key and args, is
     /// flattened in as `cause` and `cause.<arg>`.
     pub fn fold_failed(
-        reason: RouterReason,
+        reason: AngzarrReason,
         at: FoldAt<'_>,
         state_type_url: &str,
         cause: Option<&angzarr_proto::v1::Diagnostic>,
@@ -341,78 +388,100 @@ impl CodedError {
     }
 
     /// An unclassified error that escaped a business handler (INTERNAL):
-    /// ROUTER_REASON_UNHANDLED_HANDLER_ERROR with no cause. What escaped stays in the
+    /// ANGZARR_REASON_UNHANDLED_HANDLER_ERROR with no cause. What escaped stays in the
     /// handler's own log.
     pub fn unhandled() -> Self {
-        Self::keyed(RouterReason::UnhandledHandlerError, [])
+        Self::keyed(AngzarrReason::UnhandledHandlerError, [])
     }
 
-    /// A business handler that panicked (INTERNAL): ROUTER_REASON_UNHANDLED_HANDLER_ERROR
-    /// with cause ROUTER_REASON_HANDLER_PANICKED. The panic's message stays in the
+    /// A business handler that panicked (INTERNAL): ANGZARR_REASON_UNHANDLED_HANDLER_ERROR
+    /// with cause ANGZARR_REASON_HANDLER_PANICKED. The panic's message stays in the
     /// handler's own log.
     pub fn panicked() -> Self {
-        Self::bug(RouterReason::HandlerPanicked.as_str_name(), [])
+        Self::bug(AngzarrReason::HandlerPanicked.as_str_name(), [])
     }
 
-    /// A business rejection under `status`, one of the business set: the
-    /// command is refused, a business "no", never a fault. One of the two
-    /// classes a handler fails with (the other is [`Self::bug`]). `code` is
-    /// its key and `details` its args; a typed refusal is
-    /// [`Self::refused`] instead. The coordinator hands it to the issuing
-    /// policy's OnRefused.
-    pub fn rejection(
-        status: BusinessStatus,
-        code: &str,
-        details: impl IntoIterator<Item = (String, String)>,
-    ) -> Self {
-        Self::coded(code, details, status.into())
-    }
-
-    /// A typed business refusal (FAILED_PRECONDITION): `refusal` is one of
-    /// the command's `refuses` types, packed. Its wire reason is
-    /// ROUTER_REASON_COMMAND_REFUSED, its `refusal_type` arg the object's fully-qualified
-    /// type, and the object itself rides the status details (owner's
-    /// ruling on decision 14.37).
-    pub fn refused(refusal: prost_types::Any) -> Self {
+    /// A typed refusal, a command's only (decision 14.95): `refusal` is
+    /// one of the command's `refuses` types, packed, refused under
+    /// `status`, the business status its message declares
+    /// (`(io.angzarr.v1.refusal_status)`; generated code passes it). Its
+    /// wire reason is ANGZARR_REASON_COMMAND_REFUSED, its `refusal_type`
+    /// arg the object's fully-qualified type, and the object itself rides
+    /// the status details (decision 14.37). The refusing domain records
+    /// nothing.
+    pub fn refused(status: BusinessStatus, refusal: prost_types::Any) -> Self {
         let full_name = refusal
             .type_url
             .rsplit('/')
             .next()
             .unwrap_or_default()
             .to_string();
-        Self::keyed(
-            RouterReason::CommandRefused,
-            [(reason_args::REFUSAL_TYPE.to_string(), full_name)],
-        )
+        CodedError {
+            grpc: status.into(),
+            ..Self::keyed(
+                AngzarrReason::CommandRefused,
+                [(reason_args::REFUSAL_TYPE.to_string(), full_name)],
+            )
+        }
         .with_refusal(refusal)
     }
 
-    /// A bug: a defect, never a business answer. The other of the two
-    /// classes a handler fails with (the first is [`Self::rejection`]). It
-    /// goes out as ROUTER_REASON_UNHANDLED_HANDLER_ERROR (INTERNAL), with `code` and
-    /// `details` as its cause, flattened as `cause=<code>` and
-    /// `cause.<arg>=<value>` (decision 14.37); the runtime alerts it and
-    /// dead-letters the input, and it never reaches a policy's OnRefused.
+    /// This error's typed refusal as a refused policy's Translate receives
+    /// it (`io.angzarr.handler.v1.Refusal`; decision 14.95): the object and
+    /// the business status it travelled as. `None` for anything but a
+    /// typed refusal (a re-run or a bug never reaches Translate).
+    pub fn as_refusal(&self) -> Option<angzarr_proto_handler::v1::Refusal> {
+        let typed = self.refusal.as_deref()?;
+        let status = BusinessStatus::try_from(self.grpc).ok()?;
+        Some(angzarr_proto_handler::v1::Refusal {
+            status: angzarr_proto::v1::RefusalStatus::from(status) as i32,
+            typed: Some(typed.clone()),
+        })
+    }
+
+    /// This error as a FACT's handling answers it (decisions 14.72 and
+    /// 14.98): a fact's handling never refuses and never asks for a
+    /// re-run, so a typed refusal or a business or ABORTED status becomes
+    /// the bug it is, ANGZARR_REASON_UNHANDLED_HANDLER_ERROR (INTERNAL)
+    /// with this error's key and args as its cause, the refusal object
+    /// dropped; a bug, retryable or not, is answered unchanged.
+    pub fn as_fact_failure(self) -> Self {
+        let bug_status = matches!(self.grpc, GrpcCode::Aborted)
+            || BusinessStatus::try_from(self.grpc).is_ok()
+            || self.refusal.is_some();
+        if !bug_status {
+            return self;
+        }
+        Self::bug(&self.code, self.extras)
+    }
+
+    /// A bug: a defect, never a business answer, a domain's own key
+    /// included (decision 14.95: a rejection that is not a typed refusal is
+    /// a bug). It goes out as ANGZARR_REASON_UNHANDLED_HANDLER_ERROR
+    /// (INTERNAL), with `code` and `details` as its cause, flattened as
+    /// `cause=<code>` and `cause.<arg>=<value>` (decision 14.37); the
+    /// runtime alerts it and dead-letters the input, and it never reaches
+    /// a policy's Translate.
     pub fn bug(code: &str, details: impl IntoIterator<Item = (String, String)>) -> Self {
         Self::keyed(
-            RouterReason::UnhandledHandlerError,
+            AngzarrReason::UnhandledHandlerError,
             flatten(reason_args::CAUSE, code, details),
         )
     }
 
     /// A bug the handler marks retryable (an external dependency that is
     /// down), under the status it picks (decision 14.37, owner's rulings
-    /// 2026-10-29, latest): that status, ROUTER_REASON_UNHANDLED_HANDLER_ERROR, `code`
+    /// 2026-10-29, latest): that status, ANGZARR_REASON_UNHANDLED_HANDLER_ERROR, `code`
     /// and `details` as its cause, flattened as [`Self::bug`]'s are. The
     /// runtime retries it with capped backoff, then dead-letters it; it
-    /// never reaches a policy's OnRefused.
+    /// never reaches a policy's Translate.
     pub fn retryable_bug(
         status: RetryableStatus,
         code: &str,
         details: impl IntoIterator<Item = (String, String)>,
     ) -> Self {
         Self::coded(
-            RouterReason::UnhandledHandlerError.as_str_name(),
+            AngzarrReason::UnhandledHandlerError.as_str_name(),
             flatten(reason_args::CAUSE, code, details),
             status.into(),
         )
@@ -421,8 +490,9 @@ impl CodedError {
     /// A handler's immediate-return business error, "re-read and
     /// re-decide" (decision 14.37, owner's rulings 2026-10-29, latest):
     /// ABORTED under the handler's own `code`, its args `details`.
-    /// Returned at once to the caller, never a policy's OnRefused; for a
-    /// policy step the runtime reloads and re-runs the step.
+    /// Returned at once to the caller, never a policy's Translate; for a
+    /// policy step the runtime reloads and re-runs the step. A command's
+    /// only: from a fact's handling it is a bug ([`Self::as_fact_failure`]).
     pub fn immediate(code: &str, details: impl IntoIterator<Item = (String, String)>) -> Self {
         Self::coded(code, details, GrpcCode::Aborted)
     }
@@ -433,16 +503,16 @@ impl CodedError {
     /// request for a component the router does not host. Every router key
     /// travels as a status, so none is a readiness refusal.
     pub(crate) fn keyed(
-        reason: RouterReason,
+        reason: AngzarrReason,
         extras: impl IntoIterator<Item = (String, String)>,
     ) -> Self {
-        let grpc = GrpcCode::of_status(reason.status()).unwrap_or(GrpcCode::Internal);
+        let grpc = GrpcCode::of_surface(reason.surface()).unwrap_or(GrpcCode::Internal);
         Self::coded(reason.as_str_name(), extras, grpc)
     }
 
-    /// This business rejection carrying its typed refusal object (one of
-    /// the command's `refuses` types, packed).
-    pub fn with_refusal(self, refusal: prost_types::Any) -> Self {
+    /// This refusal carrying its typed refusal object (one of the
+    /// command's `refuses` types, packed).
+    fn with_refusal(self, refusal: prost_types::Any) -> Self {
         CodedError {
             refusal: Some(Box::new(refusal)),
             ..self
@@ -493,14 +563,14 @@ impl std::error::Error for CodedError {}
 
 /// The single handler-error mapping: coded errors pass through carrying
 /// their resolved gRPC code; unclassified errors become
-/// ROUTER_REASON_UNHANDLED_HANDLER_ERROR (INTERNAL) with no cause, their text left to the
+/// ANGZARR_REASON_UNHANDLED_HANDLER_ERROR (INTERNAL) with no cause, their text left to the
 /// handler's own log.
 pub fn map_handler_error(err: HandlerError) -> CodedError {
     match err {
         HandlerError::Coded(coded) => coded,
         HandlerError::Other(escaped) => {
             tracing::error!(
-                code = RouterReason::UnhandledHandlerError.as_str_name(),
+                code = AngzarrReason::UnhandledHandlerError.as_str_name(),
                 escaped = %escaped,
                 "a handler's unclassified error"
             );
@@ -510,7 +580,7 @@ pub fn map_handler_error(err: HandlerError) -> CodedError {
 }
 
 /// Runs a business handler, answering its panic as a bug
-/// (ROUTER_REASON_UNHANDLED_HANDLER_ERROR, cause ROUTER_REASON_HANDLER_PANICKED; decision 14.37) and
+/// (ANGZARR_REASON_UNHANDLED_HANDLER_ERROR, cause ANGZARR_REASON_HANDLER_PANICKED; decision 14.37) and
 /// mapping its error ([`map_handler_error`]). The panic's message stays in
 /// the handler's own log; the router answers rather than unwinding into its
 /// host.

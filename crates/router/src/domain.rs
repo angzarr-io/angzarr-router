@@ -1,7 +1,7 @@
-//! DomainDispatch — a domain's command → events table: an aggregate's,
-//! or a process manager's, since a process manager is a domain (decision
-//! 14.31), served by the same table ([`DomainDispatch::process_manager`]).
-//! There is no trigger-fed process manager:
+//! DomainDispatch — a domain's input → events table: an aggregate's, or a
+//! process manager's, since a process manager is a domain (decision 14.31),
+//! served by the same table ([`DomainDispatch::process_manager`]). There is
+//! no trigger-fed process manager:
 //!
 //! ```compile_fail
 //! use angzarr_router::process_manager::ProcessManagerDispatch;
@@ -12,156 +12,167 @@
 //! store reads and writes around it, and admits the input first.
 //!
 //! The router never sees a meta-event and has no edition-lifecycle outcome
-//! (owner ruling, 2026-10-28): creating, forking, refusing an unforked or
-//! deleted edition's arrival and deleting are the runtime's, decided before
-//! it calls the router.
+//! (owner ruling, 2026-10-28): forking, refusing an input to an unforked
+//! stream and deleting are the runtime's, decided before it calls the
+//! router.
 //!
-//! `CommandHandlerService.Handle` is the only input path: the body arm of the
-//! ContextualCommand's page picks the pipeline (Command → a command handler,
-//! Fact → a fact handler) and the payload's type URL picks the handler. The
-//! envelope, the arm and the type validate BEFORE state is rebuilt (an
-//! unknown command must report ROUTER_REASON_UNKNOWN_COMMAND_TYPE, not whatever the
-//! rebuild would surface). There is no compensation input.
+//! `CommandHandlerService.Handle` is the one input path, for commands and
+//! facts alike (decision 14.98): the body arm of the input book's page
+//! picks the handler table (Command → a command handler, Fact → a fact
+//! handler) and the payload's type URL picks the handler. The arm and the
+//! type are checked BEFORE state is rebuilt (an unknown command must report
+//! ANGZARR_REASON_UNKNOWN_COMMAND_TYPE, not whatever the rebuild would
+//! surface). There is no compensation input and no pass-through refusal
+//! fact: a refusal fact is an ordinary fact of the domain (decision 46 #5).
 //!
-//! The router admits nothing (decision 14.42): deduplication, the refusal
-//! fact's stream check and a process manager's start rule are the
+//! Every handler returns an [`Emit`] (decision 14.104): events, and
+//! optionally a continuation run on the state with them folded in, all of
+//! it one decision. There is no step cap.
+//!
+//! The router admits nothing (decision 14.42): deduplication, a process
+//! manager's start rule and the expected-sequence check are the
 //! coordinator's, done before it calls the router. No admit rules,
 //!
 //! ```compile_fail
 //! use angzarr_router::domain::admit_rules;
 //! ```
 //!
-//! no domain that admits,
+//! and no conflict resolution (decision 14.92):
 //!
 //! ```compile_fail
-//! use angzarr_router::domain::{Admission, Arrival};
-//! fn admits(domain: &dyn angzarr_router::router::CommandHandler, arrival: &Arrival<'_>) -> Admission {
-//!     domain.admit(arrival).unwrap()
-//! }
-//! ```
-//!
-//! and no router that admits:
-//!
-//! ```compile_fail
-//! use angzarr_router::domain::{Admission, Arrival};
-//! fn admits(router: &angzarr_router::router::Router, arrival: &Arrival<'_>) -> Admission {
-//!     router.admit(arrival).unwrap()
-//! }
+//! use angzarr_router::domain::Conflict;
 //! ```
 
 use std::collections::HashMap;
 
-use prost::Message;
 use prost_types::Any;
 
-use crate::error::{call_handler, CodedError, HandlerError, RouterReason};
+use crate::error::{call_handler, AngzarrReason, CodedError, HandlerError};
+use crate::hpb;
 use crate::pb;
-use crate::rebuild::{PageOrigin, Rebuilder};
-use angzarr_proto::v1::reason_args;
+use crate::rebuild::Rebuilder;
 
-pub use crate::context::{command_context, CommandContext, Conflict};
+pub use crate::context::{command_context, CommandContext, InputArm};
 
-/// The COMMUTATIVE resolver over one state instance (options.proto, the
-/// conflict_units region, "The resolver"): captures the state at the
-/// expected sequence and at the head, lets decide run on the head, restores
-/// the head, folds the command's events, captures that, and reports the two
-/// unit sets `changed(expected, head)` and `changed(head, after)`.
-trait Resolver<S>: Send + Sync {
-    fn resolve(
-        &self,
-        state: &mut S,
-        fold_window: &mut dyn FnMut(&mut S) -> Result<(), CodedError>,
-        decide: &mut dyn FnMut(&mut S) -> Result<pb::EventBook, CodedError>,
-        fold_events: &mut dyn FnMut(&mut S, &pb::EventBook) -> Result<(), CodedError>,
-    ) -> Result<Resolved, CodedError>;
+/// A continuation step: run on the state with every earlier event of the
+/// decision folded in, it answers an [`Emit`] of its own.
+pub type StepFn<S> = Box<dyn FnOnce(&S, &CommandContext) -> Result<Emit<S>, HandlerError>>;
+
+/// What every command and fact handler returns (decision 14.104;
+/// docs/design/command-handling.md §9): events, applied in order, and
+/// optionally a continuation run on the state with them folded in, which
+/// returns an `Emit` of its own, and so on.
+///
+/// All of it is **one decision**: a refusal or a bug from the handler or
+/// any step fails it all, and what is answered is every step's events, in
+/// order, as one list (the wire's `HandleResponse.events`). There is no
+/// step cap: a step that always continues never terminates, a handler bug
+/// with no framework guard; a step must be idempotent on its own result,
+/// which [`DomainDispatch::check_step_idempotent`] checks.
+pub struct Emit<S> {
+    events: Vec<Any>,
+    next: Option<StepFn<S>>,
 }
 
-/// What the resolver produced: decide's events and the two unit sets.
-struct Resolved {
-    events: pb::EventBook,
-    window: Vec<String>,
-    mine: Vec<String>,
-}
-
-type CaptureFn<S, I> = Box<dyn Fn(&S) -> Result<I, HandlerError> + Send + Sync>;
-type RestoreFn<S, I> = Box<dyn Fn(&mut S, &I) -> Result<(), HandlerError> + Send + Sync>;
-type ChangedFn<I> = Box<dyn Fn(&I, &I) -> Result<Vec<String>, HandlerError> + Send + Sync>;
-
-struct CommutativeOps<S, I> {
-    capture: CaptureFn<S, I>,
-    restore: RestoreFn<S, I>,
-    changed: ChangedFn<I>,
-}
-
-impl<S, I> Resolver<S> for CommutativeOps<S, I> {
-    fn resolve(
-        &self,
-        state: &mut S,
-        fold_window: &mut dyn FnMut(&mut S) -> Result<(), CodedError>,
-        decide: &mut dyn FnMut(&mut S) -> Result<pb::EventBook, CodedError>,
-        fold_events: &mut dyn FnMut(&mut S, &pb::EventBook) -> Result<(), CodedError>,
-    ) -> Result<Resolved, CodedError> {
-        let expected = call_handler(|| (self.capture)(state))?;
-        fold_window(state)?;
-        let head = call_handler(|| (self.capture)(state))?;
-        let events = decide(state)?;
-        call_handler(|| (self.restore)(state, &head))?;
-        fold_events(state, &events)?;
-        let after = call_handler(|| (self.capture)(state))?;
-        Ok(Resolved {
-            window: call_handler(|| (self.changed)(&expected, &head))?,
-            mine: call_handler(|| (self.changed)(&head, &after))?,
-            events,
-        })
+impl<S> Emit<S> {
+    /// These events, in order, and no continuation.
+    pub fn of(events: impl IntoIterator<Item = Any>) -> Self {
+        Emit {
+            events: events.into_iter().collect(),
+            next: None,
+        }
     }
-}
 
-/// Handles one command against rebuilt state, emitting an event book (or
-/// nothing). Binding/generated thunks unmarshal to the typed command and
-/// call the typed business method.
-pub type CommandFn<S> = Box<
-    dyn Fn(&Any, &mut S, CommandContext) -> Result<Option<pb::EventBook>, HandlerError>
-        + Send
-        + Sync,
->;
+    /// No events and no continuation: a decision that records nothing.
+    pub fn none() -> Self {
+        Emit::of([])
+    }
 
-/// What a fact handler records: the fact (as received, or annotated) and the
-/// events that flag it, in order — the fact command's events. A fact cannot
-/// be refused, so there is no way to record nothing.
-#[derive(Debug, Clone, PartialEq)]
-pub struct FactRecord {
-    pub fact: Any,
-    pub flags: Vec<Any>,
-}
+    /// Run `step` on the state once these events (and any continuation
+    /// already added) are folded in. The step may itself return an `Emit`
+    /// with a continuation.
+    pub fn then(
+        self,
+        step: impl FnOnce(&S, &CommandContext) -> Result<Emit<S>, HandlerError> + 'static,
+    ) -> Self
+    where
+        S: 'static,
+    {
+        self.push(Box::new(step))
+    }
 
-impl From<Any> for FactRecord {
-    /// The fact recorded with no flags.
-    fn from(fact: Any) -> Self {
-        FactRecord {
-            fact,
-            flags: Vec::new(),
+    /// `step` after this emit's continuation, if it has one, else as it.
+    fn push(self, step: StepFn<S>) -> Self
+    where
+        S: 'static,
+    {
+        let next: StepFn<S> = match self.next {
+            None => step,
+            Some(first) => {
+                Box::new(move |state, ctx| first(state, ctx).map(|emit| emit.push(step)))
+            }
+        };
+        Emit {
+            events: self.events,
+            next: Some(next),
+        }
+    }
+
+    /// This step's own events, in order.
+    pub fn events(&self) -> &[Any] {
+        &self.events
+    }
+
+    /// Whether a continuation follows: [`Continues::Somewhere`] when one
+    /// does.
+    pub fn continues(&self) -> Continues {
+        match self.next {
+            Some(_) => Continues::Somewhere,
+            None => Continues::Nowhere,
         }
     }
 }
 
-/// Records one fact (a command page's Fact arm) against the rebuilt state,
-/// reading the fact's [`CommandContext`] (its identity and origin).
-/// Generated thunks unmarshal to the typed fact and pack the typed result.
-pub type FactFn<S> =
-    Box<dyn Fn(&Any, &S, CommandContext) -> Result<FactRecord, HandlerError> + Send + Sync>;
+impl<S> std::fmt::Debug for Emit<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Emit")
+            .field("events", &self.events)
+            .field("continues", &self.continues())
+            .finish()
+    }
+}
 
-/// Handles a passed-through refusal (the standard `CommandRefused`) of one
-/// refused command type against the rebuilt state, with the refusal fact's
-/// [`CommandContext`] (its identity is the refused command's): the source
-/// domain's `on_refused_<Command>`.
-pub type RefusedFn<S> = Box<
-    dyn Fn(&pb::CommandRefused, &S, CommandContext) -> Result<FactRecord, HandlerError>
-        + Send
-        + Sync,
->;
+/// Whether an [`Emit`] continues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Continues {
+    Nowhere,
+    Somewhere,
+}
 
-/// One fact handler, bound to its input: records it against the state.
-type RecordFn<'a, S> = Box<dyn Fn(&S, CommandContext) -> Result<FactRecord, CodedError> + 'a>;
+/// Why a step is not idempotent on its own result
+/// ([`DomainDispatch::check_step_idempotent`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum NotIdempotent {
+    /// A run of the step failed.
+    Failed(CodedError),
+    /// Run again on the state its own events produce, the step emitted
+    /// these events.
+    EmittedAgain(Vec<Any>),
+    /// Run again, the step emitted nothing but continued.
+    ContinuedAgain,
+}
+
+/// Handles one command (or records one fact) against the rebuilt state.
+/// Generated thunks unmarshal to the typed input and call the typed business
+/// method.
+pub type HandlerFn<S> =
+    Box<dyn Fn(&Any, &S, &CommandContext) -> Result<Emit<S>, HandlerError> + Send + Sync>;
+
+/// The input's kind, by its book's body arm, and the handler that runs it.
+enum Dispatched<'a, S> {
+    Command(&'a HandlerFn<S>),
+    Fact(&'a HandlerFn<S>),
+}
 
 /// The dispatch table for one domain: an aggregate or a process manager.
 pub struct DomainDispatch<S> {
@@ -169,10 +180,8 @@ pub struct DomainDispatch<S> {
     domain: String,
     kind: pb::ComponentKind,
     rebuilder: Rebuilder<S>,
-    handlers: HashMap<String, CommandFn<S>>,
-    facts: HashMap<String, FactFn<S>>,
-    refused: HashMap<String, RefusedFn<S>>,
-    commutative: Option<Box<dyn Resolver<S>>>,
+    handlers: HashMap<String, HandlerFn<S>>,
+    facts: HashMap<String, HandlerFn<S>>,
     rules_version: String,
 }
 
@@ -190,8 +199,6 @@ impl<S> DomainDispatch<S> {
             rebuilder,
             handlers: HashMap::new(),
             facts: HashMap::new(),
-            refused: HashMap::new(),
-            commutative: None,
             rules_version: String::new(),
         }
     }
@@ -213,92 +220,26 @@ impl<S> DomainDispatch<S> {
         }
     }
 
-    /// Registers the handler of a refusal fact passed through by one of the
-    /// domain's policies: the standard `CommandRefused` whose refused command
-    /// is of the fully-qualified type `refused_command` (another domain's
-    /// command), the generated `on_refused_<Command>` dispatch (types.proto,
-    /// the refusal_facts region; decision 14.31). An ordinary fact handler:
-    /// it receives the decoded `CommandRefused` and the refusal fact's
-    /// [`CommandContext`] (its command id and correlation the refused
-    /// command's, its cover the stream of the policy's trigger), and records
-    /// its events, or fails as any fact handler may. A `CommandRefused` for
-    /// a command type with none is ROUTER_REASON_NO_FACT_HANDLER.
-    pub fn on_refused(
-        mut self,
-        refused_command: &str,
-        thunk: impl Fn(&pb::CommandRefused, &S, CommandContext) -> Result<FactRecord, HandlerError>
-            + Send
-            + Sync
-            + 'static,
-    ) -> Self {
-        self.refused
-            .insert(refused_command.to_string(), Box::new(thunk));
-        self
-    }
-
     /// AGGREGATE or PROCESS_MANAGER.
     pub fn kind(&self) -> pb::ComponentKind {
         self.kind
     }
 
-    /// The rules version reported on every response
-    /// (CommandHandlerResponse.rules_version; decision 12.6, backlog RV-2): the
-    /// business binary's full version string, baked in at build. Empty until
+    /// The rules version reported on every answer
+    /// (`HandleResponse.rules_version`; decision 14.56): the business
+    /// binary's full version string, baked in at build. Empty until
     /// declared.
     pub fn with_rules_version(mut self, rules_version: impl Into<String>) -> Self {
         self.rules_version = rules_version.into();
         self
     }
 
-    /// Supports COMMUTATIVE conflict resolution with the state's generated
-    /// `changed(before, after)` (backlog CR-1): the router folds the state to
-    /// the expected sequence and to the head, runs decide on the head, and
-    /// reports `changed(expected, head)` and `changed(head, head + events)`
-    /// beside the command's events, for the coordinator to judge (decision
-    /// 14.42).
-    pub fn with_commutative(
-        self,
-        changed: impl Fn(&S, &S) -> Vec<String> + Send + Sync + 'static,
-    ) -> Self
-    where
-        S: Clone + Send + Sync + 'static,
-    {
-        self.with_commutative_via(
-            |state: &S| Ok(state.clone()),
-            |state: &mut S, image: &S| {
-                *state = image.clone();
-                Ok(())
-            },
-            move |before: &S, after: &S| Ok(changed(before, after)),
-        )
-    }
-
-    /// [`Self::with_commutative`] over state images of type `I` rather than
-    /// clones of the state, for state the router cannot clone (a host's,
-    /// across the C ABI): `capture` takes an image of the current state,
-    /// `restore` puts an image back, and `changed` compares two images.
-    pub fn with_commutative_via<I: 'static>(
-        mut self,
-        capture: impl Fn(&S) -> Result<I, HandlerError> + Send + Sync + 'static,
-        restore: impl Fn(&mut S, &I) -> Result<(), HandlerError> + Send + Sync + 'static,
-        changed: impl Fn(&I, &I) -> Result<Vec<String>, HandlerError> + Send + Sync + 'static,
-    ) -> Self
-    where
-        S: 'static,
-    {
-        self.commutative = Some(Box::new(CommutativeOps {
-            capture: Box::new(capture),
-            restore: Box::new(restore),
-            changed: Box::new(changed),
-        }));
-        self
-    }
-
-    /// Registers the thunk for a fully-qualified command type name.
+    /// Registers the handler for a fully-qualified command type name: a
+    /// page whose Command arm carries it runs this handler.
     pub fn on_command(
         mut self,
         full_name: &str,
-        thunk: impl Fn(&Any, &mut S, CommandContext) -> Result<Option<pb::EventBook>, HandlerError>
+        thunk: impl Fn(&Any, &S, &CommandContext) -> Result<Emit<S>, HandlerError>
             + Send
             + Sync
             + 'static,
@@ -307,29 +248,20 @@ impl<S> DomainDispatch<S> {
         self
     }
 
-    /// Registers the fact handler for a FULLY-QUALIFIED fact type: a page
-    /// whose Fact arm carries it runs this handler.
+    /// Registers the fact handler for a fully-qualified fact type name: a
+    /// page whose Fact arm carries it runs this handler, which records the
+    /// fact (typically as its first event, possibly with events that flag
+    /// it). A fact's handling never refuses: any error it answers is a bug
+    /// ([`CodedError::as_fact_failure`]; decision 14.72).
     pub fn on_fact(
-        self,
-        fq_fact_type: &str,
-        thunk: impl Fn(&Any, &S) -> Result<FactRecord, HandlerError> + Send + Sync + 'static,
-    ) -> Self {
-        self.on_fact_with_context(fq_fact_type, move |fact, state, _cctx| thunk(fact, state))
-    }
-
-    /// Registers a fact handler, as [`Self::on_fact`], that also receives
-    /// the fact's [`CommandContext`]: what a command handler receives
-    /// (STRICT, no conflict), the fact's command id, correlation and origin
-    /// (types.proto, CommandPage) included.
-    pub fn on_fact_with_context(
         mut self,
-        fq_fact_type: &str,
-        thunk: impl Fn(&Any, &S, CommandContext) -> Result<FactRecord, HandlerError>
+        full_name: &str,
+        thunk: impl Fn(&Any, &S, &CommandContext) -> Result<Emit<S>, HandlerError>
             + Send
             + Sync
             + 'static,
     ) -> Self {
-        self.facts.insert(fq_fact_type.to_string(), Box::new(thunk));
+        self.facts.insert(full_name.to_string(), Box::new(thunk));
         self
     }
 
@@ -353,243 +285,112 @@ impl<S> DomainDispatch<S> {
         self.facts.keys().cloned().collect()
     }
 
-    /// `CommandHandlerService.Handle`: the page's body arm picks the handler
-    /// table — a Command runs its command handler (none:
-    /// ROUTER_REASON_UNKNOWN_COMMAND_TYPE), a Fact its fact handler (none: ROUTER_REASON_NO_FACT_HANDLER,
-    /// so a fact never reaches a command handler or the reverse) — before
-    /// rebuild (a corrupt persisted event fails the
-    /// command). A refusal names the type URL it was given: the coordinator
-    /// has upcast it (decision 14.39), and relays the type as sent beside it.
-    /// A command is then decided under its resolved conflict resolution
-    /// ([`Self::decide`]). The emitted book passes through as the handler
-    /// returned it: the coordinator stamps the cover, sequences and meta. A
-    /// fact handler's record becomes the book: the fact, then its flags,
-    /// payloads only.
-    ///
-    /// It guards no envelope (decision 14.42): the coordinator delivers
-    /// every input well formed. A delivery with no book, page, arm or
-    /// payload is routed as a command of no type, ROUTER_REASON_UNKNOWN_COMMAND_TYPE.
-    pub fn dispatch(
-        &self,
-        req: &pb::ContextualCommand,
-    ) -> Result<pb::CommandHandlerResponse, CodedError> {
-        let body = req
-            .command
-            .as_ref()
-            .and_then(|b| b.page.as_ref())
-            .and_then(|p| p.body.as_ref());
-        let untyped = Any::default();
-        let cover = req.events.as_ref().and_then(|b| b.cover.as_ref());
-        let (mut events, state, conflict) = match body {
-            Some(pb::command_page::Body::Fact(fact)) => {
-                let any = fact.payload.as_ref().unwrap_or(&untyped);
-                let fact_type = crate::type_name_from_url(&any.type_url);
-                let record_with: RecordFn<'_, S> = match self.facts.get(fact_type) {
-                    Some(thunk) => {
-                        let any = any.clone();
-                        Box::new(move |state, cctx| call_handler(|| thunk(&any, state, cctx)))
-                    }
-                    None if fact_type == <pb::CommandRefused as prost::Name>::full_name() => {
-                        let refused =
-                            pb::CommandRefused::decode(any.value.as_slice()).map_err(|e| {
-                                CodedError::undecodable(
-                                    &<pb::CommandRefused as prost::Name>::full_name(),
-                                    &e,
-                                )
-                            })?;
-                        let refused_type = refused
-                            .command
-                            .as_ref()
-                            .and_then(|b| b.page.as_ref())
-                            .and_then(crate::command_payload)
-                            .map(|p| p.type_url.clone())
-                            .unwrap_or_default();
-                        let Some(thunk) =
-                            self.refused.get(crate::type_name_from_url(&refused_type))
-                        else {
-                            return Err(CodedError::keyed(
-                                RouterReason::NoRefusalHandler,
-                                [(reason_args::COMMAND_TYPE.to_string(), refused_type)],
-                            ));
-                        };
-                        Box::new(move |state, cctx| call_handler(|| thunk(&refused, state, cctx)))
-                    }
-                    None => {
-                        return Err(CodedError::unknown_type(
-                            RouterReason::NoFactHandler,
-                            &any.type_url,
-                        ))
-                    }
-                };
-                let (mut state, _) = self.rebuilder.rebuild(req.events.as_ref())?;
-                let cctx = command_context(req);
-                let meta = cctx.event_meta(&self.rules_version);
-                let record = record_with(&state, cctx)?;
-                let recorded = pb::EventBook {
-                    pages: std::iter::once(record.fact)
-                        .chain(record.flags)
-                        .map(|payload| pb::EventPage {
-                            payload: Some(payload),
-                            ..Default::default()
-                        })
-                        .collect(),
-                    ..Default::default()
-                };
-                self.rebuilder.apply_emitted(
-                    &mut state,
-                    &recorded.pages,
-                    cover,
-                    crate::next_sequence(req.events.as_ref()),
-                    &meta,
-                )?;
-                (recorded, state, None)
-            }
-            command => {
-                let any = match command {
-                    Some(pb::command_page::Body::Command(command)) => command.payload.as_ref(),
-                    _ => None,
-                }
-                .unwrap_or(&untyped);
-                let Some(thunk) = self.handlers.get(crate::type_name_from_url(&any.type_url))
-                else {
-                    return Err(CodedError::unknown_type(
-                        RouterReason::UnknownCommandType,
-                        &any.type_url,
-                    ));
-                };
-                self.decide(req, any, thunk)?
-            }
-        };
-        // The state after the input, on every answer (decision 14.12): the
-        // coordinator decides whether to write it, and stamps its sequence
-        // and rules version (decision 14.40).
-        if let Some(after) = self.rebuilder.encode_state(&state) {
-            events.snapshot = Some(pb::Snapshot {
-                state: Some(after),
-                ..Default::default()
-            });
+    /// The handler the input's arm and payload type pick, with the
+    /// payload: a Command runs its command handler (none:
+    /// ANGZARR_REASON_UNKNOWN_COMMAND_TYPE), a Fact its fact handler (none:
+    /// ANGZARR_REASON_NO_FACT_HANDLER, so a fact never reaches a command
+    /// handler or the reverse). A refusal names the type URL it was given:
+    /// the coordinator upcast it, and relays the type as sent beside it
+    /// (decision 14.39). A page with no arm or payload is a command of no
+    /// type: the router guards no envelope (decision 14.42).
+    fn route<'a>(
+        &'a self,
+        page: Option<&'a pb::CommandPage>,
+        untyped: &'a Any,
+    ) -> Result<(Dispatched<'a, S>, &'a Any), CodedError> {
+        if let Some(pb::command_page::Body::Fact(fact)) = page.and_then(|p| p.body.as_ref()) {
+            let any = fact.payload.as_ref().unwrap_or(untyped);
+            return match self.facts.get(crate::type_name_from_url(&any.type_url)) {
+                Some(thunk) => Ok((Dispatched::Fact(thunk), any)),
+                None => Err(CodedError::unknown_type(
+                    AngzarrReason::NoFactHandler,
+                    &any.type_url,
+                )),
+            };
         }
-        Ok(pb::CommandHandlerResponse {
-            events: Some(events),
+        let any = page.and_then(crate::command_payload).unwrap_or(untyped);
+        match self.handlers.get(crate::type_name_from_url(&any.type_url)) {
+            Some(thunk) => Ok((Dispatched::Command(thunk), any)),
+            None => Err(CodedError::unknown_type(
+                AngzarrReason::UnknownCommandType,
+                &any.type_url,
+            )),
+        }
+    }
+
+    /// `CommandHandlerService.Handle` (decision 14.98): routes the input
+    /// ([`Self::route`]) before rebuild, rebuilds the state from the
+    /// history (a corrupt persisted event fails the input), runs the
+    /// handler's [`Emit`] to its end ([`Self::decide`]), and answers success
+    /// only (decision 14.95): the events, payloads only, in order (the
+    /// coordinator wraps and stamps them); the state after them, on every
+    /// answer, when the state has a codec (decision 14.12); and the rules
+    /// version. Every other outcome is the error: a command's typed
+    /// refusal, a re-run (ABORTED) or a bug; for a fact, a bug only.
+    pub fn dispatch(&self, req: &hpb::HandleRequest) -> Result<hpb::HandleResponse, CodedError> {
+        let page = req.input.as_ref().and_then(|b| b.page.as_ref());
+        let untyped = Any::default();
+        let (dispatched, any) = self.route(page, &untyped)?;
+        let (mut state, _) = self.rebuilder.rebuild(req.history.as_ref())?;
+        let ctx = command_context(req);
+        let cover = req
+            .history
+            .as_ref()
+            .and_then(|b| b.cover.as_ref())
+            .or(ctx.cover.as_ref());
+        let events = match dispatched {
+            Dispatched::Command(thunk) => self.decide(thunk, any, &mut state, &ctx, cover),
+            Dispatched::Fact(thunk) => self
+                .decide(thunk, any, &mut state, &ctx, cover)
+                .map_err(CodedError::as_fact_failure),
+        }?;
+        Ok(hpb::HandleResponse {
+            events,
+            state: self.rebuilder.encode_state(&state),
             rules_version: self.rules_version.clone(),
-            conflict,
         })
     }
 
-    /// Runs a command's handler under its resolved conflict resolution
-    /// (types.proto, Handling and ConflictResolution):
-    /// - STRICT (or unspecified): decide on the rebuilt head;
-    /// - AGGREGATE_HANDLES: decide on the head with the window and nonce in
-    ///   [`CommandContext::conflict`];
-    /// - COMMUTATIVE: the registered resolver ([`Self::with_commutative`])
-    ///   decides on the head and computes the window's units and the
-    ///   command's; with none registered, ROUTER_REASON_CONFLICT_RESOLUTION_UNSUPPORTED,
-    ///   before rebuild.
-    ///
-    /// It judges nothing (decision 14.42): the coordinator accepts the
-    /// events only if the reported nonce is the one it delivered
-    /// (COORDINATOR_REASON_CONFLICT_UNRESOLVED), or the two unit sets do not overlap
-    /// (COORDINATOR_REASON_CONFLICT_OVERLAP).
-    ///
-    /// Answers decide's events, the state after them (the head with the
-    /// events folded in, origin Emitted) and the conflict report (decision
-    /// 14.42): under AGGREGATE_HANDLES the nonce the handler passed to
-    /// `resolve_conflicts` (empty if it never called it), under COMMUTATIVE
-    /// the window's units and the command's; none under STRICT.
+    /// Runs `thunk` on `any` and its [`Emit`] to its end, as one decision:
+    /// each step's events are folded into `state`, seen as they will be
+    /// persisted (at their sequences on from the history's head, with the
+    /// meta the coordinator will stamp), before the next step runs on it.
+    /// Answers every step's events, in order, leaving `state` at the head
+    /// with all of them folded in.
     fn decide(
         &self,
-        req: &pb::ContextualCommand,
+        thunk: &HandlerFn<S>,
         any: &Any,
-        thunk: &CommandFn<S>,
-    ) -> Result<(pb::EventBook, S, Option<pb::ConflictReport>), CodedError> {
-        let events = req.events.as_ref();
-        let next_sequence = crate::next_sequence(events);
-        let cover = events.and_then(|b| b.cover.as_ref());
-        let base = command_context(req);
-        let meta = base.event_meta(&self.rules_version);
-        let fold_emitted = |state: &mut S, out: &pb::EventBook| {
-            self.rebuilder
-                .apply_emitted(state, &out.pages, cover, next_sequence, &meta)
-        };
-        let expected_sequence = base.expected_sequence;
-        let conflict_resolution = base.conflict_resolution;
-        let run = |state: &mut S, cctx: CommandContext| -> Result<pb::EventBook, CodedError> {
-            Ok(call_handler(|| thunk(any, state, cctx))?.unwrap_or_default())
-        };
-        match conflict_resolution {
-            pb::ConflictResolution::AggregateHandles => {
-                let (mut state, _) = self.rebuilder.rebuild(events)?;
-                let out = run(&mut state, base.clone())?;
-                let report = pb::ConflictReport {
-                    resolved_nonce: base
-                        .conflict
-                        .as_ref()
-                        .map(Conflict::resolved_nonce)
-                        .unwrap_or_default()
-                        .into(),
-                    ..Default::default()
-                };
-                fold_emitted(&mut state, &out)?;
-                Ok((out, state, Some(report)))
-            }
-            pb::ConflictResolution::Commutative => {
-                let Some(resolver) = self.commutative.as_ref() else {
-                    return Err(CodedError::keyed(
-                        RouterReason::ConflictResolutionUnsupported,
-                        [],
-                    ));
-                };
-                let (prefix, window) = split_at_expected(events, expected_sequence);
-                let (mut state, _) = self.rebuilder.rebuild(Some(&prefix))?;
-                let resolved = resolver.resolve(
-                    &mut state,
-                    &mut |state| {
-                        self.rebuilder
-                            .apply_pages(state, &window, cover, PageOrigin::Persisted)
-                    },
-                    &mut |state| run(state, base.clone()),
-                    &mut |state, book| fold_emitted(state, book),
-                )?;
-                // The resolver leaves the state at the head plus the
-                // command's events.
-                let report = pb::ConflictReport {
-                    window_units: resolved.window,
-                    command_units: resolved.mine,
-                    ..Default::default()
-                };
-                Ok((resolved.events, state, Some(report)))
-            }
-            _ => {
-                let (mut state, _) = self.rebuilder.rebuild(events)?;
-                let out = run(&mut state, base.clone())?;
-                fold_emitted(&mut state, &out)?;
-                Ok((out, state, None))
-            }
-        }
+        state: &mut S,
+        ctx: &CommandContext,
+        cover: Option<&pb::Cover>,
+    ) -> Result<Vec<Any>, CodedError> {
+        let meta = ctx.event_meta(&self.rules_version);
+        let emit = call_handler(|| thunk(any, state, ctx))?;
+        self.rebuilder
+            .apply_emitted(state, &emit.events, cover, ctx.next_sequence, &meta)?;
+        // RED: the continuation is not yet run (decision 14.104).
+        Ok(emit.events)
     }
-}
 
-/// The prior-events book up to `expected` (its snapshot and earlier pages)
-/// and the window after it.
-fn split_at_expected(
-    events: Option<&pb::EventBook>,
-    expected: u64,
-) -> (pb::EventBook, Vec<pb::EventPage>) {
-    let Some(book) = events else {
-        return (pb::EventBook::default(), Vec::new());
-    };
-    let (window, prefix): (Vec<_>, Vec<_>) = book
-        .pages
-        .iter()
-        .cloned()
-        .partition(|p| p.sequence >= expected);
-    (
-        pb::EventBook {
-            pages: prefix,
-            ..book.clone()
-        },
-        window,
-    )
+    /// The client library's step-idempotence test helper (decision 14.104):
+    /// runs `step` on `state`, folds its own events into a copy, and runs it
+    /// again there. Idempotent when the second run emits nothing and
+    /// continues nowhere; otherwise the events the second run emitted
+    /// ([`NotIdempotent::EmittedAgain`]), or that it continued
+    /// ([`NotIdempotent::ContinuedAgain`]), or a run's failure.
+    pub fn check_step_idempotent(
+        &self,
+        state: &S,
+        ctx: &CommandContext,
+        step: impl Fn(&S, &CommandContext) -> Result<Emit<S>, HandlerError>,
+    ) -> Result<(), NotIdempotent>
+    where
+        S: Clone,
+    {
+        let _ = (state, ctx, step);
+        todo!("RED: the step-idempotence helper (decision 14.104)")
+    }
 }
 
 #[cfg(test)]

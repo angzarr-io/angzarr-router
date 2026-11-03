@@ -7,6 +7,9 @@
 #   angzarr-proto               the io.angzarr.v1 wire types (angzarr-core's
 #                               crates/angzarr-proto, a git dependency: an
 #                               external crate, constrained by `deny` alone)
+#   angzarr-proto-handler       the handler layer's messages
+#                               (io.angzarr.handler.v1; the same core rev,
+#                               external, like angzarr-proto)
 #   angzarr-ports               `MaybeSend`/`MaybeSync`/`BoxFuture` only
 #                               (core's crates/angzarr-ports, the same git
 #                               rev; external, like angzarr-proto)
@@ -84,6 +87,7 @@ from = [
     "angzarr_router::domain::**",
     "angzarr_router::policy::**",
     "angzarr_router::projector::**",
+    "angzarr_router::upcaster::**",
 ]
 scope = "lib"
 allow = [

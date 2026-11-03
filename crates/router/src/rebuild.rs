@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use prost_types::Any;
 
-use crate::error::{CodedError, FoldAt, RouterReason};
+use crate::error::{AngzarrReason, CodedError, FoldAt};
 use crate::pb;
 use crate::PageContext;
 
@@ -58,9 +58,9 @@ pub struct RebuildInfo {
 /// commands must never validate against silently-truncated state. The
 /// events were accepted by the same apply logic, so the failure is a handler
 /// bug (INTERNAL; [`fold_error`]), and so is a page whose applier or batched
-/// fold panics, its cause ROUTER_REASON_HANDLER_PANICKED (decision 14.37). A starting
-/// state the codec cannot decode is ROUTER_REASON_PERSISTED_EVENT_CORRUPT; one whose decode
-/// panics is ROUTER_REASON_FOLD_FAILED with cause ROUTER_REASON_HANDLER_PANICKED, naming the delivered
+/// fold panics, its cause ANGZARR_REASON_HANDLER_PANICKED (decision 14.37). A starting
+/// state the codec cannot decode is ANGZARR_REASON_PERSISTED_EVENT_CORRUPT; one whose decode
+/// panics is ANGZARR_REASON_FOLD_FAILED with cause ANGZARR_REASON_HANDLER_PANICKED, naming the delivered
 /// snapshot's sequence and its state's type URL. Event types with no
 /// registered applier are skipped: not every event folds into state.
 pub struct Rebuilder<S> {
@@ -84,20 +84,21 @@ pub struct FoldFailure {
 /// Where the pages a fold failed on came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageOrigin {
-    /// Persisted events: a rebuild, or a conflict window.
+    /// Persisted events: a rebuild's history, a projector's delivery.
     Persisted,
-    /// The events the command being handled emitted, not yet persisted.
+    /// The events the input being handled emitted (any step's), not yet
+    /// persisted.
     Emitted,
 }
 
 impl PageOrigin {
-    /// The key a fold failing on pages from here answers with: ROUTER_REASON_FOLD_FAILED
-    /// for persisted events, ROUTER_REASON_FOLD_FAILED_EMITTED for emitted ones
+    /// The key a fold failing on pages from here answers with: ANGZARR_REASON_FOLD_FAILED
+    /// for persisted events, ANGZARR_REASON_FOLD_FAILED_EMITTED for emitted ones
     /// (decision 14.37).
-    pub fn reason(self) -> RouterReason {
+    pub fn reason(self) -> AngzarrReason {
         match self {
-            PageOrigin::Persisted => RouterReason::FoldFailed,
-            PageOrigin::Emitted => RouterReason::FoldFailedEmitted,
+            PageOrigin::Persisted => AngzarrReason::FoldFailed,
+            PageOrigin::Emitted => AngzarrReason::FoldFailedEmitted,
         }
     }
 }
@@ -135,11 +136,11 @@ fn applier_cause(err: &(dyn std::error::Error + Send + Sync + 'static)) -> Optio
     }
 }
 
-/// A panicking fold's cause: ROUTER_REASON_HANDLER_PANICKED, with no args (the panic's
+/// A panicking fold's cause: ANGZARR_REASON_HANDLER_PANICKED, with no args (the panic's
 /// message stays in the handler's own log; decision 14.37).
 fn panicked_cause() -> pb::Diagnostic {
     pb::Diagnostic {
-        code: RouterReason::HandlerPanicked.as_str_name().to_string(),
+        code: AngzarrReason::HandlerPanicked.as_str_name().to_string(),
         ..Default::default()
     }
 }
@@ -161,7 +162,7 @@ fn run_applier<S>(
 }
 
 /// Runs a batched fold: its panic is a failure at no known page, caused by
-/// ROUTER_REASON_HANDLER_PANICKED ([`panicked_cause`]), answered rather than unwound into
+/// ANGZARR_REASON_HANDLER_PANICKED ([`panicked_cause`]), answered rather than unwound into
 /// the host.
 fn run_fold<S>(
     fold: &FoldFn<S>,
@@ -357,7 +358,7 @@ impl<S> Rebuilder<S> {
                     // the fold fails, naming the snapshot (decision 14.37).
                     Err(_) => {
                         return Err(CodedError::fold_failed(
-                            RouterReason::FoldFailed,
+                            AngzarrReason::FoldFailed,
                             FoldAt::Page {
                                 sequence: snapshot.sequence,
                                 type_url: &start.type_url,
@@ -442,28 +443,29 @@ impl<S> Rebuilder<S> {
         Ok(())
     }
 
-    /// Folds `pages` a handler emitted (not yet persisted) into `state`,
-    /// each seen as it will be persisted: at the sequence it will be given
-    /// (`next_sequence` onward, in order) and with the `meta` its
-    /// coordinator will stamp ([`crate::context::CommandContext::event_meta`]),
-    /// so an applier sees at decide time what replay hands it (the pages
-    /// themselves stay unstamped). A failure is a handler bug naming the
-    /// command's own event ([`PageOrigin::Emitted`]).
+    /// Folds `events` a handler emitted (payloads, not yet persisted) into
+    /// `state`, each seen as it will be persisted: wrapped as an EventPage
+    /// at the sequence it will be given (`next_sequence` onward, in order)
+    /// with the `meta` its coordinator will stamp
+    /// ([`crate::context::CommandContext::event_meta`]), so an applier sees
+    /// at decide time what replay hands it (the answered events stay
+    /// payloads only). A failure is a handler bug naming the input's own
+    /// event ([`PageOrigin::Emitted`]).
     pub fn apply_emitted(
         &self,
         state: &mut S,
-        pages: &[pb::EventPage],
+        events: &[Any],
         cover: Option<&pb::Cover>,
         next_sequence: u64,
         meta: &pb::EventMeta,
     ) -> Result<(), CodedError> {
-        let numbered: Vec<pb::EventPage> = pages
+        let numbered: Vec<pb::EventPage> = events
             .iter()
             .zip(next_sequence..)
-            .map(|(page, sequence)| pb::EventPage {
-                sequence,
+            .map(|(event, sequence)| pb::EventPage {
+                body: Some(pb::event_page::Body::Event(event.clone())),
                 meta: Some(meta.clone()),
-                ..page.clone()
+                sequence,
             })
             .collect();
         self.apply_pages(state, &numbered, cover, PageOrigin::Emitted)

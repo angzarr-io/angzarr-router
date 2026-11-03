@@ -5,7 +5,8 @@ use std::path::PathBuf;
 /// pool the harness uses to parse `.txtpb` fixtures (textproto, with Any
 /// expansion) into typed messages.
 ///
-/// `io.angzarr.v1.*` and `sererr.v1.*` are extern-pathed to the router crate
+/// `io.angzarr.v1.*`, `io.angzarr.handler.v1.*` and `google.rpc.*` are
+/// extern-pathed to the router crate
 /// so we DON'T regenerate them: the harness must build the SAME Rust types
 /// `DomainDispatch::dispatch` consumes. extern_path suppresses codegen
 /// only — the descriptor set still carries those files for the pool. The
@@ -24,12 +25,17 @@ fn main() {
     let fixture = top.join("angzarr-project/features/handler-contract/fixture");
     let counter = fixture.join("counter.proto");
     let order = fixture.join("order.proto");
-    // The fixture pool parses framework envelopes (ContextualCommand, EventPage)
-    // from the .txtpb fixtures. The message-annotation counter.proto no longer
-    // imports these, so the harness names them explicitly — its descriptor
-    // needs are its own, not an artifact of what the fixture proto imports.
+    // The fixture pool parses the handler layer's requests (HandleRequest,
+    // decision 14.78) and core's EventPage from the .txtpb fixtures. The
+    // message-annotation counter.proto imports neither, so the harness
+    // names them explicitly — its descriptor needs are its own, not an
+    // artifact of what the fixture proto imports. The handler layer's
+    // protos come from this repository's angzarr-project submodule, held to
+    // the same spec commit as core's (`just check-core-lockstep`); core's
+    // resolve from angzarr-proto's embedded copies, the first include.
+    let spec_proto = top.join("angzarr-project/proto");
     let types = framework_proto.join("io/angzarr/v1/types.proto");
-    let command_handler = framework_proto.join("io/angzarr/v1/command_handler.proto");
+    let command_handler = spec_proto.join("io/angzarr/handler/v1/command_handler.proto");
 
     let fds_path = out_dir.join("conformance_fds.bin");
 
@@ -39,11 +45,15 @@ fn main() {
     config
         .enable_type_names()
         .extern_path(".io.angzarr.v1", "::angzarr_router::pb")
-        .extern_path(".sererr.v1", "::angzarr_router::angzarr_proto::sererr::v1")
+        .extern_path(".io.angzarr.handler.v1", "::angzarr_router::hpb")
+        .extern_path(
+            ".google.rpc",
+            "::angzarr_router::angzarr_proto::google::rpc",
+        )
         .file_descriptor_set_path(&fds_path)
         .compile_protos(
             &[counter, order, types, command_handler],
-            &[framework_proto, fixture],
+            &[framework_proto, spec_proto, fixture],
         )
         .expect("prost: compile conformance protos");
 }

@@ -1,331 +1,186 @@
-//! PolicyDispatch contracts (spec C-0050..C-0053): a stateless translator
-//! that walks EVERY source page, emits commands for declared event types
-//! (passed through unstamped: the coordinator stamps identity, causation
-//! and correlation) and skips undeclared events.
+//! PolicyDispatch's React (decision 14.78): one trigger event (decision
+//! 46, Q3); a declared event answers its outputs, each a root and a payload
+//! in the arm of its kind (decision 14.91), passed through as business code
+//! returned them; an undeclared one answers nothing.
 
 use std::sync::{Arc, Mutex};
 
 use prost_types::Any;
 
-use crate::error::{HandlerError, RouterReason};
+use crate::error::{AngzarrReason, HandlerError};
+use crate::hpb;
 use crate::pb;
-use crate::policy::PolicyDispatch;
-use crate::test_support::{command_page, commands_of, event_page, uuid_of};
+use crate::policy::{self, PolicyDispatch};
+use crate::test_support::*;
 use crate::type_url;
 
-const FQ_ORDER_CREATED: &str = "test.OrderCreated";
-const FQ_STOCK_RESERVED: &str = "test.StockReserved";
-
-// --- fixtures -------------------------------------------------------------
-
-/// A source EventBook in `domain` over the given pages.
-fn source_book(domain: &str, pages: Vec<pb::EventPage>) -> pb::EventBook {
-    pb::EventBook {
-        cover: Some(pb::Cover {
-            domain: domain.to_string(),
-            ..Default::default()
-        }),
-        pages,
-        ..Default::default()
-    }
-}
-
-/// An event page carrying a bare `Any` of the fully-qualified type (no
-/// payload bytes — these policies react to type, not content).
-fn event_page_of(fq: &str) -> pb::EventPage {
-    event_page(Any {
+fn typed(fq: &str) -> Any {
+    Any {
         type_url: type_url(fq),
-        value: Vec::new(),
-    })
-}
-
-/// A command book targeting `domain` (root 1: a command to an aggregate
-/// names its root, decision 14.36) with one command page.
-fn command_to(domain: &str) -> pb::CommandBook {
-    pb::CommandBook {
-        cover: Some(pb::Cover {
-            domain: domain.to_string(),
-            root: Some(uuid_of(1)),
-            ..Default::default()
-        }),
-        page: Some(command_page(Any {
-            type_url: type_url("test.Command"),
-            value: Vec::new(),
-        })),
-        ..Default::default()
+        value: vec![],
     }
 }
 
-fn cmd_to(resp: &pb::PolicyResponse, domain: &str) -> pb::CommandBook {
-    commands_of(resp)
-        .into_iter()
-        .find(|c| c.cover.as_ref().map(|cv| cv.domain.as_str()) == Some(domain))
-        .unwrap_or_else(|| panic!("no command targets {domain}"))
+/// React's request: a trigger book of `domain` holding `page`.
+fn trigger(domain: &str, page: pb::EventPage) -> hpb::ReactRequest {
+    hpb::ReactRequest {
+        trigger: Some(pb::EventBook {
+            cover: Some(stream(domain, None, 1)),
+            pages: vec![page],
+            ..Default::default()
+        }),
+    }
 }
 
-fn sequenced_page_of(fq: &str, seq: u64) -> pb::EventPage {
-    let mut page = event_page_of(fq);
-    page.sequence = seq;
-    page
+fn reserve(root: u8) -> hpb::Output {
+    policy::command(Some(uuid_of(root)), typed("test.inventory.ReserveStock"))
 }
 
-// --- emission -------------------------------------------------------------
+fn hold(root: u8) -> hpb::Output {
+    policy::fact(Some(uuid_of(root)), typed("test.inventory.HoldRequested"))
+}
+
+fn order_policy() -> PolicyDispatch {
+    PolicyDispatch::new("order-inventory", "order", "inventory")
+        .on_event("test.order.OrderPlaced", |_event, _ctx| {
+            Ok(vec![reserve(7), hold(8)])
+        })
+}
 
 #[test]
-fn declared_event_emits_its_command() {
-    let policy = PolicyDispatch::new("OrderFulfillment", "order", "inventory")
-        .on_event(FQ_ORDER_CREATED, |_e, _c| Ok(vec![command_to("inventory")]));
-    let resp = policy
-        .dispatch(&source_book("order", vec![event_page_of(FQ_ORDER_CREATED)]))
-        .expect("dispatch");
-    assert_eq!(commands_of(&resp).len(), 1, "one command emitted (C-0050)");
+fn output_builders_put_the_payload_in_their_arm() {
+    let payload = typed("a.B");
     assert_eq!(
-        cmd_to(&resp, "inventory").cover.as_ref().unwrap().domain,
-        "inventory"
+        policy::command(Some(uuid_of(1)), payload.clone()),
+        hpb::Output {
+            root: Some(uuid_of(1)),
+            body: Some(hpb::output::Body::Command(payload.clone())),
+        }
+    );
+    assert_eq!(
+        policy::fact(None, payload.clone()),
+        hpb::Output {
+            root: None,
+            body: Some(hpb::output::Body::Fact(payload)),
+        }
     );
 }
 
 #[test]
-fn undeclared_event_type_is_skipped() {
-    // Only OrderCreated is declared; a StockReserved page emits nothing and
-    // is not an error (spec C-0051).
-    let policy = PolicyDispatch::new("OrderFulfillment", "order", "inventory")
-        .on_event(FQ_ORDER_CREATED, |_e, _c| Ok(vec![command_to("inventory")]));
-    let resp = policy
-        .dispatch(&source_book(
+fn a_declared_event_answers_its_outputs_in_order_unchanged() {
+    let answer = order_policy()
+        .react(&trigger(
             "order",
-            vec![event_page_of(FQ_STOCK_RESERVED)],
+            sequenced_event_page(3, typed("test.order.OrderPlaced")),
         ))
-        .expect("dispatch");
-    assert!(
-        commands_of(&resp).is_empty(),
-        "undeclared event emits no commands"
-    );
+        .expect("reacted");
+    assert_eq!(answer.outputs, vec![reserve(7), hold(8)]);
 }
 
 #[test]
-fn every_page_is_a_fresh_trigger() {
-    // The policy walks EVERY page (source = triggering events, not state):
-    // three OrderCreated pages each emit one command → three commands.
-    let policy = PolicyDispatch::new("OrderFulfillment", "order", "inventory")
-        .on_event(FQ_ORDER_CREATED, |_e, _c| Ok(vec![command_to("inventory")]));
-    let pages = (0..3).map(|_| event_page_of(FQ_ORDER_CREATED)).collect();
-    let resp = policy
-        .dispatch(&source_book("order", pages))
-        .expect("dispatch");
+fn an_undeclared_event_a_meta_event_or_no_trigger_answers_nothing() {
+    let policy = order_policy();
+    let empty = hpb::ReactResponse::default();
     assert_eq!(
-        commands_of(&resp).len(),
-        3,
-        "every page triggers the handler"
+        policy.react(&trigger(
+            "order",
+            sequenced_event_page(1, typed("test.order.OrderShipped"))
+        )),
+        Ok(empty.clone()),
+        "C-0051"
+    );
+    let fork = pb::EventPage {
+        body: Some(pb::event_page::Body::MetaEvent(pb::MetaEvent::default())),
+        ..Default::default()
+    };
+    assert_eq!(policy.react(&trigger("order", fork)), Ok(empty.clone()));
+    assert_eq!(
+        policy.react(&hpb::ReactRequest::default()),
+        Ok(empty.clone()),
+        "no trigger book"
+    );
+    assert_eq!(
+        policy.react(&hpb::ReactRequest {
+            trigger: Some(pb::EventBook::default()),
+        }),
+        Ok(empty),
+        "a trigger book with no page"
     );
 }
 
-// --- pass-through: the coordinator stamps emitted commands ---------------
-
+// React is handed one trigger: the book's first page is the trigger; the
+// router guards no envelope (decision 14.42).
 #[test]
-fn emitted_commands_pass_through_unstamped_in_emission_order() {
-    // A handler-set correlation survives untouched (the coordinator checks
-    // it, decision 14.42); nothing is filled in from the source.
-    let policy = PolicyDispatch::new("OrderSplit", "order", "inventory").on_event(
-        FQ_ORDER_CREATED,
-        |_e, _c| {
-            let mut own = command_to("inventory");
-            own.page.as_mut().unwrap().correlation_id = Some(uuid_of(1));
-            Ok(vec![own, command_to("inventory")])
+fn react_reacts_to_the_books_one_trigger() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let captured = seen.clone();
+    let policy = PolicyDispatch::new("p", "order", "inventory").on_event(
+        "test.order.OrderPlaced",
+        move |_event, ctx| {
+            captured.lock().unwrap().push(ctx.sequence);
+            Ok(vec![])
         },
     );
-    let mut src = source_book(
+    let mut req = trigger(
         "order",
-        vec![
-            sequenced_page_of(FQ_ORDER_CREATED, 1),
-            sequenced_page_of(FQ_ORDER_CREATED, 2),
-        ],
+        sequenced_event_page(4, typed("test.order.OrderPlaced")),
     );
-    for page in &mut src.pages {
-        page.meta = Some(pb::EventMeta {
-            correlation_id: Some(uuid_of(1)),
-            ..Default::default()
-        });
-    }
-    let resp = policy.dispatch(&src).expect("dispatch");
+    req.trigger
+        .as_mut()
+        .unwrap()
+        .pages
+        .push(sequenced_event_page(5, typed("test.order.OrderPlaced")));
+    policy.react(&req).expect("reacted");
+    assert_eq!(*seen.lock().unwrap(), vec![4]);
+}
 
-    let mut expected_first = command_to("inventory");
-    expected_first.page.as_mut().unwrap().correlation_id = Some(uuid_of(1));
+#[test]
+fn a_reaction_sees_its_triggers_cover_sequence_and_metadata() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let captured = seen.clone();
+    let policy = PolicyDispatch::new("p", "order", "inventory").on_event(
+        "test.order.OrderPlaced",
+        move |_event, ctx| {
+            captured.lock().unwrap().push((
+                ctx.cover.cloned(),
+                ctx.sequence,
+                ctx.meta.and_then(|m| m.correlation_id.clone()),
+            ));
+            Ok(vec![])
+        },
+    );
+    let mut page = sequenced_event_page(9, typed("test.order.OrderPlaced"));
+    page.meta = Some(pb::EventMeta {
+        correlation_id: Some(uuid_of(5)),
+        ..Default::default()
+    });
+    policy.react(&trigger("order", page)).expect("reacted");
     assert_eq!(
-        commands_of(&resp),
-        vec![
-            expected_first.clone(),
-            command_to("inventory"),
-            expected_first,
-            command_to("inventory"),
-        ],
-        "commands are returned exactly as emitted, page by page"
+        *seen.lock().unwrap(),
+        vec![(Some(stream("order", None, 1)), 9, Some(uuid_of(5)))]
     );
 }
 
-// --- no envelope guards; errors ---------------------------------------------
-
-// Decision 14.42: the router guards no envelope; a source with no pages
-// answers no reactions.
 #[test]
-fn an_empty_source_answers_no_reactions() {
-    let policy = PolicyDispatch::new("OrderFulfillment", "order", "inventory")
-        .on_event(FQ_ORDER_CREATED, |_e, _c| Ok(vec![command_to("inventory")]));
-    let resp = policy
-        .dispatch(&source_book("order", vec![]))
-        .expect("answered");
-    assert_eq!(resp, pb::PolicyResponse::default());
-}
-
-#[test]
-fn handler_error_propagates_as_unhandled() {
-    let policy = PolicyDispatch::new("OrderFulfillment", "order", "inventory")
-        .on_event(FQ_ORDER_CREATED, |_e, _c| {
+fn a_failing_reaction_is_a_bug() {
+    let policy = PolicyDispatch::new("p", "order", "inventory")
+        .on_event("test.order.OrderPlaced", |_event, _ctx| {
             Err(HandlerError::Other("boom".to_string()))
         });
     let err = policy
-        .dispatch(&source_book("order", vec![event_page_of(FQ_ORDER_CREATED)]))
-        .expect_err("handler error must fail dispatch");
-    assert_eq!(err.code, RouterReason::UnhandledHandlerError.as_str_name());
+        .react(&trigger(
+            "order",
+            sequenced_event_page(0, typed("test.order.OrderPlaced")),
+        ))
+        .expect_err("failed");
+    assert_eq!(err.code, AngzarrReason::UnhandledHandlerError.as_str_name());
 }
-
-// --- accessors ------------------------------------------------------------
 
 #[test]
 fn accessors_report_name_domains_and_types() {
-    let policy = PolicyDispatch::new("OrderFulfillment", "order", "inventory")
-        .on_event(FQ_ORDER_CREATED, |_e, _c| Ok(vec![]));
-    assert_eq!(policy.name(), "OrderFulfillment");
+    let policy = order_policy();
+    assert_eq!(policy.name(), "order-inventory");
     assert_eq!(policy.input_domain(), "order");
     assert_eq!(policy.output_domain(), "inventory");
-    assert_eq!(policy.event_types(), vec![FQ_ORDER_CREATED.to_string()]);
-    assert_eq!(
-        policy.subscriptions().get("order"),
-        Some(&vec![FQ_ORDER_CREATED.to_string()])
-    );
-}
-
-// --- handler context: the triggering page's cover and sequence (X-037) ----
-
-#[test]
-fn a_context_handler_sees_each_triggering_page() {
-    let seen: Arc<Mutex<Vec<(String, u64)>>> = Arc::default();
-    let sink = seen.clone();
-    let policy = PolicyDispatch::new("OrderFulfillment", "order", "inventory")
-        .on_event_with_context(FQ_ORDER_CREATED, move |_e, source| {
-            let domain = source.cover.map(|c| c.domain.clone()).unwrap_or_default();
-            sink.lock().unwrap().push((domain, source.sequence));
-            Ok(vec![command_to("inventory")])
-        });
-    let resp = policy
-        .dispatch(&source_book(
-            "order",
-            vec![
-                sequenced_page_of(FQ_ORDER_CREATED, 4),
-                sequenced_page_of(FQ_STOCK_RESERVED, 5),
-                sequenced_page_of(FQ_ORDER_CREATED, 6),
-            ],
-        ))
-        .expect("dispatch");
-    assert_eq!(commands_of(&resp).len(), 2, "one command per declared page");
-    assert_eq!(
-        *seen.lock().unwrap(),
-        vec![("order".to_string(), 4), ("order".to_string(), 6)]
-    );
-}
-
-#[test]
-fn a_context_handler_sees_sequence_zero_for_an_unsequenced_page() {
-    let seen: Arc<Mutex<Vec<u64>>> = Arc::default();
-    let sink = seen.clone();
-    let policy = PolicyDispatch::new("OrderFulfillment", "order", "inventory")
-        .on_event_with_context(FQ_ORDER_CREATED, move |_e, source| {
-            sink.lock().unwrap().push(source.sequence);
-            Ok(vec![])
-        });
-    policy
-        .dispatch(&source_book("order", vec![event_page_of(FQ_ORDER_CREATED)]))
-        .expect("dispatch");
-    assert_eq!(*seen.lock().unwrap(), vec![0]);
-}
-
-// --- reactions by triggering page (decision 14.42) ---------------------------
-
-/// A policy answering `test.A` with `per_page` commands to "inventory", and
-/// `test.B` with none; `test.C` is undeclared.
-fn reacting(per_page: usize) -> PolicyDispatch {
-    PolicyDispatch::new("p", "order", "inventory")
-        .on_event("test.A", move |_e, _c| {
-            Ok((0..per_page)
-                .map(|i| pb::CommandBook {
-                    cover: Some(pb::Cover {
-                        domain: "inventory".into(),
-                        root: Some(uuid_of(i as u8 + 1)),
-                        ..Default::default()
-                    }),
-                    page: Some(command_page(Any {
-                        type_url: type_url("test.Command"),
-                        value: vec![i as u8],
-                    })),
-                    ..Default::default()
-                })
-                .collect())
-        })
-        .on_event("test.B", |_e, _c| Ok(Vec::new()))
-}
-
-fn source_of(pages: &[(&str, u64)]) -> pb::EventBook {
-    pb::EventBook {
-        cover: Some(pb::Cover {
-            domain: "order".into(),
-            ..Default::default()
-        }),
-        pages: pages
-            .iter()
-            .map(|(kind, seq)| {
-                crate::test_support::sequenced_event_page(
-                    *seq,
-                    Any {
-                        type_url: type_url(kind),
-                        value: Vec::new(),
-                    },
-                )
-            })
-            .collect(),
-        ..Default::default()
-    }
-}
-
-#[test]
-fn every_handled_page_answers_one_reaction_in_page_order_an_empty_one_included() {
-    let resp = reacting(2)
-        .dispatch(&source_of(&[
-            ("test.A", 3),
-            ("test.C", 4),
-            ("test.B", 5),
-            ("test.A", 6),
-        ]))
-        .expect("translated");
-    let shape: Vec<(u64, usize)> = resp
-        .reactions
-        .iter()
-        .map(|r| (r.trigger_sequence, r.outputs.len()))
-        .collect();
-    assert_eq!(
-        shape,
-        vec![(3, 2), (5, 0), (6, 2)],
-        "one reaction per handled page, empty included; none for the unhandled page"
-    );
-    assert_eq!(
-        resp.reactions[0]
-            .outputs
-            .iter()
-            .map(|c| crate::command_payload(c.page.as_ref().unwrap())
-                .unwrap()
-                .value
-                .clone())
-            .collect::<Vec<_>>(),
-        vec![vec![0], vec![1]],
-        "a reaction's commands in the order business code returned them"
-    );
+    assert_eq!(policy.event_types(), vec!["test.order.OrderPlaced"]);
 }

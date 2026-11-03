@@ -1,24 +1,26 @@
 //! Cucumber harness for the handler-contract tier's
 //! `counter_dispatch.feature`: step defs parse the tier's orthogonal
-//! `.txtpb` skeletons, set the scenario's data by field, dispatch to the
-//! Rust router, and assert outcomes. Every router binds the same feature;
-//! only the step-definition layer differs.
+//! `.txtpb` request skeletons, set the scenario's data by field, dispatch to
+//! the Rust router, and assert outcomes. Every router binds the same
+//! feature; only the step-definition layer differs.
 
 mod common;
 
 use angzarr_router::error::CodedError;
+use angzarr_router::hpb;
 use angzarr_router::pb;
 use angzarr_router::router::CommandHandler;
 use angzarr_router_conformance as conf;
 use cucumber::writer::Stats as _;
 use cucumber::{given, then, when, World};
+use prost::Message;
 
 #[derive(Debug, Default, World)]
 struct CounterWorld {
-    /// Prior-events book supplied to the next dispatch.
+    /// The stream's history supplied to the next dispatch.
     prior: Option<pb::EventBook>,
     /// Outcome of the dispatched command.
-    result: Option<Result<pb::CommandHandlerResponse, CodedError>>,
+    result: Option<Result<hpb::HandleResponse, CodedError>>,
     /// Historical-state evidence the handler recorded during dispatch.
     observed: conf::ObservedSink,
 }
@@ -26,10 +28,10 @@ struct CounterWorld {
 impl CounterWorld {
     /// Dispatches through the kernel-facing [`CommandHandler`], awaiting
     /// its answer.
-    async fn dispatch(&mut self, mut cc: pb::ContextualCommand) {
-        cc.events = self.prior.clone();
+    async fn dispatch(&mut self, mut req: hpb::HandleRequest) {
+        req.history = self.prior.clone();
         let counter = conf::counter_aggregate(self.observed.clone());
-        self.result = Some(CommandHandler::dispatch(&counter, &cc).await);
+        self.result = Some(CommandHandler::dispatch(&counter, &req).await);
     }
 
     fn last_observed(&self) -> conf::Observed {
@@ -39,6 +41,22 @@ impl CounterWorld {
             .unwrap()
             .last()
             .expect("the handler recorded an observation")
+    }
+
+    fn answer(&self) -> &hpb::HandleResponse {
+        self.result
+            .as_ref()
+            .expect("a command was dispatched")
+            .as_ref()
+            .expect("expected a successful answer")
+    }
+
+    fn error(&self) -> &CodedError {
+        self.result
+            .as_ref()
+            .expect("a command was dispatched")
+            .as_ref()
+            .expect_err("expected a refusal")
     }
 }
 
@@ -56,11 +74,11 @@ async fn prior_increases(w: &mut CounterWorld, n: u32) {
     regex = r#"^a counter that has already recorded (\d+) increases under the "([^"]*)" type-URL prefix$"#
 )]
 async fn prior_increases_prefixed(w: &mut CounterWorld, n: u32, prefix: String) {
-    let carrier = pb::ContextualCommand {
-        events: conf::prior_history(n),
+    let carrier = hpb::HandleRequest {
+        history: conf::prior_history(n),
         ..Default::default()
     };
-    w.prior = conf::with_type_url_prefix(carrier, &prefix).events;
+    w.prior = conf::with_type_url_prefix(carrier, &prefix).history;
 }
 
 #[given("a counter whose history holds a corrupt event")]
@@ -102,36 +120,58 @@ async fn unhandled_command(w: &mut CounterWorld) {
 }
 
 #[then(regex = r"^(\d+) increases are recorded$")]
-async fn recorded(w: &mut CounterWorld, count: u32) {
-    assert_eq!(
-        recorded_book(w).pages.len() as u32,
-        count,
-        "recorded event count"
-    );
+async fn recorded(w: &mut CounterWorld, count: usize) {
+    assert_eq!(w.answer().events.len(), count, "recorded event count");
 }
 
-#[then("the recorded events carry no router-stamped sequence")]
-async fn no_stamped_sequence(w: &mut CounterWorld) {
-    for (i, page) in recorded_book(w).pages.iter().enumerate() {
-        assert_eq!(page.sequence, 0, "event {i} passes through unsequenced");
-        assert_eq!(page.meta, None, "event {i} passes through with no meta");
+#[then("the answer's events are Increased payloads alone, with no sequence, cover or metadata")]
+async fn payloads_alone(w: &mut CounterWorld) {
+    // HandleResponse.events are payloads: an Any holds no sequence, cover
+    // or metadata to stamp (decision 14.78).
+    for event in &w.answer().events {
+        assert_eq!(
+            angzarr_router::type_name_from_url(&event.type_url),
+            "test.counter.Increased"
+        );
     }
 }
 
-#[then(regex = r"^the command is rejected as ([A-Z_]+)$")]
-async fn rejected_as(w: &mut CounterWorld, code: String) {
-    assert_failed_with(w, &code);
-    let err = w.result.as_ref().unwrap().as_ref().unwrap_err();
+#[then(regex = r"^the command is refused ([A-Z_]+) with reason (ANGZARR_REASON_[A-Z_]+)$")]
+async fn refused_with(w: &mut CounterWorld, status: String, reason: String) {
+    let err = w.error();
+    assert_eq!(err.code, reason);
+    assert_eq!(err.grpc, conf::status_named(&status));
+}
+
+#[then(regex = r#"^the refusal's error info carries refusal_type "([^"]*)"$"#)]
+async fn refusal_type_carried(w: &mut CounterWorld, refusal_type: String) {
     assert_eq!(
-        err.grpc,
-        angzarr_router::error::GrpcCode::FailedPrecondition,
-        "a business rejection is FAILED_PRECONDITION"
+        w.error().extras.get("refusal_type"),
+        Some(&refusal_type),
+        "the refusal_type arg"
     );
 }
 
-#[then(regex = r"^the command fails with ([A-Z_]+)$")]
-async fn fails_with(w: &mut CounterWorld, code: String) {
-    assert_failed_with(w, &code);
+#[then(regex = r"^the refusal's status details carry the ValueNotPositive with n (\d+)$")]
+async fn details_carry(w: &mut CounterWorld, n: u32) {
+    let typed = w.error().refusal.as_deref().expect("a refusal object");
+    assert_eq!(
+        angzarr_router::type_name_from_url(&typed.type_url),
+        "test.counter.ValueNotPositive"
+    );
+    assert_eq!(
+        conf::counter::ValueNotPositive::decode(typed.value.as_slice()).unwrap(),
+        conf::counter::ValueNotPositive { n }
+    );
+}
+
+#[then(regex = r"^the command fails (INTERNAL )?with ([A-Z_]+)$")]
+async fn fails_with(w: &mut CounterWorld, internal: String, code: String) {
+    let err = w.error();
+    assert_eq!(err.code, code, "coded-error reason");
+    if !internal.is_empty() {
+        assert_eq!(err.grpc, angzarr_router::error::GrpcCode::Internal);
+    }
 }
 
 #[then(regex = r"^the handler saw (no )?prior history, at next sequence (\d+)$")]
@@ -158,37 +198,20 @@ async fn observed_count(w: &mut CounterWorld, count: u32, next_sequence: u64) {
 
 #[then("no events are recorded")]
 async fn no_events(w: &mut CounterWorld) {
-    // A rejection/failure is an Err and carries no events; if some impl
-    // returned Ok, it must carry an empty book.
-    if let Some(Ok(resp)) = &w.result {
-        if let Some(book) = &resp.events {
-            assert!(
-                book.pages.is_empty(),
-                "expected no events recorded, got {}",
-                book.pages.len()
-            );
-        }
-    }
-}
-
-fn recorded_book(w: &CounterWorld) -> &pb::EventBook {
-    let resp = w
-        .result
-        .as_ref()
-        .expect("a command was dispatched")
-        .as_ref()
-        .expect("expected a successful response");
-    resp.events.as_ref().expect("an events response")
+    // A refusal is an error status: no HandleResponse, so no events
+    // (decision 14.95).
+    assert!(
+        w.result
+            .as_ref()
+            .expect("a command was dispatched")
+            .is_err(),
+        "a refusal answers no events"
+    );
 }
 
 #[then(regex = r#"^the refusal is INTERNAL naming the type URL "([^"]*)"$"#)]
 async fn refused_naming(w: &mut CounterWorld, url: String) {
-    let err = w
-        .result
-        .as_ref()
-        .expect("a command was dispatched")
-        .as_ref()
-        .expect_err("expected a refusal");
+    let err = w.error();
     // The router's own malformed-input error is a bug (14.37 ruling).
     assert_eq!(err.grpc, angzarr_router::error::GrpcCode::Internal);
     // Decision 14.37: the type URL is an arg; the status message is the key.
@@ -198,17 +221,6 @@ async fn refused_naming(w: &mut CounterWorld, url: String) {
         err.code,
         "the status message is the key"
     );
-}
-
-fn assert_failed_with(w: &CounterWorld, code: &str) {
-    let err = w
-        .result
-        .as_ref()
-        .expect("a command was dispatched")
-        .as_ref()
-        .err()
-        .unwrap_or_else(|| panic!("expected failure {code}, got a success"));
-    assert_eq!(err.code, code, "coded-error reason");
 }
 
 #[tokio::main]

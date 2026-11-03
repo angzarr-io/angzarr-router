@@ -1,66 +1,20 @@
-//! A policy on the current spec: a refusal of one of its commands comes back
-//! through OnRefused, which answers the translating callback's fact payload
-//! alone, or no translation (policy.proto, PolicyService, Refusals; decisions
-//! 14.31, 14.42). Building the pass-through `CommandRefused`, and
-//! addressing and identifying every refusal fact, are the coordinator's.
+//! PolicyDispatch's Translate: the one refusal path (decision 46 #5)
+//! through the policy's ONE refusal callback (decision 14.89), handed the
+//! refused command, the target's typed refusal and the full context, and
+//! answering a domestic fact's payload alone, or a bug; a policy written by
+//! hand with no callback answers ANGZARR_REASON_NO_REFUSAL_HANDLER.
+
+use std::sync::{Arc, Mutex};
 
 use prost::Message;
 use prost_types::Any;
 
-use crate::domain::CommandContext;
-use crate::error::{GrpcCode, HandlerError, RouterReason};
+use crate::error::{AngzarrReason, CodedError, HandlerError};
+use crate::hpb;
 use crate::pb;
 use crate::policy::PolicyDispatch;
+use crate::router::RouterBuilder;
 use crate::test_support::*;
-
-const INSTANCE: u8 = 7;
-
-/// The policy (buyin -> wallet): BuyInStarted becomes HoldFunds for the
-/// player's wallet (root 1), addressed by the business code without an
-/// edition.
-fn buyin_wallet() -> PolicyDispatch {
-    PolicyDispatch::new("BuyInWallet", "buyin", "wallet").on_event(
-        &fq::<BuyInStarted>(),
-        |event, _cover| {
-            let started = BuyInStarted::decode(event.value.as_slice()).expect("BuyInStarted");
-            Ok(vec![pb::CommandBook {
-                cover: Some(stream("wallet", None, 1)),
-                page: Some(command_page(any_of(&HoldFunds {
-                    amount: started.amount,
-                }))),
-                ..Default::default()
-            }])
-        },
-    )
-}
-
-/// The triggering event: BuyInStarted at sequence 4 of the buy-in instance
-/// in `edition`.
-fn trigger_book(edition: Option<&str>) -> pb::EventBook {
-    pb::EventBook {
-        cover: Some(stream("buyin", edition, INSTANCE)),
-        pages: vec![sequenced_event_page(
-            4,
-            any_of(&BuyInStarted { amount: 150 }),
-        )],
-        ..Default::default()
-    }
-}
-
-/// The HoldFunds the policy sent, as delivered: identity stamped.
-fn sent_command(edition: Option<&str>) -> pb::CommandBook {
-    let mut book = caused_by(
-        command_book(
-            stream("wallet", edition, 1),
-            any_of(&HoldFunds { amount: 150 }),
-            9,
-        ),
-        stream("buyin", edition, INSTANCE),
-        4,
-    );
-    book.page.as_mut().unwrap().correlation_id = Some(uuid_of(INSTANCE));
-    book
-}
 
 fn insufficient() -> Any {
     any_of(&InsufficientFunds {
@@ -69,201 +23,227 @@ fn insufficient() -> Any {
     })
 }
 
-fn refusal(edition: Option<&str>, typed: Option<Any>) -> pb::Refusal {
-    pb::Refusal {
-        event: Some(trigger_book(edition)),
-        command: Some(sent_command(edition)),
-        response: Some(pb::RefusalResponse {
-            reason: Some(match typed {
-                Some(typed) => pb::refusal_response::Reason::Refusal(typed),
-                None => pb::refusal_response::Reason::Diagnostic(pb::Diagnostic {
-                    code: "WALLET_EMPTY".to_string(),
-                    ..Default::default()
-                }),
-            }),
+fn hold_funds() -> Any {
+    any_of(&HoldFunds { amount: 150 })
+}
+
+/// The HoldFunds as the policy's coordinator delivered it, in the arm
+/// `body` picks.
+fn delivered(body: fn(Any) -> pb::reaction_delivery::Body) -> pb::ReactionDelivery {
+    pb::ReactionDelivery {
+        cover: Some(stream("wallet", Some("what-if"), 2)),
+        body: Some(body(hold_funds())),
+        command_id: Some(uuid_of(9)),
+        correlation_id: Some(uuid_of(7)),
+        causation: Some(pb::EventRef {
+            stream: Some(stream("buyin", Some("what-if"), 7)),
+            sequence: 3,
+        }),
+        component: "buyin-wallet".to_string(),
+    }
+}
+
+fn trigger_book() -> pb::EventBook {
+    let mut page = sequenced_event_page(3, any_of(&BuyInStarted { amount: 150 }));
+    page.meta = Some(pb::EventMeta {
+        correlation_id: Some(uuid_of(7)),
+        ..Default::default()
+    });
+    pb::EventBook {
+        cover: Some(stream("buyin", Some("what-if"), 7)),
+        pages: vec![page],
+        ..Default::default()
+    }
+}
+
+fn request() -> hpb::TranslateRequest {
+    hpb::TranslateRequest {
+        trigger: Some(trigger_book()),
+        command: Some(delivered(pb::reaction_delivery::Body::Command)),
+        refusal: Some(hpb::Refusal {
+            status: pb::RefusalStatus::FailedPrecondition as i32,
+            typed: Some(insufficient()),
         }),
     }
 }
 
-/// The fact of an OnRefused answer, decoded as `M`.
-fn fact_of<M: Message + Default>(answer: &pb::OnRefusedResponse) -> M {
-    let book = answer.fact.as_ref().expect("a fact");
-    let any = crate::fact_payload(book.page.as_ref().expect("its page")).expect("a Fact arm");
-    M::decode(any.value.as_slice()).expect("the fact's type")
+/// What the callback was handed: the command, the refusal, the trigger's
+/// cover, sequence and correlation, and the delivery.
+type Seen = Arc<
+    Mutex<
+        Vec<(
+            Any,
+            hpb::Refusal,
+            Option<pb::Cover>,
+            u64,
+            Option<pb::Uuid>,
+            pb::ReactionDelivery,
+        )>,
+    >,
+>;
+
+/// The buy-in's policy to the wallet, its one callback translating an
+/// InsufficientFunds into the buy-in fact FundsUnavailable, and every other
+/// refusal a Bug.
+fn buyin_wallet(seen: Seen) -> PolicyDispatch {
+    PolicyDispatch::new("buyin-wallet", "buyin", "wallet").on_refused(
+        move |command, refusal, ctx| {
+            seen.lock().unwrap().push((
+                command.clone(),
+                refusal.clone(),
+                ctx.trigger.cover.cloned(),
+                ctx.trigger.sequence,
+                ctx.trigger.meta.and_then(|m| m.correlation_id.clone()),
+                ctx.delivery.clone(),
+            ));
+            let typed = refusal.typed.as_ref().expect("typed");
+            if crate::type_name_from_url(&typed.type_url) != fq::<InsufficientFunds>() {
+                return Err(CodedError::bug("UNHANDLED_REFUSAL", []).into());
+            }
+            let funds = InsufficientFunds::decode(typed.value.as_slice()).expect("decodes");
+            Ok(any_of(&FundsUnavailable {
+                available: funds.available,
+            }))
+        },
+    )
 }
 
-// --- a policy translates an event into a command --------------------------------------
-
 #[test]
-fn a_policy_translates_an_event_into_a_command_for_its_destination() {
-    let resp = buyin_wallet()
-        .dispatch(&trigger_book(None))
+fn translate_answers_the_callbacks_domestic_fact_alone() {
+    let answer = buyin_wallet(Seen::default())
+        .translate(&request())
         .expect("translated");
-    assert_eq!(commands_of(&resp).len(), 1);
     assert_eq!(
-        crate::command_payload(commands_of(&resp)[0].page.as_ref().unwrap()),
-        Some(&any_of(&HoldFunds { amount: 150 }))
+        answer,
+        hpb::TranslateResponse {
+            fact: Some(any_of(&FundsUnavailable { available: 100 })),
+        }
     );
 }
 
-// --- no translation (C-0692) ------------------------------------------------------------
-
+// The callback is handed the full context, read-only: the refused command
+// (its target's command choice), the typed refusal with its status, the
+// trigger's cover, sequence and metadata, and the delivery as delivered.
 #[test]
-fn with_no_callback_the_answer_carries_no_fact() {
-    for typed in [Some(insufficient()), None] {
-        let answer = buyin_wallet()
-            .dispatch_refusal(&refusal(None, typed), &CommandContext::default())
-            .expect("answered");
-        assert_eq!(answer, pb::OnRefusedResponse { fact: None });
-    }
-}
-
-// --- translate --------------------------------------------------------------------------
-
-#[test]
-fn translate_answers_the_callbacks_domestic_fact() {
-    let policy = buyin_wallet().on_refused(&fq::<HoldFunds>(), |refusal, _ctx| {
-        let typed = refusal
-            .response
-            .as_ref()
-            .and_then(|r| match &r.reason {
-                Some(pb::refusal_response::Reason::Refusal(typed)) => Some(typed),
-                _ => None,
-            })
-            .expect("the typed refusal");
-        let insufficient =
-            InsufficientFunds::decode(typed.value.as_slice()).expect("InsufficientFunds");
-        Ok(any_of(&FundsUnavailable {
-            available: insufficient.available,
-        }))
-    });
-    let answer = policy
-        .dispatch_refusal(
-            &refusal(None, Some(insufficient())),
-            &CommandContext::default(),
-        )
-        .expect("answered");
-    let fact: FundsUnavailable = fact_of(&answer);
-    assert_eq!(fact, FundsUnavailable { available: 100 });
-    // C-0691: the payload alone; its cover, handling and identity are the
-    // coordinator's.
-    assert_eq!(
-        answer.fact,
-        Some(pb::CommandBook {
-            page: Some(fact_page(any_of(&FundsUnavailable { available: 100 }))),
-            ..Default::default()
-        })
-    );
-}
-
-// The translating callback reads the refused command's context, whole, as
-// the runtime passes it on from the target's dispatch: its cover, its
-// sequences, history, resolution and conflict, and its identity.
-#[test]
-fn a_translating_callback_reads_the_refused_commands_context() {
-    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let sink = seen.clone();
-    let policy = buyin_wallet().on_refused(&fq::<HoldFunds>(), move |_refusal, ctx| {
-        sink.lock().unwrap().push(ctx.clone());
-        Ok(any_of(&FundsUnavailable { available: 0 }))
-    });
-    let window = vec![sequenced_event_page(
-        3,
-        any_of(&FundsUnavailable { available: 1 }),
-    )];
-    let ctx = CommandContext {
-        next_sequence: 4,
-        had_prior_events: true,
-        cover: Some(stream("wallet", None, 1)),
-        expected_sequence: 3,
-        conflict_resolution: pb::ConflictResolution::AggregateHandles,
-        conflict: Some(crate::domain::Conflict::new(window.clone(), vec![7, 7])),
-        command_id: Some(uuid_of(9)),
-        correlation_id: Some(uuid_of(8)),
-        fact_origin: None,
-        recorded_at: None,
-    };
-    policy
-        .dispatch_refusal(&refusal(None, Some(insufficient())), &ctx)
-        .expect("answered");
+fn the_callback_reads_the_command_refusal_trigger_and_delivery() {
+    let seen = Seen::default();
+    buyin_wallet(seen.clone())
+        .translate(&request())
+        .expect("translated");
     let seen = seen.lock().unwrap();
-    let [got] = seen.as_slice() else {
-        panic!("the callback ran once");
-    };
-    assert_eq!(
-        (
-            got.next_sequence,
-            got.had_prior_events,
-            got.expected_sequence
-        ),
-        (4, true, 3)
-    );
-    assert_eq!(got.cover, Some(stream("wallet", None, 1)));
-    assert_eq!(
-        got.conflict_resolution,
-        pb::ConflictResolution::AggregateHandles
-    );
-    let conflict = got.conflict.as_ref().expect("the conflict");
-    assert_eq!(
-        (conflict.window(), conflict.nonce()),
-        (window.as_slice(), &[7u8, 7][..])
-    );
-    assert_eq!(
-        (got.command_id.clone(), got.correlation_id.clone()),
-        (Some(uuid_of(9)), Some(uuid_of(8)))
-    );
+    assert_eq!(seen.len(), 1);
+    let (command, refusal, cover, sequence, correlation, delivery) = &seen[0];
+    assert_eq!(command, &hold_funds());
+    assert_eq!(refusal, request().refusal.as_ref().unwrap());
+    assert_eq!(cover, &Some(stream("buyin", Some("what-if"), 7)));
+    assert_eq!(*sequence, 3);
+    assert_eq!(correlation, &Some(uuid_of(7)));
+    assert_eq!(delivery, &delivered(pb::reaction_delivery::Body::Command));
 }
 
-// The callback's presence is translate mode for THAT command type only.
+// Whichever arm the delivery carried, its payload is the refused input.
 #[test]
-fn a_command_type_with_no_callback_has_no_translation() {
-    let policy = buyin_wallet().on_refused(&fq::<ReleaseFunds>(), |_, _| {
-        panic!("not the refused command's type")
-    });
-    let answer = policy
-        .dispatch_refusal(
-            &refusal(None, Some(insufficient())),
-            &CommandContext::default(),
-        )
-        .expect("answered");
-    assert_eq!(answer.fact, None);
+fn the_callback_is_handed_the_deliverys_payload_whichever_its_arm() {
+    let seen = Seen::default();
+    let mut req = request();
+    req.command = Some(delivered(pb::reaction_delivery::Body::Fact));
+    buyin_wallet(seen.clone())
+        .translate(&req)
+        .expect("translated");
+    assert_eq!(seen.lock().unwrap()[0].0, hold_funds());
 }
 
-// A failing callback is a policy bug: dead-lettered and alerted by the runtime.
+// A refusal the callback does not handle is a Bug (decision 14.89), never a
+// fact (C-0854); a failing callback likewise.
 #[test]
-fn a_failing_callback_is_a_policy_bug() {
-    let policy = buyin_wallet().on_refused(&fq::<HoldFunds>(), |_, _| {
-        Err(HandlerError::Other("cannot translate".to_string()))
-    });
-    let err = policy
-        .dispatch_refusal(
-            &refusal(None, Some(insufficient())),
-            &CommandContext::default(),
-        )
+fn an_unhandled_refusal_or_a_failing_callback_is_a_bug() {
+    let mut req = request();
+    req.refusal.as_mut().unwrap().typed = Some(any_of(&ReleaseFunds { amount: 1 }));
+    let err = buyin_wallet(Seen::default())
+        .translate(&req)
         .expect_err("a bug");
-    assert_eq!(err.code, RouterReason::UnhandledHandlerError.as_str_name());
-    assert_eq!(err.grpc, GrpcCode::Internal);
+    assert_eq!(err.code, AngzarrReason::UnhandledHandlerError.as_str_name());
+    let failing = PolicyDispatch::new("p", "buyin", "wallet")
+        .on_refused(|_command, _refusal, _ctx| Err(HandlerError::Other("boom".to_string())));
+    assert_eq!(
+        failing.translate(&request()).expect_err("a bug").code,
+        AngzarrReason::UnhandledHandlerError.as_str_name()
+    );
+}
+
+// A policy written by hand with no callback: NO_REFUSAL_HANDLER, naming the
+// refused command's type URL (C-0670).
+#[test]
+fn with_no_callback_translate_is_no_refusal_handler() {
+    let err = PolicyDispatch::new("p", "buyin", "wallet")
+        .translate(&request())
+        .expect_err("no callback");
+    assert_eq!(err.code, AngzarrReason::NoRefusalHandler.as_str_name());
+    assert_eq!(err.extras.get("command_type"), Some(&hold_funds().type_url));
+    assert_eq!(err.grpc, crate::error::GrpcCode::Internal);
+    let err = PolicyDispatch::new("p", "buyin", "wallet")
+        .translate(&hpb::TranslateRequest::default())
+        .expect_err("no callback");
+    assert_eq!(err.extras.get("command_type"), Some(&String::new()));
+}
+
+// The router guards no envelope: an empty request is handed to the
+// callback as empty parts.
+#[test]
+fn an_empty_request_reaches_the_callback_as_empty_parts() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let captured = seen.clone();
+    let policy =
+        PolicyDispatch::new("p", "buyin", "wallet").on_refused(move |command, refusal, ctx| {
+            captured.lock().unwrap().push((
+                command.clone(),
+                refusal.clone(),
+                ctx.trigger.cover.cloned(),
+                ctx.trigger.sequence,
+                ctx.trigger.meta.cloned(),
+            ));
+            Ok(Any::default())
+        });
+    assert_eq!(
+        policy.translate(&hpb::TranslateRequest::default()),
+        Ok(hpb::TranslateResponse {
+            fact: Some(Any::default())
+        }),
+        "an empty fact is answered like any other (policies.md §6)"
+    );
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![(Any::default(), hpb::Refusal::default(), None, 0, None)]
+    );
+}
+
+// A later on_refused replaces the earlier: there is one callback.
+#[test]
+fn there_is_one_callback_per_policy() {
+    let policy = PolicyDispatch::new("p", "buyin", "wallet")
+        .on_refused(|_c, _r, _x| Ok(any_of(&BuyInFailed { requested: 1 })))
+        .on_refused(|_c, _r, _x| Ok(any_of(&BuyInFailed { requested: 2 })));
+    assert_eq!(
+        policy.translate(&request()).expect("translated").fact,
+        Some(any_of(&BuyInFailed { requested: 2 }))
+    );
 }
 
 #[test]
-fn a_policy_router_answers_a_refusal_and_no_other_router_does() {
-    let refusal = refusal(None, Some(insufficient()));
-    let router = crate::router::RouterBuilder::new()
-        .policy(buyin_wallet().on_refused(&fq::<HoldFunds>(), |_, _| {
-            Ok(any_of(&FundsUnavailable { available: 2 }))
-        }))
+fn a_policy_router_translates_and_no_other_router_does() {
+    let router = RouterBuilder::new()
+        .policy(buyin_wallet(Seen::default()))
         .build()
-        .expect("build");
-    let answer =
-        now(router.dispatch_refusal(&refusal, &CommandContext::default())).expect("answered");
-    let fact: FundsUnavailable = fact_of(&answer);
-    assert_eq!(fact, FundsUnavailable { available: 2 });
-
-    let projector = crate::router::RouterBuilder::new()
-        .projector(crate::projector::ProjectorDispatch::new("p", || ()))
+        .expect("one policy");
+    assert!(now(router.dispatch_translate(&request())).is_ok());
+    let router = RouterBuilder::new()
+        .aggregate(crate::domain::DomainDispatch::new(
+            "wallet",
+            "wallet",
+            fresh_rebuilder(),
+        ))
         .build()
-        .expect("build");
-    let err = now(projector.dispatch_refusal(&refusal, &CommandContext::default()))
-        .expect_err("no policy");
-    assert_eq!(err.code, "ROUTER_REASON_NO_COMPONENT_OF_KIND");
+        .expect("one aggregate");
+    let err = now(router.dispatch_translate(&request())).expect_err("no policy");
+    assert_eq!(err.code, AngzarrReason::NoComponentOfKind.as_str_name());
 }

@@ -1,250 +1,215 @@
 //! The refusal path end to end, composed in-process from the router's pure
-//! calls alone, as annals' kernel composes them (plan ruling 4: the seam is
-//! router dispatch). Each hop is its own step (plan ruling 2): the test
-//! plays the runtime between hops, admitting inputs (decision 14.42),
-//! stamping identity and reading streams, and commits nothing.
+//! calls alone, as the angzarr-embedded kernel composes them (plan ruling
+//! 4: the seam is router dispatch). Each hop is its own step (plan ruling
+//! 2): the test plays the runtime between hops, building each request from
+//! the last answer (decision 14.79's ReactionDelivery, the refusal read off
+//! the target's status), and commits nothing.
 //!
 //! The owner's words (decision 14.31): "policy calls foreign command handler,
 //! which refuses. policy then calls its domain command handler and passes it a
-//! fact (that the foreign CH refused)".
+//! fact (that the foreign CH refused)". The one path (decision 46 #5): the
+//! policy's one refusal callback translates it (decision 14.89).
 
 use prost::Message;
 
-use crate::domain::{CommandContext, DomainDispatch, FactRecord};
-use crate::error::{CodedError, HandlerError};
+use crate::domain::{DomainDispatch, Emit};
+use crate::error::{BusinessStatus, CodedError};
+use crate::hpb;
 use crate::pb;
-use crate::policy::PolicyDispatch;
+use crate::policy::{self, PolicyDispatch};
 use crate::test_support::*;
 
 const INSTANCE: u8 = 7;
 const EDITION: &str = "what-if";
 
 fn wallet() -> DomainDispatch<TestState> {
-    DomainDispatch::new("Wallet", "wallet", fresh_rebuilder()).on_command(
+    DomainDispatch::new("wallet", "wallet", fresh_rebuilder()).on_command(
         &fq::<HoldFunds>(),
         |command, _state, _ctx| {
             let hold = HoldFunds::decode(command.value.as_slice()).expect("HoldFunds");
-            Err(HandlerError::Coded(CodedError::refused(any_of(
-                &InsufficientFunds {
+            Err(CodedError::refused(
+                BusinessStatus::FailedPrecondition,
+                any_of(&InsufficientFunds {
                     available: 100,
                     requested: hold.amount,
-                },
-            ))))
+                }),
+            )
+            .into())
         },
     )
 }
 
 fn buyin() -> DomainDispatch<TestState> {
-    DomainDispatch::process_manager("BuyIn", "buyin", fresh_rebuilder())
+    DomainDispatch::process_manager("buyin", "buyin", fresh_rebuilder())
         .on_command(&fq::<StartBuyIn>(), |command, _state, _ctx| {
             let start = StartBuyIn::decode(command.value.as_slice()).expect("StartBuyIn");
-            Ok(Some(pb::EventBook {
-                pages: vec![event_page(any_of(&BuyInStarted {
-                    amount: start.amount,
-                }))],
-                ..Default::default()
-            }))
+            Ok(Emit::of([any_of(&BuyInStarted {
+                amount: start.amount,
+            })]))
         })
-        .on_refused(&fq::<HoldFunds>(), |refused, _state, _cctx| {
-            let typed = InsufficientFunds::decode(
-                refused.refusal.as_ref().expect("typed").value.as_slice(),
-            )
-            .expect("InsufficientFunds");
-            Ok(FactRecord::from(any_of(&BuyInFailed {
-                requested: typed.requested,
-            })))
-        })
-        .on_fact(&fq::<FundsUnavailable>(), |fact, _state| {
+        .on_fact(&fq::<FundsUnavailable>(), |fact, _state, _ctx| {
             let unavailable =
                 FundsUnavailable::decode(fact.value.as_slice()).expect("FundsUnavailable");
-            Ok(FactRecord::from(any_of(&BuyInFailed {
+            Ok(Emit::of([any_of(&BuyInFailed {
                 requested: unavailable.available,
-            })))
+            })]))
         })
 }
 
 fn buyin_wallet() -> PolicyDispatch {
-    PolicyDispatch::new("BuyInWallet", "buyin", "wallet").on_event(
-        &fq::<BuyInStarted>(),
-        |event, _cover| {
+    PolicyDispatch::new("buyin-wallet", "buyin", "wallet")
+        .on_event(&fq::<BuyInStarted>(), |event, _ctx| {
             let started = BuyInStarted::decode(event.value.as_slice()).expect("BuyInStarted");
-            Ok(vec![pb::CommandBook {
-                cover: Some(stream("wallet", None, 1)),
-                page: Some(command_page(any_of(&HoldFunds {
+            Ok(vec![policy::command(
+                Some(uuid_of(1)),
+                any_of(&HoldFunds {
                     amount: started.amount,
-                }))),
-                ..Default::default()
-            }])
-        },
-    )
+                }),
+            )])
+        })
+        .on_refused(|_command, refusal, _ctx| {
+            let typed = refusal.typed.as_ref().expect("typed");
+            let insufficient =
+                InsufficientFunds::decode(typed.value.as_slice()).expect("InsufficientFunds");
+            Ok(any_of(&FundsUnavailable {
+                available: insufficient.available,
+            }))
+        })
 }
 
-/// The refused policy's view of a business refusal, as the runtime builds
-/// it (types.proto, RefusalResponse; decision 14.42): its typed refusal
-/// object, else its key and args.
-fn runtime_refusal_response(refused: &CodedError) -> pb::RefusalResponse {
-    pb::RefusalResponse {
-        reason: Some(match refused.refusal.as_deref() {
-            Some(typed) => pb::refusal_response::Reason::Refusal(typed.clone()),
-            None => pb::refusal_response::Reason::Diagnostic(refused.diagnostic()),
+/// The output as the policy's coordinator delivers it (decision 14.79):
+/// to its destination's stream in the trigger's edition, with the identity
+/// it derives, its causation the trigger.
+fn delivered(
+    output: &hpb::Output,
+    edition: Option<&str>,
+    trigger: pb::EventRef,
+) -> pb::ReactionDelivery {
+    let body = match output.body.clone().expect("an arm") {
+        hpb::output::Body::Command(any) => pb::reaction_delivery::Body::Command(any),
+        hpb::output::Body::Fact(any) => pb::reaction_delivery::Body::Fact(any),
+    };
+    pb::ReactionDelivery {
+        cover: Some(pb::Cover {
+            domain: "wallet".to_string(),
+            root: output.root.clone(),
+            edition: edition.map(str::to_string),
         }),
+        body: Some(body),
+        command_id: Some(uuid_of(9)),
+        correlation_id: Some(uuid_of(INSTANCE)),
+        causation: Some(trigger),
+        component: "buyin-wallet".to_string(),
     }
 }
 
-/// The refusal fact the runtime builds from OnRefused's `answer` (decision
-/// 14.42): the translated fact, or with none the standard pass-through
-/// `CommandRefused`, addressed to the trigger's exact stream under the
-/// refused command's identity.
-fn runtime_refusal_fact(refusal: &pb::Refusal, answer: &pb::OnRefusedResponse) -> pb::CommandBook {
-    let refused = refusal.command.clone().expect("the refused command");
-    let trigger = refusal.event.as_ref().expect("the trigger");
-    let body = match answer.fact.as_ref().and_then(|f| f.page.as_ref()) {
-        Some(page) => page.body.clone(),
-        None => Some(pb::command_page::Body::Fact(pb::Fact {
-            payload: Some(any_of(&pb::CommandRefused {
-                command: Some(refused.clone()),
-                refusal: refusal.response.as_ref().and_then(|r| match &r.reason {
-                    Some(pb::refusal_response::Reason::Refusal(typed)) => Some(typed.clone()),
-                    _ => None,
-                }),
-                trigger: Some(pb::EventRef {
-                    stream: trigger.cover.clone(),
-                    sequence: trigger.pages.last().map_or(0, |p| p.sequence),
-                }),
-            })),
-        })),
+/// A delivery as the destination's coordinator hands it to Handle: its
+/// input book, the arm as delivered, its causation the trigger.
+fn handled(delivery: &pb::ReactionDelivery) -> hpb::HandleRequest {
+    let page = match delivery.body.clone().expect("an arm") {
+        pb::reaction_delivery::Body::Command(any) => command_page(any),
+        pb::reaction_delivery::Body::Fact(any) => fact_page(any),
     };
-    let page = refused.page.expect("its page");
-    let command_id = page.command_id.expect("its id");
-    pb::CommandBook {
-        cover: trigger.cover.clone(),
-        page: Some(pb::CommandPage {
-            body,
-            fact_origin: Some(pb::FactOrigin {
-                external_id: command_id.to_string(),
-                ..Default::default()
+    hpb::HandleRequest {
+        input: Some(pb::CommandBook {
+            cover: delivery.cover.clone(),
+            page: Some(pb::CommandPage {
+                command_id: delivery.command_id.clone(),
+                correlation_id: delivery.correlation_id.clone(),
+                ..page
             }),
-            command_id: Some(command_id),
-            correlation_id: page.correlation_id,
-            causation_id: page.causation_id,
         }),
-        handling: None,
+        causation: delivery.causation.clone(),
+        ..Default::default()
     }
 }
 
 /// Runs the chain from StartBuyIn (in `edition`) to the buy-in's answer to
 /// the refusal, and returns the event it records.
-fn run(policy: PolicyDispatch, edition: Option<&str>) -> pb::EventPage {
+fn run(policy: PolicyDispatch, edition: Option<&str>) -> prost_types::Any {
     let pm = buyin();
     let instance = stream("buyin", edition, INSTANCE);
 
-    // 1. The PM starts: a client's StartBuyIn to a new instance, in the
-    //    edition (forked by the runtime) or in main.
-    let start = command_book(instance.clone(), any_of(&StartBuyIn { amount: 150 }), 1);
-    let started = pm
-        .dispatch(&pb::ContextualCommand {
-            command: Some(start),
-            ..Default::default()
-        })
-        .expect("started")
-        .events
-        .expect("its events");
+    // 1. The PM starts: a client's StartBuyIn to a new instance.
+    let mut start = command_for(any_of(&StartBuyIn { amount: 150 }));
+    start.input.as_mut().unwrap().cover = Some(instance.clone());
+    let started = pm.dispatch(&start).expect("started").events;
 
-    // 2. The runtime commits BuyInStarted at sequence 0; the policy translates.
-    let mut trigger = pb::EventBook {
+    // 2. The runtime commits BuyInStarted at sequence 0; the policy reacts
+    //    to that one trigger.
+    let trigger = pb::EventBook {
         cover: Some(instance.clone()),
-        pages: started.pages.clone(),
+        pages: vec![sequenced_event_page(0, started[0].clone())],
         ..Default::default()
     };
-    trigger.pages[0].sequence = 0;
-    let sent = commands_of(&policy.dispatch(&trigger).expect("translated"));
-    assert_eq!(sent.len(), 1);
-    // The runtime checks the command and stamps its trigger's edition
-    // (decision 14.42): a policy's command stays in that edition.
-    let mut hold = sent[0].clone();
-    hold.cover.as_mut().unwrap().edition = edition.map(str::to_string);
-    let mut hold = caused_by(hold, instance.clone(), 0);
-    let page = hold.page.as_mut().unwrap();
-    page.command_id = Some(uuid_of(9));
-    page.correlation_id = Some(uuid_of(INSTANCE));
-
-    // 3. The wallet (forked in the edition by the runtime, which owns
-    //    edition lifecycle) refuses.
-    let refused = wallet()
-        .dispatch(&pb::ContextualCommand {
-            command: Some(hold.clone()),
-            ..Default::default()
+    let outputs = policy
+        .react(&hpb::ReactRequest {
+            trigger: Some(trigger.clone()),
         })
-        .expect_err("refused");
-
-    // 4. Back to the policy: OnRefused translates, or answers no translation;
-    //    the runtime builds the pass-through fact and addresses it.
-    let refusal = pb::Refusal {
-        event: Some(trigger),
-        command: Some(hold),
-        response: Some(runtime_refusal_response(&refused)),
+        .expect("reacted")
+        .outputs;
+    assert_eq!(outputs.len(), 1);
+    let at = pb::EventRef {
+        stream: Some(instance.clone()),
+        sequence: 0,
     };
-    let answer = policy
-        .dispatch_refusal(&refusal, &CommandContext::default())
-        .expect("answered");
-    let fact = runtime_refusal_fact(&refusal, &answer);
-    assert_eq!(fact.cover, Some(instance));
+    let delivery = delivered(&outputs[0], edition, at.clone());
+
+    // 3. The wallet (forked in the edition by the runtime) refuses.
+    let refused = wallet().dispatch(&handled(&delivery)).expect_err("refused");
+    let refusal = refused.as_refusal().expect("a typed refusal");
+    assert_eq!(refusal.status(), pb::RefusalStatus::FailedPrecondition);
+
+    // 4. Back to the policy: Translate answers the domestic fact's payload;
+    //    the runtime addresses it to the trigger's exact stream under the
+    //    refused command's identity.
+    let fact = policy
+        .translate(&hpb::TranslateRequest {
+            trigger: Some(trigger),
+            command: Some(delivery.clone()),
+            refusal: Some(refusal),
+        })
+        .expect("translated")
+        .fact
+        .expect("a fact");
+    let refusal_fact = pb::ReactionDelivery {
+        cover: Some(instance.clone()),
+        body: Some(pb::reaction_delivery::Body::Fact(fact)),
+        ..delivery
+    };
 
     // 5. The buy-in records its own event for the fact.
-    let recorded = pm
-        .dispatch(&pb::ContextualCommand {
-            command: Some(fact),
-            events: Some(started),
-            ..Default::default()
-        })
-        .expect("recorded")
-        .events
-        .expect("its events");
-    recorded.pages[0].clone()
-}
-
-#[test]
-fn a_refusal_passes_through_to_the_policies_source_in_process() {
-    let recorded = run(buyin_wallet(), None);
+    let mut recorded = handled(&refusal_fact);
+    recorded.history = Some(pb::EventBook {
+        cover: Some(instance),
+        pages: vec![sequenced_event_page(0, started[0].clone())],
+        next_sequence: 1,
+        ..Default::default()
+    });
+    let events = pm.dispatch(&recorded).expect("recorded").events;
     assert_eq!(
-        recorded.payload,
-        Some(any_of(&BuyInFailed { requested: 150 }))
+        recorded.causation,
+        Some(at),
+        "the fact's trigger rides along"
     );
+    events[0].clone()
 }
 
 #[test]
 fn a_refusal_is_translated_for_the_policies_source_in_process() {
-    let policy = buyin_wallet().on_refused(&fq::<HoldFunds>(), |refusal, _ctx| {
-        let typed = refusal
-            .response
-            .as_ref()
-            .and_then(|r| match &r.reason {
-                Some(pb::refusal_response::Reason::Refusal(typed)) => Some(typed),
-                _ => None,
-            })
-            .expect("typed");
-        let insufficient =
-            InsufficientFunds::decode(typed.value.as_slice()).expect("InsufficientFunds");
-        Ok(any_of(&FundsUnavailable {
-            available: insufficient.available,
-        }))
-    });
-    let recorded = run(policy, None);
     assert_eq!(
-        recorded.payload,
-        Some(any_of(&BuyInFailed { requested: 100 }))
+        run(buyin_wallet(), None),
+        any_of(&BuyInFailed { requested: 100 })
     );
 }
 
 // The same chain in an edition: the policy's command stays in its trigger's
-// edition (the runtime stamps it), and the refusal fact returns to the
-// buy-in's stream in the edition. (Forking the wallet there is the
-// runtime's.)
+// edition (the runtime addresses it), and the refusal fact returns to the
+// buy-in's stream in the edition.
 #[test]
 fn the_refusal_path_stays_in_its_edition() {
-    let recorded = run(buyin_wallet(), Some(EDITION));
     assert_eq!(
-        recorded.payload,
-        Some(any_of(&BuyInFailed { requested: 150 }))
+        run(buyin_wallet(), Some(EDITION)),
+        any_of(&BuyInFailed { requested: 100 })
     );
 }

@@ -1,6 +1,11 @@
 # Design: rules version, conflict resolution, command upcasting and router-owned state
 
-> **Superseded in most of its detail by decisions 14.39, 14.40 and 14.42
+> **Historical.** Superseded whole by the proto rewrite (decisions 14.78
+> to 14.109): the handler layer, one Handle, success-only answers, typed
+> refusals only, Emit, and no conflict concept (14.92). See
+> [architecture.md](architecture.md) for the router as it is.
+>
+> **Earlier: superseded in most of its detail by decisions 14.39, 14.40 and 14.42
 > (the router keeps dispatch; everything else is the coordinator's):** the
 > router no longer upcasts (no `UpcasterDispatch`, no command chains, no
 > claims), skips no page a snapshot covers (one state codec), admits

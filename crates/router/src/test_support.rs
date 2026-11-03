@@ -9,6 +9,7 @@ use std::task::{Context, Poll, Waker};
 use prost::{Message, Name};
 use prost_types::Any;
 
+use crate::hpb;
 use crate::pb;
 use crate::rebuild::Rebuilder;
 use crate::{type_url, TYPE_URL_PREFIX};
@@ -53,7 +54,7 @@ pub fn event_page(event: Any) -> pb::EventPage {
 
 pub fn sequenced_event_page(seq: u64, event: Any) -> pb::EventPage {
     pb::EventPage {
-        payload: Some(event),
+        body: Some(pb::event_page::Body::Event(event)),
         sequence: seq,
         ..Default::default()
     }
@@ -93,35 +94,46 @@ pub fn fresh_rebuilder() -> Rebuilder<TestState> {
     Rebuilder::new(TestState::default)
 }
 
-/// A command page whose Command arm carries `command`.
+/// A command page whose Command arm carries `command`, with no Handling.
 pub fn command_page(command: Any) -> pb::CommandPage {
     pb::CommandPage {
         body: Some(pb::command_page::Body::Command(pb::Command {
             payload: Some(command),
+            handling: None,
         })),
         ..Default::default()
     }
 }
 
-/// A command page whose Fact arm carries `fact`.
+/// A command page whose Fact arm carries `fact`, from the external id
+/// "ext-1".
 pub fn fact_page(fact: Any) -> pb::CommandPage {
     pb::CommandPage {
         body: Some(pb::command_page::Body::Fact(pb::Fact {
             payload: Some(fact),
+            origin: Some(origin("ext-1")),
         })),
         ..Default::default()
     }
 }
 
-/// Wraps a command Any as the page of a ContextualCommand.
-pub fn command_for(command: Any) -> pb::ContextualCommand {
-    contextual(command_page(command))
+/// A fact's origin of `external_id`.
+pub fn origin(external_id: &str) -> pb::FactOrigin {
+    pb::FactOrigin {
+        external_id: external_id.to_string(),
+        description: "test".to_string(),
+    }
 }
 
-/// Wraps a command page as the page of a ContextualCommand.
-pub fn contextual(page: pb::CommandPage) -> pb::ContextualCommand {
-    pb::ContextualCommand {
-        command: Some(pb::CommandBook {
+/// Wraps a command Any as the input of a HandleRequest.
+pub fn command_for(command: Any) -> hpb::HandleRequest {
+    request(command_page(command))
+}
+
+/// Wraps a page as the input of a HandleRequest, with no history.
+pub fn request(page: pb::CommandPage) -> hpb::HandleRequest {
+    hpb::HandleRequest {
+        input: Some(pb::CommandBook {
             page: Some(page),
             ..Default::default()
         }),
@@ -154,7 +166,8 @@ pub fn assert_bug(err: &crate::error::CodedError) {
 }
 
 /// Asserts `err` is a failing fold answered INTERNAL as a handler bug, under
-/// `code` (ROUTER_REASON_FOLD_FAILED or ROUTER_REASON_FOLD_FAILED_EMITTED; decision 14.37), the `located` metadata (sequence and type_url, or the batch's
+/// `code` (ANGZARR_REASON_FOLD_FAILED or ANGZARR_REASON_FOLD_FAILED_EMITTED;
+/// decision 14.37), the `located` metadata (sequence and type_url, or the batch's
 /// first_sequence and last_sequence) and `state_type_url`.
 pub fn assert_fold_failed(
     err: &crate::error::CodedError,
@@ -213,16 +226,6 @@ test_message!(HoldFunds, "test.wallet" { amount: u32 = "1" });
 test_message!(ReleaseFunds, "test.wallet" { amount: u32 = "1" });
 test_message!(InsufficientFunds, "test.wallet" { available: u32 = "1", requested: u32 = "2" });
 
-// --- policy addressing (decision 14.36; policy_addressing.feature) ----------
-//
-// An "order" aggregate whose OrderPlaced feeds two policies: one to the
-// "inventory" aggregate (ReserveStock), one to the "fulfillment" process
-// manager (StartFulfillment).
-
-test_message!(OrderPlaced, "test.order" { quantity: u32 = "1" });
-test_message!(ReserveStock, "test.inventory" { quantity: u32 = "1" });
-test_message!(StartFulfillment, "test.fulfillment" { quantity: u32 = "1" });
-
 /// The fully-qualified name of a test message.
 pub fn fq<M: prost::Name>() -> String {
     M::full_name()
@@ -235,37 +238,6 @@ pub fn stream(domain: &str, edition: Option<&str>, root: u8) -> pb::Cover {
         root: Some(uuid_of(root)),
         edition: edition.map(str::to_string),
     }
-}
-
-/// A command book addressed to `cover`, its Command arm carrying `command`,
-/// with command_id `id`.
-pub fn command_book(cover: pb::Cover, command: Any, id: u8) -> pb::CommandBook {
-    let mut page = command_page(command);
-    page.command_id = Some(uuid_of(id));
-    pb::CommandBook {
-        cover: Some(cover),
-        page: Some(page),
-        ..Default::default()
-    }
-}
-
-/// `book` as a policy's command: caused by the event at `sequence` of
-/// `trigger`.
-pub fn caused_by(mut book: pb::CommandBook, trigger: pb::Cover, sequence: u64) -> pb::CommandBook {
-    book.page.as_mut().unwrap().causation_id = Some(pb::EventRef {
-        stream: Some(trigger),
-        sequence,
-    });
-    book
-}
-
-/// Every command a policy answered, in page order: its reactions' commands,
-/// flattened.
-pub fn commands_of(resp: &pb::PolicyResponse) -> Vec<pb::CommandBook> {
-    resp.reactions
-        .iter()
-        .flat_map(|r| r.outputs.iter().cloned())
-        .collect()
 }
 
 /// The answer of a dispatch future, which must be ready on its first poll:
