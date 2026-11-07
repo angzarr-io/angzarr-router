@@ -274,6 +274,121 @@ impl From<CodedError> for HandlerError {
     }
 }
 
+/// A fact handler's failure: a CLASSIFIED BUG, the one failure a fact's
+/// handling (its handler or any continuation step) may answer (decisions
+/// 14.72 and 14.98: a fact never refuses and never asks for a re-run). It
+/// carries a bug code, args and an optional retryable status, or bare text
+/// for the handler's own log (which, like [`HandlerError::Other`]'s, never
+/// crosses a boundary). It has no refusal and no typed refusal, and no way
+/// to hold a [`CodedError`] that is one: its constructors take a bug code,
+/// args and a retryable status only, and [`Bug::from_error`] turns a
+/// refusal or a re-run into the bug it is.
+///
+/// A refusal cannot be put into a `Bug`:
+///
+/// ```compile_fail
+/// use angzarr_router::error::{Bug, BusinessStatus, CodedError};
+/// let refusal = CodedError::refused(BusinessStatus::FailedPrecondition, prost_types::Any::default());
+/// let _ = Bug::coded(refusal, []);
+/// ```
+///
+/// nor a typed refusal object, nor the error itself (the representation is
+/// private):
+///
+/// ```compile_fail
+/// use angzarr_router::error::{Bug, CodedError};
+/// let _ = Bug(CodedError::bug("X", []));
+/// ```
+///
+/// `?` does not convert a [`CodedError`] or a [`HandlerError`] into a
+/// `Bug`: the conversion is the deliberate [`Bug::from_error`] or
+/// [`BugExt::bug`].
+///
+/// ```compile_fail
+/// use angzarr_router::error::{Bug, CodedError};
+/// fn step(e: CodedError) -> Result<(), Bug> {
+///     Err(e)?
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bug(BugRepr);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BugRepr {
+    /// Unclassified: text for the handler's own log.
+    Text(String),
+    /// Classified: a bug or retryable bug [`CodedError`], or a router key
+    /// that is itself a bug; never a refusal or a re-run.
+    Coded(CodedError),
+}
+
+impl Bug {
+    /// An unclassified bug: `text` is for the handler's own log and is
+    /// never sent ([`HandlerError::Other`]'s rule).
+    pub fn new(text: impl std::fmt::Display) -> Self {
+        Bug(BugRepr::Text(text.to_string()))
+    }
+
+    /// A bug under the handler's own `code` and `args` ([`CodedError::bug`]):
+    /// INTERNAL, the code and args as the cause.
+    pub fn coded(code: &str, args: impl IntoIterator<Item = (String, String)>) -> Self {
+        Bug(BugRepr::Coded(CodedError::bug(code, args)))
+    }
+
+    /// A bug the handler marks retryable, under the status it picks
+    /// ([`CodedError::retryable_bug`]).
+    pub fn retryable(
+        status: RetryableStatus,
+        code: &str,
+        args: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        Bug(BugRepr::Coded(CodedError::retryable_bug(
+            status, code, args,
+        )))
+    }
+
+    /// The bug `err` is, by a deliberate call: a [`CodedError`] keeps its
+    /// code, args and status when it is already a bug or a router key (an
+    /// undecodable payload stays ANGZARR_REASON_ANY_DECODE_FAILED), and a
+    /// refusal or a re-run becomes a bug carrying its key as the cause
+    /// ([`CodedError::as_fact_failure`]); any other error is an
+    /// unclassified bug with its text for the log.
+    pub fn from_error<E: std::error::Error + 'static>(err: E) -> Self {
+        Bug::new(err) // RED STUB
+    }
+}
+
+impl std::fmt::Display for Bug {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            BugRepr::Text(text) => f.write_str(text),
+            BugRepr::Coded(coded) => std::fmt::Display::fmt(coded, f),
+        }
+    }
+}
+
+/// A bug is what the boundary maps a fact's failure from: unclassified
+/// text is [`HandlerError::Other`] (decision 14.72), a classified bug its
+/// [`CodedError`].
+impl From<Bug> for HandlerError {
+    fn from(bug: Bug) -> Self {
+        let _ = bug; // RED STUB
+        HandlerError::Other(String::new())
+    }
+}
+
+/// `.bug()` on a `Result` whose error is a std error: the deliberate
+/// conversion into a [`Bug`] ([`Bug::from_error`]).
+pub trait BugExt<T> {
+    fn bug(self) -> Result<T, Bug>;
+}
+
+impl<T, E: std::error::Error + 'static> BugExt<T> for Result<T, E> {
+    fn bug(self) -> Result<T, Bug> {
+        self.map_err(Bug::from_error)
+    }
+}
+
 /// `cause`'s code under `name`, each of its args under `<name>.<arg>`
 /// (decision 14.37).
 fn flatten(

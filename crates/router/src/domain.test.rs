@@ -9,9 +9,9 @@ use std::sync::{Arc, Mutex};
 use prost::Message;
 use prost_types::Any;
 
-use crate::domain::{Continues, DomainDispatch, Emit, InputArm, NotIdempotent};
+use crate::domain::{Continues, DomainDispatch, Emit, FactEmit, InputArm, NotIdempotent};
 use crate::error::{
-    AngzarrReason, BusinessStatus, CodedError, GrpcCode, HandlerError, RetryableStatus,
+    AngzarrReason, Bug, BugExt, BusinessStatus, CodedError, GrpcCode, HandlerError, RetryableStatus,
 };
 use crate::hpb;
 use crate::pb;
@@ -47,7 +47,7 @@ fn bumps(applied: Applied) -> DomainDispatch<TestState> {
         })
         .on_fact("test.Seen", |fact, _state, _ctx| {
             let key = pb::Cover::decode(fact.value.as_slice()).unwrap().domain;
-            Ok(Emit::of([cover_any(&key)]))
+            Ok(FactEmit::of([cover_any(&key)]))
         })
 }
 
@@ -298,41 +298,193 @@ fn an_emit_shows_its_own_events_and_whether_it_continues() {
 
 // --- a fact's handling never refuses (decisions 14.72 and 14.98) ------------------
 
-fn fact_failing(fail: fn() -> HandlerError) -> DomainDispatch<TestState> {
+fn fact_failing(fail: fn() -> Bug) -> DomainDispatch<TestState> {
     DomainDispatch::new("facts", "facts", fresh_rebuilder())
         .on_fact("test.Seen", move |_fact, _state, _ctx| Err(fail()))
-        .on_command("test.Bump", move |_cmd, _state, _ctx| Err(fail()))
+}
+
+fn command_refusing() -> DomainDispatch<TestState> {
+    DomainDispatch::new("cmds", "cmds", fresh_rebuilder()).on_command(
+        "test.Bump",
+        |_cmd, _state, _ctx| {
+            Err(CodedError::refused(BusinessStatus::FailedPrecondition, cover_any("no")).into())
+        },
+    )
+}
+
+fn seen() -> hpb::HandleRequest {
+    request(fact_page(typed("test.Seen", "")))
 }
 
 #[test]
-fn a_facts_refusal_or_rerun_is_answered_as_a_bug_and_a_commands_is_not() {
-    let refused = || {
-        HandlerError::from(CodedError::refused(
-            BusinessStatus::FailedPrecondition,
-            cover_any("no"),
-        ))
-    };
-    let err = fact_failing(refused)
-        .dispatch(&request(fact_page(typed("test.Seen", ""))))
+fn a_facts_unclassified_bug_is_the_unhandled_handler_error_with_no_cause() {
+    let err = fact_failing(|| Bug::new("ledger exploded"))
+        .dispatch(&seen())
         .expect_err("a bug");
     assert_eq!(err.code, AngzarrReason::UnhandledHandlerError.as_str_name());
     assert_eq!(err.grpc, GrpcCode::Internal);
     assert_eq!(err.refusal, None);
-    let err = fact_failing(refused)
+    assert!(
+        err.extras.is_empty(),
+        "no cause, and the text stays in the log: {err:?}"
+    );
+}
+
+#[test]
+fn a_facts_classified_bug_carries_its_cause_and_a_retryable_one_its_status() {
+    let err = fact_failing(|| {
+        Bug::coded(
+            "LEDGER_OFFLINE",
+            [("ledger".to_string(), "main".to_string())],
+        )
+    })
+    .dispatch(&seen())
+    .expect_err("a bug");
+    assert_eq!(err.code, AngzarrReason::UnhandledHandlerError.as_str_name());
+    assert_eq!(err.grpc, GrpcCode::Internal);
+    assert_eq!(
+        err.extras.get("cause").map(String::as_str),
+        Some("LEDGER_OFFLINE")
+    );
+    assert_eq!(
+        err.extras.get("cause.ledger").map(String::as_str),
+        Some("main")
+    );
+    let err = fact_failing(|| {
+        Bug::retryable(
+            RetryableStatus::Unavailable,
+            "LEDGER_OFFLINE",
+            [("ledger".to_string(), "main".to_string())],
+        )
+    })
+    .dispatch(&seen())
+    .expect_err("a retryable bug");
+    assert_eq!(err.grpc, GrpcCode::Unavailable, "a bug's own status");
+    assert_eq!(
+        err.extras.get("cause").map(String::as_str),
+        Some("LEDGER_OFFLINE")
+    );
+    assert_eq!(err.refusal, None);
+}
+
+#[test]
+fn a_facts_undecodable_payload_keeps_its_router_key_through_from_error() {
+    let err = fact_failing(|| {
+        crate::decode_message::<pb::Cover>(&[0xff, 0xff, 0xff])
+            .map(|_| ())
+            .bug()
+            .expect_err("undecodable")
+    })
+    .dispatch(&seen())
+    .expect_err("a bug");
+    assert_eq!(err.code, AngzarrReason::AnyDecodeFailed.as_str_name());
+    assert_eq!(err.grpc, GrpcCode::Internal);
+}
+
+#[test]
+fn a_command_still_refuses_and_a_commands_refusal_is_not_a_bug() {
+    let err = command_refusing()
         .dispatch(&command_for(typed("test.Bump", "")))
         .expect_err("refused");
     assert_eq!(err.code, AngzarrReason::CommandRefused.as_str_name());
-    let retryable = || {
-        HandlerError::from(CodedError::retryable_bug(
-            RetryableStatus::Unavailable,
-            "LEDGER_OFFLINE",
-            [],
-        ))
+}
+
+// --- a fact's steps: one decision, bugs only --------------------------------------
+
+fn fact_with_steps(build: fn() -> FactEmit<TestState>) -> DomainDispatch<TestState> {
+    DomainDispatch::new("facts", "facts", fresh_rebuilder())
+        .on_fact("test.Seen", move |_fact, _state, _ctx| Ok(build()))
+}
+
+#[test]
+fn a_fact_with_steps_emits_every_steps_events_in_order_as_one_decision() {
+    let resp =
+        fact_with_steps(|| {
+            FactEmit::<TestState>::of([cover_any("a")])
+                .then(|state, _ctx| {
+                    assert_eq!(state.applied, ["a"], "the step sees the events folded in");
+                    Ok(FactEmit::of([cover_any("b")])
+                        .then(|_s, _c| Ok(FactEmit::of([cover_any("d")]))))
+                })
+                .then(|_s, _c| Ok(FactEmit::of([cover_any("c")])))
+        })
+        .dispatch(&seen())
+        .expect("recorded");
+    assert_eq!(events_of(&resp), ["a", "b", "d", "c"]);
+}
+
+#[test]
+fn a_bug_in_a_fact_step_fails_the_whole_decision() {
+    let err = fact_with_steps(|| {
+        FactEmit::of([cover_any("a")]).then(|_s, _c| Err(Bug::new("step exploded")))
+    })
+    .dispatch(&seen())
+    .expect_err("the decision fails");
+    assert_eq!(err.code, AngzarrReason::UnhandledHandlerError.as_str_name());
+    assert_eq!(err.grpc, GrpcCode::Internal);
+    assert!(err.extras.is_empty(), "no cause on the wire: {err:?}");
+    let err = fact_with_steps(|| {
+        FactEmit::of([cover_any("a")]).then(|_s, _c| {
+            Err(Bug::retryable(
+                RetryableStatus::Unavailable,
+                "LEDGER_OFFLINE",
+                [],
+            ))
+        })
+    })
+    .dispatch(&seen())
+    .expect_err("the decision fails");
+    assert_eq!(err.grpc, GrpcCode::Unavailable);
+}
+
+#[test]
+fn a_fact_emit_reports_its_events_and_whether_it_continues() {
+    let plain = FactEmit::<TestState>::of([cover_any("a")]);
+    assert_eq!(plain.continues(), Continues::Nowhere);
+    let next = plain.then(|_s, _c| Ok(FactEmit::none()));
+    assert_eq!(next.continues(), Continues::Somewhere);
+    assert_eq!(next.events(), [cover_any("a")]);
+    assert!(FactEmit::<TestState>::none().events().is_empty());
+    let shown = format!("{next:?}");
+    assert!(
+        shown.contains("FactEmit") && shown.contains("Somewhere"),
+        "{shown}"
+    );
+    let lowered: Emit<TestState> = next.into();
+    assert_eq!(lowered.continues(), Continues::Somewhere);
+}
+
+#[test]
+fn a_fact_steps_idempotence_is_checked_like_a_commands() {
+    let ctx = crate::context::CommandContext::default();
+    let once = |state: &Notes, _ctx: &crate::context::CommandContext| {
+        if state.notes.iter().any(|n| n == "restock") {
+            return Ok(FactEmit::none());
+        }
+        Ok(FactEmit::of([cover_any("restock")]))
     };
-    let err = fact_failing(retryable)
-        .dispatch(&request(fact_page(typed("test.Seen", ""))))
-        .expect_err("a retryable bug");
-    assert_eq!(err.grpc, GrpcCode::Unavailable, "a bug's own status");
+    assert_eq!(
+        notes().check_fact_step_idempotent(&Notes::default(), &ctx, once),
+        Ok(())
+    );
+    let always =
+        |_s: &Notes, _c: &crate::context::CommandContext| Ok(FactEmit::of([cover_any("restock")]));
+    assert_eq!(
+        notes().check_fact_step_idempotent(&Notes::default(), &ctx, always),
+        Err(NotIdempotent::EmittedAgain(vec![cover_any("restock")]))
+    );
+    let continuing = |_s: &Notes, _c: &crate::context::CommandContext| {
+        Ok(FactEmit::none().then(|_s, _c| Ok(FactEmit::none())))
+    };
+    assert_eq!(
+        notes().check_fact_step_idempotent(&Notes::default(), &ctx, continuing),
+        Err(NotIdempotent::ContinuedAgain)
+    );
+    let failing = |_s: &Notes, _c: &crate::context::CommandContext| Err(Bug::new("boom"));
+    assert!(matches!(
+        notes().check_fact_step_idempotent(&Notes::default(), &ctx, failing),
+        Err(NotIdempotent::Failed(err)) if err.code == AngzarrReason::UnhandledHandlerError.as_str_name()
+    ));
 }
 
 // --- the context, and the state's cover --------------------------------------------
@@ -354,7 +506,7 @@ fn a_handler_and_its_appliers_see_the_input_and_the_streams_cover() {
         "test.Seen",
         move |_fact, _state, ctx| {
             captured.lock().unwrap().push(ctx.arm.clone());
-            Ok(Emit::of([cover_any("x")]))
+            Ok(FactEmit::of([cover_any("x")]))
         },
     );
     let mut req = request(fact_page(typed("test.Seen", "")));

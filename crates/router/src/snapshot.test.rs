@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use prost::Message;
 use prost_types::Any;
 
-use crate::domain::{DomainDispatch, Emit};
+use crate::domain::{DomainDispatch, Emit, FactEmit};
 use crate::hpb;
 use crate::pb;
 use crate::rebuild::Rebuilder;
@@ -68,7 +68,7 @@ fn items(rebuilder: Rebuilder<Items>) -> DomainDispatch<Items> {
             .into())
         })
         .on_fact("test.Note", |fact, _state, _cctx| {
-            Ok(Emit::of([
+            Ok(FactEmit::of([
                 cover_any(&pb::Cover::decode(fact.value.as_slice()).unwrap().domain),
                 cover_any("flag"),
             ]))

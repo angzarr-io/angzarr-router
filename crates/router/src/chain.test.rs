@@ -12,7 +12,7 @@
 
 use prost::Message;
 
-use crate::domain::{DomainDispatch, Emit};
+use crate::domain::{DomainDispatch, Emit, FactEmit};
 use crate::error::{BusinessStatus, CodedError};
 use crate::hpb;
 use crate::pb;
@@ -50,7 +50,7 @@ fn buyin() -> DomainDispatch<TestState> {
         .on_fact(&fq::<FundsUnavailable>(), |fact, _state, _ctx| {
             let unavailable =
                 FundsUnavailable::decode(fact.value.as_slice()).expect("FundsUnavailable");
-            Ok(Emit::of([any_of(&BuyInFailed {
+            Ok(FactEmit::of([any_of(&BuyInFailed {
                 requested: unavailable.available,
             })]))
         })

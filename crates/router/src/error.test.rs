@@ -836,3 +836,80 @@ fn a_refusal_travels_under_its_declared_status() {
     assert_eq!(err.grpc, GrpcCode::InvalidArgument);
     assert_eq!(err.code, "ANGZARR_REASON_COMMAND_REFUSED");
 }
+
+// --- Bug: a fact's one failure, a classified bug and never a refusal ----------------
+
+#[test]
+fn an_unclassified_bug_lowers_to_other_and_a_classified_one_to_its_bug_error() {
+    assert!(matches!(
+        HandlerError::from(Bug::new("log text")),
+        HandlerError::Other(text) if text == "log text"
+    ));
+    let coded = Bug::coded("LEDGER_OFFLINE", [arg("ledger", "main")]);
+    assert!(matches!(
+        HandlerError::from(coded),
+        HandlerError::Coded(e) if e == CodedError::bug("LEDGER_OFFLINE", [arg("ledger", "main")])
+    ));
+    let retry = Bug::retryable(RetryableStatus::Unavailable, "LEDGER_OFFLINE", []);
+    assert!(matches!(
+        HandlerError::from(retry),
+        HandlerError::Coded(e) if e == CodedError::retryable_bug(RetryableStatus::Unavailable, "LEDGER_OFFLINE", [])
+    ));
+}
+
+#[test]
+fn a_bug_shows_its_text_or_its_code() {
+    assert_eq!(Bug::new("log text").to_string(), "log text");
+    assert_eq!(
+        Bug::coded("LEDGER_OFFLINE", [arg("ledger", "main")]).to_string(),
+        CodedError::bug("LEDGER_OFFLINE", [arg("ledger", "main")]).to_string()
+    );
+}
+
+#[test]
+fn from_error_makes_a_bug_of_any_error_and_a_refusal_needs_that_deliberate_call() {
+    let plain = Bug::from_error(decode_error());
+    assert!(matches!(HandlerError::from(plain), HandlerError::Other(t) if !t.is_empty()));
+    // A router key that is already a bug keeps its code and status.
+    let undecodable = CodedError::undecodable("orders.v1.ItemDelivered", &decode_error());
+    assert_eq!(
+        HandlerError::from(Bug::from_error(undecodable.clone())).into_coded(),
+        undecodable
+    );
+    // A refusal or a re-run becomes the bug it is: no refusal object, no
+    // business status.
+    let refusal = CodedError::refused(BusinessStatus::FailedPrecondition, typed_refusal());
+    let bug = HandlerError::from(Bug::from_error(refusal)).into_coded();
+    assert_eq!(bug.refusal, None);
+    assert_eq!(bug.grpc, GrpcCode::Internal);
+    assert_eq!(bug.code, AngzarrReason::UnhandledHandlerError.as_str_name());
+    let rerun =
+        HandlerError::from(Bug::from_error(CodedError::immediate("PRICE_MOVED", []))).into_coded();
+    assert_eq!(rerun.grpc, GrpcCode::Internal);
+    assert_eq!(
+        rerun.extras.get("cause").map(String::as_str),
+        Some("PRICE_MOVED")
+    );
+}
+
+#[test]
+fn the_bug_extension_converts_a_results_error_deliberately() {
+    let ok: Result<u8, CodedError> = Ok(3);
+    assert_eq!(ok.bug().expect("ok"), 3);
+    let refused: Result<(), CodedError> = Err(CodedError::refused(
+        BusinessStatus::FailedPrecondition,
+        typed_refusal(),
+    ));
+    let bug = refused.bug().expect_err("a bug");
+    assert_eq!(HandlerError::from(bug).into_coded().refusal, None);
+}
+
+impl HandlerError {
+    /// The coded error a test expects.
+    fn into_coded(self) -> CodedError {
+        match self {
+            HandlerError::Coded(e) => e,
+            HandlerError::Other(t) => panic!("not coded: {t}"),
+        }
+    }
+}

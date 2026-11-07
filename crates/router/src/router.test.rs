@@ -5,7 +5,7 @@
 
 use prost_types::Any;
 
-use crate::domain::{DomainDispatch, Emit};
+use crate::domain::{DomainDispatch, Emit, FactEmit};
 use crate::error::{AngzarrReason, CodedError};
 use crate::hpb;
 use crate::pb;
@@ -133,8 +133,9 @@ fn a_router_hosts_one_component_and_refuses_a_second_of_any_kind() {
 fn a_router_dispatches_commands_and_facts_to_its_aggregate() {
     let router = RouterBuilder::new()
         .aggregate(
-            aggregate("created", "order", &["test.Create"])
-                .on_fact("test.Paid", |_, _, _| Ok(Emit::of([any_of_type("paid")]))),
+            aggregate("created", "order", &["test.Create"]).on_fact("test.Paid", |_, _, _| {
+                Ok(FactEmit::of([any_of_type("paid")]))
+            }),
         )
         .build()
         .expect("build");

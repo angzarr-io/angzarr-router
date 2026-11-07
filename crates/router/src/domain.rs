@@ -47,7 +47,7 @@ use std::collections::HashMap;
 
 use prost_types::Any;
 
-use crate::error::{call_handler, AngzarrReason, CodedError, HandlerError};
+use crate::error::{call_handler, AngzarrReason, Bug, CodedError, HandlerError};
 use crate::hpb;
 use crate::pb;
 use crate::rebuild::Rebuilder;
@@ -139,6 +139,94 @@ impl<S> std::fmt::Debug for Emit<S> {
             .field("events", &self.events)
             .field("continues", &self.continues())
             .finish()
+    }
+}
+
+/// What every fact handler returns: events and optionally a continuation,
+/// as an [`Emit`], one decision all the same, but its steps fail only with a
+/// [`Bug`]: a fact never refuses and never asks for a re-run (decisions
+/// 14.72 and 14.98, amending 14.104 for facts). It lowers to an [`Emit`]
+/// (`From<FactEmit<S>> for Emit<S>`), so a fact runs through the one
+/// step-running core a command's does.
+///
+/// A fact step cannot fail with a refusal or any [`HandlerError`]:
+///
+/// ```compile_fail
+/// use angzarr_router::domain::FactEmit;
+/// use angzarr_router::error::{BusinessStatus, CodedError, HandlerError};
+/// let _ = FactEmit::<()>::none().then(|_, _| {
+///     Err(HandlerError::from(CodedError::refused(
+///         BusinessStatus::FailedPrecondition,
+///         prost_types::Any::default(),
+///     )))
+/// });
+/// ```
+///
+/// nor with a [`CodedError`] (a refusal included):
+///
+/// ```compile_fail
+/// use angzarr_router::domain::FactEmit;
+/// use angzarr_router::error::{BusinessStatus, CodedError};
+/// let _ = FactEmit::<()>::none().then(|_, _| {
+///     Err(CodedError::refused(
+///         BusinessStatus::FailedPrecondition,
+///         prost_types::Any::default(),
+///     ))
+/// });
+/// ```
+///
+/// and a step cannot return a command's [`Emit`]:
+///
+/// ```compile_fail
+/// use angzarr_router::domain::{Emit, FactEmit};
+/// let _ = FactEmit::<()>::none().then(|_, _| Ok(Emit::none()));
+/// ```
+pub struct FactEmit<S>(Emit<S>);
+
+impl<S> FactEmit<S> {
+    /// These events, in order, and no continuation.
+    pub fn of(events: impl IntoIterator<Item = Any>) -> Self {
+        FactEmit(Emit::of(events))
+    }
+
+    /// No events and no continuation.
+    pub fn none() -> Self {
+        FactEmit(Emit::none())
+    }
+
+    /// Run `step` on the state once these events are folded in; a step
+    /// fails only with a [`Bug`].
+    pub fn then(
+        self,
+        step: impl FnOnce(&S, &CommandContext) -> Result<FactEmit<S>, Bug> + 'static,
+    ) -> Self
+    where
+        S: 'static,
+    {
+        let _ = step; // RED STUB
+        self
+    }
+
+    /// This step's own events, in order.
+    pub fn events(&self) -> &[Any] {
+        self.0.events()
+    }
+
+    /// Whether a continuation follows.
+    pub fn continues(&self) -> Continues {
+        self.0.continues()
+    }
+}
+
+impl<S> From<FactEmit<S>> for Emit<S> {
+    fn from(fact: FactEmit<S>) -> Self {
+        fact.0
+    }
+}
+
+impl<S> std::fmt::Debug for FactEmit<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("FactEmit").field(&self.0).finish()
     }
 }
 
@@ -256,12 +344,16 @@ impl<S> DomainDispatch<S> {
     pub fn on_fact(
         mut self,
         full_name: &str,
-        thunk: impl Fn(&Any, &S, &CommandContext) -> Result<Emit<S>, HandlerError>
-            + Send
-            + Sync
-            + 'static,
+        thunk: impl Fn(&Any, &S, &CommandContext) -> Result<FactEmit<S>, Bug> + Send + Sync + 'static,
     ) -> Self {
-        self.facts.insert(full_name.to_string(), Box::new(thunk));
+        self.facts.insert(
+            full_name.to_string(),
+            Box::new(move |any, state, ctx| {
+                thunk(any, state, ctx)
+                    .map(Emit::from)
+                    .map_err(HandlerError::from)
+            }),
+        );
         self
     }
 
@@ -378,6 +470,20 @@ impl<S> DomainDispatch<S> {
             };
             emit = call_handler(|| step(state, ctx))?;
         }
+    }
+
+    /// [`Self::check_step_idempotent`] for a fact's step.
+    pub fn check_fact_step_idempotent(
+        &self,
+        state: &S,
+        ctx: &CommandContext,
+        step: impl Fn(&S, &CommandContext) -> Result<FactEmit<S>, Bug>,
+    ) -> Result<(), NotIdempotent>
+    where
+        S: Clone,
+    {
+        let _ = (state, ctx, step); // RED STUB
+        Ok(())
     }
 
     /// The client library's step-idempotence test helper (decision 14.104):

@@ -9,8 +9,10 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use angzarr_router::domain::{DomainDispatch, Emit};
-use angzarr_router::error::{BusinessStatus, CodedError, HandlerError, RetryableStatus};
+use angzarr_router::domain::{DomainDispatch, Emit, FactEmit};
+use angzarr_router::error::{
+    Bug, BugExt, BusinessStatus, CodedError, HandlerError, RetryableStatus,
+};
 use angzarr_router::policy::{self, PolicyDispatch};
 use angzarr_router::projector::ProjectorDispatch;
 use angzarr_router::rebuild::Rebuilder;
@@ -564,7 +566,7 @@ pub fn ledger_aggregate(seen: CoverSink, applied: SequenceSink) -> DomainDispatc
         .on_fact(
             "test.counter.Increased",
             |fact, state: &CounterState, _ctx| {
-                Ok(Emit::of([
+                Ok(FactEmit::of([
                     fact.clone(),
                     any_of(&CounterState {
                         count: state.count + 1,
@@ -735,6 +737,27 @@ impl AddItemFails {
                 let _ = logs; // the handler's own log
                 CodedError::immediate(code, args.clone()).into()
             }
+        }
+    }
+}
+
+impl AddItemFails {
+    /// The failure as a FACT handler answers it: only a bug (decisions
+    /// 14.72 and 14.98), so a refusal or a re-run is the bug it becomes
+    /// through the deliberate [`Bug::from_error`].
+    pub fn fail_as_bug(&self) -> Bug {
+        match self {
+            AddItemFails::Errs { text } => Bug::new(text),
+            AddItemFails::Bug { code, args, .. } => Bug::coded(code, args.clone()),
+            AddItemFails::BugRetryable {
+                status, code, args, ..
+            } => Bug::retryable(*status, code, args.clone()),
+            AddItemFails::Panics { .. }
+            | AddItemFails::Refuses { .. }
+            | AddItemFails::Immediate { .. } => match self.fail() {
+                HandlerError::Coded(coded) => Bug::from_error(coded),
+                HandlerError::Other(text) => Bug::new(text),
+            },
         }
     }
 }
@@ -921,22 +944,23 @@ pub fn order_aggregate(
         .on_fact("orders.v1.ItemDelivered", move |payload, state, cctx| {
             // A payload that does not decode is ANY_DECODE_FAILED, naming
             // its message type (C-0670).
-            let item =
-                angzarr_router::decode_message::<orders::v1::ItemDelivered>(&payload.value)?.item;
+            let item = angzarr_router::decode_message::<orders::v1::ItemDelivered>(&payload.value)
+                .bug()?
+                .item;
             facts.lock().unwrap().push(OrderObserved {
                 handled: angzarr_router::type_name_from_url(&payload.type_url).to_string(),
                 item: item.clone(),
                 items: sorted_items(state),
                 recorded_at: cctx.recorded_at,
             });
-            let recorded = Emit::of([payload.clone()]);
+            let recorded = FactEmit::of([payload.clone()]);
             match &fact {
                 FactReturns::Recorded => Ok(recorded),
                 FactReturns::ThenDeliveredNote => {
                     let delivered = format!("delivered {item}");
-                    Ok(recorded.then(move |_state, _ctx| Ok(Emit::of([note(&delivered)]))))
+                    Ok(recorded.then(move |_state, _ctx| Ok(FactEmit::of([note(&delivered)]))))
                 }
-                FactReturns::Fails(fails) => Err(fails.fail()),
+                FactReturns::Fails(fails) => Err(fails.fail_as_bug()),
             }
         })
 }
