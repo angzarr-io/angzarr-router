@@ -392,7 +392,7 @@ fn a_command_still_refuses_and_a_commands_refusal_is_not_a_bug() {
 // --- a fact's steps: one decision, bugs only --------------------------------------
 
 fn fact_with_steps(build: fn() -> FactEmit<TestState>) -> DomainDispatch<TestState> {
-    DomainDispatch::new("facts", "facts", fresh_rebuilder())
+    DomainDispatch::new("facts", "facts", recording(Applied::default()))
         .on_fact("test.Seen", move |_fact, _state, _ctx| Ok(build()))
 }
 

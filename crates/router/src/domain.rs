@@ -25,9 +25,12 @@
 //! surface). There is no compensation input and no pass-through refusal
 //! fact: a refusal fact is an ordinary fact of the domain (decision 46 #5).
 //!
-//! Every handler returns an [`Emit`] (decision 14.104): events, and
+//! A command handler returns an [`Emit`] (decision 14.104): events, and
 //! optionally a continuation run on the state with them folded in, all of
-//! it one decision. There is no step cap.
+//! it one decision. There is no step cap. A fact handler returns a
+//! [`FactEmit`], the same but for its failures: its handler and steps fail
+//! only with a [`Bug`] (a classified bug, never a refusal or a re-run),
+//! lowered to the same `Emit` core.
 //!
 //! The router admits nothing (decision 14.42): deduplication, a process
 //! manager's start rule and the expected-sequence check are the
@@ -203,8 +206,7 @@ impl<S> FactEmit<S> {
     where
         S: 'static,
     {
-        let _ = step; // RED STUB
-        self
+        FactEmit(self.0.then(move |state, ctx| lower(step(state, ctx))))
     }
 
     /// This step's own events, in order.
@@ -216,6 +218,12 @@ impl<S> FactEmit<S> {
     pub fn continues(&self) -> Continues {
         self.0.continues()
     }
+}
+
+/// A fact step's answer as the shared step-running core takes it: its
+/// [`Emit`], or its [`Bug`] as the handler error it lowers to.
+fn lower<S>(answer: Result<FactEmit<S>, Bug>) -> Result<Emit<S>, HandlerError> {
+    answer.map(Emit::from).map_err(HandlerError::from)
 }
 
 impl<S> From<FactEmit<S>> for Emit<S> {
@@ -339,8 +347,9 @@ impl<S> DomainDispatch<S> {
     /// Registers the fact handler for a fully-qualified fact type name: a
     /// page whose Fact arm carries it runs this handler, which records the
     /// fact (typically as its first event, possibly with events that flag
-    /// it). A fact's handling never refuses: any error it answers is a bug
-    /// ([`CodedError::as_fact_failure`]; decision 14.72).
+    /// it). A fact's handling never refuses: it returns a [`FactEmit`], and
+    /// fails only with a [`Bug`] (decision 14.72), lowered to the one
+    /// step-running core a command's [`Emit`] runs through.
     pub fn on_fact(
         mut self,
         full_name: &str,
@@ -348,11 +357,7 @@ impl<S> DomainDispatch<S> {
     ) -> Self {
         self.facts.insert(
             full_name.to_string(),
-            Box::new(move |any, state, ctx| {
-                thunk(any, state, ctx)
-                    .map(Emit::from)
-                    .map_err(HandlerError::from)
-            }),
+            Box::new(move |any, state, ctx| lower(thunk(any, state, ctx))),
         );
         self
     }
@@ -482,8 +487,7 @@ impl<S> DomainDispatch<S> {
     where
         S: Clone,
     {
-        let _ = (state, ctx, step); // RED STUB
-        Ok(())
+        self.check_step_idempotent(state, ctx, |state, ctx| lower(step(state, ctx)))
     }
 
     /// The client library's step-idempotence test helper (decision 14.104):

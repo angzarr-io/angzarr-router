@@ -354,7 +354,10 @@ impl Bug {
     /// ([`CodedError::as_fact_failure`]); any other error is an
     /// unclassified bug with its text for the log.
     pub fn from_error<E: std::error::Error + 'static>(err: E) -> Self {
-        Bug::new(err) // RED STUB
+        match (&err as &dyn std::any::Any).downcast_ref::<CodedError>() {
+            Some(coded) => Bug(BugRepr::Coded(coded.clone().as_fact_failure())),
+            None => Bug::new(err),
+        }
     }
 }
 
@@ -372,8 +375,10 @@ impl std::fmt::Display for Bug {
 /// [`CodedError`].
 impl From<Bug> for HandlerError {
     fn from(bug: Bug) -> Self {
-        let _ = bug; // RED STUB
-        HandlerError::Other(String::new())
+        match bug.0 {
+            BugRepr::Text(text) => HandlerError::Other(text),
+            BugRepr::Coded(coded) => HandlerError::Coded(coded),
+        }
     }
 }
 

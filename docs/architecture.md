@@ -47,10 +47,14 @@ fully-qualified type name.
   `Rebuilder::of_message` takes all of them from a prost message.
 - `DomainDispatch<S>`: an aggregate (`new`) or a process manager
   (`process_manager`; a PM is a domain, decision 14.31): command handlers
-  (`on_command`), fact handlers (`on_fact`), each returning an `Emit<S>`
-  (`Emit::of(events)`, `Emit::none()`, `.then(step)`), the rules version
-  (`with_rules_version`), and the step-idempotence test helper
-  (`check_step_idempotent`).
+  (`on_command`) returning an `Emit<S>` (`Emit::of(events)`, `Emit::none()`,
+  `.then(step)`; a step fails with a `HandlerError`, a refusal included),
+  fact handlers (`on_fact`) returning a `FactEmit<S>` (the same shape, but
+  its handler and steps fail only with a `Bug`: a classified bug, never a
+  refusal or a re-run; `Bug::new`, `Bug::coded`, `Bug::retryable`, and the
+  deliberate `Bug::from_error` / `.bug()` for a std error), the rules
+  version (`with_rules_version`), and the step-idempotence test helpers
+  (`check_step_idempotent`, `check_fact_step_idempotent`).
 - `PolicyDispatch`: one input domain and one output domain, reactions
   (`on_event`, answering `policy::command` and `policy::fact` outputs)
   and the one refusal callback (`on_refused`).
