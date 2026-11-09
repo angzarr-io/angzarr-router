@@ -794,11 +794,8 @@ fn a_facts_refusal_or_rerun_is_a_bug_and_its_bugs_are_unchanged() {
     );
     assert_eq!(
         refused.extras,
-        [
-            arg("cause", "ANGZARR_REASON_COMMAND_REFUSED"),
-            arg("cause.refusal_type", "test.wallet.InsufficientFunds"),
-        ]
-        .into()
+        [arg("cause", "test.wallet.InsufficientFunds")].into(),
+        "the refusal's key is its type"
     );
     assert_eq!(refused.refusal, None, "the refusal object is dropped");
     let rerun = CodedError::immediate("PRICE_MOVED", [arg("item", "apple")]).as_fact_failure();

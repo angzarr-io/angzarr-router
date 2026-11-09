@@ -7,7 +7,7 @@
 
 mod common;
 
-use angzarr_router::domain::{Emit, NotIdempotent};
+use angzarr_router::domain::{Emit, FactEmit, NotIdempotent};
 use angzarr_router::error::{CodedError, GrpcCode, HandlerError, RetryableStatus};
 use angzarr_router::hpb;
 use angzarr_router::pb;
@@ -82,6 +82,8 @@ struct HandlingWorld {
     /// refused.
     outcome: Option<Result<(), CodedError>>,
     step_under_check: Option<StepUnderCheck>,
+    /// Whether the step under check is a fact's (C-0878), not a command's.
+    step_is_fact: bool,
     step_check: Option<Result<(), NotIdempotent>>,
 }
 
@@ -565,6 +567,16 @@ async fn fact_fails(w: &mut HandlingWorld, fails: String) {
     w.behaviour.fact = conf::FactReturns::Fails(failure(&fails));
 }
 
+// A fact's handler fails only with a Bug (decision 14.110): a refusal object
+// reaches the answer only through the explicit `Bug::from_error`, which
+// `fail_as_bug` applies to a refusal.
+#[given(
+    regex = r#"^business code for the fact ItemDelivered fails by passing the refusal object ItemOutOfStock with item "([^"]*)" and on_hand (\d+) through Bug::from_error$"#
+)]
+async fn fact_fails_through_from_error(w: &mut HandlingWorld, item: String, on_hand: u32) {
+    w.behaviour.fact = conf::FactReturns::Fails(conf::AddItemFails::Refuses { item, on_hand });
+}
+
 #[then(regex = r"^the call fails with status (\w+) and reason (\w+)$")]
 async fn call_fails(w: &mut HandlingWorld, status: String, reason: String) {
     let err = w.the_error();
@@ -682,7 +694,11 @@ async fn error_info_carries(w: &mut HandlingWorld, metadata: String) {
         .await;
     }
     let err = w.the_error();
-    match metadata.as_str() {
+    // A trailing gloss ("..., the refusal's key") is the spec's prose.
+    let metadata = metadata
+        .split_once(", the ")
+        .map_or(metadata.as_str(), |(m, _)| m);
+    match metadata {
         "no other metadata" => assert!(
             err.extras.is_empty(),
             "expected no metadata, got {:?}",
@@ -704,7 +720,7 @@ async fn error_info_carries(w: &mut HandlingWorld, metadata: String) {
             );
         }
         _ => {
-            for (name, value) in expected_metadata(&metadata) {
+            for (name, value) in expected_metadata(metadata) {
                 let carried = err.extras.get(&name);
                 match value {
                     Some(value) => assert_eq!(
@@ -964,7 +980,7 @@ async fn emit_chain(w: &mut HandlingWorld, _item: String, steps: u32) {
 }
 
 #[given(
-    regex = r#"^business code for the fact ItemDelivered returns Emit of the fact's own event, then a step that records OrderNoteAdded "([^"]*)"$"#
+    regex = r#"^business code for the fact ItemDelivered returns FactEmit of the fact's own event, then a step that records OrderNoteAdded "([^"]*)"$"#
 )]
 async fn fact_emit(w: &mut HandlingWorld, _note: String) {
     w.behaviour.fact = conf::FactReturns::ThenDeliveredNote;
@@ -1041,9 +1057,41 @@ async fn not_refused(w: &mut HandlingWorld) {
     regex = r#"^a step that records OrderNoteAdded "([^"]*)" (only while no such note is in the state|whenever it runs)$"#
 )]
 async fn step_under_check(w: &mut HandlingWorld, _note: String, when: String) {
+    w.step_is_fact = false;
     w.step_under_check = Some(match when.as_str() {
         "whenever it runs" => StepUnderCheck::Always,
         _ => StepUnderCheck::OnlyWhileAbsent,
+    });
+}
+
+#[given(
+    regex = r#"^a fact step that records OrderNoteAdded "([^"]*)" (only while no such note is in the state|whenever it runs)$"#
+)]
+async fn fact_step_under_check(w: &mut HandlingWorld, _note: String, when: String) {
+    step_under_check(w, _note, when).await;
+    w.step_is_fact = true;
+}
+
+#[when("the client library's fact step-idempotence test helper runs it")]
+async fn fact_helper_runs(w: &mut HandlingWorld) {
+    let state = conf::orders::v1::OrderState {
+        items: [("apple".to_string(), 1)].into(),
+        ..Default::default()
+    };
+    let ctx = angzarr_router::context::CommandContext::default();
+    let order = w.order();
+    w.step_check = Some(match w.step_under_check.expect("a step") {
+        StepUnderCheck::OnlyWhileAbsent => {
+            order.check_fact_step_idempotent(&state, &ctx, |state, _ctx| {
+                if state.notes == "delivered apple" {
+                    return Ok(FactEmit::none());
+                }
+                Ok(FactEmit::of([conf::note("delivered apple")]))
+            })
+        }
+        StepUnderCheck::Always => order.check_fact_step_idempotent(&state, &ctx, |_state, _ctx| {
+            Ok(FactEmit::of([conf::note("delivered apple")]))
+        }),
     });
 }
 
@@ -1067,13 +1115,16 @@ async fn helper_runs(w: &mut HandlingWorld) {
 #[then(regex = r"^the helper (passes|fails, naming the events the second run emitted)$")]
 async fn helper_verdict(w: &mut HandlingWorld, verdict: String) {
     let check = w.step_check.as_ref().expect("the helper ran");
+    let again = if w.step_is_fact {
+        "delivered apple"
+    } else {
+        "restock apple"
+    };
     match verdict.as_str() {
         "passes" => assert_eq!(check, &Ok(())),
         _ => assert_eq!(
             check,
-            &Err(NotIdempotent::EmittedAgain(vec![conf::note(
-                "restock apple"
-            )]))
+            &Err(NotIdempotent::EmittedAgain(vec![conf::note(again)]))
         ),
     }
 }

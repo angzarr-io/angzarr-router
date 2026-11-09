@@ -563,14 +563,20 @@ impl CodedError {
     /// 14.98): a fact's handling never refuses and never asks for a
     /// re-run, so a typed refusal or a business or ABORTED status becomes
     /// the bug it is, ANGZARR_REASON_UNHANDLED_HANDLER_ERROR (INTERNAL)
-    /// with this error's key and args as its cause, the refusal object
-    /// dropped; a bug, retryable or not, is answered unchanged.
+    /// with this error's key and args as its cause (a typed refusal's key is
+    /// its type, and it has no args), the refusal object dropped; a bug, retryable or not, is answered unchanged.
     pub fn as_fact_failure(self) -> Self {
         let bug_status = matches!(self.grpc, GrpcCode::Aborted)
             || BusinessStatus::try_from(self.grpc).is_ok()
             || self.refusal.is_some();
         if !bug_status {
             return self;
+        }
+        if self.refusal.is_some() {
+            // A refusal's key is its type (decision 14.95), not the wire
+            // reason it travelled under.
+            let key = self.extras.get(reason_args::REFUSAL_TYPE);
+            return Self::bug(key.unwrap_or(&self.code), []);
         }
         Self::bug(&self.code, self.extras)
     }
